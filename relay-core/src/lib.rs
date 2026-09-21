@@ -27,6 +27,8 @@ pub struct AgentRecord {
     pub stderr_next: u64,
     pub stdout_dropped_before: u64,
     pub stderr_dropped_before: u64,
+    pub log_next: u64,
+    pub log_dropped_before: u64,
 }
 
 impl AgentRecord {
@@ -62,6 +64,10 @@ impl AgentRecord {
             (
                 "stderr_dropped_before".to_owned(),
                 Json::number(self.stderr_dropped_before),
+            ),
+            (
+                "dropped_before".to_owned(),
+                Json::number(self.log_dropped_before),
             ),
         ])
     }
@@ -212,11 +218,13 @@ impl AgentRegistry {
             .collect();
         for id in &removed {
             updated.remove(id);
-            let _ = fs::remove_file(self.log_path(id));
         }
         if !removed.is_empty() {
             self.save(&updated)?;
             *entries = updated;
+            for id in &removed {
+                let _ = fs::remove_file(self.log_path(id));
+            }
         }
         Ok(removed)
     }
@@ -230,12 +238,13 @@ impl AgentRegistry {
         let Some(entry) = updated.get_mut(id) else {
             return Ok(());
         };
-        let (next, dropped) = if stream == "stdout" {
-            (&mut entry.stdout_next, &mut entry.stdout_dropped_before)
+        let next = if stream == "stdout" {
+            &mut entry.stdout_next
         } else {
-            (&mut entry.stderr_next, &mut entry.stderr_dropped_before)
+            &mut entry.stderr_next
         };
-        let cursor = *next;
+        let cursor = entry.log_next;
+        entry.log_next += bytes.len() as u64;
         *next += bytes.len() as u64;
         let mut text = String::from_utf8_lossy(bytes).into_owned();
         let redacted = redact(&mut text);
@@ -249,10 +258,10 @@ impl AgentRegistry {
             + "\n";
         let log_path = self.log_path(id);
         let write = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)?;
+            if !log_path.exists() {
+                let _ = create_private(&log_path)?;
+            }
+            let mut file = OpenOptions::new().append(true).open(&log_path)?;
             file.write_all(line.as_bytes())?;
             file.sync_data()
         })();
@@ -264,16 +273,20 @@ impl AgentRegistry {
         }
         let length = fs::metadata(&log_path).map(|v| v.len()).unwrap_or(0);
         if length > AGENT_LOG_CAP {
-            let content = fs::read_to_string(&log_path).unwrap_or_default();
-            let keep_from = content.len().saturating_sub(AGENT_LOG_CAP as usize);
-            let keep_from = content[keep_from..]
-                .find('\n')
-                .map_or(content.len(), |offset| keep_from + offset + 1);
+            let content = fs::read(&log_path).unwrap_or_default();
+            let start = content.len().saturating_sub(AGENT_LOG_CAP as usize);
+            let keep_from = content[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(content.len(), |offset| start + offset + 1);
             let kept = &content[keep_from..];
-            if let Some(Json::Object(fields)) = kept.lines().next().and_then(|v| parse_json(v).ok())
+            if let Some(Json::Object(fields)) = std::str::from_utf8(kept)
+                .ok()
+                .and_then(|v| v.lines().next())
+                .and_then(|v| parse_json(v).ok())
                 && let Some(value) = Json::Object(fields).object("cursor").and_then(Json::as_u64)
             {
-                *dropped = (*dropped).max(value);
+                entry.log_dropped_before = entry.log_dropped_before.max(value);
             }
             let temporary = log_path.with_extension("tmp");
             fs::write(&temporary, kept).map_err(|_| "agent log spool is unavailable".to_owned())?;
@@ -292,7 +305,8 @@ impl AgentRegistry {
         after: u64,
         tail: Option<usize>,
     ) -> Option<Json> {
-        let entry = self.get(id)?;
+        let entries = self.inner.lock().ok()?;
+        let entry = entries.get(id)?.clone();
         let content = fs::read_to_string(self.log_path(id)).unwrap_or_default();
         let mut values: Vec<Json> = content
             .lines()
@@ -319,14 +333,7 @@ impl AgentRegistry {
             });
             values.reverse();
         }
-        let (next_cursor, dropped_before) = match stream {
-            "stderr" => (entry.stderr_next, entry.stderr_dropped_before),
-            "stdout" => (entry.stdout_next, entry.stdout_dropped_before),
-            _ => (
-                entry.stdout_next.max(entry.stderr_next),
-                entry.stdout_dropped_before.max(entry.stderr_dropped_before),
-            ),
-        };
+        let (next_cursor, dropped_before) = (entry.log_next, entry.log_dropped_before);
         Some(Json::Object(vec![
             ("records".to_owned(), Json::Array(values)),
             ("next_cursor".to_owned(), Json::number(next_cursor)),
@@ -417,6 +424,11 @@ fn agent_json(entry: &AgentRecord) -> Json {
             "stderr_dropped_before".to_owned(),
             Json::number(entry.stderr_dropped_before),
         ),
+        ("log_next".to_owned(), Json::number(entry.log_next)),
+        (
+            "log_dropped_before".to_owned(),
+            Json::number(entry.log_dropped_before),
+        ),
     ])
 }
 fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentRecord>, String> {
@@ -461,6 +473,8 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
             stderr_next: integer("stderr_next")?,
             stdout_dropped_before: integer("stdout_dropped_before")?,
             stderr_dropped_before: integer("stderr_dropped_before")?,
+            log_next: integer("log_next")?,
+            log_dropped_before: integer("log_dropped_before")?,
         };
         entries.insert(record.id.clone(), record);
     }
@@ -1210,6 +1224,8 @@ mod tests {
             stderr_next: 0,
             stdout_dropped_before: 0,
             stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
         }
     }
 
@@ -1234,6 +1250,27 @@ mod tests {
             .to_json();
         assert!(logs.contains("[REDACTED]"));
         assert!(!logs.contains("secret-value"));
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
+    }
+
+    #[test]
+    fn agent_log_cursor_orders_interleaved_streams() {
+        let file = path("agent-cursors");
+        let registry = AgentRegistry::open(&file).unwrap();
+        registry.register(agent("one")).unwrap();
+        registry.append_log("one", "stdout", b"first").unwrap();
+        registry.append_log("one", "stderr", b"second").unwrap();
+        let logs = registry.logs_json("one", "both", 5, None).unwrap();
+        assert_eq!(logs.object("next_cursor"), Some(&Json::number(11)));
+        let Json::Array(records) = logs.object("records").unwrap() else {
+            panic!("records")
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].object("data"),
+            Some(&Json::String("second".to_owned()))
+        );
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
     }

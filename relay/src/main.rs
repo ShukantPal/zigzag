@@ -69,14 +69,6 @@ struct CappedOutput {
     complete: bool,
 }
 
-impl Drop for ProcEntry {
-    fn drop(&mut self) {
-        if self.finished_at.is_none() {
-            let _ = kill_process_group(self.process_group);
-        }
-    }
-}
-
 impl CappedOutput {
     fn append(&mut self, bytes: &[u8]) {
         let room = COMPAT_OUTPUT_CAP.saturating_sub(self.bytes.len());
@@ -792,6 +784,8 @@ fn spawn_proc(
         stderr_next: 0,
         stdout_dropped_before: 0,
         stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
     };
     // The registry transition commits before this spawn can be acknowledged.
     if let Err(error) = supervisor.registry.register(record) {
