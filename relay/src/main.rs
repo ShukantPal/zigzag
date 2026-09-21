@@ -1,4 +1,6 @@
-use relay_core::{Json, ReadResult, Store, parse_json, read_secret_file};
+use relay_core::{
+    AgentRecord, AgentRegistry, Json, ReadResult, Store, parse_json, read_secret_file,
+};
 use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,6 +17,7 @@ mod exec;
 const MAX_BODY: usize = 64 * 1024;
 const MAX_FINISHED_PROCS: usize = 128;
 const FINISHED_PROC_RETENTION: Duration = Duration::from_secs(60 * 60);
+const COMPAT_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
 const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
 #[cfg(any(target_os = "macos", test))]
@@ -22,7 +25,9 @@ const SESSION_IS_REMOTE: u32 = 0x1000;
 
 struct Config {
     secret_file: PathBuf,
+    control_secret_file: Option<PathBuf>,
     state_file: PathBuf,
+    agent_registry_file: PathBuf,
     port: u16,
     tailscale_ip: Option<IpAddr>,
     max_events: usize,
@@ -31,7 +36,15 @@ struct Config {
 }
 struct Server {
     secret: String,
+    control_secret: Option<String>,
     store: Store,
+    supervisor: Supervisor,
+}
+
+/// Live handles deliberately disappear on restart; the durable half lives in
+/// `relay-core::AgentRegistry` and records the resulting orphan/loss state.
+struct Supervisor {
+    registry: Arc<AgentRegistry>,
     procs: Mutex<HashMap<String, ProcEntry>>,
 }
 
@@ -56,17 +69,9 @@ struct CappedOutput {
     complete: bool,
 }
 
-impl Drop for ProcEntry {
-    fn drop(&mut self) {
-        if self.finished_at.is_none() {
-            let _ = kill_process_group(self.process_group);
-        }
-    }
-}
-
 impl CappedOutput {
     fn append(&mut self, bytes: &[u8]) {
-        let room = exec::OUTPUT_CAP.saturating_sub(self.bytes.len());
+        let room = COMPAT_OUTPUT_CAP.saturating_sub(self.bytes.len());
         self.bytes
             .extend_from_slice(&bytes[..bytes.len().min(room)]);
         self.truncated |= bytes.len() > room;
@@ -83,6 +88,11 @@ impl CappedOutput {
 enum ProcRoute<'a> {
     Poll(&'a str),
     Kill(&'a str),
+}
+enum AgentRoute<'a> {
+    List,
+    Status(&'a str),
+    Logs(&'a str),
 }
 struct Request {
     method: String,
@@ -110,11 +120,24 @@ fn run() -> Result<(), String> {
     }
     let config = server_config(arguments)?;
     let secret = read_secret_file(&config.secret_file)?;
+    let control_secret = config
+        .control_secret_file
+        .as_deref()
+        .map(read_secret_file)
+        .transpose()?;
     let state = Arc::new(Server {
         secret,
+        control_secret,
         store: Store::open(config.state_file, config.max_events)?,
-        procs: Mutex::new(HashMap::new()),
+        supervisor: Supervisor {
+            registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
+            procs: Mutex::new(HashMap::new()),
+        },
     });
+    for agent in state.supervisor.registry.recover(process_group_running)? {
+        let _ = state.store.add(agent_event("agent_recovered", &agent));
+    }
+    start_reaper(Arc::clone(&state));
     if !config.github_watch_repos.is_empty() {
         let state = Arc::clone(&state);
         let repos = config.github_watch_repos.clone();
@@ -141,6 +164,7 @@ fn run() -> Result<(), String> {
 fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut secret_file = env::var_os("ZIGZAG_SECRET_FILE").map(PathBuf::from);
     let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
+    let mut control_secret_file = env::var_os("ZIGZAG_CONTROL_SECRET_FILE").map(PathBuf::from);
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
@@ -155,6 +179,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         };
         match argument.as_str() {
             "--secret-file" => secret_file = Some(PathBuf::from(value(&mut values, "--secret-file")?)),
+            "--control-secret-file" => control_secret_file = Some(PathBuf::from(value(&mut values, "--control-secret-file")?)),
             "--state-file" => state_file = Some(PathBuf::from(value(&mut values, "--state-file")?)),
             "--port" => port = value(&mut values, "--port")?.parse().map_err(|_| "--port must be a valid u16".to_owned())?,
             "--tailscale-ip" => {
@@ -185,7 +210,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
                 github_watch_interval = Duration::from_secs(seconds);
             }
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -196,9 +221,12 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     if max_events == 0 {
         return Err("--max-events must be greater than zero".to_owned());
     }
+    let agent_registry_file = state_file.with_extension("agents.json");
     Ok(Config {
         secret_file,
+        control_secret_file,
         state_file,
+        agent_registry_file,
         port,
         tailscale_ip,
         max_events,
@@ -439,25 +467,38 @@ where
             return Ok(());
         }
     };
+    let request_path = request.target.split('?').next().unwrap_or("");
+    let control_route =
+        request.method == "POST" && matches!(proc_route(request_path), Some(ProcRoute::Kill(_)));
+    let Some(required_secret) = (if control_route {
+        state.control_secret.as_deref()
+    } else {
+        Some(state.secret.as_str())
+    }) else {
+        return reply(&mut stream, 404, error("not_found"));
+    };
     if !authorized(
         request
             .headers
             .get("authorization")
             .map(String::as_str)
             .unwrap_or(""),
-        &state.secret,
+        required_secret,
     ) {
         reply(&mut stream, 401, error("unauthorized"))?;
         return Ok(());
     }
-    match (
-        request.method.as_str(),
-        request.target.split('?').next().unwrap_or(""),
-    ) {
+    match (request.method.as_str(), request_path) {
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("GET", path) if agent_route(path).is_some() => agent_request(
+            &mut stream,
+            &state,
+            &request.target,
+            agent_route(path).expect("checked"),
+        ),
         ("GET", path) => match proc_route(path) {
             Some(ProcRoute::Poll(handle)) => poll_proc(&mut stream, &state, handle),
             Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
@@ -469,6 +510,106 @@ where
             None => reply(&mut stream, 404, error("not_found")),
         },
         _ => reply(&mut stream, 404, error("not_found")),
+    }
+}
+
+fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
+    if path == "/v1/agents" {
+        return Some(AgentRoute::List);
+    }
+    let rest = path.strip_prefix("/v1/agents/")?;
+    if let Some(id) = rest.strip_suffix("/logs") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Logs(id));
+    }
+    (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
+}
+
+fn agent_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    target: &str,
+    route: AgentRoute<'_>,
+) -> Result<(), String> {
+    let values = match query(target) {
+        Ok(values) => values,
+        Err(_) => return reply(stream, 400, error("invalid_agent_query")),
+    };
+    match route {
+        AgentRoute::List => {
+            let allowed = ["state", "task_id"];
+            if values.keys().any(|key| !allowed.contains(&key.as_str())) {
+                return reply(stream, 400, error("invalid_agent_query"));
+            }
+            let agents = state.supervisor.registry.list(
+                values.get("state").map(String::as_str),
+                values.get("task_id").map(String::as_str),
+            );
+            reply(
+                stream,
+                200,
+                Json::Object(vec![(
+                    "agents".to_owned(),
+                    Json::Array(agents.iter().map(AgentRecord::status_json).collect()),
+                )]),
+            )
+        }
+        AgentRoute::Status(id) => match state.supervisor.registry.get(id) {
+            Some(agent) => reply(stream, 200, agent.status_json()),
+            None => reply(stream, 404, error("unknown_agent")),
+        },
+        AgentRoute::Logs(id) => {
+            let allowed = ["stream", "after", "tail", "follow"];
+            if values.keys().any(|key| !allowed.contains(&key.as_str())) {
+                return reply(stream, 400, error("invalid_log_query"));
+            }
+            let stream_name = values.get("stream").map(String::as_str).unwrap_or("both");
+            if !matches!(stream_name, "stdout" | "stderr" | "both") {
+                return reply(stream, 400, error("invalid_log_query"));
+            }
+            let after = match values
+                .get("after")
+                .map_or(Ok(0), |value| value.parse::<u64>())
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_log_query")),
+            };
+            let tail = match values
+                .get("tail")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_log_query")),
+            };
+            let follow =
+                match values
+                    .get("follow")
+                    .map_or(Ok(false), |value| match value.as_str() {
+                        "0" => Ok(false),
+                        "1" => Ok(true),
+                        _ => Err(()),
+                    }) {
+                    Ok(value) => value,
+                    Err(_) => return reply(stream, 400, error("invalid_log_query")),
+                };
+            let deadline = Instant::now() + Duration::from_secs(50);
+            loop {
+                let Some(logs) = state
+                    .supervisor
+                    .registry
+                    .logs_json(id, stream_name, after, tail)
+                else {
+                    return reply(stream, 404, error("unknown_agent"));
+                };
+                let has_records = logs.object("records").is_some_and(
+                    |records| matches!(records, Json::Array(records) if !records.is_empty()),
+                );
+                if !follow || has_records || Instant::now() >= deadline {
+                    return reply(stream, 200, logs);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 }
 
@@ -575,7 +716,7 @@ fn spawn_request(
         Ok(path) => path,
         Err(denial) => return reply(stream, 200, denial),
     };
-    match spawn_proc(&state.procs, path, request) {
+    match spawn_proc(&state.supervisor, path, request) {
         Ok(handle) => reply(
             stream,
             200,
@@ -597,7 +738,7 @@ struct SpawnedProc {
 }
 
 fn spawn_proc(
-    procs: &Mutex<HashMap<String, ProcEntry>>,
+    supervisor: &Supervisor,
     path: &str,
     request: exec::ExecRequest,
 ) -> Result<SpawnedProc, String> {
@@ -616,14 +757,55 @@ fn spawn_proc(
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
     let process_group = child.id() as i32;
-    drain_to_capture(child_stdout, Arc::clone(&stdout));
-    drain_to_capture(child_stderr, Arc::clone(&stderr));
-    let mut table = procs
+    let mut table = supervisor
+        .procs
         .lock()
         .map_err(|_| "process table lock poisoned".to_owned())?;
     prune_procs(&mut table, Instant::now());
     let handle = unique_handle(&table)?;
     let id = request.id;
+    let record = AgentRecord {
+        id: handle.clone(),
+        task_id: id.clone(),
+        leader_pid: process_group,
+        process_group,
+        started_at: unix_timestamp(),
+        deadline_at: None,
+        command: format!(
+            "{} {}",
+            request.bin,
+            request.args.first().map(String::as_str).unwrap_or("")
+        ),
+        state: "running".to_owned(),
+        exit_code: None,
+        log_degraded: false,
+        redacted: false,
+        stdout_next: 0,
+        stderr_next: 0,
+        stdout_dropped_before: 0,
+        stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
+    };
+    // The registry transition commits before this spawn can be acknowledged.
+    if let Err(error) = supervisor.registry.register(record) {
+        let _ = kill_process_group(process_group);
+        return Err(error);
+    }
+    drain_to_capture(
+        child_stdout,
+        Arc::clone(&stdout),
+        Arc::clone(&supervisor.registry),
+        handle.clone(),
+        "stdout",
+    );
+    drain_to_capture(
+        child_stderr,
+        Arc::clone(&stderr),
+        Arc::clone(&supervisor.registry),
+        handle.clone(),
+        "stderr",
+    );
     table.insert(
         handle.clone(),
         ProcEntry {
@@ -644,7 +826,13 @@ fn spawn_proc(
     Ok(SpawnedProc { id, handle })
 }
 
-fn drain_to_capture(mut pipe: impl Read + Send + 'static, capture: Arc<Mutex<CappedOutput>>) {
+fn drain_to_capture(
+    mut pipe: impl Read + Send + 'static,
+    capture: Arc<Mutex<CappedOutput>>,
+    registry: Arc<AgentRegistry>,
+    agent_id: String,
+    stream: &'static str,
+) {
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
@@ -656,6 +844,9 @@ fn drain_to_capture(mut pipe: impl Read + Send + 'static, capture: Arc<Mutex<Cap
                     } else {
                         break;
                     }
+                    // A spool failure never stops pipe draining; it is recorded
+                    // as log_degraded and retried on the next chunk.
+                    let _ = registry.append_log(&agent_id, stream, &chunk[..n]);
                 }
             }
         }
@@ -668,6 +859,7 @@ fn drain_to_capture(mut pipe: impl Read + Send + 'static, capture: Arc<Mutex<Cap
 fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
+            .supervisor
             .procs
             .lock()
             .map_err(|_| "process table lock poisoned".to_owned())?;
@@ -675,7 +867,7 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
         let Some(entry) = table.get_mut(handle) else {
             return reply(stream, 404, error("unknown_proc"));
         };
-        update_proc_status(entry);
+        update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         eprintln!(
             "poll id={} bin={} subcommand={}",
             entry.id, entry.bin, entry.subcommand
@@ -688,6 +880,7 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
 fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
+            .supervisor
             .procs
             .lock()
             .map_err(|_| "process table lock poisoned".to_owned())?;
@@ -695,7 +888,7 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
         let Some(entry) = table.get_mut(handle) else {
             return reply(stream, 404, error("unknown_proc"));
         };
-        update_proc_status(entry);
+        update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         let killed = if entry.finished_at.is_none() {
             kill_process_group(entry.process_group)
         } else {
@@ -704,7 +897,7 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
         if killed {
             // Reap promptly when the signal is delivered before a subsequent
             // poll, but do not block an HTTP request waiting for cleanup.
-            update_proc_status(entry);
+            update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         }
         eprintln!(
             "kill id={} bin={} subcommand={}",
@@ -716,28 +909,6 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
         ])
     };
     reply(stream, 200, result)
-}
-
-fn update_proc_status(entry: &mut ProcEntry) {
-    if entry.finished_at.is_some() {
-        return;
-    }
-    if !entry.leader_reaped {
-        match entry.child.try_wait() {
-            Ok(Some(status)) => {
-                entry.exit_code = status.code();
-                entry.leader_reaped = true;
-            }
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("detached child wait failed: {error}");
-                return;
-            }
-        }
-    }
-    if !process_group_running(entry.process_group) && output_is_complete(entry) {
-        entry.finished_at = Some(Instant::now());
-    }
 }
 
 fn output_is_complete(entry: &ProcEntry) -> bool {
@@ -803,9 +974,8 @@ fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String>
 }
 
 fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant) {
-    for entry in entries.values_mut() {
-        update_proc_status(entry);
-    }
+    // The independent reaper does durable transitions. This compatibility
+    // pruning pass only bounds completed in-memory handles.
     entries.retain(|_, entry| {
         entry
             .finished_at
@@ -819,6 +989,82 @@ fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant) {
     let excess = finished.len().saturating_sub(MAX_FINISHED_PROCS);
     for (handle, _) in finished.into_iter().take(excess) {
         entries.remove(&handle);
+    }
+}
+
+fn unix_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+fn agent_event(kind: &str, agent: &AgentRecord) -> Json {
+    Json::Object(vec![
+        (
+            "id".to_owned(),
+            Json::String(format!("agent:{}:{}", agent.id, kind)),
+        ),
+        ("kind".to_owned(), Json::String(kind.to_owned())),
+        ("agent_id".to_owned(), Json::String(agent.id.clone())),
+        ("task_id".to_owned(), Json::String(agent.task_id.clone())),
+        ("state".to_owned(), Json::String(agent.state.clone())),
+    ])
+}
+
+fn start_reaper(state: Arc<Server>) {
+    thread::spawn(move || {
+        loop {
+            if let Ok(mut entries) = state.supervisor.procs.lock() {
+                for (handle, entry) in entries.iter_mut() {
+                    update_proc_status_with_handle(
+                        entry,
+                        handle,
+                        &state.supervisor.registry,
+                        &state.store,
+                    );
+                }
+                prune_procs(&mut entries, Instant::now());
+            }
+            let _ = state
+                .supervisor
+                .registry
+                .prune(unix_timestamp().parse().unwrap_or_default());
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
+fn update_proc_status_with_handle(
+    entry: &mut ProcEntry,
+    handle: &str,
+    registry: &AgentRegistry,
+    store: &Store,
+) {
+    if entry.finished_at.is_some() {
+        return;
+    }
+    if !entry.leader_reaped {
+        match entry.child.try_wait() {
+            Ok(Some(status)) => {
+                entry.exit_code = status.code();
+                entry.leader_reaped = true;
+            }
+            Ok(None) => return,
+            Err(_) => return,
+        }
+    }
+    if !process_group_running(entry.process_group) && output_is_complete(entry) {
+        entry.finished_at = Some(Instant::now());
+        let state = match entry.exit_code {
+            Some(0) => "succeeded",
+            Some(_) => "failed",
+            None => "unexpected_exit",
+        };
+        if let Ok(Some(agent)) = registry.transition(handle, state, entry.exit_code) {
+            let _ = store.add(agent_event("agent_completed", &agent));
+        }
     }
 }
 
@@ -1306,28 +1552,36 @@ mod tests {
     #[test]
     fn captured_output_stops_at_the_exec_output_cap() {
         let mut output = CappedOutput::default();
-        output.append(&vec![b'x'; exec::OUTPUT_CAP]);
+        output.append(&vec![b'x'; COMPAT_OUTPUT_CAP]);
         output.append(b"extra");
         let (captured, truncated) = output.snapshot();
-        assert_eq!(captured.len(), exec::OUTPUT_CAP);
+        assert_eq!(captured.len(), COMPAT_OUTPUT_CAP);
         assert!(truncated);
     }
 
     #[test]
     fn prune_drops_finished_entries_past_the_retention_window() {
-        let procs = Mutex::new(HashMap::new());
+        let registry_path = std::env::temp_dir().join(format!(
+            "zigzag-test-agents-{}",
+            unique_handle(&HashMap::new()).unwrap()
+        ));
+        let supervisor = Supervisor {
+            registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
+            procs: Mutex::new(HashMap::new()),
+        };
         let request = exec::ExecRequest {
             id: "old".to_owned(),
             bin: "sh".to_owned(),
             args: vec!["-c".to_owned(), "exit 0".to_owned()],
         };
-        let handle = spawn_proc(&procs, "/bin/sh", request).unwrap().handle;
-        let mut entries = procs.lock().unwrap();
+        let handle = spawn_proc(&supervisor, "/bin/sh", request).unwrap().handle;
+        let mut entries = supervisor.procs.lock().unwrap();
         let entry = entries.get_mut(&handle).unwrap();
         let _ = entry.child.wait();
         entry.finished_at = Some(Instant::now() - FINISHED_PROC_RETENTION - Duration::from_secs(1));
         prune_procs(&mut entries, Instant::now());
         assert!(entries.is_empty());
+        let _ = std::fs::remove_file(registry_path);
     }
 
     #[test]
@@ -1366,6 +1620,28 @@ mod tests {
             completed.object("stdout"),
             Some(&Json::String("hello".to_owned()))
         );
+        // New diagnostics are read-only and use the same authenticated relay
+        // path; the legacy proc response above remains unchanged.
+        let agent = response_json(request_once(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            &format!("/v1/agents/{handle}"),
+            "",
+        ));
+        assert_eq!(agent.object("id"), Some(&Json::String(handle.clone())));
+        assert_eq!(
+            agent.object("state"),
+            Some(&Json::String("succeeded".to_owned()))
+        );
+        let logs = response_json(request_once(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            &format!("/v1/agents/{handle}/logs?stream=stdout&after=0"),
+            "",
+        ));
+        assert!(logs.to_json().contains("hello"));
 
         // The shell leader exits immediately, leaving the sleep descendant in
         // the dedicated process group. It must still be visible and killable.
@@ -1410,8 +1686,12 @@ mod tests {
         (
             Arc::new(Server {
                 secret: "x".repeat(32),
+                control_secret: Some("x".repeat(32)),
                 store: Store::open(&path, 1).unwrap(),
-                procs: Mutex::new(HashMap::new()),
+                supervisor: Supervisor {
+                    registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
+                    procs: Mutex::new(HashMap::new()),
+                },
             }),
             path,
         )
