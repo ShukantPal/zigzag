@@ -13,6 +13,34 @@ event remains in the durable bounded queue; a replay after eviction is a new
 delivery. The queue is durable but bounded; when it overflows, the poller
 reports a warning on stderr.
 
+## Supervised agent diagnostics
+
+`POST /v1/spawn` keeps its existing `{"id", "proc"}` response and
+`/v1/proc/<proc>` compatibility status view. During migration, `proc` is also
+the relay-generated agent ID. The relay persists a private agent registry next
+to its event state and continuously drains each agent's stdout and stderr.
+Authenticated read-only diagnostics are available at:
+
+- `GET /v1/agents?state=…&task_id=…`
+- `GET /v1/agents/<agent-id>`
+- `GET /v1/agents/<agent-id>/logs?stream=stdout|stderr|both&after=…&tail=…&follow=0|1`
+
+Logs are sensitive. They are owner-only local spools, limited to 32 MiB per
+agent; evicting old complete records advances `dropped_before` rather than
+silently truncating. Readers use `next_cursor` and must handle that explicit
+loss marker. Known bearer/API-key/private-key forms are redacted before the
+spool is written, but redaction is not a guarantee—treat the relay bearer
+token as granting log access and rotate it after suspected exposure.
+
+After a relay restart, live process groups become `orphaned` (their former
+pipes cannot be reattached); dead groups become `lost_after_restart`. Terminal
+registry records and their bounded spool metadata are pruned after seven days.
+The relay remains HTTP only on loopback/Tailscale; the approved forwarding
+proxy terminates TLS for orchestrator-facing HTTPS. The bearer token and
+GUI-session Keychain allowlist are unchanged. The legacy kill route is only
+enabled when a distinct `--control-secret-file` (or
+`ZIGZAG_CONTROL_SECRET_FILE`) is configured.
+
 ## Build and test
 
 ```sh
