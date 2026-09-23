@@ -86,6 +86,59 @@ Policy JSON shape: `{"bins": {"<name>": {"path": "/abs/path", "commands": [["sub
 `commands` entries are argv prefixes. The `gh` bin also accepts
 `"gh_read_repos": ["owner/repo"]` to scope `gh api` / `pr` commands.
 
+### OpenCode pilot runner
+
+`scripts/opencode-launch` is the only OpenCode launcher owned by Zigzag. A
+department client stages a directory, asks the existing `/v1/spawn` flow to
+invoke the runner, and records the returned process handle. It must not
+construct a separate `opencode run` command itself.
+
+The runner accepts exactly one operation and an absolute staged-task directory:
+
+```sh
+scripts/opencode-launch run --task-dir /absolute/staged-task
+scripts/opencode-launch resume --task-dir /absolute/staged-task
+```
+
+Each staged task has two UTF-8, regular (non-symlink) input files:
+
+```text
+prompt.txt
+runtime.json
+```
+
+`runtime.json` is an object with a required absolute `project_dir` and optional
+`model`, `title`, `agent`, and `session_id` strings. `resume` requires
+`session_id`. The runner allows only its source-controlled OSS/Talon project
+roots and only the listed free OpenCode Zen models. Its default model is
+`opencode/muse-spark-1.3-contributor-free`; `--model` may select another
+approved free model. It rejects all OpenAI, Anthropic, and paid/non-Zen model
+IDs. Adding a project root or a model is therefore a reviewed code change.
+
+After every invocation the task directory contains the raw structured stream
+in `opencode-events.jsonl`, stderr in `opencode-stderr.log`, and rendered
+artifacts: `opencode-result.txt`, `opencode-session-id.txt` (when OpenCode
+emits one), `opencode-usage.json`, and `opencode-run.json`. Usage is labeled
+`runtime: "opencode"` and includes input, output, reasoning, cache-read,
+cache-write, and cost fields from the final `step_finish` event.
+
+The runner always invokes OpenCode with closed stdin. Leaving stdin open makes
+non-interactive `opencode run` wait forever for an interactive session.
+
+Install its relay policy from Shukant's GUI login session after reviewing the
+absolute path for the deployed checkout:
+
+```json
+{
+  "bins": {
+    "opencode-launch": {
+      "path": "/Users/shukant/Workspace/ShukantPal/zigzag/scripts/opencode-launch",
+      "commands": [["run"], ["resume"]]
+    }
+  }
+}
+```
+
 ## Linux VM build
 
 The poller uses only the Rust standard library. Cross-compile for the VM after

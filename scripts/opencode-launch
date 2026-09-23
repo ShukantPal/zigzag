@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Run a staged OpenCode task through the reviewed Zigzag launch contract.
+
+The relay may invoke this program with only `run` or `resume` plus a staged
+task directory.  All OpenCode-specific validation and artifact handling stays
+here, rather than being duplicated by department clients.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from typing import Any, Iterable
+
+
+DEFAULT_MODEL = "opencode/muse-spark-1.3-contributor-free"
+FREE_ZEN_MODELS = frozenset(
+    {
+        DEFAULT_MODEL,
+        "opencode/big-pickle",
+        "opencode/ling-3.0-flash-fin-free",
+        "opencode/mimo-v2.6-flash-free",
+        "opencode/muse-spark-1.2-contributor-free",
+        "opencode/nemotron-3-ultra-free",
+        "opencode/nemotron-3.5-lightning-free",
+    }
+)
+
+# This is intentionally source-controlled rather than task-configurable.  Add
+# a root only after its OSS/Talon status has been reviewed with this runner.
+ALLOWED_PROJECT_ROOTS = (
+    Path("/Users/shukant/Workspace/ShukantPal/zigzag"),
+    Path("/Users/shukant/Workspace/impalasys/talon"),
+)
+OPENCODE_BIN = Path("/run/current-system/sw/bin/opencode")
+MAX_PROMPT_BYTES = 64 * 1024
+MAX_SETTING_BYTES = 4 * 1024
+
+PROMPT_FILE = "prompt.txt"
+RUNTIME_FILE = "runtime.json"
+EVENTS_FILE = "opencode-events.jsonl"
+STDERR_FILE = "opencode-stderr.log"
+RESULT_FILE = "opencode-result.txt"
+SESSION_FILE = "opencode-session-id.txt"
+USAGE_FILE = "opencode-usage.json"
+RUN_FILE = "opencode-run.json"
+
+
+class RunnerError(Exception):
+    """A validation error safe to report to the launcher caller."""
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="run a validated staged OpenCode task",
+    )
+    parser.add_argument("operation", choices=("run", "resume"))
+    parser.add_argument("--task-dir", required=True, type=Path)
+    parser.add_argument(
+        "--model",
+        help="a supported free OpenCode Zen model; defaults to the staged model or Muse Spark 1.3",
+    )
+    return parser.parse_args(argv)
+
+
+def checked_task_dir(value: Path) -> Path:
+    if not value.is_absolute():
+        raise RunnerError("--task-dir must be an absolute path")
+    try:
+        task_dir = value.resolve(strict=True)
+    except OSError as error:
+        raise RunnerError(f"task directory is unavailable: {error}") from error
+    if not task_dir.is_dir():
+        raise RunnerError("--task-dir must name a directory")
+    return task_dir
+
+
+def read_staged_file(task_dir: Path, name: str, limit: int) -> str:
+    path = task_dir / name
+    try:
+        stat = path.lstat()
+    except OSError as error:
+        raise RunnerError(f"missing required staged file {name}: {error}") from error
+    if not path.is_file() or path.is_symlink() or stat.st_size > limit:
+        raise RunnerError(f"staged file {name} must be a regular file no larger than {limit} bytes")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise RunnerError(f"could not read staged file {name}: {error}") from error
+
+
+def parse_runtime(task_dir: Path) -> dict[str, str]:
+    text = read_staged_file(task_dir, RUNTIME_FILE, MAX_SETTING_BYTES)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RunnerError(f"runtime.json is not valid JSON: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise RunnerError("runtime.json must be a JSON object")
+    allowed = {"project_dir", "model", "title", "agent", "session_id"}
+    if set(value) - allowed or "project_dir" not in value:
+        raise RunnerError("runtime.json must contain project_dir and only supported runtime settings")
+    parsed: dict[str, str] = {}
+    for name, setting in value.items():
+        if not isinstance(setting, str) or not setting.strip() or "\x00" in setting:
+            raise RunnerError(f"runtime setting {name} must be a non-empty string")
+        parsed[name] = setting
+    return parsed
+
+
+def checked_project_dir(value: str) -> Path:
+    project = Path(value)
+    if not project.is_absolute():
+        raise RunnerError("runtime project_dir must be an absolute path")
+    try:
+        project = project.resolve(strict=True)
+    except OSError as error:
+        raise RunnerError(f"runtime project_dir is unavailable: {error}") from error
+    if not project.is_dir():
+        raise RunnerError("runtime project_dir must name a directory")
+    if not any(project.is_relative_to(root) for root in ALLOWED_PROJECT_ROOTS):
+        raise RunnerError("runtime project_dir is not an approved OSS or Talon project root")
+    return project
+
+
+def checked_model(model: str) -> str:
+    if model not in FREE_ZEN_MODELS:
+        raise RunnerError(
+            "model must be an approved free OpenCode Zen model; OpenAI and Anthropic models are not allowed"
+        )
+    return model
+
+
+def write_artifact(task_dir: Path, name: str, text: str) -> None:
+    destination = task_dir / name
+    temporary = task_dir / f".{name}.{os.getpid()}.tmp"
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, destination)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RunnerError(f"could not write artifact {name}: {error}") from error
+
+
+def write_json_artifact(task_dir: Path, name: str, value: Any) -> None:
+    write_artifact(task_dir, name, json.dumps(value, sort_keys=True) + "\n")
+
+
+def event_value(event: dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key in event:
+            return event[key]
+    part = event.get("part")
+    if isinstance(part, dict):
+        for key in keys:
+            if key in part:
+                return part[key]
+    return None
+
+
+def first_string(value: Any, keys: Iterable[str]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            found = first_string(item, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = first_string(item, keys)
+            if found:
+                return found
+    return None
+
+
+def number_from(value: Any, keys: Iterable[str]) -> int | float | None:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            return candidate
+    return None
+
+
+def usage_from_event(event: dict[str, Any]) -> dict[str, int | float | None]:
+    usage_sources: list[dict[str, Any]] = [event]
+    for key in ("usage", "tokens"):
+        candidate = event.get(key)
+        if isinstance(candidate, dict):
+            usage_sources.append(candidate)
+    part = event.get("part")
+    if isinstance(part, dict):
+        usage_sources.append(part)
+        for key in ("usage", "tokens"):
+            candidate = part.get(key)
+            if isinstance(candidate, dict):
+                usage_sources.append(candidate)
+
+    aliases = {
+        "input_tokens": ("input", "input_tokens", "inputTokens"),
+        "output_tokens": ("output", "output_tokens", "outputTokens"),
+        "reasoning_tokens": ("reasoning", "reasoning_tokens", "reasoningTokens"),
+        "cost": ("cost",),
+    }
+    usage = {
+        name: next(
+            (number for source in usage_sources if (number := number_from(source, names)) is not None),
+            None,
+        )
+        for name, names in aliases.items()
+    }
+    cache_sources = [
+        cache
+        for source in usage_sources
+        if isinstance((cache := source.get("cache")), dict)
+    ]
+    usage["cache_read_tokens"] = next(
+        (number for cache in cache_sources if (number := number_from(cache, ("read", "cache_read", "cacheRead"))) is not None),
+        None,
+    )
+    usage["cache_write_tokens"] = next(
+        (number for cache in cache_sources if (number := number_from(cache, ("write", "cache_write", "cacheWrite"))) is not None),
+        None,
+    )
+    return usage
+
+
+def render_artifacts(task_dir: Path, operation: str, return_code: int) -> None:
+    events_text = read_staged_file(task_dir, EVENTS_FILE, 16 * 1024 * 1024)
+    session_id: str | None = None
+    text_parts: list[str] = []
+    usage: dict[str, int | float | None] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "reasoning_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cost": None,
+    }
+    for line in events_text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        session_id = session_id or first_string(event, ("sessionID", "session_id"))
+        if event.get("type") == "text":
+            value = event_value(event, ("text", "content"))
+            if isinstance(value, str):
+                text_parts.append(value)
+        if event.get("type") == "step_finish":
+            usage = usage_from_event(event)
+    if session_id:
+        write_artifact(task_dir, SESSION_FILE, session_id + "\n")
+    write_artifact(task_dir, RESULT_FILE, "".join(text_parts))
+    write_json_artifact(
+        task_dir,
+        USAGE_FILE,
+        {"runtime": "opencode", "operation": operation, "exit_code": return_code, **usage},
+    )
+
+
+def run_task(options: argparse.Namespace) -> int:
+    task_dir = checked_task_dir(options.task_dir)
+    prompt = read_staged_file(task_dir, PROMPT_FILE, MAX_PROMPT_BYTES)
+    if not prompt.strip():
+        raise RunnerError("prompt.txt must not be empty")
+    runtime = parse_runtime(task_dir)
+    project = checked_project_dir(runtime["project_dir"])
+    model = checked_model(options.model or runtime.get("model", DEFAULT_MODEL))
+    if options.operation == "resume" and "session_id" not in runtime:
+        raise RunnerError("runtime.json requires session_id for resume")
+    if not OPENCODE_BIN.is_file() or not os.access(OPENCODE_BIN, os.X_OK):
+        raise RunnerError("configured opencode binary is not executable")
+
+    command = [str(OPENCODE_BIN), "run", "--format", "json", "--dir", str(project)]
+    if options.operation == "run":
+        command.extend(["--model", model])
+        if "title" in runtime:
+            command.extend(["--title", runtime["title"]])
+        if "agent" in runtime:
+            command.extend(["--agent", runtime["agent"]])
+    else:
+        command.extend(["--session", runtime["session_id"]])
+    command.append(prompt)
+    write_json_artifact(
+        task_dir,
+        RUN_FILE,
+        {
+            "runtime": "opencode",
+            "operation": options.operation,
+            "project_dir": str(project),
+            "model": model,
+            "title": runtime.get("title"),
+            "agent": runtime.get("agent"),
+            "session_id": runtime.get("session_id"),
+        },
+    )
+
+    # stdin must remain closed: OpenCode otherwise waits forever for an
+    # interactive session when launched non-interactively.
+    with (task_dir / EVENTS_FILE).open("w", encoding="utf-8") as stdout, (
+        task_dir / STDERR_FILE
+    ).open("w", encoding="utf-8") as stderr:
+        completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+    render_artifacts(task_dir, options.operation, completed.returncode)
+    return completed.returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run_task(parse_arguments(sys.argv[1:] if argv is None else argv))
+    except RunnerError as error:
+        print(f"opencode-launch: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
