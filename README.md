@@ -118,11 +118,14 @@ project and a free Zen model.
 The pilot deliberately does not accept a staged `agent`: an agent definition
 can itself select a model or subagent, which cannot yet be attested as part of
 this one-runner contract. The runner starts OpenCode in pure mode with a
-minimal environment, discarding caller-supplied `OPENCODE_CONFIG`,
-`OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, and model-catalog overrides.
-It pins both primary and small-model config to the approved model, then exports
-the completed session and verifies the effective project and model before
-reporting success.
+minimal environment, a fresh configuration directory, and an empty inline
+configuration for catalog inspection; it discards caller-supplied
+`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, and
+model-catalog overrides. (The account's local model cache remains available so
+the approved default catalog is not replaced by an empty-home fallback.) It
+pins both primary and small-model config to the approved model, then exports
+the completed session and verifies the effective project, model, standard
+`build` agent, and every assistant turn before reporting success.
 
 Project roots are source-controlled OSS/Talon allowlists. Models are checked
 against OpenCode's current local `models opencode --verbose` metadata: the
@@ -138,7 +141,8 @@ last text event; usage is labeled `runtime: "opencode"` and aggregates input,
 output, reasoning, cache-read, cache-write, and cost from every `step_finish`
 event. `opencode-usage.json` also records `completed`, `stream_error`, and
 `timed_out` so a child exit code of zero cannot hide an OpenCode error event,
-malformed stream, or missing completion.
+malformed stream, non-finite usage, or a stream missing a terminal `stop`
+completion.
 Preflight rejection clears prior artifacts and writes the same structured
 failure status whenever the staged task directory is usable.
 
