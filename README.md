@@ -108,12 +108,21 @@ runtime.json
 ```
 
 For `run`, `runtime.json` requires an absolute, non-symlink `project_dir` and
-may contain `model`, `title`, and `agent`. The model defaults to
+may contain `model` and `title`. The model defaults to
 `opencode/muse-spark-1.3-contributor-free`; selecting another free model is a
 staged `model` setting, not a CLI override. For `resume`, it instead requires
 only `project_dir` and `session_id`. Before resuming, the runner exports the
 session and requires its project and effective model to match the staged
 project and a free Zen model.
+
+The pilot deliberately does not accept a staged `agent`: an agent definition
+can itself select a model or subagent, which cannot yet be attested as part of
+this one-runner contract. The runner starts OpenCode in pure mode with a
+minimal environment, discarding caller-supplied `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, and model-catalog overrides.
+It pins both primary and small-model config to the approved model, then exports
+the completed session and verifies the effective project and model before
+reporting success.
 
 Project roots are source-controlled OSS/Talon allowlists. Models are checked
 against OpenCode's current local `models opencode --verbose` metadata: the
@@ -130,6 +139,8 @@ output, reasoning, cache-read, cache-write, and cost from every `step_finish`
 event. `opencode-usage.json` also records `completed`, `stream_error`, and
 `timed_out` so a child exit code of zero cannot hide an OpenCode error event,
 malformed stream, or missing completion.
+Preflight rejection clears prior artifacts and writes the same structured
+failure status whenever the staged task directory is usable.
 
 The runner always invokes OpenCode with closed stdin and places `--` before
 the staged prompt. Leaving stdin open makes non-interactive `opencode run`
