@@ -107,26 +107,40 @@ prompt.txt
 runtime.json
 ```
 
-`runtime.json` is an object with a required absolute `project_dir` and optional
-`model`, `title`, `agent`, and `session_id` strings. `resume` requires
-`session_id`. The runner allows only its source-controlled OSS/Talon project
-roots and only the listed free OpenCode Zen models. Its default model is
-`opencode/muse-spark-1.3-contributor-free`; `--model` may select another
-approved free model. It rejects all OpenAI, Anthropic, and paid/non-Zen model
-IDs. Adding a project root or a model is therefore a reviewed code change.
+For `run`, `runtime.json` requires an absolute, non-symlink `project_dir` and
+may contain `model`, `title`, and `agent`. The model defaults to
+`opencode/muse-spark-1.3-contributor-free`; selecting another free model is a
+staged `model` setting, not a CLI override. For `resume`, it instead requires
+only `project_dir` and `session_id`. Before resuming, the runner exports the
+session and requires its project and effective model to match the staged
+project and a free Zen model.
+
+Project roots are source-controlled OSS/Talon allowlists. Models are checked
+against OpenCode's current local `models opencode --verbose` metadata: the
+provider must be `opencode`, the endpoint must be Zen, and every reported cost
+must be zero. This admits newly available free Zen models (including
+`opencode/big-pickle`) while rejecting OpenAI, Anthropic, and paid models.
 
 After every invocation the task directory contains the raw structured stream
 in `opencode-events.jsonl`, stderr in `opencode-stderr.log`, and rendered
 artifacts: `opencode-result.txt`, `opencode-session-id.txt` (when OpenCode
-emits one), `opencode-usage.json`, and `opencode-run.json`. Usage is labeled
-`runtime: "opencode"` and includes input, output, reasoning, cache-read,
-cache-write, and cost fields from the final `step_finish` event.
+emits one), `opencode-usage.json`, and `opencode-run.json`. The result is the
+last text event; usage is labeled `runtime: "opencode"` and aggregates input,
+output, reasoning, cache-read, cache-write, and cost from every `step_finish`
+event. `opencode-usage.json` also records `completed`, `stream_error`, and
+`timed_out` so a child exit code of zero cannot hide an OpenCode error event,
+malformed stream, or missing completion.
 
-The runner always invokes OpenCode with closed stdin. Leaving stdin open makes
-non-interactive `opencode run` wait forever for an interactive session.
+The runner always invokes OpenCode with closed stdin and places `--` before
+the staged prompt. Leaving stdin open makes non-interactive `opencode run`
+wait forever for an interactive session; the option terminator keeps prompt
+text from being interpreted as an OpenCode flag.
 
 Install its relay policy from Shukant's GUI login session after reviewing the
-absolute path for the deployed checkout:
+absolute path for the deployed checkout. The following is a **policy fragment**
+to merge under `bins`; `set-allowlist` replaces the entire policy, so first run
+`zigzag config get-allowlist`, merge this entry with the existing bins, then
+write the complete policy back with `zigzag config set-allowlist --file …`.
 
 ```json
 {
