@@ -46,7 +46,7 @@ class OpenCodeLaunchTests(unittest.TestCase):
                 state = json.loads(Path(__file__).with_name("opencode-state.json").read_text())
                 args = sys.argv[1:]
                 with Path(state["calls"]).open("a") as calls:
-                    calls.write(json.dumps(args) + "\\n")
+                    calls.write(json.dumps({"args": args, "config": os.environ.get("OPENCODE_CONFIG_CONTENT"), "home": os.environ.get("HOME")}) + "\\n")
                 if sys.stdin.buffer.read():
                     raise SystemExit("stdin was not closed")
                 for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR", "OPENCODE_MODELS_URL"):
@@ -60,20 +60,26 @@ class OpenCodeLaunchTests(unittest.TestCase):
                         {"id": "wrong-provider", "providerID": "openai", "api": {"url": "https://opencode.ai/zen/v1"}, "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}},
                         {"id": "wrong-endpoint", "providerID": "opencode", "api": {"url": "https://example.test"}, "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}},
                         {"id": "paid-listed", "providerID": "opencode", "api": {"url": "https://opencode.ai/zen/v1"}, "cost": {"input": 1, "output": 0, "cache": {"read": 0, "write": 0}}},
+                        {"id": "hidden-fee", "providerID": "opencode", "api": {"url": "https://opencode.ai/zen/v1"}, "cost": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}, "other": 1}},
                     ]
                     for model in models:
                         print(json.dumps(model))
                     raise SystemExit(0)
                 if args[:1] == ["export"]:
                     model = "paid-listed" if mode in ("bad_session_model", "postflight_bad_model") else "big-pickle"
-                    if mode not in ("bad_session_model", "postflight_bad_model"):
-                        prior = [json.loads(line) for line in Path(state["calls"]).read_text().splitlines()]
+                    if mode == "postflight_different_free":
+                        model = "muse-spark-1.3-contributor-free"
+                    if mode not in ("bad_session_model", "postflight_bad_model", "postflight_different_free"):
+                        prior = [json.loads(line)["args"] for line in Path(state["calls"]).read_text().splitlines()]
                         for call in reversed(prior):
                             if call[:1] == ["run"] and "--model" in call:
                                 model = call[call.index("--model") + 1].split("/", 1)[1]
                                 break
                     project = "/wrong-project" if mode == "wrong_session_project" else state["project"]
-                    print(json.dumps({"info": {"directory": project, "model": {"providerID": "opencode", "id": model}}}))
+                    assistant = {"role": "assistant", "agent": "build", "providerID": "opencode", "modelID": model, "finish": "stop"}
+                    if mode == "subtask_session":
+                        assistant["agent"] = "explore"
+                    print(json.dumps({"info": {"directory": project, "agent": "build", "model": {"providerID": "opencode", "id": model}}, "messages": [{"info": assistant, "parts": []}]}))
                     raise SystemExit(0)
                 if mode == "timeout":
                     signal.pause()
@@ -86,11 +92,17 @@ class OpenCodeLaunchTests(unittest.TestCase):
                 if mode == "error":
                     print(json.dumps({"type": "error", "sessionID": "ses_error"}))
                     raise SystemExit(0)
-                def finish(input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost):
-                    return {"type": "step_finish", "sessionID": "ses_test", "part": {"tokens": {"input": input_tokens, "output": output_tokens, "reasoning": reasoning_tokens, "cache": {"read": cache_read, "write": cache_write}}, "cost": cost}}
+                def finish(input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write, cost, reason="stop"):
+                    return {"type": "step_finish", "sessionID": "ses_test", "part": {"tokens": {"input": input_tokens, "output": output_tokens, "reasoning": reasoning_tokens, "cache": {"read": cache_read, "write": cache_write}}, "cost": cost, "reason": reason}}
                 print(json.dumps({"type": "step_start", "sessionID": "ses_test"}))
                 print(json.dumps({"type": "text", "sessionID": "ses_test", "part": {"text": "intermediate"}}))
                 if mode == "no_completion":
+                    raise SystemExit(0)
+                if mode == "intermediate_only":
+                    print(json.dumps(finish(3, 2, 1, 4, 5, 0, "tool-calls")))
+                    raise SystemExit(0)
+                if mode == "nonfinite":
+                    print(json.dumps(finish(3, 2, 1, 4, 5, float("nan"))))
                     raise SystemExit(0)
                 print(json.dumps(finish(3, 2, 1, 4, 5, 0)))
                 print(json.dumps({"type": "text", "sessionID": "ses_test", "part": {"text": "zen-ok"}}))
@@ -141,6 +153,11 @@ class OpenCodeLaunchTests(unittest.TestCase):
     def calls(self) -> list[list[str]]:
         if not self.calls_path.exists():
             return []
+        return [json.loads(line)["args"] for line in self.calls_path.read_text().splitlines()]
+
+    def call_records(self) -> list[dict[str, object]]:
+        if not self.calls_path.exists():
+            return []
         return [json.loads(line) for line in self.calls_path.read_text().splitlines()]
 
     def run_calls(self) -> list[list[str]]:
@@ -152,11 +169,16 @@ class OpenCodeLaunchTests(unittest.TestCase):
     def clear_calls(self) -> None:
         self.calls_path.unlink(missing_ok=True)
 
-    def assert_preflight_failure(self, operation: str = "run") -> None:
+    def seed_outputs(self) -> None:
+        for name in runner.OUTPUT_FILES:
+            (self.task / name).write_text("stale", encoding="utf-8")
+
+    def assert_preflight_failure(self) -> None:
         self.assertEqual(self.run_calls(), [])
         self.assertEqual(self.usage()["exit_code"], 2)
         self.assertEqual(json.loads((self.task / runner.RUN_FILE).read_text())["state"], "failed")
         self.assertFalse((self.task / runner.SESSION_FILE).exists())
+        self.assertEqual((self.task / runner.RESULT_FILE).read_text(), "")
         self.clear_calls()
 
     def test_run_uses_staged_model_terminates_prompt_options_and_aggregates_usage(self) -> None:
@@ -177,6 +199,8 @@ class OpenCodeLaunchTests(unittest.TestCase):
             self.run_calls(),
             [["run", "--pure", "--format", "json", "--dir", str(self.project.resolve()), "--model", "opencode/big-pickle", "--title", "smoke", "--", "--model=openai/gpt-5"]],
         )
+        config = json.loads(next(record["config"] for record in self.call_records() if record["args"][:1] == ["run"]))
+        self.assertEqual(config, {"model": "opencode/big-pickle", "small_model": "opencode/big-pickle"})
 
     def test_default_model_and_resume_are_attested_after_execution(self) -> None:
         self.stage()
@@ -188,17 +212,33 @@ class OpenCodeLaunchTests(unittest.TestCase):
         self.assertIn(["export", "ses_prior"], self.calls())
         self.assertIn(["export", "ses_test"], self.calls())
         self.assertIn("--session", self.run_calls()[0])
+        config = json.loads(next(record["config"] for record in self.call_records() if record["args"][:1] == ["run"]))
+        self.assertEqual(config, {"model": "opencode/big-pickle", "small_model": "opencode/big-pickle"})
 
     def test_metadata_filter_rejects_listed_non_zen_nonfree_and_foreign_models(self) -> None:
-        for model in ("opencode/wrong-endpoint", "opencode/paid-listed", "openai/wrong-provider", "anthropic/claude"):
+        for model in ("opencode/wrong-endpoint", "opencode/paid-listed", "opencode/hidden-fee", "openai/wrong-provider", "anthropic/claude"):
             with self.subTest(model=model):
                 self.stage(model=model)
                 (self.task / runner.SESSION_FILE).write_text("stale\n", encoding="utf-8")
                 self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
                 self.assert_preflight_failure()
 
+    def test_preflight_failure_replaces_stale_artifacts(self) -> None:
+        self.stage(model="opencode/paid-listed")
+        self.seed_outputs()
+        self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
+        self.assertFalse((self.task / runner.EVENTS_FILE).exists())
+        self.assertFalse((self.task / runner.SESSION_FILE).exists())
+        self.assertTrue((self.task / runner.STDERR_FILE).read_text().startswith("opencode-launch:"))
+        self.assert_preflight_failure()
+
     def test_rejects_absolute_outside_root_and_invalid_staged_files(self) -> None:
         self.stage(project_dir=str(self.outside_project))
+        self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
+        self.assert_preflight_failure()
+        linked_project = self.root / "linked-project"
+        linked_project.symlink_to(self.project, target_is_directory=True)
+        self.stage(project_dir=str(linked_project))
         self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
         self.assert_preflight_failure()
         cases = ((runner.PROMPT_FILE, b"\xff"), (runner.RUNTIME_FILE, b"\xff"))
@@ -214,6 +254,14 @@ class OpenCodeLaunchTests(unittest.TestCase):
         self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
         self.assert_preflight_failure()
         self.stage()
+        (self.task / runner.RUNTIME_FILE).write_text("{", encoding="utf-8")
+        self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
+        self.assert_preflight_failure()
+        self.stage()
+        (self.task / runner.RUNTIME_FILE).write_text("x" * (runner.MAX_SETTINGS_BYTES + 1), encoding="utf-8")
+        self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
+        self.assert_preflight_failure()
+        self.stage()
         (self.task / runner.PROMPT_FILE).write_text("x" * (runner.MAX_PROMPT_BYTES + 1), encoding="utf-8")
         self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
         self.assert_preflight_failure()
@@ -224,9 +272,9 @@ class OpenCodeLaunchTests(unittest.TestCase):
         self.assert_preflight_failure()
 
     def test_missing_completion_and_postflight_model_mismatch_fail(self) -> None:
-        for mode, expected_error in (("no_completion", "no step_finish"), ("postflight_bad_model", "does not attest")):
+        for mode, expected_error in (("no_completion", "no terminal stop"), ("intermediate_only", "no terminal stop"), ("nonfinite", "invalid numeric"), ("postflight_bad_model", "does not attest"), ("postflight_different_free", "differs")):
             with self.subTest(mode=mode):
-                self.stage()
+                self.stage(**({"model": "opencode/big-pickle"} if mode == "postflight_different_free" else {}))
                 self.set_state(mode)
                 self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 1)
                 self.assertIn(expected_error, self.usage()["stream_error"])
@@ -253,7 +301,15 @@ class OpenCodeLaunchTests(unittest.TestCase):
     def test_rejects_bad_resume_session_and_unknown_runtime_setting(self) -> None:
         self.stage(session_id="--help")
         self.assertEqual(runner.main(["resume", "--task-dir", str(self.task)]), 2)
-        self.assert_preflight_failure("resume")
+        self.assert_preflight_failure()
+        for mode, error in (("bad_session_model", "does not attest"), ("wrong_session_project", "does not attest"), ("subtask_session", "does not attest")):
+            with self.subTest(mode=mode):
+                self.stage(session_id="ses_prior")
+                self.set_state(mode)
+                self.assertEqual(runner.main(["resume", "--task-dir", str(self.task)]), 2)
+                self.assertIn(error, self.usage()["stream_error"])
+                self.assert_preflight_failure()
+                self.set_state()
         self.stage(agent="untrusted")
         self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 2)
         self.assert_preflight_failure()
