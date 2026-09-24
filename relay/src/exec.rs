@@ -37,9 +37,6 @@ struct BinPolicy {
 
 pub struct ExecRequest {
     pub id: String,
-    /// Optional correlation key for detached execution audit events. It is
-    /// deliberately ignored by synchronous execution and never becomes argv.
-    pub execution_id: Option<String>,
     pub bin: String,
     pub args: Vec<String>,
 }
@@ -379,13 +376,7 @@ fn valid_bin_name(name: &str) -> bool {
 
 pub fn parse_request(body: &Json) -> Result<ExecRequest, String> {
     let fields = object_fields(body, "request")?;
-    require_allowed(fields, &["id", "bin", "args", "execution_id"], "request")?;
-    if ["id", "bin", "args"]
-        .iter()
-        .any(|required| field(fields, required).is_none())
-    {
-        return Err("request is missing a required field".to_owned());
-    }
+    require_only(fields, &["id", "bin", "args"], "request")?;
     let id = field(fields, "id")
         .and_then(Json::as_str)
         .filter(|id| !id.is_empty() && id.len() <= MAX_ID_BYTES)
@@ -394,25 +385,6 @@ pub fn parse_request(body: &Json) -> Result<ExecRequest, String> {
         .and_then(Json::as_str)
         .filter(|bin| valid_bin_name(bin))
         .ok_or_else(|| "request bin must be a valid binary name".to_owned())?;
-    let execution_id = match field(fields, "execution_id") {
-        None => None,
-        Some(value) => Some(
-            value
-                .as_str()
-                .filter(|value| {
-                    !value.is_empty()
-                        && value.len() <= MAX_ID_BYTES
-                        && value
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-                })
-                .ok_or_else(|| {
-                    "request execution_id must be a non-empty safe identifier of at most 128 bytes"
-                        .to_owned()
-                })?
-                .to_owned(),
-        ),
-    };
     let args = match field(fields, "args") {
         Some(Json::Array(args)) if args.len() <= MAX_ARGS => args
             .iter()
@@ -426,7 +398,6 @@ pub fn parse_request(body: &Json) -> Result<ExecRequest, String> {
     }
     Ok(ExecRequest {
         id: id.to_owned(),
-        execution_id,
         bin: bin.to_owned(),
         args: args.into_iter().map(str::to_owned).collect(),
     })
@@ -807,7 +778,6 @@ mod tests {
     fn execution_captures_output_and_exit_code() {
         let request = ExecRequest {
             id: "echo-1".to_owned(),
-            execution_id: None,
             bin: "echo".to_owned(),
             args: args(&["new"]),
         };
@@ -822,7 +792,6 @@ mod tests {
     fn execution_reports_a_missing_binary_without_panicking() {
         let request = ExecRequest {
             id: "missing-1".to_owned(),
-            execution_id: None,
             bin: "missing".to_owned(),
             args: args(&["new"]),
         };
@@ -841,7 +810,6 @@ mod tests {
     fn execution_kills_a_child_that_outlives_the_timeout() {
         let request = ExecRequest {
             id: "sleep-1".to_owned(),
-            execution_id: None,
             bin: "sleep".to_owned(),
             args: args(&["30"]),
         };

@@ -25,6 +25,7 @@ pub struct AgentRecord {
     pub state: String,
     pub exit_code: Option<i32>,
     pub log_degraded: bool,
+    pub audit_degraded: bool,
     pub redacted: bool,
     pub stdout_next: u64,
     pub stderr_next: u64,
@@ -64,6 +65,7 @@ impl AgentRecord {
                     .unwrap_or(Json::Null),
             ),
             ("log_degraded".to_owned(), Json::Bool(self.log_degraded)),
+            ("audit_degraded".to_owned(), Json::Bool(self.audit_degraded)),
             ("redacted".to_owned(), Json::Bool(self.redacted)),
             (
                 "stdout_dropped_before".to_owned(),
@@ -196,6 +198,24 @@ impl AgentRegistry {
         self.save(&updated)?;
         *entries = updated;
         Ok(true)
+    }
+
+    pub fn mark_audit_degraded(&self, id: &str) -> Result<(), String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(old) = entries.get(id) else {
+            return Ok(());
+        };
+        if old.audit_degraded {
+            return Ok(());
+        }
+        let mut updated = entries.clone();
+        updated.get_mut(id).expect("entry cloned").audit_degraded = true;
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(())
     }
 
     /// Mark formerly live agents honestly after a relay restart.  The caller
@@ -446,6 +466,10 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .unwrap_or(Json::Null),
         ),
         ("log_degraded".to_owned(), Json::Bool(entry.log_degraded)),
+        (
+            "audit_degraded".to_owned(),
+            Json::Bool(entry.audit_degraded),
+        ),
         ("redacted".to_owned(), Json::Bool(entry.redacted)),
         ("stdout_next".to_owned(), Json::number(entry.stdout_next)),
         ("stderr_next".to_owned(), Json::number(entry.stderr_next)),
@@ -515,6 +539,9 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
             state: text("state")?,
             exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
             log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
+            audit_degraded: get("audit_degraded")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
             stdout_next: integer("stdout_next")?,
             stderr_next: integer("stderr_next")?,
@@ -1007,6 +1034,16 @@ impl AuditStore {
         let path = self
             .directory
             .join(format!("{}.jsonl", audit_filename(execution_id)));
+        if fs::read_to_string(&path).ok().is_some_and(|contents| {
+            contents
+                .lines()
+                .filter_map(|line| parse_json(line).ok())
+                .any(|existing| {
+                    existing.object("id").and_then(Json::as_str) == Some(event.id.as_str())
+                })
+        }) {
+            return Ok(());
+        }
         let line = event.response_json().to_json() + "\n";
         let result = (|| -> std::io::Result<()> {
             if !path.exists() {
@@ -1320,7 +1357,7 @@ fn validate_audit_envelope(payload: &Json) -> Result<(), String> {
         return Err("invalid_audit_event_source".to_owned());
     }
     let occurred_at = text("occurred_at")?;
-    if !is_rfc3339_millis(occurred_at) {
+    if parse_rfc3339_millis(occurred_at).is_none() {
         return Err("invalid_audit_event_occurred_at".to_owned());
     }
     text("clock")?;
@@ -1330,9 +1367,11 @@ fn validate_audit_envelope(payload: &Json) -> Result<(), String> {
     Ok(())
 }
 
-fn is_rfc3339_millis(value: &str) -> bool {
+/// Parses a strict RFC 3339 UTC millisecond timestamp into Unix milliseconds.
+/// This is shared by schema validation and the timeline so they cannot drift.
+pub fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     let bytes = value.as_bytes();
-    bytes.len() == 24
+    if !(bytes.len() == 24
         && bytes[4] == b'-'
         && bytes[7] == b'-'
         && bytes[10] == b'T'
@@ -1344,7 +1383,57 @@ fn is_rfc3339_millis(value: &str) -> bool {
             .iter()
             .enumerate()
             .filter(|(index, _)| !matches!(*index, 4 | 7 | 10 | 13 | 16 | 19 | 23))
-            .all(|(_, byte)| byte.is_ascii_digit())
+            .all(|(_, byte)| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let number = |start, end| {
+        std::str::from_utf8(&bytes[start..end])
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    };
+    let year = number(0, 4)? as i64;
+    let month = number(5, 7)? as i64;
+    let day = number(8, 10)? as i64;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let millis = number(20, 23)?;
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let adjusted_month = month + if month <= 2 { 9 } else { -3 };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let yoe = adjusted_year - era * 400;
+    let doy = (153 * adjusted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400_000)?
+        .checked_add((hour * 3_600 + minute * 60 + second) * 1_000)?
+        .checked_add(millis)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// RFC 3339 UTC with millisecond precision, without a time-formatting crate.
@@ -1538,6 +1627,7 @@ mod tests {
             state: "running".to_owned(),
             exit_code: None,
             log_degraded: false,
+            audit_degraded: false,
             redacted: false,
             stdout_next: 0,
             stderr_next: 0,
@@ -1621,6 +1711,98 @@ mod tests {
             timeline[0].object("kind"),
             Some(&Json::String("task_dispatched".to_owned()))
         );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn execution_audit_reopens_and_keeps_execution_files_separate() {
+        let file = path("execution-reopen");
+        let store = Store::open(&file, 10).unwrap();
+        store.add(audit_event("one", "task_dispatched")).unwrap();
+        let mut second = audit_event("two", "poll_started");
+        if let Json::Object(fields) = &mut second {
+            for (name, value) in fields {
+                if name == "execution_id" {
+                    *value = Json::String("execution-2".to_owned());
+                }
+            }
+        }
+        store.add(second).unwrap();
+        drop(store);
+        let reopened = Store::open(&file, 10).unwrap();
+        assert_eq!(reopened.timeline("task-1").unwrap().len(), 2);
+        assert_eq!(
+            fs::read_dir(file.with_extension("audit")).unwrap().count(),
+            2
+        );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn audit_validation_rejects_invalid_calendar_and_schema_fields() {
+        for (field, value) in [
+            ("source", Json::String("other".to_owned())),
+            ("schema_version", Json::number(2)),
+            (
+                "occurred_at",
+                Json::String("2026-99-99T99:99:99.999Z".to_owned()),
+            ),
+            ("payload", Json::Array(vec![])),
+        ] {
+            let mut value_to_test = audit_event("bad", "task_dispatched");
+            if let Json::Object(fields) = &mut value_to_test {
+                for (name, existing) in fields {
+                    if name == field {
+                        *existing = value.clone();
+                    }
+                }
+            }
+            assert!(validate_audit_envelope(&value_to_test).is_err(), "{field}");
+        }
+        assert!(parse_rfc3339_millis("2024-02-29T23:59:59.999Z").is_some());
+        assert!(parse_rfc3339_millis("2023-02-29T23:59:59.999Z").is_none());
+        let generated = rfc3339_timestamp();
+        assert!(parse_rfc3339_millis(&generated).is_some());
+    }
+
+    #[test]
+    fn failed_live_state_save_does_not_duplicate_audit_on_retry() {
+        let file = path("audit-retry");
+        let store = Store::open(&file, 10).unwrap();
+        fs::create_dir(&file).unwrap();
+        let payload = audit_event("retry", "task_dispatched");
+        assert!(store.add(payload.clone()).is_err());
+        fs::remove_dir(&file).unwrap();
+        assert!(store.add(payload).is_ok());
+        assert_eq!(store.timeline("task-1").unwrap().len(), 1);
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn audit_retention_prunes_the_oldest_execution_first() {
+        let file = path("audit-cap");
+        let store = Store::open(&file, 1).unwrap();
+        let mut first = audit_event("first", "task_dispatched");
+        let mut second = audit_event("second", "task_dispatched");
+        let blob = Json::String("x".repeat((AUDIT_CAP_BYTES / 2 + 1024) as usize));
+        for (event, execution_id) in [(&mut first, "old"), (&mut second, "new")] {
+            if let Json::Object(fields) = event {
+                for (name, value) in fields {
+                    if name == "execution_id" {
+                        *value = Json::String(execution_id.to_owned());
+                    }
+                    if name == "payload" {
+                        *value = Json::Object(vec![("blob".to_owned(), blob.clone())]);
+                    }
+                }
+            }
+        }
+        store.add(first).unwrap();
+        store.add(second).unwrap();
+        assert_eq!(store.timeline("task-1").unwrap().len(), 1);
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("audit"));
     }
