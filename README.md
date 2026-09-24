@@ -13,6 +13,41 @@ event remains in the durable bounded queue; a replay after eviction is a new
 delivery. The queue is durable but bounded; when it overflows, the poller
 reports a warning on stderr.
 
+## Execution audit trail
+
+The relay also keeps append-only JSON Lines audit logs beside its state file
+(`events.audit/` for an `events.json` state file). These are per execution,
+separate from the 1,000-event live-delivery queue, and capped at 20 MiB total;
+the oldest execution logs are removed first when the cap is exceeded. Audit
+records contain the posted event envelope plus relay `sequence` and
+`received_at` fields. They never contain command arguments, prompts, or raw
+agent output.
+
+New audit events use schema version 1 and include `id`, `task_id`,
+`execution_id`, `kind`, `source`, `occurred_at` (RFC 3339 UTC milliseconds),
+`clock`, and an object payload. The relay accepts `vm-department`,
+`mac-relay`, and `vm-poller` sources. Existing id-only event posts remain
+wire-compatible for live delivery, but cannot be archived by execution because
+they have no execution key.
+
+`POST /v1/spawn` also accepts an optional safe `execution_id` field. A VM that
+has already assigned an execution should supply it so its dispatch/poll facts
+and the relay's launch/process facts land in the same per-execution log;
+callers that omit it retain the existing request shape and receive a
+relay-generated execution identifier internally.
+
+The Mac reader is `zigzag timeline`, rather than `dept timeline`: this
+repository owns the `zigzag` relay binary while `dept.py` is VM-owned and is
+not present here.
+
+```sh
+zigzag timeline TASK_ID --state-file ~/.codex/zigzag/events.json
+```
+
+It renders the persisted events and named duration summaries. Durations are
+shown only when both facts came from the same `clock`; a Mac/VM handoff prints
+both timestamps as cross-clock rather than fabricating a transit time.
+
 ## Supervised agent diagnostics
 
 `POST /v1/spawn` keeps its existing `{"id", "proc"}` response and

@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,9 +38,11 @@ struct Config {
 struct Server {
     secret: String,
     control_secret: Option<String>,
-    store: Store,
+    store: Arc<Store>,
     supervisor: Supervisor,
 }
+
+static EXECUTION_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Live handles deliberately disappear on restart; the durable half lives in
 /// `relay-core::AgentRegistry` and records the resulting orphan/loss state.
@@ -118,6 +121,9 @@ fn run() -> Result<(), String> {
     if arguments.first().map(String::as_str) == Some("config") {
         return run_config(&arguments[1..]);
     }
+    if arguments.first().map(String::as_str) == Some("timeline") {
+        return run_timeline(&arguments[1..]);
+    }
     let config = server_config(arguments)?;
     let secret = read_secret_file(&config.secret_file)?;
     let control_secret = config
@@ -128,7 +134,7 @@ fn run() -> Result<(), String> {
     let state = Arc::new(Server {
         secret,
         control_secret,
-        store: Store::open(config.state_file, config.max_events)?,
+        store: Arc::new(Store::open(config.state_file, config.max_events)?),
         supervisor: Supervisor {
             registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
             procs: Mutex::new(HashMap::new()),
@@ -159,6 +165,135 @@ fn run() -> Result<(), String> {
     loop {
         thread::park();
     }
+}
+
+fn run_timeline(arguments: &[String]) -> Result<(), String> {
+    let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
+    let mut task_id = None;
+    let mut values = arguments.iter();
+    while let Some(argument) = values.next() {
+        match argument.as_str() {
+            "--state-file" => {
+                state_file = Some(PathBuf::from(
+                    values
+                        .next()
+                        .ok_or_else(|| "--state-file requires a value".to_owned())?,
+                ));
+            }
+            "--help" | "-h" => {
+                return Err(
+                    "usage: zigzag timeline <task-id> --state-file PATH (or ZIGZAG_STATE_FILE)"
+                        .to_owned(),
+                );
+            }
+            value if !value.starts_with('-') && task_id.is_none() => {
+                task_id = Some(value.to_owned())
+            }
+            value => return Err(format!("unknown timeline argument: {value}")),
+        }
+    }
+    let task_id = task_id.ok_or_else(|| "timeline requires a task id".to_owned())?;
+    let state_file = state_file
+        .ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required for timeline".to_owned())?;
+    let events = Store::open(state_file, 1_000)?.timeline(&task_id)?;
+    if events.is_empty() {
+        println!("No durable audit events for task {task_id}.");
+        return Ok(());
+    }
+    println!("Timeline for {task_id}");
+    for event in &events {
+        println!(
+            "{}  {}  {}  {}",
+            event_text(event, "occurred_at"),
+            event_text(event, "source"),
+            event_text(event, "kind"),
+            event_text(event, "clock"),
+        );
+    }
+    println!("\nPhase durations (only same-clock facts are subtracted):");
+    for (label, start, end) in [
+        ("dispatch", "task_dispatched", "relay_request_started"),
+        ("relay/launch", "relay_accepted", "process_spawned"),
+        ("agent work", "process_spawned", "process_completed"),
+        ("agent failure", "process_spawned", "process_failed"),
+        ("time to first output", "process_spawned", "first_output"),
+        ("delivery/poll health", "poll_started", "poller_received"),
+        ("review", "review_wait_started", "review_work_started"),
+        ("human wait", "human_wait_started", "human_wait_ended"),
+    ] {
+        if let Some((left, right)) = phase_events(&events, start, end) {
+            match same_clock_duration(left, right) {
+                Some(duration) => println!("{label}: {}", format_duration(duration)),
+                None => println!(
+                    "{label}: cross-clock/unknown ({} → {})",
+                    event_text(left, "occurred_at"),
+                    event_text(right, "occurred_at")
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn event_text<'a>(event: &'a Json, field: &str) -> &'a str {
+    event.object(field).and_then(Json::as_str).unwrap_or("?")
+}
+
+fn phase_events<'a>(events: &'a [Json], start: &str, end: &str) -> Option<(&'a Json, &'a Json)> {
+    let left = events
+        .iter()
+        .find(|event| event_text(event, "kind") == start)?;
+    let right = events
+        .iter()
+        .skip_while(|event| !std::ptr::eq(*event, left))
+        .skip(1)
+        .find(|event| event_text(event, "kind") == end)?;
+    Some((left, right))
+}
+
+fn same_clock_duration(left: &Json, right: &Json) -> Option<u64> {
+    (event_text(left, "clock") == event_text(right, "clock"))
+        .then(|| {
+            timestamp_millis(event_text(right, "occurred_at"))?
+                .checked_sub(timestamp_millis(event_text(left, "occurred_at"))?)
+        })
+        .flatten()
+}
+
+fn timestamp_millis(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24 {
+        return None;
+    }
+    let parse = |start, end| {
+        std::str::from_utf8(&bytes[start..end])
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    };
+    let year = parse(0, 4)? as i64;
+    let original_month = parse(5, 7)? as i64;
+    let day = parse(8, 10)? as i64;
+    let hour = parse(11, 13)?;
+    let minute = parse(14, 16)?;
+    let second = parse(17, 19)?;
+    let millis = parse(20, 23)?;
+    let month = original_month - if original_month <= 2 { -9 } else { 3 };
+    let year = year - i64::from(original_month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400_000)?
+        .checked_add((hour * 3_600 + minute * 60 + second) * 1_000)?
+        .checked_add(millis)
+}
+
+fn format_duration(millis: u64) -> String {
+    format!("{}.{:03}s", millis / 1_000, millis % 1_000)
 }
 
 fn server_config(arguments: Vec<String>) -> Result<Config, String> {
@@ -287,6 +422,7 @@ fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
         id: format!("github-pr-scan-{repo}"),
+        execution_id: None,
         bin: "gh".to_owned(),
         args: vec![
             "api".to_owned(),
@@ -705,6 +841,18 @@ fn spawn_request(
         request.bin,
         request.args.first().map(String::as_str).unwrap_or("")
     );
+    let execution_id = request
+        .execution_id
+        .clone()
+        .unwrap_or_else(new_execution_id);
+    // This fact intentionally precedes policy evaluation: it records that the
+    // authenticated relay received a request, not that it chose to launch it.
+    let _ = state.store.add(relay_event(
+        "relay_request_started",
+        &request.id,
+        &execution_id,
+        Json::Object(vec![]),
+    ));
     let policy = match policy {
         Ok(policy) => policy,
         Err(message) => {
@@ -716,16 +864,49 @@ fn spawn_request(
         Ok(path) => path,
         Err(denial) => return reply(stream, 200, denial),
     };
-    match spawn_proc(&state.supervisor, path, request) {
-        Ok(handle) => reply(
-            stream,
-            200,
-            Json::Object(vec![
-                ("id".to_owned(), Json::String(handle.id)),
-                ("proc".to_owned(), Json::String(handle.handle)),
-            ]),
-        ),
+    let _ = state.store.add(relay_event(
+        "relay_accepted",
+        &request.id,
+        &execution_id,
+        Json::Object(vec![]),
+    ));
+    let task_id = request.id.clone();
+    match spawn_proc(
+        &state.supervisor,
+        Arc::clone(&state.store),
+        path,
+        request,
+        execution_id.clone(),
+    ) {
+        Ok(handle) => {
+            let _ = state.store.add(relay_event(
+                "process_spawned",
+                &task_id,
+                &execution_id,
+                Json::Object(vec![(
+                    "agent_id".to_owned(),
+                    Json::String(handle.handle.clone()),
+                )]),
+            ));
+            reply(
+                stream,
+                200,
+                Json::Object(vec![
+                    ("id".to_owned(), Json::String(handle.id)),
+                    ("proc".to_owned(), Json::String(handle.handle)),
+                ]),
+            )
+        }
         Err(_) => {
+            let _ = state.store.add(relay_event(
+                "process_failed",
+                &task_id,
+                &execution_id,
+                Json::Object(vec![(
+                    "reason".to_owned(),
+                    Json::String("spawn_failed".to_owned()),
+                )]),
+            ));
             eprintln!("spawn failed");
             reply(stream, 500, error("could_not_spawn_process"))
         }
@@ -739,8 +920,10 @@ struct SpawnedProc {
 
 fn spawn_proc(
     supervisor: &Supervisor,
+    store: Arc<Store>,
     path: &str,
     request: exec::ExecRequest,
+    execution_id: String,
 ) -> Result<SpawnedProc, String> {
     let stdout = Arc::new(Mutex::new(CappedOutput::default()));
     let stderr = Arc::new(Mutex::new(CappedOutput::default()));
@@ -767,6 +950,7 @@ fn spawn_proc(
     let record = AgentRecord {
         id: handle.clone(),
         task_id: id.clone(),
+        execution_id: execution_id.clone(),
         leader_pid: process_group,
         process_group,
         started_at: unix_timestamp(),
@@ -786,6 +970,7 @@ fn spawn_proc(
         stderr_dropped_before: 0,
         log_next: 0,
         log_dropped_before: 0,
+        first_output_at: None,
     };
     // The registry transition commits before this spawn can be acknowledged.
     if let Err(error) = supervisor.registry.register(record) {
@@ -796,6 +981,7 @@ fn spawn_proc(
         child_stdout,
         Arc::clone(&stdout),
         Arc::clone(&supervisor.registry),
+        Arc::clone(&store),
         handle.clone(),
         "stdout",
     );
@@ -803,6 +989,7 @@ fn spawn_proc(
         child_stderr,
         Arc::clone(&stderr),
         Arc::clone(&supervisor.registry),
+        store,
         handle.clone(),
         "stderr",
     );
@@ -830,6 +1017,7 @@ fn drain_to_capture(
     mut pipe: impl Read + Send + 'static,
     capture: Arc<Mutex<CappedOutput>>,
     registry: Arc<AgentRegistry>,
+    store: Arc<Store>,
     agent_id: String,
     stream: &'static str,
 ) {
@@ -847,6 +1035,24 @@ fn drain_to_capture(
                     // A spool failure never stops pipe draining; it is recorded
                     // as log_degraded and retried on the next chunk.
                     let _ = registry.append_log(&agent_id, stream, &chunk[..n]);
+                    let occurred_at = relay_timestamp();
+                    if registry
+                        .mark_first_output(&agent_id, &occurred_at)
+                        .unwrap_or(false)
+                        && let Some(agent) = registry.get(&agent_id)
+                    {
+                        let _ = store.add(relay_event_at(
+                            "first_output",
+                            &agent.task_id,
+                            &agent.execution_id,
+                            occurred_at,
+                            Json::Object(vec![
+                                ("agent_id".to_owned(), Json::String(agent.id)),
+                                ("stream".to_owned(), Json::String(stream.to_owned())),
+                                ("bytes".to_owned(), Json::number(n as u64)),
+                            ]),
+                        ));
+                    }
                 }
             }
         }
@@ -1000,6 +1206,62 @@ fn unix_timestamp() -> String {
         .to_string()
 }
 
+fn relay_timestamp() -> String {
+    relay_core::rfc3339_timestamp()
+}
+
+fn relay_clock() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_owned());
+    // Linux exposes a real boot identifier; macOS has no equivalent stable
+    // portable file in this no-dependency relay, so make that absence explicit.
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "boot-unknown".to_owned());
+    format!("mac-relay:{host}:{boot}")
+}
+
+fn new_execution_id() -> String {
+    format!(
+        "relay-{}-{:x}",
+        unix_timestamp(),
+        EXECUTION_SERIAL.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn relay_event(kind: &str, task_id: &str, execution_id: &str, payload: Json) -> Json {
+    relay_event_at(kind, task_id, execution_id, relay_timestamp(), payload)
+}
+
+fn relay_event_at(
+    kind: &str,
+    task_id: &str,
+    execution_id: &str,
+    occurred_at: String,
+    payload: Json,
+) -> Json {
+    Json::Object(vec![
+        (
+            "id".to_owned(),
+            Json::String(format!("relay:{execution_id}:{kind}")),
+        ),
+        ("schema_version".to_owned(), Json::number(1)),
+        ("task_id".to_owned(), Json::String(task_id.to_owned())),
+        (
+            "execution_id".to_owned(),
+            Json::String(execution_id.to_owned()),
+        ),
+        ("kind".to_owned(), Json::String(kind.to_owned())),
+        ("source".to_owned(), Json::String("mac-relay".to_owned())),
+        ("occurred_at".to_owned(), Json::String(occurred_at)),
+        ("clock".to_owned(), Json::String(relay_clock())),
+        ("payload".to_owned(), payload),
+    ])
+}
+
 fn agent_event(kind: &str, agent: &AgentRecord) -> Json {
     Json::Object(vec![
         (
@@ -1064,6 +1326,26 @@ fn update_proc_status_with_handle(
         };
         if let Ok(Some(agent)) = registry.transition(handle, state, entry.exit_code) {
             let _ = store.add(agent_event("agent_completed", &agent));
+            let kind = if state == "succeeded" {
+                "process_completed"
+            } else {
+                "process_failed"
+            };
+            let mut payload = vec![
+                ("agent_id".to_owned(), Json::String(agent.id.clone())),
+                ("state".to_owned(), Json::String(agent.state.clone())),
+            ];
+            if let Some(exit_code) = agent.exit_code {
+                payload.push(("exit_code".to_owned(), Json::Number(exit_code.to_string())));
+            }
+            payload.push(("stdout_bytes".to_owned(), Json::number(agent.stdout_next)));
+            payload.push(("stderr_bytes".to_owned(), Json::number(agent.stderr_next)));
+            let _ = store.add(relay_event(
+                kind,
+                &agent.task_id,
+                &agent.execution_id,
+                Json::Object(payload),
+            ));
         }
     }
 }
@@ -1560,6 +1842,31 @@ mod tests {
     }
 
     #[test]
+    fn timeline_durations_never_cross_clock_boundaries() {
+        let left = relay_event_at(
+            "process_spawned",
+            "task",
+            "execution",
+            "2026-01-02T03:04:05.006Z".to_owned(),
+            Json::Object(vec![]),
+        );
+        let right = relay_event_at(
+            "first_output",
+            "task",
+            "execution",
+            "2026-01-02T03:04:07.009Z".to_owned(),
+            Json::Object(vec![]),
+        );
+        assert_eq!(same_clock_duration(&left, &right), Some(2_003));
+        let mut cross_clock = right.clone();
+        if let Json::Object(fields) = &mut cross_clock {
+            fields.retain(|(name, _)| name != "clock");
+            fields.push(("clock".to_owned(), Json::String("vm:boot".to_owned())));
+        }
+        assert_eq!(same_clock_duration(&left, &cross_clock), None);
+    }
+
+    #[test]
     fn prune_drops_finished_entries_past_the_retention_window() {
         let registry_path = std::env::temp_dir().join(format!(
             "zigzag-test-agents-{}",
@@ -1571,10 +1878,20 @@ mod tests {
         };
         let request = exec::ExecRequest {
             id: "old".to_owned(),
+            execution_id: None,
             bin: "sh".to_owned(),
             args: vec!["-c".to_owned(), "exit 0".to_owned()],
         };
-        let handle = spawn_proc(&supervisor, "/bin/sh", request).unwrap().handle;
+        let event_path = registry_path.with_extension("events");
+        let handle = spawn_proc(
+            &supervisor,
+            Arc::new(Store::open(&event_path, 10).unwrap()),
+            "/bin/sh",
+            request,
+            "execution-old".to_owned(),
+        )
+        .unwrap()
+        .handle;
         let mut entries = supervisor.procs.lock().unwrap();
         let entry = entries.get_mut(&handle).unwrap();
         let _ = entry.child.wait();
@@ -1582,6 +1899,7 @@ mod tests {
         prune_procs(&mut entries, Instant::now());
         assert!(entries.is_empty());
         let _ = std::fs::remove_file(registry_path);
+        let _ = std::fs::remove_file(event_path);
     }
 
     #[test]
@@ -1642,6 +1960,20 @@ mod tests {
             "",
         ));
         assert!(logs.to_json().contains("hello"));
+        let audit = state.store.timeline("echo").unwrap();
+        let kinds: Vec<_> = audit
+            .iter()
+            .filter_map(|event| event.object("kind").and_then(Json::as_str))
+            .collect();
+        for required in [
+            "relay_request_started",
+            "relay_accepted",
+            "process_spawned",
+            "first_output",
+            "process_completed",
+        ] {
+            assert!(kinds.contains(&required), "missing audit event {required}");
+        }
 
         // The shell leader exits immediately, leaving the sleep descendant in
         // the dedicated process group. It must still be visible and killable.
@@ -1687,7 +2019,7 @@ mod tests {
             Arc::new(Server {
                 secret: "x".repeat(32),
                 control_secret: Some("x".repeat(32)),
-                store: Store::open(&path, 1).unwrap(),
+                store: Arc::new(Store::open(&path, 1).unwrap()),
                 supervisor: Supervisor {
                     registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                     procs: Mutex::new(HashMap::new()),
