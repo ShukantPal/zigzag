@@ -34,6 +34,8 @@ pub struct AgentRecord {
     pub log_next: u64,
     pub log_dropped_before: u64,
     pub first_output_at: Option<String>,
+    pub first_output_stream: Option<String>,
+    pub first_output_bytes: Option<u64>,
 }
 
 impl AgentRecord {
@@ -179,25 +181,34 @@ impl AgentRegistry {
         Ok(Some(result))
     }
 
-    /// Persist the first observed byte before publishing the corresponding
-    /// lifecycle event.  Concurrent stdout/stderr drains therefore emit at
-    /// most one `first_output` fact.
-    pub fn mark_first_output(&self, id: &str, occurred_at: &str) -> Result<bool, String> {
+    /// Persist the first observed byte so a transient archive failure can be
+    /// retried by later output or the terminal reaper.
+    pub fn record_first_output(
+        &self,
+        id: &str,
+        occurred_at: &str,
+        stream: &str,
+        bytes: u64,
+    ) -> Result<Option<AgentRecord>, String> {
         let mut entries = self
             .inner
             .lock()
             .map_err(|_| "agent registry lock poisoned".to_owned())?;
         let Some(old) = entries.get(id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if old.first_output_at.is_some() {
-            return Ok(false);
+            return Ok(Some(old.clone()));
         }
         let mut updated = entries.clone();
-        updated.get_mut(id).expect("entry cloned").first_output_at = Some(occurred_at.to_owned());
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.first_output_at = Some(occurred_at.to_owned());
+        entry.first_output_stream = Some(stream.to_owned());
+        entry.first_output_bytes = Some(bytes);
+        let result = entry.clone();
         self.save(&updated)?;
         *entries = updated;
-        Ok(true)
+        Ok(Some(result))
     }
 
     pub fn mark_audit_degraded(&self, id: &str) -> Result<(), String> {
@@ -494,6 +505,21 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .map(Json::String)
                 .unwrap_or(Json::Null),
         ),
+        (
+            "first_output_stream".to_owned(),
+            entry
+                .first_output_stream
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "first_output_bytes".to_owned(),
+            entry
+                .first_output_bytes
+                .map(Json::number)
+                .unwrap_or(Json::Null),
+        ),
     ])
 }
 fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentRecord>, String> {
@@ -553,6 +579,19 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 Some(Json::String(value)) => Some(value.clone()),
                 Some(Json::Null) | None => None,
                 _ => return Err("invalid agent registry".to_owned()),
+            },
+            first_output_stream: match get("first_output_stream") {
+                Some(Json::String(value)) => Some(value.clone()),
+                Some(Json::Null) | None => None,
+                _ => return Err("invalid agent registry".to_owned()),
+            },
+            first_output_bytes: match get("first_output_bytes") {
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| "invalid agent registry".to_owned())?,
+                ),
+                None => None,
             },
         };
         entries.insert(record.id.clone(), record);
@@ -1636,6 +1675,8 @@ mod tests {
             log_next: 0,
             log_dropped_before: 0,
             first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
         }
     }
 
@@ -1802,7 +1843,12 @@ mod tests {
         }
         store.add(first).unwrap();
         store.add(second).unwrap();
-        assert_eq!(store.timeline("task-1").unwrap().len(), 1);
+        let retained = store.timeline("task-1").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].object("execution_id").and_then(Json::as_str),
+            Some("new")
+        );
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("audit"));
     }

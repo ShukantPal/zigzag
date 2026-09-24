@@ -144,7 +144,15 @@ fn run() -> Result<(), String> {
         },
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
-        let _ = state.store.add(agent_event("agent_recovered", &agent));
+        state.store.add(relay_event(
+            "process_spawned",
+            &agent.task_id,
+            &agent.execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent.id)),
+                ("recovered".to_owned(), Json::Bool(true)),
+            ]),
+        ))?;
     }
     start_reaper(Arc::clone(&state));
     if !config.github_watch_repos.is_empty() {
@@ -250,15 +258,18 @@ fn event_text<'a>(event: &'a Json, field: &str) -> &'a str {
 }
 
 fn phase_events<'a>(events: &'a [Json], start: &str, end: &str) -> Option<(&'a Json, &'a Json)> {
-    let left = events
-        .iter()
-        .find(|event| event_text(event, "kind") == start)?;
-    let right = events
-        .iter()
-        .skip_while(|event| !std::ptr::eq(*event, left))
-        .skip(1)
-        .find(|event| event_text(event, "kind") == end)?;
-    Some((left, right))
+    for (index, left) in events.iter().enumerate() {
+        if event_text(left, "kind") != start {
+            continue;
+        }
+        let execution_id = event_text(left, "execution_id");
+        if let Some(right) = events[index + 1..].iter().find(|event| {
+            event_text(event, "kind") == end && event_text(event, "execution_id") == execution_id
+        }) {
+            return Some((left, right));
+        }
+    }
+    None
 }
 
 fn same_clock_duration(left: &Json, right: &Json) -> Option<u64> {
@@ -965,6 +976,8 @@ fn spawn_proc(
         log_next: 0,
         log_dropped_before: 0,
         first_output_at: None,
+        first_output_stream: None,
+        first_output_bytes: None,
     };
     // The registry transition commits before this spawn can be acknowledged.
     if let Err(error) = supervisor.registry.register(record) {
@@ -1041,28 +1054,14 @@ fn drain_to_capture(
                     // A spool failure never stops pipe draining; it is recorded
                     // as log_degraded and retried on the next chunk.
                     let _ = registry.append_log(&agent_id, stream, &chunk[..n]);
-                    let occurred_at = relay_timestamp();
-                    if let Some(agent) = registry.get(&agent_id) {
-                        match store.add(relay_event_at(
-                            "first_output",
-                            &agent.task_id,
-                            &agent.execution_id,
-                            occurred_at.clone(),
-                            Json::Object(vec![
-                                ("agent_id".to_owned(), Json::String(agent.id)),
-                                ("stream".to_owned(), Json::String(stream.to_owned())),
-                                ("bytes".to_owned(), Json::number(n as u64)),
-                            ]),
-                        )) {
-                            Ok(_) => {
-                                if registry.mark_first_output(&agent_id, &occurred_at).is_err() {
-                                    let _ = registry.mark_audit_degraded(&agent_id);
-                                }
-                            }
-                            Err(_) => {
-                                let _ = registry.mark_audit_degraded(&agent_id);
-                            }
-                        }
+                    if let Ok(Some(agent)) = registry.record_first_output(
+                        &agent_id,
+                        &relay_timestamp(),
+                        stream,
+                        n as u64,
+                    ) && persist_first_output(&store, &agent).is_err()
+                    {
+                        let _ = registry.mark_audit_degraded(&agent_id);
                     }
                 }
             }
@@ -1280,17 +1279,34 @@ fn relay_event_at(
     ])
 }
 
-fn agent_event(kind: &str, agent: &AgentRecord) -> Json {
-    Json::Object(vec![
-        (
-            "id".to_owned(),
-            Json::String(format!("agent:{}:{}", agent.id, kind)),
-        ),
-        ("kind".to_owned(), Json::String(kind.to_owned())),
-        ("agent_id".to_owned(), Json::String(agent.id.clone())),
-        ("task_id".to_owned(), Json::String(agent.task_id.clone())),
-        ("state".to_owned(), Json::String(agent.state.clone())),
-    ])
+fn persist_first_output(store: &Store, agent: &AgentRecord) -> Result<(), String> {
+    let Some(occurred_at) = agent.first_output_at.clone() else {
+        return Ok(());
+    };
+    store
+        .add(relay_event_at(
+            "first_output",
+            &agent.task_id,
+            &agent.execution_id,
+            occurred_at,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent.id.clone())),
+                (
+                    "stream".to_owned(),
+                    Json::String(
+                        agent
+                            .first_output_stream
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    ),
+                ),
+                (
+                    "bytes".to_owned(),
+                    Json::number(agent.first_output_bytes.unwrap_or_default()),
+                ),
+            ]),
+        ))
+        .map(|_| ())
 }
 
 fn start_reaper(state: Arc<Server>) {
@@ -1342,6 +1358,10 @@ fn update_proc_status_with_handle(
             None => "unexpected_exit",
         };
         if let Some(agent) = registry.get(handle) {
+            if persist_first_output(store, &agent).is_err() {
+                let _ = registry.mark_audit_degraded(handle);
+                return;
+            }
             let kind = if state == "succeeded" {
                 "process_completed"
             } else {
@@ -1351,7 +1371,7 @@ fn update_proc_status_with_handle(
                 ("agent_id".to_owned(), Json::String(agent.id.clone())),
                 ("state".to_owned(), Json::String(state.to_owned())),
             ];
-            if let Some(exit_code) = agent.exit_code {
+            if let Some(exit_code) = entry.exit_code {
                 payload.push(("exit_code".to_owned(), Json::Number(exit_code.to_string())));
             }
             payload.push(("stdout_bytes".to_owned(), Json::number(agent.stdout_next)));
@@ -1942,6 +1962,21 @@ mod tests {
             fields.push(("clock".to_owned(), Json::String("vm:boot".to_owned())));
         }
         assert_eq!(same_clock_duration(&left, &cross_clock), None);
+        let unrelated_completion = relay_event_at(
+            "process_completed",
+            "task",
+            "other-execution",
+            "2026-01-02T03:04:08.000Z".to_owned(),
+            Json::Object(vec![]),
+        );
+        assert!(
+            phase_events(
+                &[left.clone(), unrelated_completion],
+                "process_spawned",
+                "process_completed"
+            )
+            .is_none()
+        );
         let rendered = timeline_output("task", &[left, cross_clock]);
         assert!(rendered.contains("Timeline for task"));
         assert!(rendered.contains("cross-clock/unknown"));
@@ -2095,6 +2130,34 @@ mod tests {
         ] {
             assert!(kinds.contains(&required), "missing audit event {required}");
         }
+        let execution_ids: std::collections::HashSet<_> = audit
+            .iter()
+            .filter_map(|event| event.object("execution_id").and_then(Json::as_str))
+            .collect();
+        assert_eq!(execution_ids.len(), 1);
+        assert!(execution_ids.iter().next().is_some_and(|id| !id.is_empty()));
+        let missing_bin_policy = exec::Policy::parse(
+            r#"{"bins":{"missing":{"path":"/definitely/not/installed","commands":[["-c"]]}}}"#,
+        )
+        .unwrap();
+        let failed_spawn = request_once(
+            Arc::clone(&state),
+            &missing_bin_policy,
+            "POST",
+            "/v1/spawn",
+            r#"{"id":"spawn-failure","bin":"missing","args":["-c","true"]}"#,
+        );
+        assert!(failed_spawn.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(
+            state
+                .store
+                .timeline("spawn-failure")
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.object("kind").and_then(Json::as_str) == Some("process_failed")
+                })
+        );
         let explicit = response_json(request_once(
             Arc::clone(&state),
             &policy,
