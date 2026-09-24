@@ -2034,6 +2034,20 @@ mod tests {
         );
         assert!(denied.starts_with("HTTP/1.1 200 OK"));
         assert!(denied.ends_with(r#"{"id":"bad","error":"denied"}"#));
+        let policy_denied = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/spawn",
+            r#"{"id":"policy-denied","bin":"sh","args":["not-allowed"]}"#,
+        );
+        assert!(policy_denied.ends_with(r#"{"id":"policy-denied","error":"denied"}"#));
+        let denied_events = state.store.timeline("policy-denied").unwrap();
+        assert_eq!(denied_events.len(), 1);
+        assert_eq!(
+            denied_events[0].object("kind").and_then(Json::as_str),
+            Some("relay_request_started")
+        );
 
         let handle = spawn_for_test(&state, &policy, "echo", "printf hello");
         let completed = poll_until_complete(&state, &policy, &handle);
@@ -2114,6 +2128,13 @@ mod tests {
                 assert!(event.object(field).is_some(), "missing {field}");
             }
         }
+        assert_eq!(
+            explicit_events
+                .iter()
+                .filter(|event| event.object("kind").and_then(Json::as_str) == Some("first_output"))
+                .count(),
+            1
+        );
 
         // The shell leader exits immediately, leaving the sleep descendant in
         // the dedicated process group. It must still be visible and killable.
