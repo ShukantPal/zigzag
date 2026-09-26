@@ -1,0 +1,27 @@
+{
+  "state_dir": "~/.local/state/codex-dept",
+  "connection": {
+    "mac": "shukant@100.101.237.83",
+    "ssh_key": "~/.ssh/id_ed25519",
+    "proxy_helper": "~/workspace/tailscale/proxy_connect.py",
+    "known_hosts": "/home/hatch/.ssh/known_hosts",
+    "remote_dept": "/Users/shukant/.codex/dept",
+    "zigzag_url": "http://100.101.237.83:8765",
+    "zigzag_token_file": "~/.codex/zigzag.token",
+    "relay_launcher": "codex-launch"
+  },
+  "pr_comment_watcher": {
+    "repo": "owner/repo",
+    "project_dir": "/absolute/path/to/checkout",
+    "prs": []
+  },
+  "gdocs_comment_watcher": {
+    "gws": "/absolute/path/to/google-workspace-cli",
+    "docs": {}
+  },
+  "jules_pr_reviewer": {
+    "repo": "owner/repo",
+    "project": "/absolute/path/to/checkout",
+    "jules_sessions": {}
+  }
+}

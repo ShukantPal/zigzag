@@ -1,0 +1,13 @@
+# dept/ runtime state — never commit
+ledger.jsonl
+reported.json
+pr_sessions.json
+config.json
+runtime/
+prompts/
+task-prompts/
+review_rounds/
+__pycache__/
+*.pyc
+*.log
+.DS_Store

@@ -6,6 +6,12 @@ on:
     branches: [main]
 
 jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -c "import pathlib; [compile(p.read_text(), str(p), 'exec') for p in pathlib.Path('dept').glob('*.py')]"
+      - run: python3 -m unittest discover -s dept -p 'test_*.py'
   rust:
     runs-on: ubuntu-latest
     steps:
