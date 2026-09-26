@@ -76,9 +76,13 @@ def format_duration(duration: dt.timedelta | None) -> str:
 
 def sort_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     def key(event: dict[str, Any]) -> tuple[str, int, str]:
+        try:
+            sequence = int(event.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
         return (
             str(event.get("received_at") or event.get("occurred_at") or ""),
-            int(event.get("sequence") or 0),
+            sequence,
             str(event.get("id") or ""),
         )
     return sorted(events, key=key)
@@ -156,10 +160,20 @@ def audit_directory(state_file: Path) -> Path:
     return state_file.with_suffix(".audit")
 
 
+def valid_sequence(event: dict[str, Any]) -> bool:
+    try:
+        int(event.get("sequence") or 0)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def read_audit_events(state_file: Path) -> tuple[list[dict[str, Any]], list[str]]:
     events: list[dict[str, Any]] = []
     warnings: list[str] = []
     directory = audit_directory(state_file)
+    if not directory.is_dir():
+        return events, [f"audit directory unavailable: {directory} does not exist"]
     try:
         files = list(directory.glob("*.jsonl"))
     except OSError as error:
@@ -178,10 +192,12 @@ def read_audit_events(state_file: Path) -> tuple[list[dict[str, Any]], list[str]
             except json.JSONDecodeError as error:
                 warnings.append(f"degraded audit log {path.name}:{line_number}: {error.msg}")
                 continue
-            if isinstance(decoded, dict):
-                events.append(decoded)
-            else:
+            if not isinstance(decoded, dict):
                 warnings.append(f"degraded audit log {path.name}:{line_number}: event is not an object")
+            elif not valid_sequence(decoded):
+                warnings.append(f"degraded audit log {path.name}:{line_number}: sequence is not numeric")
+            else:
+                events.append(decoded)
     return events, warnings
 
 
@@ -201,20 +217,32 @@ def relay_snapshot(url: str, token_file: Path) -> tuple[list[dict[str, Any]], li
     lost = False
     try:
         token = token_file.read_text().strip()
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         return recent, agents, lost, [f"relay credentials unavailable: {error}"]
     if not token:
         return recent, agents, lost, ["relay credentials unavailable: token is empty"]
     root = url.rstrip("/")
     try:
         message = get_json(root + "/v1/events?after=0&timeout=0", token)
-        recent = [event for event in message.get("events", []) if isinstance(event, dict)]
+        values = message.get("events", [])
+        if not isinstance(values, list):
+            warnings.append("recent relay events unavailable: events is not an array")
+        else:
+            recent = [event for event in values if isinstance(event, dict) and valid_sequence(event)]
+            if len(recent) != len(values):
+                warnings.append("recent relay events unavailable: invalid event record")
         lost = bool(message.get("lost"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         warnings.append(f"recent relay events unavailable: {error}")
     try:
         message = get_json(root + "/v1/agents?state=running", token)
-        agents = [agent for agent in message.get("agents", []) if isinstance(agent, dict)]
+        values = message.get("agents", [])
+        if not isinstance(values, list):
+            warnings.append("running agents unavailable: agents is not an array")
+        else:
+            agents = [agent for agent in values if isinstance(agent, dict)]
+            if len(agents) != len(values):
+                warnings.append("running agents unavailable: invalid agent record")
     except (OSError, ValueError, json.JSONDecodeError) as error:
         warnings.append(f"running agents unavailable: {error}")
     return recent, agents, lost, warnings
@@ -229,7 +257,7 @@ def merged_events(audit: Iterable[dict[str, Any]], recent: Iterable[dict[str, An
             unique[event_id] = event
         else:
             anonymous.append(event)
-    return sort_events([*unique.values(), *anonymous])
+    return [*unique.values(), *anonymous]
 
 
 def flags(execution: Execution) -> str:
@@ -264,6 +292,7 @@ class StatusScreen:
         self.executions: list[Execution] = []
         self.warnings: list[str] = []
         self.selected = 0
+        self.offset = 0
 
     def refresh(self) -> None:
         audit, audit_warnings = read_audit_events(self.state_file)
@@ -271,6 +300,14 @@ class StatusScreen:
         self.executions = build_executions(merged_events(audit, recent), agents, relay_lost=lost)
         self.warnings = [*audit_warnings, *relay_warnings]
         self.selected = min(self.selected, max(len(self.executions) - 1, 0))
+        self.offset = min(self.offset, self.selected)
+
+    def move_selection(self, delta: int, rows: int) -> None:
+        self.selected = min(max(self.selected + delta, 0), max(len(self.executions) - 1, 0))
+        if self.selected < self.offset:
+            self.offset = self.selected
+        elif self.selected >= self.offset + rows:
+            self.offset = self.selected - rows + 1
 
     def run(self, screen: curses.window) -> None:
         curses.curs_set(0)
@@ -282,9 +319,9 @@ class StatusScreen:
             if key in (ord("q"), 27):
                 return
             if key in (curses.KEY_UP, ord("k")):
-                self.selected = max(0, self.selected - 1)
+                self.move_selection(-1, max(1, screen.getmaxyx()[0] // 2 - 2))
             if key in (curses.KEY_DOWN, ord("j")):
-                self.selected = min(max(len(self.executions) - 1, 0), self.selected + 1)
+                self.move_selection(1, max(1, screen.getmaxyx()[0] // 2 - 2))
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
@@ -294,11 +331,11 @@ class StatusScreen:
         columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
         screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
         rows = max(1, height // 2 - 2)
-        for row, execution in enumerate(self.executions[:rows], start=2):
+        for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest_event()[:24]}"
-            screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if row - 2 == self.selected else 0)
+            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest_event[:24]}"
+            screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
         if self.executions:
@@ -316,7 +353,7 @@ def print_once(executions: list[Execution], warnings: list[str]) -> None:
     for execution in executions:
         total, boundary = execution.total_elapsed()
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event(), flags(execution))))
+        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
