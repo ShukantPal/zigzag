@@ -175,13 +175,14 @@ fn run() -> Result<(), String> {
             config.github_watch_interval
         );
     }
-    if config.comment_router.enabled() {
-        let state = Arc::clone(&state);
-        let router = config.comment_router.clone();
-        let shadow = router.is_shadow();
-        thread::spawn(move || comment_router::watch_loop(state, router));
-        log::info!("started GitHub PR comment router (shadow={shadow})");
-    }
+    comment_router::configure_session_gate(
+        config.state_file.with_extension("comment-router.json"),
+    )?;
+    comment_router::recover_session_claims(Arc::clone(&state));
+    let router_state = Arc::clone(&state);
+    let router = config.comment_router.clone();
+    thread::spawn(move || comment_router::watch_loop(router_state, router));
+    log::info!("started GitHub PR comment router");
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
         SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.port),
