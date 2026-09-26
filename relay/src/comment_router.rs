@@ -265,48 +265,28 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
         return Ok(false);
     }
 
-    let fresh = candidates;
-    if fresh.is_empty() {
-        state.session_gate.release(&watched.session_id);
-        return Ok(false);
-    }
     if shadow {
-        for comment in &fresh {
-            let payload = Json::Object(vec![
-                ("id".to_owned(), Json::String(comment.event_id())),
-                (
-                    "kind".to_owned(),
-                    Json::String("github_pr_comment".to_owned()),
-                ),
-                (
-                    "repository".to_owned(),
-                    Json::String(watched.repository.clone()),
-                ),
-                ("pull_request".to_owned(), Json::number(watched.number)),
-                (
-                    "session_id".to_owned(),
-                    Json::String(watched.session_id.clone()),
-                ),
-                ("node_id".to_owned(), Json::String(comment.node_id.clone())),
-                (
-                    "surface".to_owned(),
-                    Json::String(comment.surface.to_owned()),
-                ),
-            ]);
+        let result = (|| {
+            for comment in &candidates {
+                state
+                    .store
+                    .add(comment_event(watched, comment))
+                    .map_err(|error| format!("could not persist comment event: {error}"))?;
+            }
             state
-                .store
-                .add(payload)
-                .map_err(|error| format!("could not persist comment event: {error}"))?;
+                .session_gate
+                .mark_dispatched(candidates.iter().map(Comment::event_id))
+        })();
+        if let Err(error) = result {
+            state.session_gate.release(&watched.session_id);
+            return Err(error);
         }
-        state
-            .session_gate
-            .mark_dispatched(fresh.iter().map(Comment::event_id))?;
         eprintln!(
             "shadow: would resume session {} for {}#{} on {} new GitHub comment(s)",
             watched.session_id,
             watched.repository,
             watched.number,
-            fresh.len()
+            candidates.len()
         );
         state.session_gate.release(&watched.session_id);
         return Ok(true);
@@ -314,7 +294,7 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
 
     let prompt = comment_prompt(watched, &comments);
     let request = exec::ExecRequest {
-        id: format!("github-comment-{}", fresh[0].node_id),
+        id: format!("github-comment-{}", candidates[0].node_id),
         bin: "codex".to_owned(),
         args: vec![
             "exec".to_owned(),
@@ -350,6 +330,14 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(error);
         }
     };
+    // Persist the event before launching. The ledger is only marked dispatched
+    // after a successful spawn, so any pre-launch failure remains retryable.
+    for comment in &candidates {
+        if let Err(error) = state.store.add(comment_event(watched, comment)) {
+            state.session_gate.release(&watched.session_id);
+            return Err(format!("could not persist comment event: {error}"));
+        }
+    }
     let spawned = match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
@@ -363,49 +351,61 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(format!("could not spawn comment resume: {error}"));
         }
     };
-    if let Err(error) = state
-        .session_gate
-        .bind(&watched.session_id, &spawned.handle)
-    {
-        state.session_gate.release(&watched.session_id);
-        return Err(error);
-    }
-    for comment in &fresh {
-        let payload = Json::Object(vec![
-            ("id".to_owned(), Json::String(comment.event_id())),
-            (
-                "kind".to_owned(),
-                Json::String("github_pr_comment".to_owned()),
-            ),
-            (
-                "repository".to_owned(),
-                Json::String(watched.repository.clone()),
-            ),
-            ("pull_request".to_owned(), Json::number(watched.number)),
-            (
-                "session_id".to_owned(),
-                Json::String(watched.session_id.clone()),
-            ),
-            ("node_id".to_owned(), Json::String(comment.node_id.clone())),
-            (
-                "surface".to_owned(),
-                Json::String(comment.surface.to_owned()),
-            ),
-        ]);
-        if let Err(error) = state.store.add(payload) {
-            eprintln!("could not persist dispatched GitHub comment event: {error}");
-        }
-    }
-    state
-        .session_gate
-        .mark_dispatched(fresh.iter().map(Comment::event_id))?;
     release_when_finished(
         Arc::clone(&state.session_gate),
         Arc::clone(&state.supervisor.registry),
         watched.session_id.clone(),
-        spawned.handle,
+        spawned.handle.clone(),
     );
+    if let Err(error) = state
+        .session_gate
+        .bind(&watched.session_id, &spawned.handle)
+    {
+        terminate_spawned(&state.supervisor, &spawned.handle);
+        state.session_gate.release(&watched.session_id);
+        return Err(error);
+    }
+    if let Err(error) = state
+        .session_gate
+        .mark_dispatched(candidates.iter().map(Comment::event_id))
+    {
+        // The supervisor monitor installed above still releases this claim.
+        // Retrying after it exits is safer than stranding a session forever.
+        eprintln!("could not mark GitHub comment dispatch complete: {error}");
+    }
     Ok(true)
+}
+
+fn comment_event(watched: &WatchedPr, comment: &Comment) -> Json {
+    Json::Object(vec![
+        ("id".to_owned(), Json::String(comment.event_id())),
+        (
+            "kind".to_owned(),
+            Json::String("github_pr_comment".to_owned()),
+        ),
+        (
+            "repository".to_owned(),
+            Json::String(watched.repository.clone()),
+        ),
+        ("pull_request".to_owned(), Json::number(watched.number)),
+        (
+            "session_id".to_owned(),
+            Json::String(watched.session_id.clone()),
+        ),
+        ("node_id".to_owned(), Json::String(comment.node_id.clone())),
+        (
+            "surface".to_owned(),
+            Json::String(comment.surface.to_owned()),
+        ),
+    ])
+}
+
+fn terminate_spawned(supervisor: &crate::Supervisor, handle: &str) {
+    if let Ok(entries) = supervisor.procs.lock()
+        && let Some(entry) = entries.get(handle)
+    {
+        let _ = crate::kill_process_group(entry.process_group);
+    }
 }
 
 fn release_when_finished(
@@ -824,7 +824,7 @@ mod tests {
     fn parses_all_surfaces_and_selects_burst_after_routable_feedback() {
         let issue = parse_comments(
             "issue",
-            r#"[[{"id":1,"node_id":"IC_a","body":"hello","user":{"login":"reviewer"}}]]"#,
+            r#"[[{"id":1,"node_id":"IC_a","body":"hello","user":{"login":"ShukantPal"}}]]"#,
         )
         .unwrap();
         let inline = parse_comments(
@@ -832,10 +832,27 @@ mod tests {
             r#"[[{"id":2,"node_id":"PRRC_b","body":"> 🤖 bot","user":{"login":"ShukantPal"}}]]"#,
         )
         .unwrap();
-        let review = parse_comments("review", r#"[[{"id":3,"node_id":"PRR_c","body":"mobile feedback","submitted_at":"2026-09-26T12:00:00Z","user":{"login":"reviewer"}}]]"#).unwrap();
-        assert!(!issue[0].is_owner_feedback());
+        let review = parse_comments("review", r#"[[{"id":3,"node_id":"PRR_c","body":"mobile feedback","submitted_at":"2026-09-26T12:00:00Z","user":{"login":"ShukantPal"}}]]"#).unwrap();
+        assert!(issue[0].is_owner_feedback());
         assert!(!inline[0].is_owner_feedback());
-        assert!(!review[0].is_owner_feedback());
+        assert!(review[0].is_owner_feedback());
+        let watched = WatchedPr {
+            repository: "ShukantPal/zigzag".to_owned(),
+            number: 13,
+            session_id: "session".to_owned(),
+        };
+        assert_eq!(
+            comment_event(&watched, &issue[0])
+                .object("surface")
+                .and_then(Json::as_str),
+            Some("issue")
+        );
+        assert_eq!(
+            comment_event(&watched, &review[0])
+                .object("surface")
+                .and_then(Json::as_str),
+            Some("review")
+        );
         let now = Instant::now();
         assert_eq!(
             poll_interval(now, now + Duration::from_secs(1), Duration::from_secs(300)),
