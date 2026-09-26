@@ -8,8 +8,8 @@
 use crate::config::valid_github_repo;
 use crate::events::new_execution_id;
 use crate::exec;
-use crate::proc::{AgentSpawnDetails, process_group_running, spawn_proc};
-use crate::server::Server;
+use crate::proc::{AgentSpawnDetails, kill_process_group, process_group_running, spawn_proc};
+use crate::server::{Server, Supervisor};
 use crate::session::require_gui_login_session;
 use relay_core::{Json, parse_json};
 use std::collections::{HashMap, HashSet};
@@ -295,39 +295,20 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
     }
 
     let fresh = candidates;
-    if fresh.is_empty() {
-        gate.release(&watched.session_id);
-        return Ok(false);
-    }
     if shadow {
-        for comment in &fresh {
-            let payload = Json::Object(vec![
-                ("id".to_owned(), Json::String(comment.event_id())),
-                (
-                    "kind".to_owned(),
-                    Json::String("github_pr_comment".to_owned()),
-                ),
-                (
-                    "repository".to_owned(),
-                    Json::String(watched.repository.clone()),
-                ),
-                ("pull_request".to_owned(), Json::number(watched.number)),
-                (
-                    "session_id".to_owned(),
-                    Json::String(watched.session_id.clone()),
-                ),
-                ("node_id".to_owned(), Json::String(comment.node_id.clone())),
-                (
-                    "surface".to_owned(),
-                    Json::String(comment.surface.to_owned()),
-                ),
-            ]);
-            state
-                .store
-                .add(payload)
-                .map_err(|error| format!("could not persist comment event: {error}"))?;
+        let result = (|| {
+            for comment in &fresh {
+                state
+                    .store
+                    .add(comment_event(watched, comment))
+                    .map_err(|error| format!("could not persist comment event: {error}"))?;
+            }
+            gate.mark_dispatched(fresh.iter().map(Comment::event_id))
+        })();
+        if let Err(error) = result {
+            gate.release(&watched.session_id);
+            return Err(error);
         }
-        gate.mark_dispatched(fresh.iter().map(Comment::event_id))?;
         eprintln!(
             "shadow: would resume session {} for {}#{} on {} new GitHub comment(s)",
             watched.session_id,
@@ -379,6 +360,14 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(error);
         }
     };
+    // The event must be durable before launching; the dispatch ledger is
+    // updated only after a successful spawn, so pre-launch failures retry.
+    for comment in &fresh {
+        if let Err(error) = state.store.add(comment_event(watched, comment)) {
+            gate.release(&watched.session_id);
+            return Err(format!("could not persist comment event: {error}"));
+        }
+    }
     let spawned = match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
@@ -393,44 +382,55 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(format!("could not spawn comment resume: {error}"));
         }
     };
+    release_when_finished(
+        Arc::clone(&gate),
+        Arc::clone(&state.supervisor.registry),
+        watched.session_id.clone(),
+        spawned.handle.clone(),
+    );
     if let Err(error) = gate.bind(&watched.session_id, &spawned.handle) {
+        terminate_spawned(&state.supervisor, &spawned.handle);
         gate.release(&watched.session_id);
         return Err(error);
     }
-    for comment in &fresh {
-        let payload = Json::Object(vec![
-            ("id".to_owned(), Json::String(comment.event_id())),
-            (
-                "kind".to_owned(),
-                Json::String("github_pr_comment".to_owned()),
-            ),
-            (
-                "repository".to_owned(),
-                Json::String(watched.repository.clone()),
-            ),
-            ("pull_request".to_owned(), Json::number(watched.number)),
-            (
-                "session_id".to_owned(),
-                Json::String(watched.session_id.clone()),
-            ),
-            ("node_id".to_owned(), Json::String(comment.node_id.clone())),
-            (
-                "surface".to_owned(),
-                Json::String(comment.surface.to_owned()),
-            ),
-        ]);
-        if let Err(error) = state.store.add(payload) {
-            eprintln!("could not persist dispatched GitHub comment event: {error}");
-        }
+    if let Err(error) = gate.mark_dispatched(fresh.iter().map(Comment::event_id)) {
+        // The completion monitor releases the claim; retrying after it exits
+        // is safer than stranding this session forever.
+        eprintln!("could not mark GitHub comment dispatch complete: {error}");
     }
-    gate.mark_dispatched(fresh.iter().map(Comment::event_id))?;
-    release_when_finished(
-        gate,
-        Arc::clone(&state.supervisor.registry),
-        watched.session_id.clone(),
-        spawned.handle,
-    );
     Ok(true)
+}
+
+fn comment_event(watched: &WatchedPr, comment: &Comment) -> Json {
+    Json::Object(vec![
+        ("id".to_owned(), Json::String(comment.event_id())),
+        (
+            "kind".to_owned(),
+            Json::String("github_pr_comment".to_owned()),
+        ),
+        (
+            "repository".to_owned(),
+            Json::String(watched.repository.clone()),
+        ),
+        ("pull_request".to_owned(), Json::number(watched.number)),
+        (
+            "session_id".to_owned(),
+            Json::String(watched.session_id.clone()),
+        ),
+        ("node_id".to_owned(), Json::String(comment.node_id.clone())),
+        (
+            "surface".to_owned(),
+            Json::String(comment.surface.to_owned()),
+        ),
+    ])
+}
+
+fn terminate_spawned(supervisor: &Supervisor, handle: &str) {
+    if let Ok(entries) = supervisor.procs.lock()
+        && let Some(entry) = entries.get(handle)
+    {
+        let _ = kill_process_group(entry.process_group);
+    }
 }
 
 fn release_when_finished(
@@ -866,7 +866,7 @@ mod tests {
     fn parses_all_surfaces_and_selects_burst_after_routable_feedback() {
         let issue = parse_comments(
             "issue",
-            r#"[[{"id":1,"node_id":"IC_a","body":"hello","user":{"login":"reviewer"}}]]"#,
+            r#"[[{"id":1,"node_id":"IC_a","body":"hello","user":{"login":"ShukantPal"}}]]"#,
         )
         .unwrap();
         let inline = parse_comments(
@@ -874,10 +874,27 @@ mod tests {
             r#"[[{"id":2,"node_id":"PRRC_b","body":"> 🤖 bot","user":{"login":"ShukantPal"}}]]"#,
         )
         .unwrap();
-        let review = parse_comments("review", r#"[[{"id":3,"node_id":"PRR_c","body":"mobile feedback","submitted_at":"2026-09-26T12:00:00Z","user":{"login":"reviewer"}}]]"#).unwrap();
-        assert!(!issue[0].is_owner_feedback());
+        let review = parse_comments("review", r#"[[{"id":3,"node_id":"PRR_c","body":"mobile feedback","submitted_at":"2026-09-26T12:00:00Z","user":{"login":"ShukantPal"}}]]"#).unwrap();
+        assert!(issue[0].is_owner_feedback());
         assert!(!inline[0].is_owner_feedback());
-        assert!(!review[0].is_owner_feedback());
+        assert!(review[0].is_owner_feedback());
+        let watched = WatchedPr {
+            repository: "ShukantPal/zigzag".to_owned(),
+            number: 13,
+            session_id: "session".to_owned(),
+        };
+        assert_eq!(
+            comment_event(&watched, &issue[0])
+                .object("surface")
+                .and_then(Json::as_str),
+            Some("issue")
+        );
+        assert_eq!(
+            comment_event(&watched, &review[0])
+                .object("surface")
+                .and_then(Json::as_str),
+            Some("review")
+        );
         let now = Instant::now();
         assert_eq!(
             poll_interval(now, now + Duration::from_secs(1), Duration::from_secs(300)),
