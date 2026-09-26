@@ -234,6 +234,12 @@ def session_meta_cwd(lines):
     return None
 
 
+def single_cwd(candidates):
+    """Return the sole non-empty string candidate, refusing ambiguity."""
+    cwds = {cwd for cwd in candidates if isinstance(cwd, str) and cwd}
+    return next(iter(cwds)) if len(cwds) == 1 else None
+
+
 def resolve_session_cwd(session_id):
     """Return the cwd recorded in the Codex session file on the Mac, or None.
 
@@ -263,12 +269,15 @@ def resolve_session_cwd(session_id):
         "                break\n"
         "    except OSError:\n"
         "        continue\n"
-        "print(next(iter(cwds)) if len(cwds) == 1 else '')\n"
+        "print(json.dumps(sorted(cwds)))\n"
     ).encode()
     r = ssh("python3", "-", stdin_data=script, timeout=60)
     if r.returncode != 0:
         return None
-    return r.stdout.decode().strip() or None
+    try:
+        return single_cwd(json.loads(r.stdout.decode()))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def remote_isdir(path):

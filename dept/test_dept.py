@@ -32,12 +32,17 @@ class SessionResolutionTest(unittest.TestCase):
     def test_resolve_requires_unambiguous_exact_session_identifier(self):
         self.assertIsNone(department.resolve_session_cwd("bad*id"))
         with patch.object(department, "ssh", return_value=SimpleNamespace(
-                returncode=0, stdout=b"/one/project\n")) as ssh:
+                returncode=0, stdout=b'["/one/project"]\n')) as ssh:
             self.assertEqual(department.resolve_session_cwd("session_123"), "/one/project")
         script = ssh.call_args.kwargs["stdin_data"].decode()
         self.assertIn("glob.escape(sid)", script)
         self.assertIn("rollout-*-", script)
-        self.assertIn("len(cwds) == 1", script)
+        self.assertIn("json.dumps(sorted(cwds))", script)
+
+    def test_multiple_session_cwds_are_refused(self):
+        with patch.object(department, "ssh", return_value=SimpleNamespace(
+                returncode=0, stdout=b'["/one/project", "/another/project"]\n')):
+            self.assertIsNone(department.resolve_session_cwd("session_123"))
 
 
 class ResumeCliTest(unittest.TestCase):
