@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod comment_router;
 mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
@@ -34,12 +35,17 @@ struct Config {
     max_events: usize,
     github_watch_repos: Vec<String>,
     github_watch_interval: Duration,
+    comment_router: comment_router::Config,
 }
 struct Server {
     secret: String,
     control_secret: Option<String>,
     store: Arc<Store>,
     supervisor: Supervisor,
+    /// Coordinates all operations which resume a Codex session. Future
+    /// session-touching watchers (review rounds and merge handling) share this
+    /// gate rather than racing a comment resume.
+    session_gate: Arc<comment_router::SessionGate>,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -134,6 +140,7 @@ fn run() -> Result<(), String> {
         .as_deref()
         .map(read_secret_file)
         .transpose()?;
+    let comment_router_state_file = config.state_file.with_extension("comment-router.json");
     let state = Arc::new(Server {
         secret,
         control_secret,
@@ -142,6 +149,9 @@ fn run() -> Result<(), String> {
             registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
             procs: Mutex::new(HashMap::new()),
         },
+        session_gate: Arc::new(comment_router::SessionGate::open(
+            comment_router_state_file,
+        )?),
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
         replay_recovered_lifecycle(&state.store, &agent)?;
@@ -153,6 +163,10 @@ fn run() -> Result<(), String> {
         let interval = config.github_watch_interval;
         thread::spawn(move || github_watch_loop(state, repos, interval));
     }
+    comment_router::recover_session_claims(Arc::clone(&state));
+    let router_state = Arc::clone(&state);
+    let router = config.comment_router.clone();
+    thread::spawn(move || comment_router::watch_loop(router_state, router));
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
         SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.port),
@@ -290,6 +304,11 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut max_events = 1000;
     let mut github_watch_repos = Vec::new();
     let mut github_watch_interval = Duration::from_secs(30);
+    let mut watch_pr_state = None;
+    let mut watch_prs = Vec::new();
+    let mut comment_router_shadow = true;
+    let mut comment_router_quiet_interval = Duration::from_secs(300);
+    let mut comment_router_burst_window = Duration::from_secs(10 * 60);
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -330,7 +349,28 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
                 github_watch_interval = Duration::from_secs(seconds);
             }
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
+            "--watch-pr-state" => watch_pr_state = Some(PathBuf::from(value(&mut values, "--watch-pr-state")?)),
+            "--watch-pr" => watch_prs.push(value(&mut values, "--watch-pr")?),
+            "--comment-router-live" => comment_router_shadow = false,
+            "--comment-router-quiet-interval" => {
+                let seconds = value(&mut values, "--comment-router-quiet-interval")?
+                    .parse::<u64>()
+                    .map_err(|_| "--comment-router-quiet-interval must be an integer".to_owned())?;
+                if !(30..=3600).contains(&seconds) {
+                    return Err("--comment-router-quiet-interval must be between 30 and 3600 seconds".to_owned());
+                }
+                comment_router_quiet_interval = Duration::from_secs(seconds);
+            }
+            "--comment-router-burst-window" => {
+                let seconds = value(&mut values, "--comment-router-burst-window")?
+                    .parse::<u64>()
+                    .map_err(|_| "--comment-router-burst-window must be an integer".to_owned())?;
+                if !(30..=3600).contains(&seconds) {
+                    return Err("--comment-router-burst-window must be between 30 and 3600 seconds".to_owned());
+                }
+                comment_router_burst_window = Duration::from_secs(seconds);
+            }
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--watch-pr-state PATH] [--watch-pr OWNER/REPO#NUMBER:SESSION] [--comment-router-live]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -342,6 +382,13 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         return Err("--max-events must be greater than zero".to_owned());
     }
     let agent_registry_file = state_file.with_extension("agents.json");
+    let comment_router = comment_router::Config::new(
+        watch_pr_state.unwrap_or_else(|| state_file.with_extension("pr_sessions.json")),
+        watch_prs,
+        comment_router_shadow,
+        comment_router_quiet_interval,
+        comment_router_burst_window,
+    )?;
     Ok(Config {
         secret_file,
         control_secret_file,
@@ -352,6 +399,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         max_events,
         github_watch_repos,
         github_watch_interval,
+        comment_router,
     })
 }
 
@@ -404,25 +452,32 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
 }
 
 fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+    parse_github_open_pull_requests(&github_api(
+        &format!("repos/{repo}/pulls?state=open&per_page=100"),
+        &format!("github-pr-scan-{repo}"),
+    )?)
+}
+
+pub(crate) fn github_api(endpoint: &str, id: &str) -> Result<String, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
-        id: format!("github-pr-scan-{repo}"),
+        id: id.to_owned(),
         bin: "gh".to_owned(),
         args: vec![
             "api".to_owned(),
             "--paginate".to_owned(),
             "--slurp".to_owned(),
-            format!("repos/{repo}/pulls?state=open&per_page=100"),
+            endpoint.to_owned(),
         ],
     };
     let path = policy
         .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| "the gh policy does not allow the PR scan".to_owned())?;
+        .ok_or_else(|| "the gh policy does not allow the GitHub scan".to_owned())?;
     let result = exec::run(path, request);
     if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub PR discovery did not complete successfully".to_owned());
+        return Err("GitHub API scan did not complete successfully".to_owned());
     }
-    parse_github_open_pull_requests(&result.stdout)
+    Ok(result.stdout)
 }
 
 fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, String> {
@@ -2295,6 +2350,9 @@ mod tests {
                     registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                     procs: Mutex::new(HashMap::new()),
                 },
+                session_gate: Arc::new(
+                    comment_router::SessionGate::open(path.with_extension("comments")).unwrap(),
+                ),
             }),
             path,
         )

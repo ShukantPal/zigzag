@@ -48,7 +48,7 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
-## GitHub PR watchdog events
+## GitHub PR watchdog and comment routing
 
 The relay can discover open pull requests in explicitly watched repositories
 and enqueue one durable `github_pr_opened` event per PR. This is the trigger
@@ -65,6 +65,33 @@ zigzag --secret-file ~/.codex/zigzag/zigzag.token \
 
 The supplied LaunchAgent template includes this initial repository; add
 additional `--watch-repo` argument pairs only after reviewing their scope.
+
+### Native comment router (shadow mode)
+
+Zigzag owns the PR/session list used for human comment routing. Keep it on the
+Mac beside the relay state, in `~/.codex/zigzag/pr_sessions.json`:
+
+```json
+{"watched_pull_requests":[{"repository":"ShukantPal/zigzag","pull_request":42,"session_id":"the-codex-session-id"}]}
+```
+
+The daemon reloads this file on every poll. It also accepts the older compact
+mapping form, `{ "owner/repo#42": "session-id" }`, so a VM-side session file
+can be copied to the Mac without a Python conversion. `--watch-pr
+OWNER/REPO#NUMBER:SESSION` is intended for a temporary manual entry.
+
+The comment router defaults to **shadow mode**. It polls issue comments,
+inline review comments, and submitted review bodies; ignores comments whose
+first line starts with `> 🤖`; persists an event keyed by GraphQL `node_id`;
+and logs each resume it would make. It polls every 30 seconds for ten minutes
+after new feedback, then backs off to five minutes. Tune this with
+`--comment-router-quiet-interval` and `--comment-router-burst-window`.
+
+After the shadow comparison, add `--comment-router-live` to the LaunchAgent
+arguments and restart from a local GUI session. That is the cutover: Zigzag
+uses its detached supervisor to run `codex exec ... resume <session> <prompt>`
+directly, never `dept.py`. It serializes resumes for each session until that
+detached process exits while allowing unrelated sessions to run concurrently.
 
 The template starts the scan, but it fails closed (and logs a policy error)
 until the owner installs the `gh` policy fragment below. Each scan then runs
@@ -124,6 +151,10 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 +        ["api"]
 +      ],
 +      "gh_read_repos": ["leveled-inc/leveled"]
++    },
++    "codex": {
++      "path": "/REPLACE/WITH/ABSOLUTE/PATH/codex",
++      "commands": [["exec"]]
 +    },
      "existing-binary": { "path": "/existing/path", "commands": [["existing-command"]] }
    }
