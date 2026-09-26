@@ -157,6 +157,7 @@ def dispatch_args(args, resume=False):
                     help="prepend the writing standard (strategic/hierarchical/simple) instead of the code SOP")
     ap.add_argument("--ssh", action="store_true",
                     help="launch over SSH+nohup instead of the relay (no keychain access)")
+    ap.add_argument("--model", help="override the Codex model for this task")
     return ap.parse_args(args)
 
 
@@ -177,7 +178,7 @@ def decorated_prompt(ns):
     return prompt
 
 
-def setup_task_dir(tid, project_dir, prompt, session_id=None):
+def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
     r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
@@ -187,29 +188,32 @@ def setup_task_dir(tid, project_dir, prompt, session_id=None):
     files = f"printf %s {shq(project_dir)} > {rdir}/dir.txt"
     if session_id:
         files += f" && printf %s {shq(session_id)} > {rdir}/resume.txt"
+    if model:
+        files += f" && printf %s {shq(model)} > {rdir}/model.txt"
     r = ssh(files, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh dir write failed: {r.stderr.decode()[-500:]}")
     return rdir
 
 
-def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
+def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
     """Launch start/resume through one preparation, transport, and ledger path."""
     tid = "t-" + uuid.uuid4().hex[:6]
     relay_path = asset_path("relay-announce.md")
     if os.path.exists(relay_path):
         relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
-    rdir = setup_task_dir(tid, project_dir, prompt, session_id)
+    rdir = setup_task_dir(tid, project_dir, prompt, session_id, model)
     action = "resumed" if session_id else "started"
     if use_ssh:
         command = (f'resume "$(cat {rdir}/resume.txt)" "$(cat {rdir}/prompt.txt)" '
                    f'-o {rdir}/last-message.txt'
                    if session_id else
                    f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)"')
+        model_flag = f"-m {shq(model)} " if model else ""
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
                   f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
-                  f'{command} '
+                  f'{model_flag}{command} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
                   f'echo $! > {rdir}/pid && cat {rdir}/pid')
         r = ssh(launch, timeout=60)
@@ -228,12 +232,13 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
                    "prompt_head": prefix + prompt.decode(errors="replace")[:200],
                    "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
     session = f" session={session_id[:8]}" if session_id else ""
-    print(f"{action} {tid} {detail}{session} project={project_dir} (via {transport['via']})")
+    model_text = f" model={model}" if model else ""
+    print(f"{action} {tid} {detail}{session}{model_text} project={project_dir} (via {transport['via']})")
 
 
 def cmd_start(args):
     ns = dispatch_args(args)
-    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh)
+    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh, model=ns.model)
 
 
 def shq(s):
@@ -338,7 +343,14 @@ def cmd_kill(args):
 def cmd_status(args):
     tid = args[0]
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
-    print(f"{tid}: {remote_status(entry)}")
+    status = remote_status(entry)
+    suffix = ""
+    if status == "DONE" and entry.get("via") == "relay" and entry.get("proc"):
+        payload = zigzag_poll(entry["proc"])
+        exit_code = None if payload is None else payload.get("exit_code")
+        if exit_code not in (None, 0):
+            suffix = f" (exit {exit_code})"
+    print(f"{tid}: {status}{suffix}")
 
 
 def cmd_list(args):
@@ -355,6 +367,20 @@ def cmd_result(args):
     print(f"--- status: {remote_status(entry)} ---")
     r = ssh(f"cat {rdir}/last-message.txt 2>/dev/null || echo '(no final message yet)'", timeout=60)
     print(r.stdout.decode(errors="replace"))
+    if entry.get("via") == "relay" and entry.get("proc"):
+        payload = zigzag_poll(entry["proc"])
+        if payload is not None:
+            print("--- diagnostics ---")
+            print(f"relay exit_code: {payload.get('exit_code', 'unknown')}")
+            stderr = payload.get("stderr") or ""
+            if stderr:
+                print("relay stderr (tail):")
+                print(stderr[-1500:])
+    elif entry.get("via", "ssh") == "ssh":
+        diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
+        print("--- diagnostics ---")
+        print("stderr.log (tail):")
+        print(diag.stdout.decode(errors="replace"))
     print("--- token usage ---")
     print(token_summary(tid))
 
@@ -402,7 +428,7 @@ def cmd_resume(args):
     if not remote_isdir(project_dir):
         sys.exit(f"project_dir does not exist on the Mac: {project_dir} "
                  f"(refusing to dispatch a dead task)")
-    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id)
+    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id, ns.model)
 
 
 def cmd_check(args):

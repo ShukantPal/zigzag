@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
+from review_round_watcher import project_dir_busy
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -202,8 +203,15 @@ def load_watermark():
 
 def save_watermark(wm):
     os.makedirs(STATE_DIR, exist_ok=True)
+    # A round watcher may have seeded comments after this poll loaded its copy.
+    # Reload and union instead of overwriting that concurrent watermark update.
+    current = load_watermark()
+    states = current.get("pr_state", {})
+    states.update(wm.get("pr_state", {}))
     with open(WATERMARK, "w") as f:
-        json.dump({**wm, "seen": sorted(set(wm.get("seen", [])), key=str)}, f, indent=2)
+        json.dump({**wm, "pr_state": states,
+                   "seen": sorted(set(current.get("seen", [])) | set(wm.get("seen", [])), key=str)},
+                  f, indent=2)
 
 
 def pr_head_branch(n):
@@ -415,6 +423,8 @@ def dispatch(pr, branch, new_comments, parent_bodies):
     # lined up; the worker swaps it for 👀 when it starts on them.
     # (GitHub's reaction API has no hourglass — rocket is the closest "queued".)
     running = pr_task_running(pr)
+    if not running and project_dir_busy(PROJECT_DIR):
+        running = "another project worker"
     if running:
         for c in new_comments:
             try:

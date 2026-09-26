@@ -18,6 +18,10 @@ management layer that decides what to run.
   Codex Desktop app) with a new prompt; `status` / `list` / `result` /
   `tokens` / `check` / `kill` inspect and manage tasks. Task state is kept
   in the configured state directory (local runtime state, gitignored).
+  `start` and `resume` accept `--model <name>` for a per-task override.
+- **`codex-launch.sh`** — the Mac GUI-session relay wrapper. It reads each
+  task's optional `model.txt` override and writes wrapper diagnostics to the
+  task directory before invoking `codex exec`.
 - **`dept.py status`** — with no task id (or with status-view options), this
   is the read-only live view of Zigzag execution state. It reads the relay's
   `GET /v1/agents?state=running` and cursor event endpoint plus the Mac-local
@@ -36,6 +40,9 @@ management layer that decides what to run.
   and resumes the doc's owning session.
 - **`review_round_watcher.py`** — when a seeded 3-lens review round finishes,
   resumes the owning worker session with the reviewers' findings batched.
+- **`dispatch_review_round.py`** — seeds the independent correctness,
+  simplicity, and tests reviewers for a PR; their prompts include the PR body
+  as design rationale and use explicit repository scoping.
 - **`jules_pr_reviewer.py`** — dispatches a Codex review task for each new
   Jules-authored PR in `leveled-inc/leveled` (Jules owns revisions there;
   Codex reviews only).

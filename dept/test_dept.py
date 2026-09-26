@@ -79,6 +79,10 @@ class ResumeCliTest(unittest.TestCase):
 
 
 class CommandDispatchTest(unittest.TestCase):
+    def test_start_accepts_model_override(self):
+        args = department.dispatch_args(["/project", "/prompt", "--model", "gpt-6-luna"])
+        self.assertEqual(args.model, "gpt-6-luna")
+
     def test_command_handler_key_error_is_not_reported_as_unknown_command(self):
         with patch.object(department, "cmd_start", side_effect=KeyError("connection")):
             with self.assertRaisesRegex(KeyError, "connection"):
