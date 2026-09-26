@@ -2,6 +2,8 @@
 ledger.jsonl
 reported.json
 pr_sessions.json
+config.json
+runtime/
 prompts/
 task-prompts/
 review_rounds/

@@ -4,7 +4,7 @@
 Runs from a platform cron (reliable) — no long-lived Mac process to die. Polls via SSH+gh,
 which are stateless, then dispatches through dept.py only when there is genuinely new feedback.
 
-State lives in ~/workspace/goals/codex-engineering-department/hidden_files/pr-watch-active/watermark.json
+State lives in <state-dir>/pr-watch-active/watermark.json
 as a set of already-seen comment IDs. First run seeds the watermark without dispatching.
 
 Worker replies appear under ShukantPal too (shared gh auth), so every worker threaded
@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+from dept_config import ROOT, load_config, state_dir
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -29,18 +30,18 @@ import time
 # review comments — bot-posted suggestions for Shukant to triage, not his feedback.
 MARKER = "🤖"
 
-# PRs currently under Shukant's review. Edit this list as stacks merge / new ones open.
-# (872-874, 902, 910 merged 2026-09-18; visit-attachments stack + SE4/ANDROID-Q/ANDROID-R added 2026-09-18.)
-PRS = [856, 863, 864, 865, 866, 867, 868, 869]  # 916 merged 2026-09-22 (auto-skipped)
-REPO = "leveled-inc/leveled"
-PROJECT_DIR = "/Users/shukant/Workspace/leveled-inc/leveled"
-HOME = os.path.expanduser("~")
-STATE_DIR = os.path.join(HOME, "workspace/goals/codex-engineering-department/hidden_files/pr-watch-active")
+CONFIG = load_config()
+CONNECTION = CONFIG.get("connection", {})
+WATCHER = CONFIG.get("pr_comment_watcher", {})
+PRS = WATCHER.get("prs", [])
+REPO = WATCHER.get("repo", "")
+PROJECT_DIR = WATCHER.get("project_dir", "")
+STATE_DIR = os.path.join(state_dir(CONFIG), "pr-watch-active")
 WATERMARK = os.path.join(STATE_DIR, "watermark.json")
-PROMPT_DIR = os.path.join(HOME, "workspace/codex-dept/prompts")
-DEPT = os.path.join(HOME, "workspace/codex-dept/dept.py")
-LEDGER = os.path.join(HOME, "workspace/codex-dept/ledger.jsonl")
-SESSIONS_FILE = os.path.join(HOME, "workspace/codex-dept/pr_sessions.json")
+PROMPT_DIR = os.path.join(state_dir(CONFIG), "prompts")
+DEPT = os.path.join(ROOT, "dept.py")
+LEDGER = os.path.join(state_dir(CONFIG), "ledger.jsonl")
+SESSIONS_FILE = os.path.join(state_dir(CONFIG), "pr_sessions.json")
 BURST_FILE = os.path.join(STATE_DIR, "burst.json")
 LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
 BURST_MINUTES = 30  # burst window; sliding-extended while his comments keep arriving
@@ -142,12 +143,12 @@ def pr_task_running(pr):
     return None
 
 SSH_BASE = [
-    "ssh", "-i", os.path.join(HOME, ".ssh/id_ed25519"),
+    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
     "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
     "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=/home/hatch/.ssh/known_hosts",
-    "-o", "ProxyCommand=python3 ~/workspace/tailscale/proxy_connect.py %h %p",
-    "shukant@100.101.237.83",
+    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
+    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
+    CONNECTION.get("mac", ""),
 ]
 
 

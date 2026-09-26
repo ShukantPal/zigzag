@@ -7,7 +7,7 @@ long-lived process to die. This automates what was previously a manual step:
 dispatch read-only review teams, wait for them, collect their last-message.txt
 files, and resume the owning session once with everything batched.
 
-Seeding a round: write ~/workspace/codex-dept/review_rounds/<pr>.json:
+Seeding a round: write <state-dir>/review_rounds/<pr>.json:
 {
   "pr": 922,
   "repo": "leveled-inc/leveled",
@@ -37,24 +37,28 @@ import re
 import subprocess
 import sys
 import time
+from dept_config import ROOT, load_config, state_dir
 
-HOME = os.path.expanduser("~")
-ROUNDS_DIR = os.path.join(HOME, "workspace/codex-dept/review_rounds")
-PROMPT_DIR = os.path.join(HOME, "workspace/codex-dept/task-prompts")
-DEPT = os.path.join(HOME, "workspace/codex-dept/dept.py")
-LEDGER = os.path.join(HOME, "workspace/codex-dept/ledger.jsonl")
+CONFIG = load_config()
+CONNECTION = CONFIG.get("connection", {})
+STATE_DIR = state_dir(CONFIG)
+ROUNDS_DIR = os.path.join(STATE_DIR, "review_rounds")
+PROMPT_DIR = os.path.join(STATE_DIR, "task-prompts")
+DEPT = os.path.join(ROOT, "dept.py")
+LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
+REMOTE_DEPT = CONNECTION.get("remote_dept", "~/.codex/dept")
 
 DRY_RUN = "--dry-run" in sys.argv
 # ~2h of missed polls at 10-min cadence before flagging a dead reviewer task.
 MISS_LIMIT = 12
 
 SSH_BASE = [
-    "ssh", "-i", os.path.join(HOME, ".ssh/id_ed25519"),
+    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
     "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
     "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=/home/hatch/.ssh/known_hosts",
-    "-o", "ProxyCommand=python3 ~/workspace/tailscale/proxy_connect.py %h %p",
-    "shukant@100.101.237.83",
+    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
+    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
+    CONNECTION.get("mac", ""),
 ]
 
 
@@ -92,7 +96,7 @@ def project_dir_busy(project_dir):
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if e.get("dir") == project_dir and e.get("id"):
+        if e.get("project", e.get("dir")) == project_dir and e.get("id"):
             cands.append(e["id"])
     for tid in reversed(cands[-5:]):
         try:
@@ -106,19 +110,32 @@ def project_dir_busy(project_dir):
 
 
 def reviewer_states(task_ids):
-    """One SSH call: for each task report done|running|dead-empty + pid."""
+    """Use the dept ledger/relay status, then inspect completed task output."""
+    completed = []
+    states = {}
+    for tid in task_ids:
+        p = subprocess.run([sys.executable, DEPT, "status", tid],
+                           capture_output=True, text=True, timeout=90)
+        text = p.stdout + p.stderr
+        if p.returncode != 0:
+            raise RuntimeError(f"could not determine reviewer {tid} state: {text[:200]}")
+        if "RUNNING" in text:
+            states[tid] = "running"
+        elif "DONE" in text:
+            completed.append(tid)
+        else:
+            raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")
+    if not completed:
+        return states
     script = "; ".join(
-        f'd={tid}; f=~/.codex/dept/{tid}/last-message.txt; '
-        f'if [ -s "$f" ]; then echo "{tid} done"; '
-        f'elif p=$(cat ~/.codex/dept/{tid}/pid 2>/dev/null) && [ -n "$p" ] && kill -0 $p 2>/dev/null; then echo "{tid} running"; '
-        f'else echo "{tid} dead-empty"; fi'
-        for tid in task_ids
+        f'd={tid}; f={REMOTE_DEPT}/{tid}/last-message.txt; '
+        f'if [ -s "$f" ]; then echo "{tid} done"; else echo "{tid} dead-empty"; fi'
+        for tid in completed
     )
     out = mac(script)
-    states = {}
     for line in out.splitlines():
         parts = line.strip().split()
-        if len(parts) == 2 and parts[0] in task_ids:
+        if len(parts) == 2 and parts[0] in completed:
             states[parts[0]] = parts[1]
     return states
 
@@ -131,7 +148,7 @@ def fetch_findings(task_ids):
     onto its last line and break line-based parsing.
     """
     script = "; ".join(
-        f'printf "\\n@@@{tid}@@@\\n"; cat ~/.codex/dept/{tid}/last-message.txt'
+        f'printf "\\n@@@{tid}@@@\\n"; cat {REMOTE_DEPT}/{tid}/last-message.txt'
         for tid in task_ids
     )
     out = mac(script)

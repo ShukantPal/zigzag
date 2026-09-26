@@ -15,20 +15,30 @@ All long-running work happens detached on the Mac (nohup), so it survives this V
 import json, os, subprocess, sys, time, uuid, datetime
 
 try:  # `python3 dept/dept.py` and `python3 -m dept.dept` are both supported.
+    from .dept_config import ROOT, load_config, state_dir
     from .status import main as status_main
 except ImportError:  # pragma: no cover - direct script execution path
+    from dept_config import ROOT, load_config, state_dir
     from status import main as status_main
 
-MAC = "shukant@100.101.237.83"
-SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
-PROXY_HELPER = os.path.expanduser("~/workspace/tailscale/proxy_connect.py")
-REMOTE_DEPT = "/Users/shukant/.codex/dept"  # absolute: relay spawn has no shell, so ~ never expands
-LEDGER = os.path.expanduser("~/workspace/codex-dept/ledger.jsonl")
-ZIGZAG_URL = os.environ.get("ZIGZAG_URL", "http://100.101.237.83:8765")
-ZIGZAG_TOKEN_FILE = os.path.expanduser("~/.codex/zigzag.token")
+CONFIG = load_config()
+CONNECTION = CONFIG.get("connection", {})
+STATE_DIR = state_dir(CONFIG)
+MAC = os.environ.get("CODEX_DEPT_MAC", CONNECTION.get("mac", ""))
+SSH_KEY = os.path.expanduser(CONNECTION.get("ssh_key", ""))
+PROXY_HELPER = os.path.expanduser(CONNECTION.get("proxy_helper", ""))
+# Absolute on the Mac: the relay spawn API has no shell, so ~ never expands.
+REMOTE_DEPT = CONNECTION.get("remote_dept", "")
+LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
+ZIGZAG_URL = os.environ.get("ZIGZAG_URL", CONNECTION.get("zigzag_url", ""))
+ZIGZAG_TOKEN_FILE = os.path.expanduser(CONNECTION.get("zigzag_token_file", ""))
 # Launcher the relay is allowlisted to spawn: runs in the GUI login session
 # (keychain reachable) and execs codex with the department's standard flags.
-RELAY_LAUNCHER = "codex-launch"
+RELAY_LAUNCHER = CONNECTION.get("relay_launcher", "codex-launch")
+
+
+def asset_path(name):
+    return os.path.join(ROOT, name)
 
 
 def tunnel_proxy():
@@ -37,6 +47,8 @@ def tunnel_proxy():
 
 
 def ssh(*remote_cmd, stdin_data=None, timeout=60):
+    if not (MAC and SSH_KEY and PROXY_HELPER and REMOTE_DEPT):
+        sys.exit("department connection is not configured; copy dept/config.example.json to dept/config.json")
     env = dict(os.environ)
     env["TUNNEL_PROXY"] = tunnel_proxy()
     cmd = ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes",
@@ -142,19 +154,19 @@ def cmd_start(args):
     if not prompt.strip():
         sys.exit("empty prompt")
     if ns.writing:
-        writing_path = os.path.expanduser("~/workspace/codex-dept/writing.md")
+        writing_path = asset_path("writing.md")
         if os.path.exists(writing_path):
             writing = open(writing_path, "rb").read()
             prompt = writing + b"\n\n---\n\nTASK:\n" + prompt
     elif not ns.no_sop:
-        sop_path = os.path.expanduser("~/workspace/codex-dept/sop.md")
+        sop_path = asset_path("sop.md")
         if os.path.exists(sop_path):
             sop = open(sop_path, "rb").read()
             prompt = sop + b"\n\n---\n\nTASK:\n" + prompt
     tid = "t-" + uuid.uuid4().hex[:6]
     # Every task (code or not) gets the relay announcement playbook so it can
     # push a completion event straight to the local Codex relay.
-    relay_path = os.path.expanduser("~/workspace/codex-dept/relay-announce.md")
+    relay_path = asset_path("relay-announce.md")
     if os.path.exists(relay_path):
         relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
@@ -208,6 +220,20 @@ def shq(s):
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def session_meta_cwd(lines):
+    """Return the first valid ``session_meta.payload.cwd`` in JSONL lines."""
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if record.get("type") == "session_meta":
+            cwd = (record.get("payload") or {}).get("cwd")
+            if isinstance(cwd, str) and cwd:
+                return cwd
+    return None
+
+
 def resolve_session_cwd(session_id):
     """Return the cwd recorded in the Codex session file on the Mac, or None.
 
@@ -215,25 +241,29 @@ def resolve_session_cwd(session_id):
     This is the source of truth for where a session lives, so resume doesn't
     need the caller to re-supply (and possibly mistype) the project dir.
     """
+    if not session_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in session_id):
+        return None
     script = (
         "import glob, json\n"
         f"sid = {session_id!r}\n"
-        "cwd = None\n"
-        "for f in sorted(glob.glob('/Users/shukant/.codex/sessions/**/rollout-*' + sid + '*.jsonl', recursive=True)):\n"
+        "cwds = set()\n"
+        "pattern = '/Users/shukant/.codex/sessions/**/rollout-*-' + glob.escape(sid) + '.jsonl'\n"
+        "for f in sorted(glob.glob(pattern, recursive=True)):\n"
         "    try:\n"
-        "        for line in open(f, errors='replace'):\n"
+        "        lines = open(f, errors='replace')\n"
+        "        for line in lines:\n"
         "            try:\n"
         "                d = json.loads(line)\n"
         "            except Exception:\n"
         "                continue\n"
         "            if d.get('type') == 'session_meta':\n"
-        "                cwd = d.get('payload', {}).get('cwd')\n"
+        "                cwd = (d.get('payload') or {}).get('cwd')\n"
+        "                if isinstance(cwd, str) and cwd:\n"
+        "                    cwds.add(cwd)\n"
         "                break\n"
         "    except OSError:\n"
         "        continue\n"
-        "    if cwd:\n"
-        "        break\n"
-        "print(cwd or '')\n"
+        "print(next(iter(cwds)) if len(cwds) == 1 else '')\n"
     ).encode()
     r = ssh("python3", "-", stdin_data=script, timeout=60)
     if r.returncode != 0:
@@ -313,7 +343,7 @@ def cmd_tokens(args):
 
 
 def reported_path():
-    return os.path.expanduser("~/workspace/codex-dept/reported.json")
+    return os.path.join(STATE_DIR, "reported.json")
 
 
 def load_reported():
@@ -360,18 +390,18 @@ def cmd_resume(args):
     if not prompt.strip():
         sys.exit("empty prompt")
     if ns.writing:
-        writing_path = os.path.expanduser("~/workspace/codex-dept/writing.md")
+        writing_path = asset_path("writing.md")
         if os.path.exists(writing_path):
             writing = open(writing_path, "rb").read()
             prompt = writing + b"\n\n---\n\nTASK:\n" + prompt
     elif not ns.no_sop:
-        sop_path = os.path.expanduser("~/workspace/codex-dept/sop.md")
+        sop_path = asset_path("sop.md")
         if os.path.exists(sop_path):
             sop = open(sop_path, "rb").read()
             prompt = sop + b"\n\n---\n\nTASK:\n" + prompt
     tid = "t-" + uuid.uuid4().hex[:6]
     # Same relay announcement playbook as cmd_start, keyed to the new task id.
-    relay_path = os.path.expanduser("~/workspace/codex-dept/relay-announce.md")
+    relay_path = asset_path("relay-announce.md")
     if os.path.exists(relay_path):
         relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
@@ -445,26 +475,22 @@ def cmd_check(args):
 
 
 def management_main(argv):
-    """Run the department manager commands.
-
-    `status TASK_ID` retains the manager's per-task status lookup.  Bare
-    `status` and status-view flags are handled by :func:`main` below.
-    """
+    """Run department manager commands, including ``status TASK_ID``."""
     if not argv:
         sys.exit("usage: dept.py <start|status|list|result|tokens|check|resume|kill> ...")
     cmd, rest = argv[0], argv[1:]
     commands = {"start": cmd_start, "status": cmd_status, "list": cmd_list,
-                "result": cmd_result, "tokens": cmd_tokens, "check": cmd_check,
-                "resume": cmd_resume, "kill": cmd_kill}
+     "result": cmd_result, "tokens": cmd_tokens, "check": cmd_check,
+     "resume": cmd_resume, "kill": cmd_kill}
     try:
         return commands[cmd](rest)
     except KeyError:
-        sys.exit(f"dept.py: unsupported command: {cmd}")
+        sys.exit(f"unknown command: {cmd}")
 
 
 def main(argv=None):
     """Dispatch the read-only status view alongside the department manager."""
-    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "status" and (len(argv) == 1 or argv[1].startswith("-")):
         return status_main(argv[1:])
     return management_main(argv)

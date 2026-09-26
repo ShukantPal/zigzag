@@ -4,7 +4,7 @@
 Mirrors pr_comment_watcher.py's playbook for design docs. Runs from a platform
 cron (every 5 min) — stateless, no long-lived process.
 
-The Drive API has no emoji reactions on comments, so the ":eyes: shit" is a
+The Drive API has no emoji reactions on comments, so the acknowledgment is a
 marked reply: the watcher posts "👀 Muse (AI assistant) — picked up ..." the
 moment it sees his comment (fast ack, like 🚀 on GitHub), then resumes the
 doc's owning worker session to ADDRESS the feedback.
@@ -19,7 +19,7 @@ all Docs API operations (uploads, reply updates, resolves). Dispatched prompts
 must tell the worker to put substantive reply texts + docx path in its final
 message in the parsed FORMAT below.
 
-State: ~/workspace/goals/codex-engineering-department/hidden_files/gdocs-watch/watermark.json
+State: <state-dir>/gdocs-watch/watermark.json
   {"seen": [<comment-id>...], "dispatched": {<comment-id>: <watcher-reply-id>}}
 First run seeds the watermark without dispatching.
 """
@@ -30,28 +30,21 @@ import os
 import subprocess
 import sys
 import time
+from dept_config import ROOT, load_config, state_dir
 
 # Marker every watcher/worker Docs reply must start with. Detection is
 # substring-based and tolerant (workers paraphrase).
 MARKER = "Muse (AI assistant)"
 EYES = "\U0001F440"
 
-# Docs under watch: doc_id -> owner. 'session' is the Codex session that owns
-# the doc's subject matter; update it when sessions rotate.
-DOCS = {
-    "1PF8O_BoLwKetxmcuPmQRYXq4weQGXwd6vABSd62atV4": {
-        "title": "Visit Attachments Design",
-        "project": "/Users/shukant/Workspace/leveled-inc/leveled",
-        "session": "01a0b588",
-    },
-}
-
-GWS = "/opt/hatch/bin/hatch_gws_cli"
-HOME = os.path.expanduser("~")
-STATE_DIR = os.path.join(HOME, "workspace/goals/codex-engineering-department/hidden_files/gdocs-watch")
+CONFIG = load_config()
+WATCHER = CONFIG.get("gdocs_comment_watcher", {})
+DOCS = WATCHER.get("docs", {})
+GWS = WATCHER.get("gws", "")
+STATE_DIR = os.path.join(state_dir(CONFIG), "gdocs-watch")
 WATERMARK = os.path.join(STATE_DIR, "watermark.json")
-PROMPT_DIR = os.path.join(HOME, "workspace/codex-dept/prompts")
-DEPT = os.path.join(HOME, "workspace/codex-dept/dept.py")
+PROMPT_DIR = os.path.join(state_dir(CONFIG), "prompts")
+DEPT = os.path.join(ROOT, "dept.py")
 LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
 HIS_NAME = "Shukant Pal"
 

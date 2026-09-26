@@ -1,0 +1,77 @@
+import importlib
+import pathlib
+import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+DEPT_DIR = pathlib.Path(__file__).parent
+sys.path.insert(0, str(DEPT_DIR))
+department = importlib.import_module("dept")
+
+
+class SessionResolutionTest(unittest.TestCase):
+    def test_session_meta_fixture_returns_cwd(self):
+        fixture = DEPT_DIR / "testdata" / "session-with-cwd.jsonl"
+        with fixture.open() as f:
+            self.assertEqual(
+                department.session_meta_cwd(f),
+                "/Users/shukant/Workspace/example",
+            )
+
+    def test_session_meta_ignores_absent_malformed_and_missing_cwd(self):
+        self.assertIsNone(department.session_meta_cwd([]))
+        self.assertIsNone(department.session_meta_cwd(["not json\n"]))
+        self.assertIsNone(department.session_meta_cwd([
+            '{"type": "session_meta", "payload": {}}\n',
+            '{"type": "session_meta", "payload": {"cwd": 4}}\n',
+        ]))
+
+    def test_resolve_requires_unambiguous_exact_session_identifier(self):
+        self.assertIsNone(department.resolve_session_cwd("bad*id"))
+        with patch.object(department, "ssh", return_value=SimpleNamespace(
+                returncode=0, stdout=b"/one/project\n")) as ssh:
+            self.assertEqual(department.resolve_session_cwd("session_123"), "/one/project")
+        script = ssh.call_args.kwargs["stdin_data"].decode()
+        self.assertIn("glob.escape(sid)", script)
+        self.assertIn("rollout-*-", script)
+        self.assertIn("len(cwds) == 1", script)
+
+
+class ResumeCliTest(unittest.TestCase):
+    def setUp(self):
+        self.prompt = tempfile.NamedTemporaryFile("wb", delete=False)
+        self.prompt.write(b"continue the task\n")
+        self.prompt.close()
+        self.addCleanup(lambda: pathlib.Path(self.prompt.name).unlink(missing_ok=True))
+
+    def assert_missing_directory_stops_before_dispatch(self, argv, expected_dir, resolved=True):
+        with patch.object(department, "resolve_session_cwd", return_value="/resolved/project") as resolve, \
+             patch.object(department, "remote_isdir", return_value=False) as isdir, \
+             patch.object(department, "ssh") as ssh, \
+             patch.object(department, "zigzag_spawn") as spawn:
+            with self.assertRaises(SystemExit) as exit_:
+                department.main(argv)
+        self.assertIn("project_dir does not exist", str(exit_.exception))
+        isdir.assert_called_once_with(expected_dir)
+        ssh.assert_not_called()
+        spawn.assert_not_called()
+        if resolved:
+            resolve.assert_called_once_with("session-id")
+        else:
+            resolve.assert_not_called()
+
+    def test_resume_omitted_project_resolves_session_cwd_before_dispatch(self):
+        self.assert_missing_directory_stops_before_dispatch(
+            ["resume", "session-id", self.prompt.name], "/resolved/project")
+
+    def test_resume_explicit_project_preserves_cli_shape_before_dispatch(self):
+        self.assert_missing_directory_stops_before_dispatch(
+            ["resume", "/explicit/project", "session-id", self.prompt.name],
+            "/explicit/project", resolved=False)
+
+
+if __name__ == "__main__":
+    unittest.main()

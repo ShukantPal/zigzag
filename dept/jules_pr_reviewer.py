@@ -2,7 +2,7 @@
 """Poll leveled for newly opened Jules PRs (branches jules/*) and dispatch a
 Codex review task for each one that hasn't been reviewed yet.
 
-State: ~/workspace/goals/codex-engineering-department/hidden_files/jules-pr-reviews.json
+State: <state-dir>/jules-pr-reviews.json
 Review tasks post their findings as a PR comment (with the bot marker) and never merge.
 Run from cron every ~10 min; disable the cron once all expected PRs are reviewed.
 """
@@ -10,35 +10,32 @@ import json
 import os
 import subprocess
 import sys
+from dept_config import ROOT, load_config, state_dir
 
-HOME = os.path.expanduser("~")
-STATE_FILE = os.path.join(
-    HOME, "workspace/goals/codex-engineering-department/hidden_files/jules-pr-reviews.json")
-PROMPT_DIR = os.path.join(HOME, "workspace/codex-dept/prompts")
-DEPT = os.path.join(HOME, "workspace/codex-dept/dept.py")
-PROJECT = "/Users/shukant/Workspace/leveled-inc/leveled"
-REPO = "leveled-inc/leveled"
+CONFIG = load_config()
+CONNECTION = CONFIG.get("connection", {})
+WATCHER = CONFIG.get("jules_pr_reviewer", {})
+STATE_DIR = state_dir(CONFIG)
+STATE_FILE = os.path.join(STATE_DIR, "jules-pr-reviews.json")
+PROMPT_DIR = os.path.join(STATE_DIR, "prompts")
+DEPT = os.path.join(ROOT, "dept.py")
+PROJECT = WATCHER.get("project", "")
+REPO = WATCHER.get("repo", "")
 SSH = [
-    "ssh", "-i", os.path.join(HOME, ".ssh/id_ed25519"),
+    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
     "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
     "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=/home/hatch/.ssh/known_hosts",
-    "-o", "ProxyCommand=python3 ~/workspace/tailscale/proxy_connect.py %h %p",
-    "shukant@100.101.237.83",
+    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
+    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
+    CONNECTION.get("mac", ""),
 ]
-ENV = dict(os.environ, TUNNEL_PROXY=os.environ["HTTPS_PROXY"].rsplit(":", 1)[0] + ":3130")
+_proxy = os.environ.get("HTTPS_PROXY", "")
+ENV = dict(os.environ, TUNNEL_PROXY=_proxy.rsplit(":", 1)[0] + ":3130" if ":" in _proxy else "")
 
 # Jules session ids for the J8-J13 batch (from the Delegation sheet). Jules names
 # each PR branch with the session id as suffix, e.g.
 # fix-audiorecorder-interruption-6632355049745658931
-JULES_SESSIONS = {
-    "6632355049745658931": "APPLE-IOS-22W",
-    "1844131579710009734": "APPLE-IOS-1BX",
-    "13298046696359534919": "APPLE-IOS-21Z",
-    "8060398488853582017": "APPLE-IOS-1CN",
-    "4798968791252688636": "APPLE-IOS-22R",
-    "1126462001172428634": "SCRIBES-SERVER-9N",
-}
+JULES_SESSIONS = WATCHER.get("jules_sessions", {})
 
 REVIEW_PROMPT = """# Review Jules PR #{pr} and post findings as a PR comment
 
@@ -63,9 +60,6 @@ Steps:
    - Then a verdict line (LGTM / Needs changes), then specific findings with file:line references.
    - Include a short "Build & warnings" section: the build command, result, and any new warnings (or "no new warnings").
    - If the PR is clean, still post a brief comment summarizing what you verified (diff scope, tests run, CI state, build result).
-   - The comment MUST start with this exact line: `> 🤖 Codex (AI assistant)`
-   - Then a verdict line (LGTM / Needs changes), then specific findings with file:line references.
-   - If the PR is clean, still post a brief comment summarizing what you verified (diff scope, tests run, CI state).
 4. HARD RULES: never merge, never push to the branch, never approve via `gh pr review --approve`. Comment only.
 
 Report back the comment URL when done.
@@ -150,6 +144,7 @@ def task_status(task_id):
 
 
 def dispatch(prompt_template, pr, extra):
+    os.makedirs(PROMPT_DIR, exist_ok=True)
     prompt_path = os.path.join(PROMPT_DIR, f"jules-review-{pr['n']}.md")
     with open(prompt_path, "w") as f:
         f.write(prompt_template.format(pr=pr["n"], project=PROJECT, repo=REPO))

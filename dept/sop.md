@@ -73,7 +73,7 @@ task's changes.
    the latest head AND every required lens shows a latest verdict of APPROVE
    whose HEAD equals the PR's current head. Stale approvals (older head) do not
    count. The orchestrator verifies with
-   `python3 ~/workspace/codex-dept/approval_gate.py <owner/repo> <pr>`
+   `python3 dept/approval_gate.py <owner/repo> <pr>`
    before the PR is reported — do not claim review-ready until the gate passes.
 7. **CI green**: watch the PR's checks (`gh pr checks --watch`) and fix
    failures, pushing until CI passes.
