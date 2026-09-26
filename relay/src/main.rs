@@ -144,15 +144,7 @@ fn run() -> Result<(), String> {
         },
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
-        state.store.add(relay_event(
-            "process_spawned",
-            &agent.task_id,
-            &agent.execution_id,
-            Json::Object(vec![
-                ("agent_id".to_owned(), Json::String(agent.id)),
-                ("recovered".to_owned(), Json::Bool(true)),
-            ]),
-        ))?;
+        replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
     if !config.github_watch_repos.is_empty() {
@@ -1309,6 +1301,19 @@ fn persist_first_output(store: &Store, agent: &AgentRecord) -> Result<(), String
         .map(|_| ())
 }
 
+fn replay_recovered_lifecycle(store: &Store, agent: &AgentRecord) -> Result<(), String> {
+    store.add(relay_event(
+        "process_spawned",
+        &agent.task_id,
+        &agent.execution_id,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(agent.id.clone())),
+            ("recovered".to_owned(), Json::Bool(true)),
+        ]),
+    ))?;
+    persist_first_output(store, agent)
+}
+
 fn start_reaper(state: Arc<Server>) {
     thread::spawn(move || {
         loop {
@@ -1984,6 +1989,48 @@ mod tests {
             timeline_output("missing", &[]),
             "No durable audit events for task missing.\n"
         );
+    }
+
+    #[test]
+    fn recovery_replays_a_persisted_first_output_fact() {
+        let path = std::env::temp_dir().join(format!(
+            "zigzag-recovery-audit-{}",
+            unique_handle(&HashMap::new()).unwrap()
+        ));
+        let store = Store::open(&path, 10).unwrap();
+        let agent = AgentRecord {
+            id: "agent".to_owned(),
+            task_id: "task".to_owned(),
+            execution_id: "execution".to_owned(),
+            leader_pid: 1,
+            process_group: 1,
+            started_at: "1".to_owned(),
+            deadline_at: None,
+            command: "sh -c".to_owned(),
+            state: "orphaned".to_owned(),
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: true,
+            redacted: false,
+            stdout_next: 3,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 3,
+            log_dropped_before: 0,
+            first_output_at: Some("2026-01-02T03:04:05.006Z".to_owned()),
+            first_output_stream: Some("stdout".to_owned()),
+            first_output_bytes: Some(3),
+        };
+        replay_recovered_lifecycle(&store, &agent).unwrap();
+        let events = store.timeline("task").unwrap();
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|event| event.object("kind").and_then(Json::as_str))
+            .collect();
+        assert_eq!(kinds, ["process_spawned", "first_output"]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("audit"));
     }
 
     #[test]
