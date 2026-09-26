@@ -36,6 +36,20 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertIn("flat diff only", prompt)
         self.assertIn("Intentional removal.", prompt)
 
+    def test_seed_persists_each_reviewer_and_marks_failure_attention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            info = {"headRefOid": "a" * 40, "body": "why"}
+            with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
+                 patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
+                 patch.object(dispatcher, "pr_info", return_value=info), \
+                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["t-a", RuntimeError("nope")]):
+                with self.assertRaisesRegex(RuntimeError, "nope"):
+                    dispatcher.seed(12, "owner/repo", "/work", "session", "branch")
+            data = json.loads((root / "rounds" / "12-round1.json").read_text())
+        self.assertEqual(data["status"], "attention")
+        self.assertEqual(data["reviewers"], {"t-a": "correctness"})
+
 
 if __name__ == "__main__":
     unittest.main()

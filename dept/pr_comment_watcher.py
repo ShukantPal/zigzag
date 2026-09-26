@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
-from review_round_watcher import project_dir_busy
+from review_round_watcher import project_dir_busy, set_active_task, worker_dispatch_lock
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -422,6 +422,13 @@ def dispatch(pr, branch, new_comments, parent_bodies):
     # Queued comments get a 🚀 (rocket) reaction so Shukant can see they're
     # lined up; the worker swaps it for 👀 when it starts on them.
     # (GitHub's reaction API has no hourglass — rocket is the closest "queued".)
+    with worker_dispatch_lock() as acquired:
+        if not acquired:
+            return None, "skipped: another project worker is dispatching"
+        return _dispatch_locked(pr, session_id, prompt, new_comments)
+
+
+def _dispatch_locked(pr, session_id, prompt, new_comments):
     running = pr_task_running(pr)
     if not running and project_dir_busy(PROJECT_DIR):
         running = "another project worker"
@@ -461,10 +468,7 @@ def dispatch(pr, branch, new_comments, parent_bodies):
     if task_id:
         # Record the live worker so pr_task_running() can serialize on it
         # deterministically (ledger prompt_head matching is only a fallback).
-        sessions = load_sessions()
-        sess = sessions.setdefault(str(pr), {})
-        sess["active_task"] = task_id
-        save_sessions(sessions)
+        set_active_task(pr, task_id)
     return task_id, out
 
 

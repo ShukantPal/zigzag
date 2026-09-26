@@ -116,6 +116,14 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertEqual(round_["status"], "collecting")
         self.assertEqual(round_["dispatch_misses"], 1)
 
+    def test_second_dispatch_is_refused_while_shared_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = pathlib.Path(tmp) / "dispatch.lock"
+            with patch.object(watcher, "WATCHER_LOCK", str(lock_path)):
+                with open(lock_path, "w") as lock:
+                    watcher.fcntl.flock(lock, watcher.fcntl.LOCK_EX | watcher.fcntl.LOCK_NB)
+                    self.assertIn("another watcher is dispatching", watcher.process_round("unused.json"))
+
 
 if __name__ == "__main__":
     unittest.main()

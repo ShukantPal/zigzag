@@ -4,6 +4,7 @@
 set -u
 mode="${1:?usage: codex-launch.sh run|resume <taskdir>}"
 rdir="${2:?usage: codex-launch.sh run|resume <taskdir>}"
+[ -f "$rdir/dir.txt" ] && [ -f "$rdir/prompt.txt" ] || exit 2
 d="$(cat "$rdir/dir.txt")"
 [ -d "$d" ] || exit 3
 cd "$d" || exit 3
@@ -15,8 +16,9 @@ MODEL_FLAG=""
 if [ -f "$rdir/model.txt" ]; then
   MODEL_FLAG="-m $(cat "$rdir/model.txt")"
 fi
-CODEX=/run/current-system/sw/bin/codex
+CODEX="${CODEX:-/run/current-system/sw/bin/codex}"
 if [ "$mode" = "resume" ]; then
+  [ -f "$rdir/resume.txt" ] || exit 2
   sid="$(cat "$rdir/resume.txt")"
   exec "$CODEX" exec --json --approve-for-me --skip-git-repo-check \
     $MODEL_FLAG resume "$sid" "$(cat "$rdir/prompt.txt")" \

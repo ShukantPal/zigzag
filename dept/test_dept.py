@@ -88,6 +88,25 @@ class CommandDispatchTest(unittest.TestCase):
             with self.assertRaisesRegex(KeyError, "connection"):
                 department.main(["start", "/project", "/prompt"])
 
+    def test_model_reaches_ssh_setup_and_launch(self):
+        result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
+        with patch.object(department.uuid, "uuid4", return_value=SimpleNamespace(hex="abc123")), \
+             patch.object(department, "ssh", return_value=result) as ssh, \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", b"prompt", True, model="test-model")
+        calls = "\n".join(str(c.args[0]) for c in ssh.call_args_list)
+        self.assertIn("model.txt", calls)
+        self.assertIn("-m 'test-model'", calls)
+
+    def test_model_reaches_relay_for_resume(self):
+        result = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        with patch.object(department.uuid, "uuid4", return_value=SimpleNamespace(hex="abc123")), \
+             patch.object(department, "ssh", return_value=result), \
+             patch.object(department, "zigzag_spawn", return_value="proc") as spawn, \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", b"prompt", False, "session", "test-model")
+        self.assertEqual(spawn.call_args.args[1][0], "resume")
+
 
 if __name__ == "__main__":
     unittest.main()

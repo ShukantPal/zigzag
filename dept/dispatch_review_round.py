@@ -94,19 +94,30 @@ def seed(pr, repo, project_dir, owning_session, branch, max_rounds=3):
     ROUNDS_DIR.mkdir(parents=True, exist_ok=True)
     PROMPT_DIR.mkdir(parents=True, exist_ok=True)
     reviewers = {}
-    for lens in LENSES:
+    round_path = ROUNDS_DIR / f"{pr}-round{number}.json"
+    round_data = {
+        "pr": pr, "round": number, "repo": repo, "head": head, "branch": branch,
+        "project_dir": project_dir, "owning_session": owning_session,
+        "reviewers": reviewers, "queued_comments": [], "status": "dispatching",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    # Persist before the first launch: a later failure must not orphan earlier
+    # reviewer tasks or let a retry dispatch duplicates invisibly.
+    round_path.write_text(json.dumps(round_data, indent=2))
+    try:
+      for lens in LENSES:
         prompt = FULL_TEMPLATE.format(pr=pr, repo=repo, project_dir=project_dir,
                                       lens=lens, head=head, body=info.get("body") or "(none)")
         prompt_file = PROMPT_DIR / f"pr{pr}-round{number}-{lens}.md"
         prompt_file.write_text(prompt)
         reviewers[dispatch_reviewer(project_dir, prompt_file)] = lens
-    round_path = ROUNDS_DIR / f"{pr}-round{number}.json"
-    round_path.write_text(json.dumps({
-        "pr": pr, "round": number, "repo": repo, "head": head, "branch": branch,
-        "project_dir": project_dir, "owning_session": owning_session,
-        "reviewers": reviewers, "queued_comments": [], "status": "collecting",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }, indent=2))
+        round_path.write_text(json.dumps(round_data, indent=2))
+    except Exception as e:
+        round_data.update({"status": "attention", "attention_reason": f"reviewer dispatch failed: {e}"})
+        round_path.write_text(json.dumps(round_data, indent=2))
+        raise
+    round_data["status"] = "collecting"
+    round_path.write_text(json.dumps(round_data, indent=2))
     return round_path, reviewers
 
 

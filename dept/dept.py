@@ -201,7 +201,8 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
     tid = "t-" + uuid.uuid4().hex[:6]
     relay_path = asset_path("relay-announce.md")
     if os.path.exists(relay_path):
-        relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
+        with open(relay_path, "rb") as f:
+            relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
     rdir = setup_task_dir(tid, project_dir, prompt, session_id, model)
     action = "resumed" if session_id else "started"
@@ -310,19 +311,23 @@ def remote_isdir(path):
     return r.returncode == 0
 
 
-def remote_status(entry):
-    """RUNNING / DONE / MISSING for a ledger entry, via SSH pid or relay proc."""
+def remote_status_detail(entry):
+    """Return (status, relay payload) from one liveness lookup."""
     tid = entry["id"]
     if entry.get("via") == "relay" and entry.get("proc"):
         payload = zigzag_poll(entry["proc"])
         if payload is None:
-            return "DONE"  # pruned from the relay table: finished long ago
-        return "RUNNING" if payload.get("running") else "DONE"
+            return "DONE", None  # pruned from the relay table: finished long ago
+        return ("RUNNING" if payload.get("running") else "DONE"), payload
     r = ssh(f"rdir={REMOTE_DEPT}/{tid}; "
             f"if [ ! -f $rdir/pid ]; then echo MISSING; exit 0; fi; "
             f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; else echo DONE; fi",
             timeout=60)
-    return r.stdout.decode().strip()
+    return r.stdout.decode().strip(), None
+
+
+def remote_status(entry):
+    return remote_status_detail(entry)[0]
 
 
 def cmd_kill(args):
@@ -343,10 +348,9 @@ def cmd_kill(args):
 def cmd_status(args):
     tid = args[0]
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
-    status = remote_status(entry)
+    status, payload = remote_status_detail(entry)
     suffix = ""
     if status == "DONE" and entry.get("via") == "relay" and entry.get("proc"):
-        payload = zigzag_poll(entry["proc"])
         exit_code = None if payload is None else payload.get("exit_code")
         if exit_code not in (None, 0):
             suffix = f" (exit {exit_code})"
@@ -364,11 +368,11 @@ def cmd_result(args):
     tid = args[0]
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
     rdir = f"{REMOTE_DEPT}/{tid}"
-    print(f"--- status: {remote_status(entry)} ---")
+    status, payload = remote_status_detail(entry)
+    print(f"--- status: {status} ---")
     r = ssh(f"cat {rdir}/last-message.txt 2>/dev/null || echo '(no final message yet)'", timeout=60)
     print(r.stdout.decode(errors="replace"))
     if entry.get("via") == "relay" and entry.get("proc"):
-        payload = zigzag_poll(entry["proc"])
         if payload is not None:
             print("--- diagnostics ---")
             print(f"relay exit_code: {payload.get('exit_code', 'unknown')}")
@@ -376,6 +380,9 @@ def cmd_result(args):
             if stderr:
                 print("relay stderr (tail):")
                 print(stderr[-1500:])
+        diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
+        print("stderr.log (tail):")
+        print(diag.stdout.decode(errors="replace"))
     elif entry.get("via", "ssh") == "ssh":
         diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
         print("--- diagnostics ---")
