@@ -50,6 +50,16 @@ class ProjectBusyTest(unittest.TestCase):
              patch.object(watcher, "mac", return_value="t-relay done\n"):
             self.assertEqual(watcher.reviewer_states(["t-relay"]), {"t-relay": "done"})
 
+    def test_fetch_findings_parses_multiple_outputs_without_trailing_newline(self):
+        output = "\n@@@t-correct@@@\nfirst finding\n@@@t-tests@@@\nsecond finding"
+        with patch.object(watcher, "mac", return_value=output) as mac:
+            findings = watcher.fetch_findings(["t-correct", "t-tests"])
+        self.assertEqual(findings, {
+            "t-correct": "first finding",
+            "t-tests": "second finding",
+        })
+        self.assertIn("@@@t-correct@@@", mac.call_args.args[0])
+
     def test_dead_empty_reviewers_reach_attention_after_miss_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
@@ -76,13 +86,15 @@ class ProjectBusyTest(unittest.TestCase):
             with patch.object(watcher, "PROMPT_DIR", tmp), \
                  patch.object(watcher, "reviewer_states", return_value={"t-a": "done"}), \
                  patch.object(watcher, "project_dir_busy", return_value=False), \
-                 patch.object(watcher, "fetch_findings", return_value={"t-a": "clean"}), \
+                 patch.object(watcher, "mac", return_value="\n@@@t-a@@@\nclean"), \
                  patch.object(watcher.subprocess, "run", return_value=result) as run:
                 message = watcher.process_round(str(path))
             round_ = json.loads(path.read_text())
+            prompt = pathlib.Path(round_["prompt_file"]).read_text()
         self.assertIn("resumed owning session as t-owner", message)
         self.assertEqual(round_["status"], "dispatched")
         self.assertEqual(run.call_args.args[0][1:3], [watcher.DEPT, "resume"])
+        self.assertIn("clean", prompt)
 
 
 if __name__ == "__main__":
