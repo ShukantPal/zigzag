@@ -32,12 +32,13 @@ Rules honored:
 - A reviewer task dead with no output after ~2h of polls -> status "attention".
 """
 import json
+import fcntl
 import os
 import re
 import subprocess
 import sys
 import time
-from dept_config import ROOT, load_config, state_dir
+from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
 
 CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
@@ -47,27 +48,18 @@ PROMPT_DIR = os.path.join(STATE_DIR, "task-prompts")
 DEPT = os.path.join(ROOT, "dept.py")
 LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
 REMOTE_DEPT = CONNECTION.get("remote_dept", "~/.codex/dept")
+LOCK_FILE = os.path.join(ROUNDS_DIR, "watcher.lock")
 
 DRY_RUN = "--dry-run" in sys.argv
 # ~2h of missed polls at 10-min cadence before flagging a dead reviewer task.
 MISS_LIMIT = 12
 
-SSH_BASE = [
-    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
-    "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
-    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
-    CONNECTION.get("mac", ""),
-]
+SSH_BASE = ssh_base(CONNECTION)
 
 
 def mac(cmd):
-    env = dict(os.environ)
-    hp = env.get("HTTPS_PROXY", "")
-    env["TUNNEL_PROXY"] = hp.rsplit(":", 1)[0] + ":3130" if ":" in hp else ""
     p = subprocess.run(SSH_BASE + [cmd], capture_output=True, text=True,
-                       env=env, timeout=180)
+                       env=ssh_env(), timeout=180)
     if p.returncode != 0:
         raise RuntimeError(f"mac cmd failed: {cmd[:80]} :: {p.stderr.strip()[:200]}")
     return p.stdout
@@ -87,7 +79,7 @@ def project_dir_busy(project_dir):
     """True if a dept task for this project_dir looks still running (fail closed)."""
     try:
         with open(LEDGER) as f:
-            lines = f.readlines()[-60:]
+            lines = f.readlines()
     except FileNotFoundError:
         return False
     cands = []
@@ -98,7 +90,7 @@ def project_dir_busy(project_dir):
             continue
         if e.get("project", e.get("dir")) == project_dir and e.get("id"):
             cands.append(e["id"])
-    for tid in reversed(cands[-5:]):
+    for tid in reversed(list(dict.fromkeys(cands))):
         try:
             p = subprocess.run([sys.executable, DEPT, "status", tid],
                                capture_output=True, text=True, timeout=90)
@@ -285,6 +277,12 @@ def process_round(path):
 
 def main():
     os.makedirs(ROUNDS_DIR, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another review-round poll holds the lock; exiting")
+        return
     files = sorted(f for f in os.listdir(ROUNDS_DIR) if f.endswith(".json"))
     if not files:
         print("no review rounds seeded")

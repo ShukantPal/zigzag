@@ -27,24 +27,19 @@ Exit 0 with {"pass": true, ...}; exit 1 with {"pass": false, "reasons": [...]}.
 Runs gh over SSH on Shukant's Mac (same transport as the other watchers).
 """
 import json
-import os
 import re
 import subprocess
 import sys
+from dept_config import load_config, ssh_base, ssh_env
 
-HOME = os.path.expanduser("~")
-
-SSH_BASE = [
-    "ssh", "-i", os.path.join(HOME, ".ssh/id_ed25519"),
-    "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "UserKnownHostsFile=/home/hatch/.ssh/known_hosts",
-    "-o", "ProxyCommand=python3 ~/workspace/tailscale/proxy_connect.py %h %p",
-    "shukant@100.101.237.83",
-]
+CONFIG = load_config()
+SSH_BASE = ssh_base(CONFIG.get("connection", {}))
 
 # Checks that must be green for the gate. Everything else failing is a warning.
-BLOCKING_CHECKS = re.compile(r"semgrep|buildbuddy", re.IGNORECASE)
+REQUIRED_CHECKS = {
+    "semgrep": re.compile(r"semgrep", re.IGNORECASE),
+    "BuildBuddy": re.compile(r"buildbuddy", re.IGNORECASE),
+}
 # Known noise: never a blocker.
 IGNORED_CHECKS = re.compile(r"scribes-stg-preview-deploy", re.IGNORECASE)
 
@@ -56,11 +51,8 @@ LENS_RE = re.compile(r"\[([a-z]+)\]\s+review verdict", re.IGNORECASE)
 
 
 def mac(cmd):
-    env = dict(os.environ)
-    hp = env.get("HTTPS_PROXY", "")
-    env["TUNNEL_PROXY"] = hp.rsplit(":", 1)[0] + ":3130" if ":" in hp else ""
     p = subprocess.run(SSH_BASE + [cmd], capture_output=True, text=True,
-                       env=env, timeout=180)
+                       env=ssh_env(), timeout=180)
     if p.returncode != 0:
         raise RuntimeError(f"mac cmd failed: {cmd[:100]} :: {p.stderr.strip()[:200]}")
     return p.stdout
@@ -104,7 +96,23 @@ def check(repo, pr, lenses):
     warnings = []
 
     # --- CI gate ---
-    for ch in data.get("checks") or []:
+    checks = data.get("checks") or []
+    for label, pattern in REQUIRED_CHECKS.items():
+        matches = [ch for ch in checks if pattern.search(ch.get("name") or "")]
+        if not matches:
+            reasons.append(f"required check missing: {label}")
+            continue
+        for ch in matches:
+            name = ch.get("name") or label
+            conclusion = (ch.get("conclusion") or "").upper()
+            status = (ch.get("status") or "").upper()
+            if status != "COMPLETED" or conclusion != "SUCCESS":
+                reasons.append(
+                    f"required check not green: {name} "
+                    f"({conclusion or status or 'missing status'})"
+                )
+
+    for ch in checks:
         name = ch.get("name") or ""
         conclusion = (ch.get("conclusion") or "").upper()
         status = (ch.get("status") or "").upper()
@@ -114,9 +122,7 @@ def check(repo, pr, lenses):
                  (status == "COMPLETED" and conclusion not in ("SUCCESS", "SKIPPED", "NEUTRAL"))
         if not failed:
             continue
-        if BLOCKING_CHECKS.search(name):
-            reasons.append(f"blocking check failing: {name} ({conclusion or status})")
-        else:
+        if not any(pattern.search(name) for pattern in REQUIRED_CHECKS.values()):
             warnings.append(f"non-blocking check failing: {name} ({conclusion or status})")
 
     # --- review-team approvals ---

@@ -30,7 +30,7 @@ management layer that decides what to run.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in
-  the goal's hidden files.
+  the configured runtime state directory.
 - **`gdocs_comment_watcher.py`** — same idea for Google Docs comments:
   acknowledges with a marked reply (the Drive API has no emoji reactions)
   and resumes the doc's owning session.

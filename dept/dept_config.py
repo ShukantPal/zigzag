@@ -33,10 +33,24 @@ def state_dir(config):
     return os.path.expanduser(value) if value else os.path.join(ROOT, "runtime")
 
 
-def required(config, section, key):
-    try:
-        return config[section][key]
-    except KeyError as e:
-        raise RuntimeError(
-            f"missing {section}.{key} in {config_path()}; copy config.example.json"
-        ) from e
+def ssh_base(connection):
+    """Build the shared non-interactive SSH transport from deployment config."""
+    key = os.path.expanduser(connection.get("ssh_key", ""))
+    proxy = os.path.expanduser(connection.get("proxy_helper", ""))
+    known_hosts = os.path.expanduser(connection.get("known_hosts", ""))
+    return [
+        "ssh", "-i", key,
+        "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", f"ProxyCommand=python3 {proxy} %h %p",
+        connection.get("mac", ""),
+    ]
+
+
+def ssh_env():
+    """Return the proxy environment expected by the Tailscale helper."""
+    env = dict(os.environ)
+    proxy = env.get("HTTPS_PROXY", "")
+    env["TUNNEL_PROXY"] = proxy.rsplit(":", 1)[0] + ":3130" if ":" in proxy else ""
+    return env

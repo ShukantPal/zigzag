@@ -156,6 +156,29 @@ def has_marker_reply(comment):
     return False
 
 
+def feedback_items(comments):
+    """Flatten top-level and reply comments, retaining the thread parent for ACKs."""
+    for comment in comments:
+        parent_id = comment["id"]
+        yield {**comment, "_parent_id": parent_id}
+        for reply in comment.get("replies", []) or []:
+            yield {
+                **reply,
+                "quotedFileContent": comment.get("quotedFileContent"),
+                "_parent_id": parent_id,
+                "_thread": comment,
+            }
+
+
+def existing_ack(item):
+    """Return this watcher's earlier ACK for a retry, if the thread has one."""
+    thread = item.get("_thread", item)
+    for reply in thread.get("replies", []) or []:
+        if reply.get("content") == ACK_TEXT and reply.get("id"):
+            return reply["id"]
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", action="store_true",
@@ -188,17 +211,21 @@ def main():
             print(f"{doc_id}: list failed: {e}", file=sys.stderr)
             continue
         fresh = []
-        for c in comments:
+        for c in feedback_items(comments):
             key = "gc:" + c["id"]
             if key in wm["seen"]:
                 continue
-            if c.get("resolved"):
+            thread = c.get("_thread", c)
+            if thread.get("resolved"):
                 wm["seen"].add(key)
                 continue
             if (c.get("author") or {}).get("displayName") != HIS_NAME:
                 wm["seen"].add(key)  # not his — never dispatch
                 continue
-            if has_marker_reply(c):
+            # A worker's substantive marked reply predating this poll means the
+            # thread was handled outside this watcher's retry path. An exact
+            # watcher ACK, however, is retained to retry a failed dispatch.
+            if has_marker_reply(thread) and not existing_ack(c):
                 wm["seen"].add(key)  # already acked/handled
                 continue
             fresh.append(c)
@@ -211,13 +238,11 @@ def main():
         acked = []
         for c in fresh:
             try:
-                rid = post_eyes_reply(doc_id, c["id"])
+                rid = existing_ack(c) or post_eyes_reply(doc_id, c["_parent_id"])
             except Exception as e:
                 print(f"{c['id']}: eyes reply failed: {e}", file=sys.stderr)
                 continue
             acked.append((c, rid))
-            wm["seen"].add("gc:" + c["id"])
-            wm["seen"].add("gc:" + rid)
 
         if not acked:
             save_watermark(wm)
@@ -255,6 +280,10 @@ def main():
                 m["task"] = line.split()[1]
         if r.returncode == 0 and m.get("task"):
             for c, rid in acked:
+                # Only a successful dispatch consumes the feedback item. If
+                # dispatch fails, keep its ACK and retry it on the next poll.
+                wm["seen"].add("gc:" + c["id"])
+                wm["seen"].add("gc:" + rid)
                 wm["dispatched"]["gc:" + c["id"]] = rid
             print(f"{meta['title']}: dispatched {m['task']} for {len(acked)} comment(s)")
         else:

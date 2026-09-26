@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 import time
-from dept_config import ROOT, load_config, state_dir
+from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -142,21 +142,12 @@ def pr_task_running(pr):
             return tid  # fail closed: don't dispatch if we can't verify
     return None
 
-SSH_BASE = [
-    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
-    "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
-    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
-    CONNECTION.get("mac", ""),
-]
+SSH_BASE = ssh_base(CONNECTION)
 
 
 def mac(cmd):
-    env = dict(os.environ)
-    hp = env.get("HTTPS_PROXY", "")
-    env["TUNNEL_PROXY"] = hp.rsplit(":", 1)[0] + ":3130" if ":" in hp else ""
-    p = subprocess.run(SSH_BASE + [cmd], capture_output=True, text=True, env=env, timeout=180)
+    p = subprocess.run(SSH_BASE + [cmd], capture_output=True, text=True,
+                       env=ssh_env(), timeout=180)
     if p.returncode != 0:
         raise RuntimeError(f"mac cmd failed: {cmd[:80]} :: {p.stderr.strip()[:200]}")
     return p.stdout.strip()
@@ -419,11 +410,6 @@ def dispatch(pr, branch, new_comments, parent_bodies):
                   "(resumed, not fresh). You have full context from before — "
                   "re-read the current branch state before changing anything.\n\n"
                   ) + prompt
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    ppath = os.path.join(PROMPT_DIR, f"pr{pr}-watch-feedback-{ts}.md")
-    os.makedirs(PROMPT_DIR, exist_ok=True)
-    with open(ppath, "w") as f:
-        f.write(prompt)
     # Serialize: never run two workers on the same PR/branch at once.
     # Queued comments get a 🚀 (rocket) reaction so Shukant can see they're
     # lined up; the worker swaps it for 👀 when it starts on them.
@@ -437,6 +423,11 @@ def dispatch(pr, branch, new_comments, parent_bodies):
                 log(f"#{pr}: rocket reaction failed for {c['id']} ({e})")
         log(f"#{pr}: task {running} already working it — queued with 🚀, will retry")
         return None, f"skipped: {running} already running"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    ppath = os.path.join(PROMPT_DIR, f"pr{pr}-watch-feedback-{ts}.md")
+    os.makedirs(PROMPT_DIR, exist_ok=True)
+    with open(ppath, "w") as f:
+        f.write(prompt)
     if session_id:
         p = subprocess.run([sys.executable, DEPT, "resume", PROJECT_DIR,
                             session_id, ppath, "--no-sop"],

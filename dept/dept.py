@@ -138,18 +138,29 @@ def ledger_read():
     return out
 
 
-def cmd_start(args):
+def dispatch_args(args, resume=False):
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("project_dir")
+    ap.add_argument("project_dir", nargs="?" if resume else None, default=None)
     ap.add_argument("prompt_file")
+    if resume:
+        # argparse assigns positional values left-to-right; declaring the
+        # optional project before the required session/prompt supports both
+        # `resume SESSION PROMPT` and `resume PROJECT SESSION PROMPT`.
+        ap = argparse.ArgumentParser()
+        ap.add_argument("project_dir", nargs="?", default=None)
+        ap.add_argument("session_id")
+        ap.add_argument("prompt_file")
     ap.add_argument("--no-sop", action="store_true",
                     help="skip prepending the standard PR/review/CI operating procedure")
     ap.add_argument("--writing", action="store_true",
                     help="prepend the writing standard (strategic/hierarchical/simple) instead of the code SOP")
     ap.add_argument("--ssh", action="store_true",
                     help="launch over SSH+nohup instead of the relay (no keychain access)")
-    ns = ap.parse_args(args)
+    return ap.parse_args(args)
+
+
+def decorated_prompt(ns):
     prompt = open(ns.prompt_file, "rb").read()
     if not prompt.strip():
         sys.exit("empty prompt")
@@ -163,57 +174,66 @@ def cmd_start(args):
         if os.path.exists(sop_path):
             sop = open(sop_path, "rb").read()
             prompt = sop + b"\n\n---\n\nTASK:\n" + prompt
-    tid = "t-" + uuid.uuid4().hex[:6]
-    # Every task (code or not) gets the relay announcement playbook so it can
-    # push a completion event straight to the local Codex relay.
-    relay_path = asset_path("relay-announce.md")
-    if os.path.exists(relay_path):
-        relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
-        prompt = prompt + b"\n\n---\n\n" + relay
+    return prompt
+
+
+def setup_task_dir(tid, project_dir, prompt, session_id=None):
+    """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
-    # 1) create dir, store prompt + project dir
     r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
             stdin_data=prompt, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh setup failed: {r.stderr.decode()[-500:]}")
-    r = ssh(f"printf %s {shq(ns.project_dir)} > {rdir}/dir.txt", timeout=60)
+    files = f"printf %s {shq(project_dir)} > {rdir}/dir.txt"
+    if session_id:
+        files += f" && printf %s {shq(session_id)} > {rdir}/resume.txt"
+    r = ssh(files, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh dir write failed: {r.stderr.decode()[-500:]}")
-    # 2) launch detached. Default: via the Zigzag relay, so the agent runs in
-    #    the GUI login session with keychain access (MCP credentials etc.).
-    #    --ssh keeps the old SSH+nohup path (no keychain access).
-    #    --approve-for-me implies workspace-write sandbox and auto-reviews
-    #    approval requests (non-interactive safe). Note: -s/--sandbox cannot
-    #    be combined with --approve-for-me in this CLI version.
-    if ns.ssh:
-        launch = (
-            f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
-            f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
-            f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)" '
-            f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & echo $! > {rdir}/pid && cat {rdir}/pid'
-        )
+    return rdir
+
+
+def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
+    """Launch start/resume through one preparation, transport, and ledger path."""
+    tid = "t-" + uuid.uuid4().hex[:6]
+    relay_path = asset_path("relay-announce.md")
+    if os.path.exists(relay_path):
+        relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
+        prompt = prompt + b"\n\n---\n\n" + relay
+    rdir = setup_task_dir(tid, project_dir, prompt, session_id)
+    action = "resumed" if session_id else "started"
+    if use_ssh:
+        command = (f'resume "$(cat {rdir}/resume.txt)" "$(cat {rdir}/prompt.txt)" '
+                   f'-o {rdir}/last-message.txt'
+                   if session_id else
+                   f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)"')
+        launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
+                  f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
+                  f'{command} '
+                  f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
+                  f'echo $! > {rdir}/pid && cat {rdir}/pid')
         r = ssh(launch, timeout=60)
         if r.returncode != 0:
             sys.exit(f"launch failed (rc={r.returncode}): {r.stderr.decode()[-500:]}")
         pid = r.stdout.decode().strip()
-        ledger_append({
-            "id": tid, "project": ns.project_dir, "via": "ssh",
-            "pid": pid, "status": "running",
-            "prompt_head": prompt.decode(errors="replace")[:200],
-            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        })
-        print(f"started {tid} pid={pid} project={ns.project_dir} (via ssh)")
+        transport = {"via": "ssh", "pid": pid}
+        detail = f"pid={pid}"
     else:
-        # The relay has no shell and caps spawn args at 8 KiB, so it spawns
-        # the codex-launch wrapper, which reads prompt.txt/dir.txt itself.
-        proc = zigzag_spawn(RELAY_LAUNCHER, ["run", rdir], f"codex-{tid}")
-        ledger_append({
-            "id": tid, "project": ns.project_dir, "via": "relay",
-            "proc": proc, "status": "running",
-            "prompt_head": prompt.decode(errors="replace")[:200],
-            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        })
-        print(f"started {tid} proc={proc[:12]}... project={ns.project_dir} (via relay)")
+        proc = zigzag_spawn(RELAY_LAUNCHER,
+                            ["resume" if session_id else "run", rdir], f"codex-{tid}")
+        transport = {"via": "relay", "proc": proc}
+        detail = f"proc={proc[:12]}..."
+    prefix = f"[resume {session_id[:8]}] " if session_id else ""
+    ledger_append({"id": tid, "project": project_dir, **transport, "status": "running",
+                   "prompt_head": prefix + prompt.decode(errors="replace")[:200],
+                   "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
+    session = f" session={session_id[:8]}" if session_id else ""
+    print(f"{action} {tid} {detail}{session} project={project_dir} (via {transport['via']})")
+
+
+def cmd_start(args):
+    ns = dispatch_args(args)
+    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh)
 
 
 def shq(s):
@@ -370,20 +390,7 @@ def save_reported(r):
 
 
 def cmd_resume(args):
-    import argparse
-    ap = argparse.ArgumentParser()
-    # project_dir is optional: when omitted it is resolved from the session
-    # file's recorded cwd on the Mac (see resolve_session_cwd).
-    ap.add_argument("project_dir", nargs="?", default=None)
-    ap.add_argument("session_id")
-    ap.add_argument("prompt_file")
-    ap.add_argument("--no-sop", action="store_true",
-                    help="skip prepending the standard PR/review/CI operating procedure")
-    ap.add_argument("--writing", action="store_true",
-                    help="prepend the writing standard (strategic/hierarchical/simple) instead of the code SOP")
-    ap.add_argument("--ssh", action="store_true",
-                    help="launch over SSH+nohup instead of the relay (no keychain access)")
-    ns = ap.parse_args(args)
+    ns = dispatch_args(args, resume=True)
     project_dir = ns.project_dir
     if not project_dir:
         project_dir = resolve_session_cwd(ns.session_id)
@@ -395,64 +402,7 @@ def cmd_resume(args):
     if not remote_isdir(project_dir):
         sys.exit(f"project_dir does not exist on the Mac: {project_dir} "
                  f"(refusing to dispatch a dead task)")
-    prompt = open(ns.prompt_file, "rb").read()
-    if not prompt.strip():
-        sys.exit("empty prompt")
-    if ns.writing:
-        writing_path = asset_path("writing.md")
-        if os.path.exists(writing_path):
-            writing = open(writing_path, "rb").read()
-            prompt = writing + b"\n\n---\n\nTASK:\n" + prompt
-    elif not ns.no_sop:
-        sop_path = asset_path("sop.md")
-        if os.path.exists(sop_path):
-            sop = open(sop_path, "rb").read()
-            prompt = sop + b"\n\n---\n\nTASK:\n" + prompt
-    tid = "t-" + uuid.uuid4().hex[:6]
-    # Same relay announcement playbook as cmd_start, keyed to the new task id.
-    relay_path = asset_path("relay-announce.md")
-    if os.path.exists(relay_path):
-        relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
-        prompt = prompt + b"\n\n---\n\n" + relay
-    rdir = f"{REMOTE_DEPT}/{tid}"
-    r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
-            stdin_data=prompt, timeout=60)
-    if r.returncode != 0:
-        sys.exit(f"ssh setup failed: {r.stderr.decode()[-500:]}")
-    r = ssh(f"printf %s {shq(project_dir)} > {rdir}/dir.txt && "
-            f"printf %s {shq(ns.session_id)} > {rdir}/resume.txt", timeout=60)
-    if r.returncode != 0:
-        sys.exit(f"ssh dir write failed: {r.stderr.decode()[-500:]}")
-    # resume continues the existing Codex session (e.g. one started in the
-    # desktop app) with a new prompt; same flags as start otherwise.
-    if ns.ssh:
-        launch = (
-            f'd=$(cat {rdir}/dir.txt); sid=$(cat {rdir}/resume.txt); '
-            f'[ -d "$d" ] || exit 3; cd "$d" && '
-            f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
-            f'resume "$sid" "$(cat {rdir}/prompt.txt)" -o {rdir}/last-message.txt '
-            f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & echo $! > {rdir}/pid && cat {rdir}/pid'
-        )
-        r = ssh(launch, timeout=60)
-        if r.returncode != 0:
-            sys.exit(f"launch failed (rc={r.returncode}): {r.stderr.decode()[-500:]}")
-        pid = r.stdout.decode().strip()
-        ledger_append({
-            "id": tid, "project": project_dir, "via": "ssh",
-            "pid": pid, "status": "running",
-            "prompt_head": f"[resume {ns.session_id[:8]}] " + prompt.decode(errors="replace")[:200],
-            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        })
-        print(f"resumed {tid} pid={pid} session={ns.session_id[:8]} project={project_dir} (via ssh)")
-    else:
-        proc = zigzag_spawn(RELAY_LAUNCHER, ["resume", rdir], f"codex-{tid}")
-        ledger_append({
-            "id": tid, "project": project_dir, "via": "relay",
-            "proc": proc, "status": "running",
-            "prompt_head": f"[resume {ns.session_id[:8]}] " + prompt.decode(errors="replace")[:200],
-            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        })
-        print(f"resumed {tid} proc={proc[:12]}... session={ns.session_id[:8]} project={project_dir} (via relay)")
+    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id)
 
 
 def cmd_check(args):

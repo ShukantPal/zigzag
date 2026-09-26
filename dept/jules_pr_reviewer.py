@@ -7,10 +7,11 @@ Review tasks post their findings as a PR comment (with the bot marker) and never
 Run from cron every ~10 min; disable the cron once all expected PRs are reviewed.
 """
 import json
+import fcntl
 import os
 import subprocess
 import sys
-from dept_config import ROOT, load_config, state_dir
+from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
 
 CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
@@ -21,16 +22,9 @@ PROMPT_DIR = os.path.join(STATE_DIR, "prompts")
 DEPT = os.path.join(ROOT, "dept.py")
 PROJECT = WATCHER.get("project", "")
 REPO = WATCHER.get("repo", "")
-SSH = [
-    "ssh", "-i", os.path.expanduser(CONNECTION.get("ssh_key", "")),
-    "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", f"UserKnownHostsFile={CONNECTION.get('known_hosts', '')}",
-    "-o", f"ProxyCommand=python3 {os.path.expanduser(CONNECTION.get('proxy_helper', ''))} %h %p",
-    CONNECTION.get("mac", ""),
-]
-_proxy = os.environ.get("HTTPS_PROXY", "")
-ENV = dict(os.environ, TUNNEL_PROXY=_proxy.rsplit(":", 1)[0] + ":3130" if ":" in _proxy else "")
+SSH = ssh_base(CONNECTION)
+ENV = ssh_env()
+LOCK_FILE = os.path.join(STATE_DIR, "jules-pr-reviews.lock")
 
 # Jules session ids for the J8-J13 batch (from the Delegation sheet). Jules names
 # each PR branch with the session id as suffix, e.g.
@@ -152,37 +146,60 @@ def dispatch(prompt_template, pr, extra):
         [sys.executable, DEPT, "start", PROJECT, prompt_path, "--no-sop"],
         capture_output=True, text=True, timeout=180)
     line = (out.stdout + out.stderr).strip().splitlines()
-    task_id = line[-1].split()[1] if line and line[-1].startswith("started ") else "?"
+    task_id = line[-1].split()[1] if line and line[-1].startswith("started ") else None
+    if out.returncode != 0 or not task_id:
+        print(f"failed to dispatch review for PR #{pr['n']} ({pr['b']}){extra}: "
+              f"{(out.stdout + out.stderr).strip()[:300]}", file=sys.stderr)
+        return None
     print(f"dispatched review for PR #{pr['n']} ({pr['b']}){extra}: {task_id}")
     return task_id
 
 
 def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another Jules-review poll holds the lock; exiting")
+        return
     state = load_state()
     changed = False
     for pr in open_jules_prs():
         key = str(pr["n"])
         entry = state.get(key)
         if entry and entry.get("status") in ("done", "running"):
-            if entry["status"] == "running" and task_status(entry["task"]) == "done":
-                entry["status"] = "done"
-                changed = True
+            if entry["status"] == "running":
+                live = task_status(entry["task"])
+                if live == "running":
+                    continue
+                if live == "done":
+                    entry["status"] = "done"
+                    changed = True
+                else:
+                    del state[key]
+                    entry = None
+                    changed = True
             # Revision watch: a reviewed PR whose branch moved since the last
             # review gets a Codex re-review. One task per PR at a time.
-            if (entry["status"] == "done" and pr["o"]
+            if (entry and entry["status"] == "done" and pr["o"]
                     and entry.get("head") and entry["head"] != pr["o"]):
                 task_id = dispatch(REREVIEW_PROMPT, pr,
                                    f" (re-review of head {pr['o'][:8]})")
-                entry.update({"task": task_id, "branch": pr["b"],
-                              "title": pr["t"], "head": pr["o"],
-                              "status": "running",
-                              "reviews": entry.get("reviews", 1) + 1})
-                changed = True
-            continue
+                if task_id:
+                    entry.update({"task": task_id, "branch": pr["b"],
+                                  "title": pr["t"], "head": pr["o"],
+                                  "status": "running",
+                                  "reviews": entry.get("reviews", 1) + 1})
+                    changed = True
+                continue
+            if entry:
+                continue
         task_id = dispatch(REVIEW_PROMPT, pr, "")
-        state[key] = {"task": task_id, "branch": pr["b"], "title": pr["t"],
-                      "head": pr["o"], "status": "running", "reviews": 1}
-        changed = True
+        if task_id:
+            state[key] = {"task": task_id, "branch": pr["b"], "title": pr["t"],
+                          "head": pr["o"], "status": "running", "reviews": 1}
+            changed = True
     if changed:
         save_state(state)
 
