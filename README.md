@@ -121,6 +121,88 @@ Policy JSON shape: `{"bins": {"<name>": {"path": "/abs/path", "commands": [["sub
 `commands` entries are argv prefixes. The `gh` bin also accepts
 `"gh_read_repos": ["owner/repo"]` to scope `gh api` / `pr` commands.
 
+### OpenCode pilot runner
+
+`scripts/opencode-launch` is the only OpenCode launcher owned by Zigzag. A
+department client stages a directory, asks the existing `/v1/spawn` flow to
+invoke the runner, and records the returned process handle. It must not
+construct a separate `opencode run` command itself.
+
+The runner accepts exactly one operation and an absolute staged-task directory:
+
+```sh
+scripts/opencode-launch run --task-dir /absolute/staged-task
+scripts/opencode-launch resume --task-dir /absolute/staged-task
+```
+
+Each staged task has two UTF-8, regular (non-symlink) input files:
+
+```text
+prompt.txt
+runtime.json
+```
+
+For `run`, `runtime.json` requires an absolute, non-symlink `project_dir` and
+may contain `model` and `title`. The model defaults to
+`opencode/muse-spark-1.3-contributor-free`; selecting another free model is a
+staged `model` setting, not a CLI override. For `resume`, it instead requires
+only `project_dir` and `session_id`. Before resuming, the runner exports the
+session and requires its project and effective model to match the staged
+project and a free Zen model.
+
+The pilot deliberately does not accept a staged `agent`: an agent definition
+can itself select a model or subagent, which cannot yet be attested as part of
+this one-runner contract. The runner starts OpenCode in pure mode with a
+minimal environment, a fresh configuration directory, and an empty inline
+configuration for catalog inspection; it discards caller-supplied
+`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, and
+model-catalog overrides. (The account's local model cache remains available so
+the approved default catalog is not replaced by an empty-home fallback.) It
+pins both primary and small-model config to the approved model, then exports
+the completed session and verifies the effective project, model, standard
+`build` agent, and every assistant turn before reporting success.
+
+Project roots are source-controlled OSS/Talon allowlists. Models are checked
+against OpenCode's current local `models opencode --verbose` metadata: the
+provider must be `opencode`, the endpoint must be Zen, and every reported cost
+must be zero. This admits newly available free Zen models (including
+`opencode/big-pickle`) while rejecting OpenAI, Anthropic, and paid models.
+
+After every invocation the task directory contains the raw structured stream
+in `opencode-events.jsonl`, stderr in `opencode-stderr.log`, and rendered
+artifacts: `opencode-result.txt`, `opencode-session-id.txt` (when OpenCode
+emits one), `opencode-usage.json`, and `opencode-run.json`. The result is the
+last text event; usage is labeled `runtime: "opencode"` and aggregates input,
+output, reasoning, cache-read, cache-write, and cost from every `step_finish`
+event. `opencode-usage.json` also records `completed`, `stream_error`, and
+`timed_out` so a child exit code of zero cannot hide an OpenCode error event,
+malformed stream, non-finite usage, or a stream missing a terminal `stop`
+completion.
+Preflight rejection clears prior artifacts and writes the same structured
+failure status whenever the staged task directory is usable.
+
+The runner always invokes OpenCode with closed stdin and places `--` before
+the staged prompt. Leaving stdin open makes non-interactive `opencode run`
+wait forever for an interactive session; the option terminator keeps prompt
+text from being interpreted as an OpenCode flag.
+
+Install its relay policy from Shukant's GUI login session after reviewing the
+absolute path for the deployed checkout. The following is a **policy fragment**
+to merge under `bins`; `set-allowlist` replaces the entire policy, so first run
+`zigzag config get-allowlist`, merge this entry with the existing bins, then
+write the complete policy back with `zigzag config set-allowlist --file …`.
+
+```json
+{
+  "bins": {
+    "opencode-launch": {
+      "path": "/Users/shukant/Workspace/ShukantPal/zigzag/scripts/opencode-launch",
+      "commands": [["run"], ["resume"]]
+    }
+  }
+}
+```
+
 ## Linux VM build
 
 The poller uses only the Rust standard library. Cross-compile for the VM after

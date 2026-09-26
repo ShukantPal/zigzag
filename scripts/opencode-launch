@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Run a validated staged OpenCode task through Zigzag's launch contract."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import json
+import math
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterator
+
+
+DEFAULT_MODEL = "opencode/muse-spark-1.3-contributor-free"
+SESSION_ID = re.compile(r"ses_[A-Za-z0-9]{1,124}\Z")
+ALLOWED_PROJECT_ROOTS = (
+    Path("/Users/shukant/Workspace/ShukantPal/zigzag"),
+    Path("/Users/shukant/Workspace/impalasys/talon"),
+)
+OPENCODE_BIN = Path("/run/current-system/sw/bin/opencode")
+PROCESS_TIMEOUT_SECONDS = 300
+MAX_PROMPT_BYTES = 64 * 1024
+MAX_SETTINGS_BYTES = 4 * 1024
+
+PROMPT_FILE = "prompt.txt"
+RUNTIME_FILE = "runtime.json"
+EVENTS_FILE = "opencode-events.jsonl"
+STDERR_FILE = "opencode-stderr.log"
+RESULT_FILE = "opencode-result.txt"
+SESSION_FILE = "opencode-session-id.txt"
+USAGE_FILE = "opencode-usage.json"
+RUN_FILE = "opencode-run.json"
+OUTPUT_FILES = (EVENTS_FILE, STDERR_FILE, RESULT_FILE, SESSION_FILE, USAGE_FILE, RUN_FILE)
+ENVIRONMENT_KEYS = ("HOME", "PATH", "TMPDIR", "SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "LANG", "LC_CTYPE")
+
+
+class RunnerError(Exception):
+    """A controlled staging or runtime failure."""
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="run a validated staged OpenCode task")
+    parser.add_argument("operation", choices=("run", "resume"))
+    parser.add_argument("--task-dir", required=True, type=Path)
+    return parser.parse_args(argv)
+
+
+def checked_task_dir(value: Path) -> Path:
+    if not value.is_absolute():
+        raise RunnerError("--task-dir must be an absolute path")
+    try:
+        task_dir = value.resolve(strict=True)
+    except OSError as error:
+        raise RunnerError(f"task directory is unavailable: {error}") from error
+    if not task_dir.is_dir():
+        raise RunnerError("--task-dir must name a directory")
+    return task_dir
+
+
+def read_staged_file(task_dir: Path, name: str, limit: int) -> str:
+    path = task_dir / name
+    try:
+        stat = path.lstat()
+    except OSError as error:
+        raise RunnerError(f"missing required staged file {name}: {error}") from error
+    if not path.is_file() or path.is_symlink() or stat.st_size > limit:
+        raise RunnerError(f"staged file {name} must be a regular file no larger than {limit} bytes")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise RunnerError(f"could not read staged file {name}: {error}") from error
+
+
+def parse_runtime(task_dir: Path, operation: str) -> dict[str, str]:
+    try:
+        value = json.loads(read_staged_file(task_dir, RUNTIME_FILE, MAX_SETTINGS_BYTES))
+    except json.JSONDecodeError as error:
+        raise RunnerError(f"runtime.json is not valid JSON: {error.msg}") from error
+    if not isinstance(value, dict):
+        raise RunnerError("runtime.json must be a JSON object")
+    allowed = {"project_dir", "session_id"} if operation == "resume" else {"project_dir", "model", "title"}
+    required = {"project_dir", "session_id"} if operation == "resume" else {"project_dir"}
+    if set(value) - allowed or not required.issubset(value):
+        raise RunnerError("runtime.json contains unsupported or missing settings for this operation")
+    if any(not isinstance(setting, str) or not setting.strip() or "\x00" in setting for setting in value.values()):
+        raise RunnerError("runtime settings must be non-empty strings")
+    return value
+
+
+def checked_project_dir(value: str) -> Path:
+    project = Path(value)
+    if not project.is_absolute():
+        raise RunnerError("runtime project_dir must be an absolute path")
+    if project.is_symlink():
+        raise RunnerError("runtime project_dir must not be a symlink")
+    try:
+        project = project.resolve(strict=True)
+    except OSError as error:
+        raise RunnerError(f"runtime project_dir is unavailable: {error}") from error
+    if not project.is_dir():
+        raise RunnerError("runtime project_dir must name a directory")
+    if not any(project.is_relative_to(root) for root in ALLOWED_PROJECT_ROOTS):
+        raise RunnerError("runtime project_dir is not an approved OSS or Talon project root")
+    return project
+
+
+def costs_are_zero(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value) and all(costs_are_zero(component) for component in value.values())
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value == 0
+
+
+def available_free_zen_models() -> set[str]:
+    try:
+        with opencode_environment() as environment:
+            listed = subprocess.run(
+                [str(OPENCODE_BIN), "models", "opencode", "--pure", "--verbose"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                check=False,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RunnerError(f"could not inspect OpenCode Zen models: {error}") from error
+    if listed.returncode != 0:
+        raise RunnerError("could not inspect OpenCode Zen models")
+    models = set()
+    decoder = json.JSONDecoder()
+    output = listed.stdout.decode("utf-8", errors="replace")
+    offset = 0
+    while (start := output.find("{", offset)) >= 0:
+        try:
+            metadata, end = decoder.raw_decode(output[start:])
+        except json.JSONDecodeError:
+            offset = start + 1
+            continue
+        offset = start + end
+        if not isinstance(metadata, dict):
+            continue
+        cost = metadata.get("cost")
+        api = metadata.get("api")
+        if (
+            metadata.get("providerID") == "opencode"
+            and isinstance(metadata.get("id"), str)
+            and isinstance(api, dict)
+            and api.get("url") == "https://opencode.ai/zen/v1"
+            and costs_are_zero(cost)
+        ):
+            models.add(f"opencode/{metadata['id']}")
+    if not models:
+        raise RunnerError("OpenCode reported no free Zen models")
+    return models
+
+
+def checked_model(model: str, free_models: set[str]) -> str:
+    if model not in free_models:
+        raise RunnerError(
+            "model must be a currently available free OpenCode Zen model; OpenAI and Anthropic models are not allowed"
+        )
+    return model
+
+
+def checked_session_id(session_id: str) -> str:
+    if not SESSION_ID.fullmatch(session_id):
+        raise RunnerError("session_id must be an OpenCode session identifier")
+    return session_id
+
+
+@contextmanager
+def opencode_environment(model: str | None = None) -> Iterator[dict[str, str]]:
+    """Run OpenCode without inherited config, catalog, credential, or plugin state."""
+    trusted_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    with tempfile.TemporaryDirectory(prefix="opencode-launch-config-") as config_home:
+        environment = {key: os.environ[key] for key in ENVIRONMENT_KEYS if os.environ.get(key) and key != "HOME"}
+        # Use the account's read-only model cache, but put all configuration in
+        # an empty fresh directory. HOME comes from the OS account database,
+        # never the invoking process's environment.
+        environment["HOME"] = str(trusted_home)
+        environment["XDG_CONFIG_HOME"] = config_home
+        environment.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/run/current-system/sw/bin")
+        environment["OPENCODE_CONFIG_CONTENT"] = "{}"
+        if model:
+            # This is the sole config supplied to OpenCode. Both roles are
+            # pinned so lightweight work cannot select another provider.
+            environment["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": model, "small_model": model})
+        yield environment
+
+
+def remove_outputs(task_dir: Path) -> None:
+    failures = []
+    for name in OUTPUT_FILES:
+        path = task_dir / name
+        try:
+            path.unlink(missing_ok=True)
+        except IsADirectoryError as error:
+            failures.append(f"artifact path {name} must not be a directory")
+        except OSError as error:
+            failures.append(f"could not clear artifact {name}: {error}")
+    if failures:
+        raise RunnerError("; ".join(failures))
+
+
+@contextmanager
+def artifact_writer(task_dir: Path, name: str, binary: bool = False) -> Iterator[Any]:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=task_dir)
+    try:
+        opener = os.fdopen(descriptor, "wb") if binary else os.fdopen(descriptor, "w", encoding="utf-8")
+        try:
+            with opener as handle:
+                yield handle
+        except BaseException:
+            # Preserve partial output after a timeout or child-launch failure
+            # so the renderer can report a controlled artifact status.
+            os.replace(temporary, task_dir / name)
+            raise
+        else:
+            os.replace(temporary, task_dir / name)
+    except OSError as error:
+        raise RunnerError(f"could not write artifact {name}: {error}") from error
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def write_artifact(task_dir: Path, name: str, text: str) -> None:
+    with artifact_writer(task_dir, name) as handle:
+        handle.write(text)
+
+
+def write_json_artifact(task_dir: Path, name: str, value: Any) -> None:
+    write_artifact(task_dir, name, json.dumps(value, sort_keys=True) + "\n")
+
+
+def empty_usage() -> dict[str, int | float]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost": 0,
+    }
+
+
+def number(value: Any, name: str) -> int | float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+        return value
+    raise RunnerError(f"OpenCode step_finish has invalid numeric {name}")
+
+
+def write_usage(
+    task_dir: Path,
+    operation: str,
+    exit_code: int,
+    timed_out: bool,
+    completed: bool,
+    stream_error: str | None,
+    usage: dict[str, int | float],
+) -> None:
+    write_json_artifact(
+        task_dir,
+        USAGE_FILE,
+        {
+            "runtime": "opencode",
+            "operation": operation,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "completed": completed,
+            "stream_error": stream_error,
+            **usage,
+        },
+    )
+
+
+def write_run(
+    task_dir: Path,
+    operation: str,
+    project: Path | None,
+    model: str | None,
+    runtime: dict[str, str] | None,
+    state: str,
+    error: str | None = None,
+) -> None:
+    write_json_artifact(
+        task_dir,
+        RUN_FILE,
+        {
+            "runtime": "opencode",
+            "operation": operation,
+            "project_dir": str(project) if project else None,
+            "model": model,
+            "title": runtime.get("title") if runtime else None,
+            "session_id": runtime.get("session_id") if runtime else None,
+            "state": state,
+            "error": error,
+        },
+    )
+
+
+def render_artifacts(
+    task_dir: Path, operation: str, process_exit_code: int, timed_out: bool
+) -> tuple[bool, str | None, str | None, dict[str, int | float]]:
+    usage = empty_usage()
+    session_id: str | None = None
+    final_text = ""
+    completed = False
+    stream_error: str | None = None
+    try:
+        stream = (task_dir / EVENTS_FILE).read_text(encoding="utf-8")
+        if not stream.strip():
+            raise RunnerError("OpenCode emitted an empty event stream")
+        for line in stream.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RunnerError("OpenCode emitted malformed JSON") from error
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                raise RunnerError("OpenCode emitted a malformed event")
+            event_session = event.get("sessionID")
+            if event_session is not None:
+                if not isinstance(event_session, str) or not event_session:
+                    raise RunnerError("OpenCode emitted an invalid sessionID")
+                session_id = session_id or event_session
+            event_type = event["type"]
+            if event_type == "error":
+                raise RunnerError("OpenCode emitted an error event")
+            if event_type == "text":
+                part = event.get("part")
+                if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+                    raise RunnerError("OpenCode text event is malformed")
+                final_text = part["text"]
+            if event_type == "step_finish":
+                part = event.get("part")
+                if not isinstance(part, dict) or not isinstance(part.get("tokens"), dict):
+                    raise RunnerError("OpenCode step_finish is malformed")
+                tokens = part["tokens"]
+                cache = tokens.get("cache")
+                if not isinstance(cache, dict):
+                    raise RunnerError("OpenCode step_finish is missing cache tokens")
+                usage["input_tokens"] += number(tokens.get("input"), "input tokens")
+                usage["output_tokens"] += number(tokens.get("output"), "output tokens")
+                usage["reasoning_tokens"] += number(tokens.get("reasoning"), "reasoning tokens")
+                usage["cache_read_tokens"] += number(cache.get("read"), "cache read tokens")
+                usage["cache_write_tokens"] += number(cache.get("write"), "cache write tokens")
+                usage["cost"] += number(part.get("cost"), "cost")
+                if not isinstance(part.get("reason"), str):
+                    raise RunnerError("OpenCode step_finish is missing a reason")
+                completed = completed or part["reason"] == "stop"
+        if not completed:
+            raise RunnerError("OpenCode emitted no terminal stop event")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RunnerError) as error:
+        stream_error = str(error)
+
+    if session_id:
+        write_artifact(task_dir, SESSION_FILE, session_id + "\n")
+    write_artifact(task_dir, RESULT_FILE, final_text)
+    write_usage(task_dir, operation, process_exit_code, timed_out, completed, stream_error, usage)
+    return completed, stream_error, session_id, usage
+
+
+def export_session_model(session_id: str, project: Path, free_models: set[str], expected_model: str | None = None) -> str:
+    try:
+        with opencode_environment(expected_model) as environment:
+            exported = subprocess.run(
+                [str(OPENCODE_BIN), "export", session_id],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                check=False,
+                timeout=PROCESS_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RunnerError(f"could not attest OpenCode session: {error}") from error
+    if exported.returncode != 0:
+        raise RunnerError("could not attest OpenCode session")
+    try:
+        exported_session = json.loads(exported.stdout.decode("utf-8"))
+        session = exported_session["info"]
+        model = session["model"]
+        model_id = checked_model(f"{model['providerID']}/{model['id']}", free_models)
+        session_project = Path(session["directory"]).resolve(strict=True)
+        messages = exported_session["messages"]
+        if not isinstance(messages, list) or session.get("agent") != "build":
+            raise RunnerError("OpenCode session contains an unsupported agent")
+        for message in messages:
+            info = message.get("info") if isinstance(message, dict) else None
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            if info.get("agent") != "build" or info.get("providerID") != "opencode":
+                raise RunnerError("OpenCode session contains an unsupported assistant turn")
+            assistant_model = checked_model(f"opencode/{info['modelID']}", free_models)
+            if assistant_model != model_id or info.get("finish") != "stop":
+                raise RunnerError("OpenCode session assistant turns do not attest the selected model")
+            parts = message.get("parts")
+            if not isinstance(parts, list) or any(isinstance(part, dict) and part.get("type") == "subtask" for part in parts):
+                raise RunnerError("OpenCode session contains unsupported subtask activity")
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError, OSError, RunnerError) as error:
+        raise RunnerError("OpenCode session does not attest an approved free model and project") from error
+    if session_project != project:
+        raise RunnerError("OpenCode session belongs to a different project")
+    if expected_model and model_id != expected_model:
+        raise RunnerError("OpenCode session model differs from the staged model")
+    return model_id
+
+
+def record_preflight_failure(task_dir: Path, operation: str, error: str) -> None:
+    for writer in (
+        lambda: write_artifact(task_dir, STDERR_FILE, f"opencode-launch: {error}\n"),
+        lambda: write_artifact(task_dir, RESULT_FILE, ""),
+        lambda: write_usage(task_dir, operation, 2, False, False, error, empty_usage()),
+        lambda: write_run(task_dir, operation, None, None, None, "failed", error),
+    ):
+        try:
+            writer()
+        except RunnerError:
+            # An invalid artifact path should not prevent the other status
+            # artifacts from documenting this controlled failure.
+            continue
+
+
+def run_prepared_task(task_dir: Path, options: argparse.Namespace) -> int:
+    prompt = read_staged_file(task_dir, PROMPT_FILE, MAX_PROMPT_BYTES)
+    if not prompt.strip():
+        raise RunnerError("prompt.txt must not be empty")
+    runtime = parse_runtime(task_dir, options.operation)
+    project = checked_project_dir(runtime["project_dir"])
+    if not OPENCODE_BIN.is_file() or not os.access(OPENCODE_BIN, os.X_OK):
+        raise RunnerError("configured opencode binary is not executable")
+    free_models = available_free_zen_models()
+
+    if options.operation == "run":
+        model = checked_model(runtime.get("model", DEFAULT_MODEL), free_models)
+        command = [str(OPENCODE_BIN), "run", "--pure", "--format", "json", "--dir", str(project), "--model", model]
+        if "title" in runtime:
+            command.extend(["--title", runtime["title"]])
+    else:
+        session_id = checked_session_id(runtime["session_id"])
+        model = export_session_model(session_id, project, free_models)
+        command = [str(OPENCODE_BIN), "run", "--pure", "--format", "json", "--dir", str(project), "--session", session_id]
+    command.extend(["--", prompt])
+
+    write_run(task_dir, options.operation, project, model, runtime, "running")
+    process_exit_code, timed_out = 1, False
+    try:
+        with opencode_environment(model) as environment:
+            with artifact_writer(task_dir, EVENTS_FILE, binary=True) as stdout, artifact_writer(task_dir, STDERR_FILE, binary=True) as stderr:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    env=environment,
+                    check=False,
+                    timeout=PROCESS_TIMEOUT_SECONDS,
+                )
+                process_exit_code = completed.returncode
+    except subprocess.TimeoutExpired:
+        process_exit_code, timed_out = 124, True
+    except (OSError, RunnerError) as error:
+        write_artifact(task_dir, STDERR_FILE, f"opencode-launch: {error}\n")
+
+    stream_complete, stream_error, session_id, usage = render_artifacts(
+        task_dir, options.operation, process_exit_code, timed_out
+    )
+    effective_exit = process_exit_code
+    if effective_exit == 0 and (timed_out or not stream_complete or stream_error):
+        effective_exit = 1
+    if effective_exit == 0 and not timed_out and stream_complete and not stream_error:
+        try:
+            if not session_id:
+                raise RunnerError("OpenCode emitted no sessionID")
+            effective_model = export_session_model(session_id, project, free_models, model)
+            if effective_model != model:
+                raise RunnerError("OpenCode session model differs from the staged model")
+        except RunnerError as error:
+            effective_exit = 1
+            stream_error = str(error)
+            write_usage(task_dir, options.operation, effective_exit, timed_out, False, stream_error, usage)
+    if effective_exit != 0:
+        write_run(task_dir, options.operation, project, model, runtime, "failed", stream_error)
+        return effective_exit
+    write_run(task_dir, options.operation, project, model, runtime, "succeeded")
+    return 0
+
+
+def run_task(options: argparse.Namespace) -> int:
+    task_dir = checked_task_dir(options.task_dir)
+    try:
+        remove_outputs(task_dir)
+        return run_prepared_task(task_dir, options)
+    except RunnerError as error:
+        record_preflight_failure(task_dir, options.operation, str(error))
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run_task(parse_arguments(sys.argv[1:] if argv is None else argv))
+    except RunnerError as error:
+        print(f"opencode-launch: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
