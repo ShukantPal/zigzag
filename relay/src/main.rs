@@ -140,6 +140,7 @@ fn run() -> Result<(), String> {
         .as_deref()
         .map(read_secret_file)
         .transpose()?;
+    let comment_router_state_file = config.state_file.with_extension("comment-router.json");
     let state = Arc::new(Server {
         secret,
         control_secret,
@@ -148,7 +149,9 @@ fn run() -> Result<(), String> {
             registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
             procs: Mutex::new(HashMap::new()),
         },
-        session_gate: Arc::new(comment_router::SessionGate::default()),
+        session_gate: Arc::new(comment_router::SessionGate::open(
+            comment_router_state_file,
+        )?),
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
         replay_recovered_lifecycle(&state.store, &agent)?;
@@ -160,11 +163,10 @@ fn run() -> Result<(), String> {
         let interval = config.github_watch_interval;
         thread::spawn(move || github_watch_loop(state, repos, interval));
     }
-    if config.comment_router.enabled() {
-        let state = Arc::clone(&state);
-        let router = config.comment_router.clone();
-        thread::spawn(move || comment_router::watch_loop(state, router));
-    }
+    comment_router::recover_session_claims(Arc::clone(&state));
+    let router_state = Arc::clone(&state);
+    let router = config.comment_router.clone();
+    thread::spawn(move || comment_router::watch_loop(router_state, router));
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
         SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.port),
@@ -450,25 +452,32 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
 }
 
 fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+    parse_github_open_pull_requests(&github_api(
+        &format!("repos/{repo}/pulls?state=open&per_page=100"),
+        &format!("github-pr-scan-{repo}"),
+    )?)
+}
+
+pub(crate) fn github_api(endpoint: &str, id: &str) -> Result<String, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
-        id: format!("github-pr-scan-{repo}"),
+        id: id.to_owned(),
         bin: "gh".to_owned(),
         args: vec![
             "api".to_owned(),
             "--paginate".to_owned(),
             "--slurp".to_owned(),
-            format!("repos/{repo}/pulls?state=open&per_page=100"),
+            endpoint.to_owned(),
         ],
     };
     let path = policy
         .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| "the gh policy does not allow the PR scan".to_owned())?;
+        .ok_or_else(|| "the gh policy does not allow the GitHub scan".to_owned())?;
     let result = exec::run(path, request);
     if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub PR discovery did not complete successfully".to_owned());
+        return Err("GitHub API scan did not complete successfully".to_owned());
     }
-    parse_github_open_pull_requests(&result.stdout)
+    Ok(result.stdout)
 }
 
 fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, String> {
@@ -2341,7 +2350,9 @@ mod tests {
                     registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                     procs: Mutex::new(HashMap::new()),
                 },
-                session_gate: Arc::new(comment_router::SessionGate::default()),
+                session_gate: Arc::new(
+                    comment_router::SessionGate::open(path.with_extension("comments")).unwrap(),
+                ),
             }),
             path,
         )

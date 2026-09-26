@@ -8,12 +8,12 @@
 use crate::{Server, exec, new_execution_id, spawn_proc};
 use relay_core::{Json, parse_json};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const OWNER: &str = "ShukantPal";
+const ROUTED_OWNER: &str = "ShukantPal";
 const BOT_MARKER: &str = "> 🤖";
 const BURST_INTERVAL: Duration = Duration::from_secs(30);
 const PROMPT: &str = include_str!("../prompts/comment_address.md");
@@ -46,36 +46,140 @@ impl Config {
             burst_window,
         })
     }
-
-    pub(crate) fn enabled(&self) -> bool {
-        // The state file can be created after launch (for example when a PR
-        // first acquires a session). Keep the shadow watcher alive so that a
-        // restart is not required to begin observing that ownership record.
-        true
-    }
 }
 
 /// A deliberately shared gate for *session* operations, rather than a lock
 /// local to this watcher.  A session remains claimed for the lifetime of the
 /// detached resume process; a later watcher can use the same gate.
-#[derive(Default)]
 pub(crate) struct SessionGate {
-    active: Mutex<HashSet<String>>,
+    path: PathBuf,
+    inner: Mutex<GateState>,
+}
+
+#[derive(Default)]
+struct GateState {
+    active: HashMap<String, String>,
+    dispatched: HashSet<String>,
 }
 
 impl SessionGate {
+    pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
+        let state = match std::fs::read_to_string(&path) {
+            Ok(text) => parse_gate_state(&text)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => GateState::default(),
+            Err(_) => return Err("could not read comment-router ledger".to_owned()),
+        };
+        Ok(Self {
+            path,
+            inner: Mutex::new(state),
+        })
+    }
+
     fn claim(&self, session: &str) -> bool {
-        self.active
+        self.inner
             .lock()
-            .map(|mut active| active.insert(session.to_owned()))
+            .map(|mut state| {
+                state
+                    .active
+                    .insert(session.to_owned(), String::new())
+                    .is_none()
+            })
             .unwrap_or(false)
     }
 
+    fn is_dispatched(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|state| state.dispatched.contains(id))
+    }
+
+    fn bind(&self, session: &str, handle: &str) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "comment-router ledger lock poisoned".to_owned())?;
+        state.active.insert(session.to_owned(), handle.to_owned());
+        self.save(&state)
+    }
+
+    fn mark_dispatched(&self, ids: impl IntoIterator<Item = String>) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "comment-router ledger lock poisoned".to_owned())?;
+        state.dispatched.extend(ids);
+        self.save(&state)
+    }
+
     fn release(&self, session: &str) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(session);
+        if let Ok(mut state) = self.inner.lock() {
+            state.active.remove(session);
+            let _ = self.save(&state);
         }
     }
+
+    fn recovered_claims(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .map(|state| {
+                state
+                    .active
+                    .iter()
+                    .filter(|(_, handle)| !handle.is_empty())
+                    .map(|(session, handle)| (session.clone(), handle.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn save(&self, state: &GateState) -> Result<(), String> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "could not create comment-router ledger".to_owned())?;
+        let temporary = parent.join(format!(".comment-router-{}.tmp", std::process::id()));
+        let value = Json::Object(vec![
+            (
+                "active".to_owned(),
+                Json::Object(
+                    state
+                        .active
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Json::String(v.clone())))
+                        .collect(),
+                ),
+            ),
+            (
+                "dispatched".to_owned(),
+                Json::Array(state.dispatched.iter().cloned().map(Json::String).collect()),
+            ),
+        ])
+        .to_json();
+        std::fs::write(&temporary, value)
+            .map_err(|_| "could not write comment-router ledger".to_owned())?;
+        std::fs::rename(temporary, &self.path)
+            .map_err(|_| "could not replace comment-router ledger".to_owned())
+    }
+}
+
+fn parse_gate_state(text: &str) -> Result<GateState, String> {
+    let value = parse_json(text).map_err(|_| "invalid comment-router ledger".to_owned())?;
+    let active = match value.object("active") {
+        Some(Json::Object(entries)) => entries
+            .iter()
+            .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+            .collect::<Option<HashMap<_, _>>>(),
+        _ => None,
+    }
+    .ok_or_else(|| "invalid comment-router ledger".to_owned())?;
+    let dispatched = match value.object("dispatched") {
+        Some(Json::Array(ids)) => ids.iter().map(Json::as_str).collect::<Option<HashSet<_>>>(),
+        _ => None,
+    }
+    .ok_or_else(|| "invalid comment-router ledger".to_owned())?
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    Ok(GateState { active, dispatched })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,8 +200,10 @@ struct Comment {
 }
 
 impl Comment {
-    fn is_human_feedback(&self) -> bool {
-        self.author.eq_ignore_ascii_case(OWNER)
+    /// Phase 1 intentionally routes only Shukant's feedback. Other review
+    /// authors are out of scope; marker-bearing worker replies are excluded.
+    fn is_owner_feedback(&self) -> bool {
+        self.author.eq_ignore_ascii_case(ROUTED_OWNER)
             && !self
                 .body
                 .lines()
@@ -134,12 +240,16 @@ pub(crate) fn watch_loop(state: Arc<Server>, config: Config) {
                 ),
             }
         }
-        let interval = if Instant::now() < burst_until {
-            BURST_INTERVAL
-        } else {
-            config.quiet_interval
-        };
+        let interval = poll_interval(Instant::now(), burst_until, config.quiet_interval);
         thread::sleep(interval);
+    }
+}
+
+fn poll_interval(now: Instant, burst_until: Instant, quiet_interval: Duration) -> Duration {
+    if now < burst_until {
+        BURST_INTERVAL
+    } else {
+        quiet_interval
     }
 }
 
@@ -147,51 +257,50 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
     let comments = github_comments(&watched.repository, watched.number)?;
     let candidates: Vec<_> = comments
         .iter()
-        .filter(|comment| comment.is_human_feedback())
+        .filter(|comment| comment.is_owner_feedback())
+        .filter(|comment| !state.session_gate.is_dispatched(&comment.event_id()))
         .cloned()
         .collect();
     if candidates.is_empty() || !state.session_gate.claim(&watched.session_id) {
         return Ok(false);
     }
 
-    let mut fresh = Vec::new();
-    for comment in candidates {
-        let payload = Json::Object(vec![
-            ("id".to_owned(), Json::String(comment.event_id())),
-            (
-                "kind".to_owned(),
-                Json::String("github_pr_comment".to_owned()),
-            ),
-            (
-                "repository".to_owned(),
-                Json::String(watched.repository.clone()),
-            ),
-            ("pull_request".to_owned(), Json::number(watched.number)),
-            (
-                "session_id".to_owned(),
-                Json::String(watched.session_id.clone()),
-            ),
-            ("node_id".to_owned(), Json::String(comment.node_id.clone())),
-            (
-                "surface".to_owned(),
-                Json::String(comment.surface.to_owned()),
-            ),
-        ]);
-        match state.store.add(payload) {
-            Ok((_, false)) => fresh.push(comment),
-            Ok((_, true)) => {}
-            Err(error) => {
-                state.session_gate.release(&watched.session_id);
-                return Err(format!("could not persist comment event: {error}"));
-            }
-        }
-    }
+    let fresh = candidates;
     if fresh.is_empty() {
         state.session_gate.release(&watched.session_id);
         return Ok(false);
     }
-
     if shadow {
+        for comment in &fresh {
+            let payload = Json::Object(vec![
+                ("id".to_owned(), Json::String(comment.event_id())),
+                (
+                    "kind".to_owned(),
+                    Json::String("github_pr_comment".to_owned()),
+                ),
+                (
+                    "repository".to_owned(),
+                    Json::String(watched.repository.clone()),
+                ),
+                ("pull_request".to_owned(), Json::number(watched.number)),
+                (
+                    "session_id".to_owned(),
+                    Json::String(watched.session_id.clone()),
+                ),
+                ("node_id".to_owned(), Json::String(comment.node_id.clone())),
+                (
+                    "surface".to_owned(),
+                    Json::String(comment.surface.to_owned()),
+                ),
+            ]);
+            state
+                .store
+                .add(payload)
+                .map_err(|error| format!("could not persist comment event: {error}"))?;
+        }
+        state
+            .session_gate
+            .mark_dispatched(fresh.iter().map(Comment::event_id))?;
         eprintln!(
             "shadow: would resume session {} for {}#{} on {} new GitHub comment(s)",
             watched.session_id,
@@ -217,11 +326,30 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             prompt,
         ],
     };
-    let policy = crate::require_gui_login_session().and_then(|_| exec::load_policy())?;
+    let policy = match crate::require_gui_login_session().and_then(|_| exec::load_policy()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            state.session_gate.release(&watched.session_id);
+            return Err(error);
+        }
+    };
     let path = policy
         .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| "the execution policy does not allow codex comment resumes".to_owned())?;
-    let execution_id = new_execution_id()?;
+        .ok_or_else(|| "the execution policy does not allow codex comment resumes".to_owned());
+    let path = match path {
+        Ok(path) => path,
+        Err(error) => {
+            state.session_gate.release(&watched.session_id);
+            return Err(error);
+        }
+    };
+    let execution_id = match new_execution_id() {
+        Ok(id) => id,
+        Err(error) => {
+            state.session_gate.release(&watched.session_id);
+            return Err(error);
+        }
+    };
     let spawned = match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
@@ -235,6 +363,42 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(format!("could not spawn comment resume: {error}"));
         }
     };
+    if let Err(error) = state
+        .session_gate
+        .bind(&watched.session_id, &spawned.handle)
+    {
+        state.session_gate.release(&watched.session_id);
+        return Err(error);
+    }
+    for comment in &fresh {
+        let payload = Json::Object(vec![
+            ("id".to_owned(), Json::String(comment.event_id())),
+            (
+                "kind".to_owned(),
+                Json::String("github_pr_comment".to_owned()),
+            ),
+            (
+                "repository".to_owned(),
+                Json::String(watched.repository.clone()),
+            ),
+            ("pull_request".to_owned(), Json::number(watched.number)),
+            (
+                "session_id".to_owned(),
+                Json::String(watched.session_id.clone()),
+            ),
+            ("node_id".to_owned(), Json::String(comment.node_id.clone())),
+            (
+                "surface".to_owned(),
+                Json::String(comment.surface.to_owned()),
+            ),
+        ]);
+        if let Err(error) = state.store.add(payload) {
+            eprintln!("could not persist dispatched GitHub comment event: {error}");
+        }
+    }
+    state
+        .session_gate
+        .mark_dispatched(fresh.iter().map(Comment::event_id))?;
     release_when_finished(
         Arc::clone(&state.session_gate),
         Arc::clone(&state.supervisor.registry),
@@ -254,7 +418,7 @@ fn release_when_finished(
         loop {
             let done = registry
                 .get(&handle)
-                .map(|agent| agent.state != "running")
+                .map(|agent| !crate::process_group_running(agent.process_group))
                 .unwrap_or(true);
             if done {
                 gate.release(&session_id);
@@ -263,6 +427,26 @@ fn release_when_finished(
             thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+pub(crate) fn recover_session_claims(state: Arc<Server>) {
+    for (session_id, handle) in state.session_gate.recovered_claims() {
+        let running = state
+            .supervisor
+            .registry
+            .get(&handle)
+            .is_some_and(|agent| crate::process_group_running(agent.process_group));
+        if running {
+            release_when_finished(
+                Arc::clone(&state.session_gate),
+                Arc::clone(&state.supervisor.registry),
+                session_id,
+                handle,
+            );
+        } else {
+            state.session_gate.release(&session_id);
+        }
+    }
 }
 
 fn github_comments(repo: &str, number: u64) -> Result<Vec<Comment>, String> {
@@ -275,32 +459,16 @@ fn github_comments(repo: &str, number: u64) -> Result<Vec<Comment>, String> {
         ),
         ("review", format!("repos/{repo}/pulls/{number}/reviews")),
     ] {
-        comments.extend(parse_comments(surface, &github_get(&endpoint)?)?);
+        comments.extend(parse_comments(
+            surface,
+            &crate::github_api(
+                &endpoint,
+                &format!("github-comment-scan-{}", endpoint.replace('/', "-")),
+            )?,
+        )?);
     }
     comments.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     Ok(comments)
-}
-
-fn github_get(endpoint: &str) -> Result<String, String> {
-    let policy = crate::require_gui_login_session().and_then(|_| exec::load_policy())?;
-    let request = exec::ExecRequest {
-        id: format!("github-comment-scan-{}", endpoint.replace('/', "-")),
-        bin: "gh".to_owned(),
-        args: vec![
-            "api".to_owned(),
-            "--paginate".to_owned(),
-            "--slurp".to_owned(),
-            endpoint.to_owned(),
-        ],
-    };
-    let path = policy
-        .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| "the gh policy does not allow the comment scan".to_owned())?;
-    let result = exec::run(path, request);
-    if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub comment scan did not complete successfully".to_owned());
-    }
-    Ok(result.stdout)
 }
 
 fn parse_comments(surface: &'static str, output: &str) -> Result<Vec<Comment>, String> {
@@ -454,17 +622,8 @@ fn legacy_session_for_repository(
     number: &str,
     value: &Json,
 ) -> Result<WatchedPr, String> {
-    let session_id = value
-        .as_str()
-        .or_else(|| value.object("session_id").and_then(Json::as_str))
-        .or_else(|| value.object("session").and_then(Json::as_str))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "legacy PR session is missing session_id".to_owned())?;
-    let number = number
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or_else(|| "legacy PR session has an invalid pull request number".to_owned())?;
+    let session_id = session_id(value)?;
+    let number = positive_pr_number(number)?;
     Ok(WatchedPr {
         repository: repository.to_owned(),
         number,
@@ -476,17 +635,8 @@ fn parse_legacy_session_entry(key: &str, value: &Json) -> Result<WatchedPr, Stri
     let (repository, number) = key
         .rsplit_once('#')
         .ok_or_else(|| "comment-router state needs a watched_pull_requests array".to_owned())?;
-    let session_id = value
-        .as_str()
-        .or_else(|| value.object("session_id").and_then(Json::as_str))
-        .or_else(|| value.object("session").and_then(Json::as_str))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "legacy PR session is missing session_id".to_owned())?;
-    let number = number
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or_else(|| "legacy PR session has an invalid pull request number".to_owned())?;
+    let session_id = session_id(value)?;
+    let number = positive_pr_number(number)?;
     if !crate::valid_github_repo(repository) {
         return Err("legacy PR session has an invalid repository".to_owned());
     }
@@ -495,6 +645,23 @@ fn parse_legacy_session_entry(key: &str, value: &Json) -> Result<WatchedPr, Stri
         number,
         session_id: session_id.to_owned(),
     })
+}
+
+fn session_id(value: &Json) -> Result<&str, String> {
+    value
+        .as_str()
+        .or_else(|| value.object("session_id").and_then(Json::as_str))
+        .or_else(|| value.object("session").and_then(Json::as_str))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "legacy PR session is missing session_id".to_owned())
+}
+
+fn positive_pr_number(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "legacy PR session has an invalid pull request number".to_owned())
 }
 
 fn parse_state_entry(value: &Json) -> Result<WatchedPr, String> {
@@ -573,14 +740,14 @@ mod tests {
         let mut comment = Comment {
             surface: "issue",
             node_id: "id".to_owned(),
-            author: OWNER.to_owned(),
+            author: "ShukantPal".to_owned(),
             body: "> 🤖 Codex reply\nDone".to_owned(),
             url: String::new(),
             created_at: String::new(),
         };
-        assert!(!comment.is_human_feedback());
+        assert!(!comment.is_owner_feedback());
         comment.body = "Please handle this.".to_owned();
-        assert!(comment.is_human_feedback());
+        assert!(comment.is_owner_feedback());
     }
 
     #[test]
@@ -621,7 +788,7 @@ mod tests {
             &[Comment {
                 surface: "review",
                 node_id: "id".to_owned(),
-                author: OWNER.to_owned(),
+                author: "ShukantPal".to_owned(),
                 body: "Please address this feedback.".to_owned(),
                 url: "https://example.test/comment".to_owned(),
                 created_at: "2026-09-26T12:00:00Z".to_owned(),
@@ -630,5 +797,53 @@ mod tests {
         assert!(prompt.contains("ShukantPal/zigzag pull request #12"));
         assert!(prompt.contains("Please address this feedback."));
         assert_eq!(truncate_utf8_tail("ééé", 3), "é");
+    }
+
+    #[test]
+    fn ledger_keeps_deduplication_after_reopen_and_releases_failed_claims() {
+        let path =
+            std::env::temp_dir().join(format!("zigzag-comment-ledger-{}", std::process::id()));
+        let gate = SessionGate::open(path.clone()).unwrap();
+        assert!(gate.claim("session"));
+        gate.release("session"); // a pre-spawn failure is retryable
+        assert!(gate.claim("session"));
+        gate.bind("session", "agent").unwrap();
+        gate.mark_dispatched(["github-pr-comment:node".to_owned()])
+            .unwrap();
+        drop(gate);
+        let reopened = SessionGate::open(path.clone()).unwrap();
+        assert!(reopened.is_dispatched("github-pr-comment:node"));
+        assert_eq!(
+            reopened.recovered_claims(),
+            vec![("session".to_owned(), "agent".to_owned())]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_all_surfaces_and_selects_burst_after_routable_feedback() {
+        let issue = parse_comments(
+            "issue",
+            r#"[[{"id":1,"node_id":"IC_a","body":"hello","user":{"login":"reviewer"}}]]"#,
+        )
+        .unwrap();
+        let inline = parse_comments(
+            "review_comment",
+            r#"[[{"id":2,"node_id":"PRRC_b","body":"> 🤖 bot","user":{"login":"ShukantPal"}}]]"#,
+        )
+        .unwrap();
+        let review = parse_comments("review", r#"[[{"id":3,"node_id":"PRR_c","body":"mobile feedback","submitted_at":"2026-09-26T12:00:00Z","user":{"login":"reviewer"}}]]"#).unwrap();
+        assert!(!issue[0].is_owner_feedback());
+        assert!(!inline[0].is_owner_feedback());
+        assert!(!review[0].is_owner_feedback());
+        let now = Instant::now();
+        assert_eq!(
+            poll_interval(now, now + Duration::from_secs(1), Duration::from_secs(300)),
+            BURST_INTERVAL
+        );
+        assert_eq!(
+            poll_interval(now, now, Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
     }
 }
