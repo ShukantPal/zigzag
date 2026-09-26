@@ -14,6 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct AgentRecord {
     pub id: String,
     pub task_id: String,
+    /// A relay-generated attempt identifier.  `task_id` may be retried, while
+    /// this value identifies one concrete supervised process.
+    pub execution_id: String,
     pub leader_pid: i32,
     pub process_group: i32,
     pub started_at: String,
@@ -22,6 +25,7 @@ pub struct AgentRecord {
     pub state: String,
     pub exit_code: Option<i32>,
     pub log_degraded: bool,
+    pub audit_degraded: bool,
     pub redacted: bool,
     pub stdout_next: u64,
     pub stderr_next: u64,
@@ -29,6 +33,9 @@ pub struct AgentRecord {
     pub stderr_dropped_before: u64,
     pub log_next: u64,
     pub log_dropped_before: u64,
+    pub first_output_at: Option<String>,
+    pub first_output_stream: Option<String>,
+    pub first_output_bytes: Option<u64>,
 }
 
 impl AgentRecord {
@@ -36,6 +43,10 @@ impl AgentRecord {
         Json::Object(vec![
             ("id".to_owned(), Json::String(self.id.clone())),
             ("task_id".to_owned(), Json::String(self.task_id.clone())),
+            (
+                "execution_id".to_owned(),
+                Json::String(self.execution_id.clone()),
+            ),
             ("state".to_owned(), Json::String(self.state.clone())),
             (
                 "started_at".to_owned(),
@@ -56,6 +67,7 @@ impl AgentRecord {
                     .unwrap_or(Json::Null),
             ),
             ("log_degraded".to_owned(), Json::Bool(self.log_degraded)),
+            ("audit_degraded".to_owned(), Json::Bool(self.audit_degraded)),
             ("redacted".to_owned(), Json::Bool(self.redacted)),
             (
                 "stdout_dropped_before".to_owned(),
@@ -167,6 +179,54 @@ impl AgentRegistry {
         self.save(&updated)?;
         *entries = updated;
         Ok(Some(result))
+    }
+
+    /// Persist the first observed byte so a transient archive failure can be
+    /// retried by later output or the terminal reaper.
+    pub fn record_first_output(
+        &self,
+        id: &str,
+        occurred_at: &str,
+        stream: &str,
+        bytes: u64,
+    ) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(old) = entries.get(id) else {
+            return Ok(None);
+        };
+        if old.first_output_at.is_some() {
+            return Ok(Some(old.clone()));
+        }
+        let mut updated = entries.clone();
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.first_output_at = Some(occurred_at.to_owned());
+        entry.first_output_stream = Some(stream.to_owned());
+        entry.first_output_bytes = Some(bytes);
+        let result = entry.clone();
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(Some(result))
+    }
+
+    pub fn mark_audit_degraded(&self, id: &str) -> Result<(), String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(old) = entries.get(id) else {
+            return Ok(());
+        };
+        if old.audit_degraded {
+            return Ok(());
+        }
+        let mut updated = entries.clone();
+        updated.get_mut(id).expect("entry cloned").audit_degraded = true;
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(())
     }
 
     /// Mark formerly live agents honestly after a relay restart.  The caller
@@ -384,6 +444,10 @@ fn agent_json(entry: &AgentRecord) -> Json {
         ("id".to_owned(), Json::String(entry.id.clone())),
         ("task_id".to_owned(), Json::String(entry.task_id.clone())),
         (
+            "execution_id".to_owned(),
+            Json::String(entry.execution_id.clone()),
+        ),
+        (
             "leader_pid".to_owned(),
             Json::Number(entry.leader_pid.to_string()),
         ),
@@ -413,6 +477,10 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .unwrap_or(Json::Null),
         ),
         ("log_degraded".to_owned(), Json::Bool(entry.log_degraded)),
+        (
+            "audit_degraded".to_owned(),
+            Json::Bool(entry.audit_degraded),
+        ),
         ("redacted".to_owned(), Json::Bool(entry.redacted)),
         ("stdout_next".to_owned(), Json::number(entry.stdout_next)),
         ("stderr_next".to_owned(), Json::number(entry.stderr_next)),
@@ -428,6 +496,29 @@ fn agent_json(entry: &AgentRecord) -> Json {
         (
             "log_dropped_before".to_owned(),
             Json::number(entry.log_dropped_before),
+        ),
+        (
+            "first_output_at".to_owned(),
+            entry
+                .first_output_at
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "first_output_stream".to_owned(),
+            entry
+                .first_output_stream
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "first_output_bytes".to_owned(),
+            entry
+                .first_output_bytes
+                .map(Json::number)
+                .unwrap_or(Json::Null),
         ),
     ])
 }
@@ -456,6 +547,12 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
         let record = AgentRecord {
             id: text("id")?,
             task_id: text("task_id")?,
+            // Registry files written before audit trails had no execution
+            // identifier.  The agent handle is a safe one-to-one fallback.
+            execution_id: get("execution_id")
+                .and_then(Json::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| text("id").unwrap_or_default()),
             leader_pid: integer("leader_pid")? as i32,
             process_group: integer("process_group")? as i32,
             started_at: text("started_at")?,
@@ -468,6 +565,9 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
             state: text("state")?,
             exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
             log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
+            audit_degraded: get("audit_degraded")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
             redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
             stdout_next: integer("stdout_next")?,
             stderr_next: integer("stderr_next")?,
@@ -475,6 +575,24 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
             stderr_dropped_before: integer("stderr_dropped_before")?,
             log_next: integer("log_next")?,
             log_dropped_before: integer("log_dropped_before")?,
+            first_output_at: match get("first_output_at") {
+                Some(Json::String(value)) => Some(value.clone()),
+                Some(Json::Null) | None => None,
+                _ => return Err("invalid agent registry".to_owned()),
+            },
+            first_output_stream: match get("first_output_stream") {
+                Some(Json::String(value)) => Some(value.clone()),
+                Some(Json::Null) | None => None,
+                _ => return Err("invalid agent registry".to_owned()),
+            },
+            first_output_bytes: match get("first_output_bytes") {
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| "invalid agent registry".to_owned())?,
+                ),
+                None => None,
+            },
         };
         entries.insert(record.id.clone(), record);
     }
@@ -908,8 +1026,175 @@ pub struct ReadResult {
 pub struct Store {
     path: PathBuf,
     limit: usize,
+    audit: AuditStore,
     inner: Mutex<Inner>,
     changed: Condvar,
+}
+
+/// Append-only execution archives.  They deliberately do not share the
+/// delivery queue's retention policy: queue eviction is normal live-polling
+/// behaviour, whereas these files answer historical timing questions.
+const AUDIT_CAP_BYTES: u64 = 20 * 1024 * 1024;
+
+struct AuditStore {
+    directory: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl AuditStore {
+    fn open(state_path: &Path) -> Result<Self, String> {
+        let directory = state_path.with_extension("audit");
+        fs::create_dir_all(&directory)
+            .map_err(|_| "could not initialize execution audit store".to_owned())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self {
+            directory,
+            lock: Mutex::new(()),
+        })
+    }
+
+    fn append(&self, event: &Event) -> Result<(), String> {
+        let Some(execution_id) = event
+            .payload
+            .object("execution_id")
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "execution audit lock poisoned".to_owned())?;
+        let path = self
+            .directory
+            .join(format!("{}.jsonl", audit_filename(execution_id)));
+        if fs::read_to_string(&path).ok().is_some_and(|contents| {
+            contents
+                .lines()
+                .filter_map(|line| parse_json(line).ok())
+                .any(|existing| {
+                    existing.object("id").and_then(Json::as_str) == Some(event.id.as_str())
+                })
+        }) {
+            return Ok(());
+        }
+        let line = event.response_json().to_json() + "\n";
+        let result = (|| -> std::io::Result<()> {
+            if !path.exists() {
+                let _ = create_private(&path)?;
+            }
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(line.as_bytes())?;
+            file.sync_data()?;
+            Ok(())
+        })();
+        result.map_err(|_| "could_not_persist_execution_audit".to_owned())?;
+        self.prune()?;
+        Ok(())
+    }
+
+    fn events_for_task(&self, task_id: &str) -> Result<Vec<Json>, String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "execution audit lock poisoned".to_owned())?;
+        let mut events = Vec::new();
+        for entry in fs::read_dir(&self.directory)
+            .map_err(|_| "could not read execution audit store".to_owned())?
+        {
+            let entry = entry.map_err(|_| "could not read execution audit store".to_owned())?;
+            if !entry
+                .file_type()
+                .map_err(|_| "could not read execution audit store".to_owned())?
+                .is_file()
+            {
+                continue;
+            }
+            let contents = fs::read_to_string(entry.path())
+                .map_err(|_| "could not read execution audit log".to_owned())?;
+            events.extend(
+                contents
+                    .lines()
+                    .filter_map(|line| parse_json(line).ok())
+                    .filter(|event| {
+                        event.object("task_id").and_then(Json::as_str) == Some(task_id)
+                    }),
+            );
+        }
+        events.sort_by(|left, right| {
+            left.object("received_at")
+                .and_then(Json::as_str)
+                .cmp(&right.object("received_at").and_then(Json::as_str))
+                .then_with(|| {
+                    left.object("sequence")
+                        .and_then(Json::as_u64)
+                        .cmp(&right.object("sequence").and_then(Json::as_u64))
+                })
+        });
+        Ok(events)
+    }
+
+    fn prune(&self) -> Result<(), String> {
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for entry in fs::read_dir(&self.directory)
+            .map_err(|_| "could not read execution audit store".to_owned())?
+        {
+            let entry = entry.map_err(|_| "could not read execution audit store".to_owned())?;
+            let metadata = entry
+                .metadata()
+                .map_err(|_| "could not read execution audit store".to_owned())?;
+            if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+                let oldest = fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|contents| {
+                        contents
+                            .lines()
+                            .next()
+                            .and_then(|line| parse_json(line).ok())
+                    })
+                    .and_then(|event| {
+                        event
+                            .object("received_at")
+                            .and_then(Json::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| {
+                        metadata
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                            .map(|time| format!("{:020}", time.as_secs()))
+                            .unwrap_or_default()
+                    });
+                files.push((oldest, entry.path(), metadata.len()));
+            }
+        }
+        files.sort_by_key(|(oldest, path, _)| (oldest.clone(), path.clone()));
+        for (_, path, length) in files {
+            if total <= AUDIT_CAP_BYTES {
+                break;
+            }
+            fs::remove_file(path)
+                .map_err(|_| "could not prune execution audit store".to_owned())?;
+            total = total.saturating_sub(length);
+        }
+        Ok(())
+    }
+}
+
+fn audit_filename(execution_id: &str) -> String {
+    execution_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 static TEMPORARY_FILE_SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Inner {
@@ -939,6 +1224,7 @@ impl Store {
             }
         };
         Ok(Self {
+            audit: AuditStore::open(&path)?,
             path,
             limit,
             inner: Mutex::new(inner),
@@ -948,6 +1234,7 @@ impl Store {
 
     pub fn add(&self, payload: Json) -> Result<(Event, bool), String> {
         let id = event_id(&payload)?;
+        validate_audit_envelope(&payload)?;
         let mut inner = self
             .inner
             .lock()
@@ -965,9 +1252,12 @@ impl Store {
         let event = Event {
             sequence: updated.next_sequence,
             id,
-            received_at: timestamp(),
+            received_at: rfc3339_timestamp(),
             payload,
         };
+        // Archive the exact envelope (including relay sequence/receipt time)
+        // before making it observable through the bounded delivery queue.
+        self.audit.append(&event)?;
         updated.next_sequence += 1;
         updated.events.push_back(event.clone());
         if updated.events.len() > self.limit {
@@ -977,6 +1267,11 @@ impl Store {
         *inner = updated;
         self.changed.notify_all();
         Ok((event, false))
+    }
+
+    /// Reads the durable archive; this intentionally ignores the live queue.
+    pub fn timeline(&self, task_id: &str) -> Result<Vec<Json>, String> {
+        self.audit.events_for_task(task_id)
     }
 
     pub fn read(
@@ -1075,12 +1370,140 @@ fn event_id(payload: &Json) -> Result<String, String> {
         .map(ToOwned::to_owned)
         .ok_or_else(|| "body_must_be_an_object_with_nonempty_id".to_owned())
 }
-fn timestamp() -> String {
-    SystemTime::now()
+fn validate_audit_envelope(payload: &Json) -> Result<(), String> {
+    let has_execution = payload.object("execution_id").is_some();
+    let has_schema = payload.object("schema_version").is_some();
+    if !has_execution && !has_schema {
+        // Legacy live-queue messages remain wire compatible.  They have no
+        // execution archive because there is no safe execution partition key.
+        return Ok(());
+    }
+    let text = |field: &str| {
+        payload
+            .object(field)
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("invalid_audit_event_{field}"))
+    };
+    if payload.object("schema_version").and_then(Json::as_u64) != Some(1) {
+        return Err("invalid_audit_event_schema_version".to_owned());
+    }
+    text("task_id")?;
+    text("execution_id")?;
+    text("kind")?;
+    let source = text("source")?;
+    if !matches!(source, "vm-department" | "mac-relay" | "vm-poller") {
+        return Err("invalid_audit_event_source".to_owned());
+    }
+    let occurred_at = text("occurred_at")?;
+    if parse_rfc3339_millis(occurred_at).is_none() {
+        return Err("invalid_audit_event_occurred_at".to_owned());
+    }
+    text("clock")?;
+    if !matches!(payload.object("payload"), Some(Json::Object(_))) {
+        return Err("invalid_audit_event_payload".to_owned());
+    }
+    Ok(())
+}
+
+/// Parses a strict RFC 3339 UTC millisecond timestamp into Unix milliseconds.
+/// This is shared by schema validation and the timeline so they cannot drift.
+pub fn parse_rfc3339_millis(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if !(bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(*index, 4 | 7 | 10 | 13 | 16 | 19 | 23))
+            .all(|(_, byte)| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let number = |start, end| {
+        std::str::from_utf8(&bytes[start..end])
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    };
+    let year = number(0, 4)? as i64;
+    let month = number(5, 7)? as i64;
+    let day = number(8, 10)? as i64;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    let millis = number(20, 23)?;
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let adjusted_month = month + if month <= 2 { 9 } else { -3 };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let yoe = adjusted_year - era * 400;
+    let doy = (153 * adjusted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400_000)?
+        .checked_add((hour * 3_600 + minute * 60 + second) * 1_000)?
+        .checked_add(millis)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// RFC 3339 UTC with millisecond precision, without a time-formatting crate.
+pub fn rfc3339_timestamp() -> String {
+    let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+        .unwrap_or_default();
+    let (year, month, day) = civil_date(elapsed.as_secs() / 86_400);
+    let second_of_day = elapsed.as_secs() % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        second_of_day / 3_600,
+        (second_of_day % 3_600) / 60,
+        second_of_day % 60,
+        elapsed.subsec_millis()
+    )
+}
+
+// Howard Hinnant's civil-from-days algorithm, with 1970-01-01 as day zero.
+fn civil_date(days_since_epoch: u64) -> (i64, u32, u32) {
+    let z = days_since_epoch as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u32, day as u32)
 }
 fn new_epoch() -> String {
     let now = SystemTime::now()
@@ -1207,10 +1630,34 @@ mod tests {
         Json::Object(vec![("id".to_owned(), Json::String(id.to_owned()))])
     }
 
+    fn audit_event(id: &str, kind: &str) -> Json {
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id.to_owned())),
+            ("schema_version".to_owned(), Json::number(1)),
+            ("task_id".to_owned(), Json::String("task-1".to_owned())),
+            (
+                "execution_id".to_owned(),
+                Json::String("execution-1".to_owned()),
+            ),
+            ("kind".to_owned(), Json::String(kind.to_owned())),
+            (
+                "source".to_owned(),
+                Json::String("vm-department".to_owned()),
+            ),
+            (
+                "occurred_at".to_owned(),
+                Json::String("2026-09-23T12:34:56.789Z".to_owned()),
+            ),
+            ("clock".to_owned(), Json::String("vm:boot-1".to_owned())),
+            ("payload".to_owned(), Json::Object(vec![])),
+        ])
+    }
+
     fn agent(id: &str) -> AgentRecord {
         AgentRecord {
             id: id.to_owned(),
             task_id: "task-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
             leader_pid: 42,
             process_group: 42,
             started_at: "1".to_owned(),
@@ -1219,6 +1666,7 @@ mod tests {
             state: "running".to_owned(),
             exit_code: None,
             log_degraded: false,
+            audit_degraded: false,
             redacted: false,
             stdout_next: 0,
             stderr_next: 0,
@@ -1226,6 +1674,9 @@ mod tests {
             stderr_dropped_before: 0,
             log_next: 0,
             log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
         }
     }
 
@@ -1285,6 +1736,133 @@ mod tests {
         assert!(duplicate);
         assert_eq!(first, second);
         assert_eq!(store.read(0, "", Duration::ZERO).unwrap().events.len(), 1);
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn execution_audit_survives_live_queue_eviction() {
+        let file = path("execution-audit");
+        let store = Store::open(&file, 1).unwrap();
+        store.add(audit_event("one", "task_dispatched")).unwrap();
+        store.add(audit_event("two", "poll_started")).unwrap();
+        assert_eq!(store.read(0, "", Duration::ZERO).unwrap().events.len(), 1);
+        let timeline = store.timeline("task-1").unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(
+            timeline[0].object("kind"),
+            Some(&Json::String("task_dispatched".to_owned()))
+        );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn execution_audit_reopens_and_keeps_execution_files_separate() {
+        let file = path("execution-reopen");
+        let store = Store::open(&file, 10).unwrap();
+        store.add(audit_event("one", "task_dispatched")).unwrap();
+        let mut second = audit_event("two", "poll_started");
+        if let Json::Object(fields) = &mut second {
+            for (name, value) in fields {
+                if name == "execution_id" {
+                    *value = Json::String("execution-2".to_owned());
+                }
+            }
+        }
+        store.add(second).unwrap();
+        drop(store);
+        let reopened = Store::open(&file, 10).unwrap();
+        assert_eq!(reopened.timeline("task-1").unwrap().len(), 2);
+        assert_eq!(
+            fs::read_dir(file.with_extension("audit")).unwrap().count(),
+            2
+        );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn audit_validation_rejects_invalid_calendar_and_schema_fields() {
+        for (field, value) in [
+            ("source", Json::String("other".to_owned())),
+            ("schema_version", Json::number(2)),
+            (
+                "occurred_at",
+                Json::String("2026-99-99T99:99:99.999Z".to_owned()),
+            ),
+            ("payload", Json::Array(vec![])),
+        ] {
+            let mut value_to_test = audit_event("bad", "task_dispatched");
+            if let Json::Object(fields) = &mut value_to_test {
+                for (name, existing) in fields {
+                    if name == field {
+                        *existing = value.clone();
+                    }
+                }
+            }
+            assert!(validate_audit_envelope(&value_to_test).is_err(), "{field}");
+        }
+        assert!(parse_rfc3339_millis("2024-02-29T23:59:59.999Z").is_some());
+        assert!(parse_rfc3339_millis("2023-02-29T23:59:59.999Z").is_none());
+        let generated = rfc3339_timestamp();
+        assert!(parse_rfc3339_millis(&generated).is_some());
+    }
+
+    #[test]
+    fn failed_live_state_save_does_not_duplicate_audit_on_retry() {
+        let file = path("audit-retry");
+        let store = Store::open(&file, 10).unwrap();
+        fs::create_dir(&file).unwrap();
+        let payload = audit_event("retry", "task_dispatched");
+        assert!(store.add(payload.clone()).is_err());
+        fs::remove_dir(&file).unwrap();
+        assert!(store.add(payload).is_ok());
+        assert_eq!(store.timeline("task-1").unwrap().len(), 1);
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn audit_retention_prunes_the_oldest_execution_first() {
+        let file = path("audit-cap");
+        let store = Store::open(&file, 1).unwrap();
+        let mut first = audit_event("first", "task_dispatched");
+        let mut second = audit_event("second", "task_dispatched");
+        let blob = Json::String("x".repeat((AUDIT_CAP_BYTES / 2 + 1024) as usize));
+        for (event, execution_id) in [(&mut first, "old"), (&mut second, "new")] {
+            if let Json::Object(fields) = event {
+                for (name, value) in fields {
+                    if name == "execution_id" {
+                        *value = Json::String(execution_id.to_owned());
+                    }
+                    if name == "payload" {
+                        *value = Json::Object(vec![("blob".to_owned(), blob.clone())]);
+                    }
+                }
+            }
+        }
+        store.add(first).unwrap();
+        store.add(second).unwrap();
+        let retained = store.timeline("task-1").unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].object("execution_id").and_then(Json::as_str),
+            Some("new")
+        );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+    }
+
+    #[test]
+    fn malformed_audit_envelope_is_rejected_without_affecting_legacy_events() {
+        let file = path("audit-validation");
+        let store = Store::open(&file, 10).unwrap();
+        let mut invalid = audit_event("bad", "task_dispatched");
+        if let Json::Object(fields) = &mut invalid {
+            fields.retain(|(name, _)| name != "clock");
+        }
+        assert!(store.add(invalid).is_err());
+        assert!(store.add(event("legacy")).is_ok());
         let _ = fs::remove_file(file);
     }
 

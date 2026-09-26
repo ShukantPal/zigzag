@@ -36,6 +36,13 @@ zigzag --secret-file ~/.codex/zigzag/zigzag.token \
   --state-file ~/.codex/zigzag/events.json [--port 8765]
 ```
 
+Read a durable task timeline locally with the same state file (no relay token
+or running HTTP listener is needed):
+
+```sh
+zigzag timeline TASK_ID --state-file ~/.codex/zigzag/events.json
+```
+
 `--secret-file` can instead be supplied by `ZIGZAG_SECRET_FILE`. The file must
 not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
