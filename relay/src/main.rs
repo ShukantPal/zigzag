@@ -1,4 +1,5 @@
 mod auth;
+mod comment_router;
 mod config;
 mod events;
 mod exec;
@@ -173,6 +174,13 @@ fn run() -> Result<(), String> {
             config.github_watch_repos.len(),
             config.github_watch_interval
         );
+    }
+    if config.comment_router.enabled() {
+        let state = Arc::clone(&state);
+        let router = config.comment_router.clone();
+        let shadow = router.is_shadow();
+        thread::spawn(move || comment_router::watch_loop(state, router));
+        log::info!("started GitHub PR comment router (shadow={shadow})");
     }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [

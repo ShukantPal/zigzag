@@ -15,6 +15,8 @@
     <string>leveled-inc/leveled</string>
     <string>--watch-interval</string>
     <string>30</string>
+    <string>--watch-pr-state</string>
+    <string>/Users/REPLACE/.codex/zigzag/pr_sessions.json</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
