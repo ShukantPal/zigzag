@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod comment_router;
 mod exec;
 
 const MAX_BODY: usize = 64 * 1024;
@@ -34,12 +35,17 @@ struct Config {
     max_events: usize,
     github_watch_repos: Vec<String>,
     github_watch_interval: Duration,
+    comment_router: comment_router::Config,
 }
 struct Server {
     secret: String,
     control_secret: Option<String>,
     store: Arc<Store>,
     supervisor: Supervisor,
+    /// Coordinates all operations which resume a Codex session. Future
+    /// session-touching watchers (review rounds and merge handling) share this
+    /// gate rather than racing a comment resume.
+    session_gate: Arc<comment_router::SessionGate>,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -142,6 +148,7 @@ fn run() -> Result<(), String> {
             registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
             procs: Mutex::new(HashMap::new()),
         },
+        session_gate: Arc::new(comment_router::SessionGate::default()),
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
         replay_recovered_lifecycle(&state.store, &agent)?;
@@ -152,6 +159,11 @@ fn run() -> Result<(), String> {
         let repos = config.github_watch_repos.clone();
         let interval = config.github_watch_interval;
         thread::spawn(move || github_watch_loop(state, repos, interval));
+    }
+    if config.comment_router.enabled() {
+        let state = Arc::clone(&state);
+        let router = config.comment_router.clone();
+        thread::spawn(move || comment_router::watch_loop(state, router));
     }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -290,6 +302,11 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut max_events = 1000;
     let mut github_watch_repos = Vec::new();
     let mut github_watch_interval = Duration::from_secs(30);
+    let mut watch_pr_state = None;
+    let mut watch_prs = Vec::new();
+    let mut comment_router_shadow = true;
+    let mut comment_router_quiet_interval = Duration::from_secs(300);
+    let mut comment_router_burst_window = Duration::from_secs(10 * 60);
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -330,7 +347,28 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
                 github_watch_interval = Duration::from_secs(seconds);
             }
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
+            "--watch-pr-state" => watch_pr_state = Some(PathBuf::from(value(&mut values, "--watch-pr-state")?)),
+            "--watch-pr" => watch_prs.push(value(&mut values, "--watch-pr")?),
+            "--comment-router-live" => comment_router_shadow = false,
+            "--comment-router-quiet-interval" => {
+                let seconds = value(&mut values, "--comment-router-quiet-interval")?
+                    .parse::<u64>()
+                    .map_err(|_| "--comment-router-quiet-interval must be an integer".to_owned())?;
+                if !(30..=3600).contains(&seconds) {
+                    return Err("--comment-router-quiet-interval must be between 30 and 3600 seconds".to_owned());
+                }
+                comment_router_quiet_interval = Duration::from_secs(seconds);
+            }
+            "--comment-router-burst-window" => {
+                let seconds = value(&mut values, "--comment-router-burst-window")?
+                    .parse::<u64>()
+                    .map_err(|_| "--comment-router-burst-window must be an integer".to_owned())?;
+                if !(30..=3600).contains(&seconds) {
+                    return Err("--comment-router-burst-window must be between 30 and 3600 seconds".to_owned());
+                }
+                comment_router_burst_window = Duration::from_secs(seconds);
+            }
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--watch-pr-state PATH] [--watch-pr OWNER/REPO#NUMBER:SESSION] [--comment-router-live]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -342,6 +380,13 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         return Err("--max-events must be greater than zero".to_owned());
     }
     let agent_registry_file = state_file.with_extension("agents.json");
+    let comment_router = comment_router::Config::new(
+        watch_pr_state.unwrap_or_else(|| state_file.with_extension("pr_sessions.json")),
+        watch_prs,
+        comment_router_shadow,
+        comment_router_quiet_interval,
+        comment_router_burst_window,
+    )?;
     Ok(Config {
         secret_file,
         control_secret_file,
@@ -352,6 +397,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         max_events,
         github_watch_repos,
         github_watch_interval,
+        comment_router,
     })
 }
 
@@ -2295,6 +2341,7 @@ mod tests {
                     registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                     procs: Mutex::new(HashMap::new()),
                 },
+                session_gate: Arc::new(comment_router::SessionGate::default()),
             }),
             path,
         )
