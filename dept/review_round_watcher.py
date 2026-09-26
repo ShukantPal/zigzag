@@ -33,6 +33,7 @@ Rules honored:
 """
 import json
 import fcntl
+from contextlib import contextmanager
 import os
 import re
 import subprocess
@@ -49,6 +50,10 @@ DEPT = os.path.join(ROOT, "dept.py")
 LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
 REMOTE_DEPT = CONNECTION.get("remote_dept", "~/.codex/dept")
 LOCK_FILE = os.path.join(ROUNDS_DIR, "watcher.lock")
+# Shared with dispatchers: serializes the gap between checking a project and
+# launching the next owning-session worker.
+WATCHER_LOCK = os.path.join(state_dir(CONFIG), "worker-dispatch.lock")
+SESSIONS_FILE = os.path.join(state_dir(CONFIG), "pr_sessions.json")
 
 DRY_RUN = "--dry-run" in sys.argv
 # ~2h of missed polls at 10-min cadence before flagging a dead reviewer task.
@@ -73,6 +78,44 @@ def load_round(path):
 def save_round(path, rnd):
     with open(path, "w") as f:
         json.dump(rnd, f, indent=2)
+
+
+def set_active_task(pr, task_id):
+    try:
+        with open(SESSIONS_FILE) as f:
+            sessions = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        sessions = {}
+    sessions.setdefault(str(pr), {})["active_task"] = task_id
+    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(sessions, f, indent=2)
+
+
+@contextmanager
+def worker_dispatch_lock():
+    """Serialize project-idle checks and owning-worker launches across watchers."""
+    os.makedirs(os.path.dirname(WATCHER_LOCK), exist_ok=True)
+    with open(WATCHER_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+
+
+def task_survived(task_id, delay=30):
+    """Confirm a dispatched relay task did not die before it reached Codex."""
+    time.sleep(delay)
+    p = subprocess.run([sys.executable, DEPT, "status", task_id],
+                       capture_output=True, text=True, timeout=90)
+    text = p.stdout + p.stderr
+    # A short successful task may already be DONE by the first poll.  The
+    # manager includes ``exit N`` for a non-zero relay exit, so only that form
+    # is an early-launch failure.
+    return p.returncode == 0 and ("RUNNING" in text or
+                                 ("DONE" in text and "exit " not in text))
 
 
 def project_dir_busy(project_dir):
@@ -204,6 +247,15 @@ def build_prompt(rnd, findings):
 
 
 def process_round(path):
+    with worker_dispatch_lock() as acquired:
+        if not acquired:
+            return f"{os.path.basename(path)}: another watcher is dispatching"
+        return _process_round_locked(path)
+
+
+def _process_round_locked(path):
+    # Reload only after acquiring the shared lock: another watcher may have
+    # completed this round while this process was waiting to run.
     rnd = load_round(path)
     if rnd.get("status") != "collecting":
         return f"#{rnd['pr']}: status={rnd.get('status')}, skipping"
@@ -271,6 +323,16 @@ def process_round(path):
     rnd["dispatched_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     rnd["dispatched_task"] = task_id
     rnd["prompt_file"] = ppath
+    set_active_task(rnd["pr"], task_id)
+    if not task_survived(task_id):
+        misses = rnd.setdefault("dispatch_misses", 0) + 1
+        rnd["dispatch_misses"] = misses
+        rnd.pop("dispatched_task", None)
+        rnd["status"] = "attention" if misses >= 3 else "collecting"
+        if misses >= 3:
+            rnd["attention_reason"] = "dispatch task died before reaching Codex three times"
+        save_round(path, rnd)
+        return f"#{rnd['pr']}: dispatch died immediately ({misses}/3)"
     save_round(path, rnd)
     return f"#{rnd['pr']}: resumed owning session as {task_id}{log_extra}"
 

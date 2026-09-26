@@ -53,6 +53,13 @@ class ApprovalGateChecksTest(unittest.TestCase):
             result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
         self.assertTrue(result["pass"])
 
+    def test_literal_newlines_in_verdict_are_accepted(self):
+        body = (f"🤖 Codex (AI assistant) — [tests] review verdict\\n"
+                f"VERDICT: APPROVE\\nHEAD: {HEAD}")
+        verdicts = gate.latest_verdicts([{"body": body, "createdAt": "now", "id": 1,
+                                          "author": "reviewer"}])
+        self.assertEqual(verdicts["tests"][:2], ("APPROVE", HEAD))
+
 
 if __name__ == "__main__":
     unittest.main()

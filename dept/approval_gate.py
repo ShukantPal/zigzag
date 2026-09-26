@@ -74,6 +74,9 @@ def latest_verdicts(comments):
     verdicts = {}
     for c in comments:
         body = c.get("body") or ""
+        # GitHub comments normally retain newlines, but a reviewer once posted
+        # literal `\\n` separators. Parse that harmless formatting mistake too.
+        body = re.sub(r"\\+n", "\n", body)
         if MARKER not in body:
             continue
         lens_m = LENS_RE.search(body)
