@@ -78,5 +78,12 @@ class ResumeCliTest(unittest.TestCase):
             "/explicit/project", resolved=False)
 
 
+class CommandDispatchTest(unittest.TestCase):
+    def test_command_handler_key_error_is_not_reported_as_unknown_command(self):
+        with patch.object(department, "cmd_start", side_effect=KeyError("connection")):
+            with self.assertRaisesRegex(KeyError, "connection"):
+                department.main(["start", "/project", "/prompt"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -491,10 +491,10 @@ def management_main(argv):
     commands = {"start": cmd_start, "status": cmd_status, "list": cmd_list,
      "result": cmd_result, "tokens": cmd_tokens, "check": cmd_check,
      "resume": cmd_resume, "kill": cmd_kill}
-    try:
-        return commands[cmd](rest)
-    except KeyError:
+    handler = commands.get(cmd)
+    if handler is None:
         sys.exit(f"unknown command: {cmd}")
+    return handler(rest)
 
 
 def main(argv=None):
