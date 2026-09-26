@@ -41,6 +41,11 @@ def duration_between(left: dict[str, Any], right: dict[str, Any]) -> dt.timedelt
     return end - start
 
 
+def is_cross_clock(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """A boundary is only a disagreement between two present clock ids."""
+    return bool(left.get("clock") and right.get("clock") and left.get("clock") != right.get("clock"))
+
+
 def observed_duration(events: list[dict[str, Any]]) -> tuple[dt.timedelta | None, bool]:
     """Sum adjacent same-clock intervals; report any unmeasurable boundary."""
     total = dt.timedelta()
@@ -49,7 +54,7 @@ def observed_duration(events: list[dict[str, Any]]) -> tuple[dt.timedelta | None
     for left, right in zip(events, events[1:]):
         duration = duration_between(left, right)
         if duration is None:
-            boundary = True
+            boundary |= is_cross_clock(left, right)
         else:
             total += duration
             measured = True
@@ -98,8 +103,10 @@ class Execution:
         return str(self.events[-1].get("kind", "not observed")) if self.events else "not observed"
 
     @property
-    def latest(self) -> str:
-        return self.phase
+    def latest_event(self) -> str:
+        if not self.events:
+            return "not observed"
+        return str(self.events[-1].get("occurred_at") or self.events[-1].get("received_at") or "not observed")
 
     def current_elapsed(self) -> dt.timedelta | None:
         if len(self.events) < 2:
@@ -159,12 +166,22 @@ def read_audit_events(state_file: Path) -> tuple[list[dict[str, Any]], list[str]
         return events, [f"audit directory unavailable: {error}"]
     for path in files:
         try:
-            for line in path.read_text().splitlines():
-                decoded = json.loads(line)
-                if isinstance(decoded, dict):
-                    events.append(decoded)
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            lines = path.read_text().splitlines()
+        except (OSError, UnicodeError) as error:
             warnings.append(f"degraded audit log {path.name}: {error}")
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                decoded = json.loads(line)
+            except json.JSONDecodeError as error:
+                warnings.append(f"degraded audit log {path.name}:{line_number}: {error.msg}")
+                continue
+            if isinstance(decoded, dict):
+                events.append(decoded)
+            else:
+                warnings.append(f"degraded audit log {path.name}:{line_number}: event is not an object")
     return events, warnings
 
 
@@ -178,12 +195,17 @@ def get_json(url: str, token: str) -> dict[str, Any]:
 
 
 def relay_snapshot(url: str, token_file: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, list[str]]:
-    token = token_file.read_text().strip()
-    root = url.rstrip("/")
     warnings: list[str] = []
     recent: list[dict[str, Any]] = []
     agents: list[dict[str, Any]] = []
     lost = False
+    try:
+        token = token_file.read_text().strip()
+    except OSError as error:
+        return recent, agents, lost, [f"relay credentials unavailable: {error}"]
+    if not token:
+        return recent, agents, lost, ["relay credentials unavailable: token is empty"]
+    root = url.rstrip("/")
     try:
         message = get_json(root + "/v1/events?after=0&timeout=0", token)
         recent = [event for event in message.get("events", []) if isinstance(event, dict)]
@@ -224,10 +246,12 @@ def detail_lines(execution: Execution, limit: int = 12) -> list[str]:
     lines = [f"{execution.task_id} / {execution.execution_id} — {flags(execution)}"]
     shown = execution.events[-limit:]
     for previous, event in zip([None, *shown], shown):
-        if previous is not None and duration_between(previous, event) is None:
+        if previous is not None and is_cross_clock(previous, event):
             lines.append(
                 f"  ↳ cross-clock: {previous.get('occurred_at', '?')} → {event.get('occurred_at', '?')} (not subtracted)"
             )
+        elif previous is not None and duration_between(previous, event) is None:
+            lines.append("  ↳ timing not observed: invalid, missing, or out-of-order same-clock timestamp")
         lines.append(
             f"  {event.get('occurred_at', '?')}  {event.get('kind', '?')}  [{event.get('source', '?')}]"
         )
@@ -265,7 +289,7 @@ class StatusScreen:
     def draw(self, screen: curses.window) -> None:
         screen.erase()
         height, width = screen.getmaxyx()
-        header = "dept status — read-only  ↑↓ select  r refresh  q quit"
+        header = "dept status — read-only  ↑↓ select  q quit"
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
         columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
         screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
@@ -273,7 +297,7 @@ class StatusScreen:
         for row, execution in enumerate(self.executions[:rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest[:24]}"
+            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest_event()[:24]}"
             screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
@@ -292,7 +316,7 @@ def print_once(executions: list[Execution], warnings: list[str]) -> None:
     for execution in executions:
         total, boundary = execution.total_elapsed()
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest, flags(execution))))
+        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event(), flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
@@ -308,8 +332,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.interval <= 0:
         parser.error("--interval must be positive")
     screen = StatusScreen(args.url, args.state_file.expanduser(), args.token_file.expanduser(), args.interval)
-    screen.refresh()
     if args.once:
+        screen.refresh()
         print_once(screen.executions, screen.warnings)
         return 0
     curses.wrapper(screen.run)

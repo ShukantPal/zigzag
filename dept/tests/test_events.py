@@ -28,9 +28,26 @@ class EventEmissionTests(unittest.TestCase):
             occurred_at="2026-01-01T00:00:00.000Z",
             clock="vm:boot",
         )
-        self.assertEqual(event["source"], "vm-department")
-        self.assertEqual(event["schema_version"], 1)
-        self.assertEqual(event["payload"], {})
+        self.assertEqual(
+            event,
+            {
+                "schema_version": 1,
+                "id": "execution:review_wait_started:1",
+                "task_id": "task",
+                "execution_id": "execution",
+                "kind": "review_wait_started",
+                "source": "vm-department",
+                "occurred_at": "2026-01-01T00:00:00.000Z",
+                "clock": "vm:boot",
+                "payload": {},
+            },
+        )
+
+    def test_transition_rejects_incomplete_or_unsupported_envelopes(self):
+        with self.assertRaises(ValueError):
+            transition_event(event_id="", task_id="task", execution_id="execution", kind="review_wait_started")
+        with self.assertRaises(ValueError):
+            transition_event(event_id="event", task_id="task", execution_id="execution", kind="not_a_transition")
 
     def test_retry_reuses_the_exact_id_and_body(self):
         event = transition_event(
