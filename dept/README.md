@@ -31,9 +31,11 @@ management layer that decides what to run.
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in
   the configured runtime state directory.
-- **`gdocs_comment_watcher.py`** — same idea for Google Docs comments:
-  acknowledges with a marked reply (the Drive API has no emoji reactions)
-  and resumes the doc's owning session.
+- **`gdocs_comment_watcher.py`** — Mac-side Drive watcher for Google Docs:
+  lists the shared folder plus the individually shared document, acknowledges
+  new feedback with a marked reply (the Drive API has no emoji reactions), and
+  resumes the document's owning session from a Drive-scoped service-account
+  token minted with the GUI-login keychain key.
 - **`review_round_watcher.py`** — when a seeded 3-lens review round finishes,
   resumes the owning worker session with the reviewers' findings batched.
 - **`jules_pr_reviewer.py`** — dispatches a Codex review task for each new
@@ -71,9 +73,14 @@ and SSH key, plus reachability to the configured Mac. The relay path also
 needs a readable Zigzag bearer token and a relay allowlist entry for the
 configured launcher (normally `codex-launch`); that launcher must be installed
 on the Mac GUI login session and understand `run <task-dir>` and
-`resume <task-dir>`. The Google Docs watcher additionally needs its configured
-Google Workspace CLI. PR/Doc lists, projects, session mappings, and the Jules
-batch mapping are deliberately deployment configuration, not source code.
+`resume <task-dir>`. The Google Docs watcher runs on the logged-in Mac and
+needs the provisioned `zigzag-sa` keychain item; it uses the `drive` OAuth
+scope directly, with no Google Workspace CLI dependency. Its `owners`
+configuration maps a discovered document to its owning project and Codex
+session; it is ownership metadata, not the watched-document list. Docs in the
+shared folder are discovered automatically. Drive watcher state lives in
+`~/.zigzag/dept/dept.db` by default and it exits silently during 22:00–07:00
+PT quiet hours (use `--force` only for an intentional manual poll).
 
 Before enabling automation, run the offline checks from the repository root:
 

@@ -16,8 +16,15 @@
     "prs": []
   },
   "gdocs_comment_watcher": {
-    "gws": "/absolute/path/to/google-workspace-cli",
-    "docs": {}
+    "state_root": "~/.zigzag/dept",
+    "folder_id": "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3",
+    "additional_file_ids": ["1PF8O_BoLwKetxmcuPmQRYXq4weQGXwd6vABSd62atV4"],
+    "owners": {
+      "google-doc-id": {
+        "project": "/absolute/path/to/owning/worktree",
+        "session": "owning-codex-session-id"
+      }
+    }
   },
   "jules_pr_reviewer": {
     "repo": "owner/repo",
