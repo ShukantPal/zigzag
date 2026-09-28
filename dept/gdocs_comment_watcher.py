@@ -27,13 +27,13 @@ from dept_config import ROOT, load_config
 SERVICE_ACCOUNT = "zigzag@shukant.iam.gserviceaccount.com"
 KEYCHAIN_SERVICE = "zigzag-sa"
 FOLDER_ID = "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3"
+# Used only when deployment configuration has not named an individual share.
 EXTRA_DOCUMENT_ID = "1PF8O_BoLwKetxmcuPmQRYXq4weQGXwd6vABSd62atV4"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 MARKER = "Muse (AI assistant)"
 EYES = "\U0001F440"
 ACK_TEXT = f"{EYES} {MARKER} — picked up, addressing it now."
-HIS_NAME = "Shukant Pal"
 
 CONFIG = load_config()
 WATCHER = CONFIG.get("gdocs_comment_watcher", {})
@@ -67,6 +67,18 @@ def read_service_account_key():
     if key.get("client_email") != SERVICE_ACCOUNT or not key.get("private_key"):
         raise DriveError("zigzag service-account keychain item has the wrong service account")
     return key
+
+
+def secure_directory(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def secure_file(path):
+    try:
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        pass
 
 
 def service_account_token(key, now=None):
@@ -113,6 +125,7 @@ def service_account_token(key, now=None):
 class DriveClient:
     def __init__(self, token):
         self.token = token
+        self.skipped_documents = []
 
     def request(self, method, path, *, params=None, body=None):
         url = "https://www.googleapis.com/drive/v3/" + path
@@ -147,8 +160,12 @@ class DriveClient:
             if not page_token:
                 break
         for doc_id in additional_ids:
-            item = self.request("GET", f"files/{urllib.parse.quote(doc_id, safe='')}", params={
-                "fields": "id,name,mimeType", "supportsAllDrives": "true"})
+            try:
+                item = self.request("GET", f"files/{urllib.parse.quote(doc_id, safe='')}", params={
+                    "fields": "id,name,mimeType", "supportsAllDrives": "true"})
+            except DriveError as error:
+                self.skipped_documents.append((doc_id, str(error)))
+                continue
             if item.get("mimeType") == GOOGLE_DOC_MIME:
                 docs[item["id"]] = item
         return list(docs.values())
@@ -157,9 +174,8 @@ class DriveClient:
         comments, page_token = [], None
         while True:
             page = self.request("GET", f"files/{urllib.parse.quote(doc_id, safe='')}/comments", params={
-                "fields": "nextPageToken,comments(id,content,quotedFileContent(value),author(displayName),createdTime,resolved,replies(id,content,author(displayName),createdTime))",
-                "pageSize": 100, "pageToken": page_token or "", "includeDeleted": "false",
-                "supportsAllDrives": "true"})
+                "fields": "nextPageToken,comments(id,content,quotedFileContent(value),author(displayName,emailAddress,permissionId),createdTime,resolved,replies(id,content,author(displayName,emailAddress,permissionId),createdTime))",
+                "pageSize": 100, "pageToken": page_token or "", "includeDeleted": "false"})
             comments.extend(page.get("comments", []))
             page_token = page.get("nextPageToken")
             if not page_token:
@@ -168,25 +184,28 @@ class DriveClient:
     def post_eyes_reply(self, doc_id, comment_id):
         reply = self.request("POST", f"files/{urllib.parse.quote(doc_id, safe='')}/comments/"
                              f"{urllib.parse.quote(comment_id, safe='')}/replies",
-                             params={"fields": "id", "supportsAllDrives": "true"},
+                             params={"fields": "id"},
                              body={"content": ACK_TEXT})
         if not reply.get("id"):
             raise DriveError("Drive created an acknowledgment reply without an id")
         return reply["id"]
 
 
-def connect_database(path=DATABASE):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def connect_database(path=None):
+    path = path or DATABASE
+    secure_directory(os.path.dirname(path))
     db = sqlite3.connect(path)
     db.execute("PRAGMA journal_mode=WAL")
+    secure_file(path)
+    secure_file(path + "-wal")
+    secure_file(path + "-shm")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS drive_comment_watermark (
             document_id TEXT NOT NULL, comment_id TEXT NOT NULL, seen_at TEXT NOT NULL,
             PRIMARY KEY (document_id, comment_id));
-        CREATE TABLE IF NOT EXISTS drive_comment_dispatch (
-            document_id TEXT NOT NULL, comment_id TEXT NOT NULL, session_id TEXT NOT NULL,
-            task_id TEXT NOT NULL, ack_reply_id TEXT NOT NULL, dispatched_at TEXT NOT NULL,
-            PRIMARY KEY (document_id, comment_id));
+        CREATE TABLE IF NOT EXISTS drive_comment_ack (
+            document_id TEXT NOT NULL, comment_id TEXT NOT NULL, ack_reply_id TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY (document_id, comment_id));
         CREATE TABLE IF NOT EXISTS drive_comment_session_task (
             session_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS drive_comment_watcher_meta (
@@ -223,15 +242,43 @@ def feedback_items(comments):
                    "_parent_id": comment["id"], "_thread": comment}
 
 
+def configured_values(name):
+    values = WATCHER.get(name, [])
+    return {str(value).casefold() for value in values if value}
+
+
+def trusted_author(item):
+    """Require a stable configured Drive identity, never a display name."""
+    author = item.get("author") or {}
+    return ((author.get("permissionId") or "").casefold() in configured_values("trusted_author_permission_ids")
+            or (author.get("emailAddress") or "").casefold() in configured_values("trusted_author_emails"))
+
+
+def bot_reply(reply):
+    """A marker is meaningful only when it came from the service-account bot."""
+    author = reply.get("author") or {}
+    return (MARKER in (reply.get("content") or "")
+            and ((author.get("emailAddress") or "").casefold() == SERVICE_ACCOUNT.casefold()
+                 or (author.get("permissionId") or "").casefold()
+                 in configured_values("bot_permission_ids")))
+
+
 def has_marker_reply(comment):
-    return any(MARKER in (reply.get("content") or "")
-               for reply in comment.get("replies", []) or [])
+    return any(bot_reply(reply) for reply in comment.get("replies", []) or [])
 
 
-def existing_ack(item):
-    thread = item.get("_thread", item)
-    return next((reply["id"] for reply in thread.get("replies", []) or []
-                 if reply.get("content") == ACK_TEXT and reply.get("id")), None)
+def stored_ack(db, doc_id, comment_id):
+    row = db.execute(
+        "SELECT ack_reply_id FROM drive_comment_ack WHERE document_id = ? AND comment_id = ?",
+        (doc_id, comment_id)).fetchone()
+    return row[0] if row else None
+
+
+def save_ack(db, doc_id, comment_id, ack_reply_id):
+    db.execute("INSERT OR IGNORE INTO drive_comment_ack VALUES (?, ?, ?, ?)",
+               (doc_id, comment_id, ack_reply_id,
+                datetime.datetime.now(datetime.timezone.utc).isoformat()))
+    db.commit()
 
 
 def owner_for(doc_id):
@@ -283,12 +330,14 @@ def write_prompt(doc, acked):
         anchor = ((item.get("quotedFileContent") or {}).get("value") or "")[:200].replace("\n", " ")
         lines.append(f"- comment {item['id']} (ack {reply_id}, {item.get('createdTime', 'unknown time')})\n"
                      f"  Anchor: {anchor}\n  Text: {item.get('content', '')}")
-    os.makedirs(PROMPT_DIR, exist_ok=True)
-    path = os.path.join(PROMPT_DIR, f"drive-feedback-{doc['id'][:8]}-{time.strftime('%Y%m%d-%H%M%S')}.md")
-    with open(path, "w") as handle:
+    secure_directory(PROMPT_DIR)
+    with tempfile.NamedTemporaryFile(
+            mode="w", prefix=f"drive-feedback-{doc['id'][:8]}-",
+            suffix=".md", dir=PROMPT_DIR, delete=False) as handle:
         handle.write(PROMPT_TEMPLATE.format(count=len(acked), title=doc.get("name", doc["id"]),
                                              doc_id=doc["id"], comments="\n".join(lines), marker=MARKER))
-    return path
+    secure_file(handle.name)
+    return handle.name
 
 
 def dispatch(owner, prompt):
@@ -298,11 +347,7 @@ def dispatch(owner, prompt):
         return None, (result.stdout + result.stderr).strip()
     task_id = next((line.split()[1] for line in result.stdout.splitlines()
                     if line.startswith("resumed ")), None)
-    if not task_id:
-        return None, (result.stdout + result.stderr).strip()
-    if not task_running(task_id):
-        return None, f"task {task_id} ended before its first status check"
-    return task_id, ""
+    return (task_id, "") if task_id else (None, (result.stdout + result.stderr).strip())
 
 
 def quiet_hours(now=None):
@@ -312,7 +357,10 @@ def quiet_hours(now=None):
 
 def watched_documents(client):
     folder_id = WATCHER.get("folder_id", FOLDER_ID)
-    additional = list(dict.fromkeys([*WATCHER.get("additional_file_ids", []), EXTRA_DOCUMENT_ID]))
+    additional = WATCHER.get("additional_file_ids")
+    if additional is None:
+        additional = [EXTRA_DOCUMENT_ID]
+    additional = list(dict.fromkeys(additional))
     return client.list_documents(folder_id, additional)
 
 
@@ -324,7 +372,7 @@ def main(argv=None):
     if quiet_hours() and not args.force:
         return 0
 
-    os.makedirs(STATE_ROOT, exist_ok=True)
+    secure_directory(STATE_ROOT)
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -337,7 +385,11 @@ def main(argv=None):
         docs = watched_documents(client)
     except DriveError as error:
         print(f"Drive watcher setup failed: {error}", file=sys.stderr)
+        db.close()
+        lock.close()
         return 1
+    for doc_id, error in client.skipped_documents:
+        print(f"{doc_id}: additional document skipped: {error}", file=sys.stderr)
 
     seed_only = args.seed or not database_initialized(db)
     dispatched = 0
@@ -352,9 +404,9 @@ def main(argv=None):
             if comment_seen(db, doc["id"], item["id"]):
                 continue
             thread = item.get("_thread", item)
-            if seed_only or thread.get("resolved") or (item.get("author") or {}).get("displayName") != HIS_NAME:
+            if seed_only or thread.get("resolved") or not trusted_author(item):
                 mark_seen(db, doc["id"], item["id"])
-            elif has_marker_reply(thread) and not existing_ack(item):
+            elif has_marker_reply(thread) and not stored_ack(db, doc["id"], item["id"]):
                 mark_seen(db, doc["id"], item["id"])
             else:
                 fresh.append(item)
@@ -371,20 +423,29 @@ def main(argv=None):
         acked = []
         for item in fresh:
             try:
-                acked.append((item, existing_ack(item) or client.post_eyes_reply(doc["id"], item["_parent_id"])))
+                reply_id = stored_ack(db, doc["id"], item["id"])
+                if not reply_id:
+                    reply_id = client.post_eyes_reply(doc["id"], item["_parent_id"])
+                    save_ack(db, doc["id"], item["id"], reply_id)
+                acked.append((item, reply_id))
             except DriveError as error:
                 print(f"{doc['id']}:{item['id']}: acknowledgment failed: {error}", file=sys.stderr)
         if not acked:
             continue
-        task_id, error = dispatch(owner, write_prompt(doc, acked))
+        prompt = write_prompt(doc, acked)
+        try:
+            task_id, error = dispatch(owner, prompt)
+        finally:
+            try:
+                os.unlink(prompt)
+            except FileNotFoundError:
+                pass
         if not task_id:
             print(f"{doc.get('name', doc['id'])}: dispatch failed; will retry: {error[:300]}", file=sys.stderr)
             continue
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for item, reply_id in acked:
             mark_seen(db, doc["id"], item["id"])
-            db.execute("INSERT OR REPLACE INTO drive_comment_dispatch VALUES (?, ?, ?, ?, ?, ?)",
-                       (doc["id"], item["id"], owner["session"], task_id, reply_id, now))
         db.execute("INSERT OR REPLACE INTO drive_comment_session_task VALUES (?, ?, ?)",
                    (owner["session"], task_id, now))
         db.commit()
@@ -396,6 +457,8 @@ def main(argv=None):
         print(f"seeded Drive comment watermark for {len(docs)} document(s)")
     elif not dispatched:
         print("NOTHING_NEW")
+    db.close()
+    lock.close()
     return 0
 
 

@@ -92,18 +92,23 @@ python3 -c "import pathlib; [compile(p.read_text(), str(p), 'exec') for p in pat
 Use `--help`/`--dry-run` where available, seed watcher watermarks before their
 first live poll, and verify one `dept.py status --once` call against the
 configured relay before dispatching real work. `dept.py status TASK_ID` keeps
-the manager's per-task lookup behavior.
+the manager's per-task lookup behavior. Configure the Drive watcher's stable
+`trusted_author_permission_ids` (preferred) or `trusted_author_emails`
+before enabling it; display names are never trusted task input.
 
-## Cron deployment
+## Scheduled deployment
 
-Run the PR, Google Docs, Jules, and review-round watchers on the configured
-VM/automation host, not on the target Mac: that host owns the state directory,
-SSH/GitHub credentials, and (for Docs) the Workspace CLI. Install cron entries
-with absolute paths and route both streams to durable logs, for example:
+Run the PR, Jules, and review-round watchers on the configured VM/automation
+host. The Google Docs watcher is different: install it as a per-user Mac
+LaunchAgent in the GUI login session, where the service-account keychain item
+is available. It owns its SQLite state at `~/.zigzag/dept/dept.db` and exits
+during quiet hours. Do not deploy it on the VM and do not configure a Workspace
+CLI for it.
+
+VM cron entries use absolute paths and durable logs, for example:
 
 ```
 */5 * * * * cd /absolute/path/to/zigzag && /usr/bin/python3 dept/pr_comment_watcher.py >>/var/log/codex-dept/pr-watcher.log 2>&1
-*/5 * * * * cd /absolute/path/to/zigzag && /usr/bin/python3 dept/gdocs_comment_watcher.py >>/var/log/codex-dept/gdocs-watcher.log 2>&1
 */10 * * * * cd /absolute/path/to/zigzag && /usr/bin/python3 dept/jules_pr_reviewer.py >>/var/log/codex-dept/jules-watcher.log 2>&1
 */10 * * * * cd /absolute/path/to/zigzag && /usr/bin/python3 dept/review_round_watcher.py >>/var/log/codex-dept/review-rounds.log 2>&1
 ```

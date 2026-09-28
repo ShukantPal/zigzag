@@ -1,8 +1,14 @@
 import importlib
+import io
+import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.parse
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -11,36 +17,161 @@ sys.path.insert(0, str(DEPT_DIR))
 watcher = importlib.import_module("gdocs_comment_watcher")
 
 
+class FakeResponse(io.StringIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class FakeDrive:
+    def __init__(self, comments):
+        self.comments = comments
+        self.acks = []
+        self.skipped_documents = []
+
+    def list_documents(self, folder_id, additional):
+        return [{"id": "doc", "name": "Watched doc"}]
+
+    def list_comments(self, doc_id):
+        return self.comments
+
+    def post_eyes_reply(self, doc_id, comment_id):
+        self.acks.append((doc_id, comment_id))
+        return f"ack-{len(self.acks)}"
+
+
+def human_comment(comment_id, text="feedback"):
+    return {
+        "id": comment_id,
+        "content": text,
+        "author": {"permissionId": "shukant-id", "displayName": "Not Trusted By Name"},
+        "createdTime": "2026-09-28T12:00:00Z",
+        "replies": [],
+    }
+
+
 class GdocsFeedbackTest(unittest.TestCase):
     def test_reply_feedback_is_flattened_with_its_thread_parent(self):
         thread = {
-            "id": "parent", "content": "original", "author": {"displayName": "Someone"},
+            "id": "parent", "content": "original", "author": {"permissionId": "other"},
             "replies": [{"id": "reply", "content": "follow up",
-                         "author": {"displayName": "Shukant Pal"}}],
+                         "author": {"permissionId": "shukant-id"}}],
         }
         items = list(watcher.feedback_items([thread]))
         self.assertEqual([item["id"] for item in items], ["parent", "reply"])
         self.assertEqual(items[1]["_parent_id"], "parent")
         self.assertIs(items[1]["_thread"], thread)
 
-    def test_existing_ack_is_reused_for_dispatch_retry(self):
-        thread = {"id": "parent", "replies": [
-            {"id": "ack", "content": watcher.ACK_TEXT},
-        ]}
-        self.assertEqual(watcher.existing_ack({"_thread": thread}), "ack")
+    def test_ack_is_persisted_for_the_exact_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = watcher.connect_database(str(pathlib.Path(tmp) / "dept.db"))
+            watcher.save_ack(db, "doc", "one", "ack-one")
+            self.assertEqual(watcher.stored_ack(db, "doc", "one"), "ack-one")
+            self.assertIsNone(watcher.stored_ack(db, "doc", "two"))
+            db.close()
 
-    def test_folder_discovery_filters_to_google_docs_and_includes_extra_share(self):
+    def test_marker_requires_authenticated_bot_author(self):
+        spoofed = {"content": watcher.ACK_TEXT, "author": {"permissionId": "human"}}
+        bot = {"content": watcher.ACK_TEXT, "author": {"emailAddress": watcher.SERVICE_ACCOUNT}}
+        self.assertFalse(watcher.bot_reply(spoofed))
+        self.assertTrue(watcher.bot_reply(bot))
+
+    def test_folder_discovery_paginates_and_skips_stale_extra_share(self):
         client = watcher.DriveClient("token")
         with patch.object(client, "request", side_effect=[
-            {"files": [
-                {"id": "doc", "name": "Folder doc", "mimeType": watcher.GOOGLE_DOC_MIME},
-                {"id": "pdf", "name": "Ignore", "mimeType": "application/pdf"},
+            {"nextPageToken": "next", "files": [
+                {"id": "doc1", "name": "One", "mimeType": watcher.GOOGLE_DOC_MIME},
             ]},
-            {"id": "extra", "name": "Individual doc", "mimeType": watcher.GOOGLE_DOC_MIME},
+            {"files": [
+                {"id": "pdf", "name": "Ignore", "mimeType": "application/pdf"},
+                {"id": "doc2", "name": "Two", "mimeType": watcher.GOOGLE_DOC_MIME},
+            ]},
+            watcher.DriveError("Drive GET files/stale failed (HTTP 404)"),
         ]) as request:
-            docs = client.list_documents("folder", ["extra"])
-        self.assertEqual([d["id"] for d in docs], ["doc", "extra"])
-        self.assertIn("'folder' in parents", request.call_args_list[0].kwargs["params"]["q"])
+            docs = client.list_documents("folder", ["stale"])
+        self.assertEqual([d["id"] for d in docs], ["doc1", "doc2"])
+        self.assertEqual(client.skipped_documents[0][0], "stale")
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["pageToken"], "next")
+
+    def test_comment_listing_paginates_without_shared_drive_parameter(self):
+        client = watcher.DriveClient("token")
+        with patch.object(client, "request", side_effect=[
+            {"nextPageToken": "next", "comments": [{"id": "one"}]},
+            {"comments": [{"id": "two"}]},
+        ]) as request:
+            comments = client.list_comments("doc")
+        self.assertEqual([c["id"] for c in comments], ["one", "two"])
+        self.assertNotIn("supportsAllDrives", request.call_args_list[0].kwargs["params"])
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["pageToken"], "next")
+
+    def test_reply_creation_uses_only_supported_parameters(self):
+        client = watcher.DriveClient("token")
+        with patch.object(client, "request", return_value={"id": "ack"}) as request:
+            self.assertEqual(client.post_eyes_reply("doc", "comment"), "ack")
+        self.assertEqual(request.call_args.kwargs["params"], {"fields": "id"})
+        self.assertEqual(request.call_args.kwargs["body"], {"content": watcher.ACK_TEXT})
+
+    def test_drive_http_error_is_redacted_to_status(self):
+        error = urllib.error.HTTPError("https://example.invalid", 403, "forbidden", {}, None)
+        with patch.object(watcher.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(watcher.DriveError, "HTTP 403"):
+                watcher.DriveClient("token").request("GET", "files")
+
+    def test_keychain_validation_rejects_malformed_or_wrong_identity(self):
+        bad = SimpleNamespace(returncode=0, stdout="not json")
+        with patch.object(watcher.subprocess, "run", return_value=bad):
+            with self.assertRaisesRegex(watcher.DriveError, "not JSON"):
+                watcher.read_service_account_key()
+        wrong = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "client_email": "other@example.com", "private_key": "key"}))
+        with patch.object(watcher.subprocess, "run", return_value=wrong):
+            with self.assertRaisesRegex(watcher.DriveError, "wrong service account"):
+                watcher.read_service_account_key()
+
+    def test_token_mint_uses_drive_scope_and_removes_temporary_key(self):
+        key = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "private"}
+        signed = SimpleNamespace(returncode=0, stdout=b"signature")
+        with patch.object(watcher.subprocess, "run", return_value=signed) as run, \
+             patch.object(watcher.urllib.request, "urlopen",
+                          return_value=FakeResponse('{"access_token": "token"}')) as urlopen:
+            token = watcher.service_account_token(key, now=10)
+            key_path = run.call_args.args[0][-1]
+        self.assertEqual(token, "token")
+        request = urlopen.call_args.args[0]
+        sent = request.data.decode()
+        self.assertIn("assertion=", sent)
+        self.assertNotIn("private", sent)
+        assertion = urllib.parse.parse_qs(sent)["assertion"][0]
+        claims = assertion.split(".")[1] + "=="
+        self.assertEqual(
+            json.loads(watcher.base64.urlsafe_b64decode(claims))["scope"],
+            watcher.DRIVE_SCOPE)
+        self.assertFalse(os.path.exists(key_path))
+
+    def test_token_mint_rejects_missing_token_and_cleans_key(self):
+        key = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "private"}
+        signed = SimpleNamespace(returncode=0, stdout=b"signature")
+        with patch.object(watcher.subprocess, "run", return_value=signed), \
+             patch.object(watcher.urllib.request, "urlopen",
+                          return_value=FakeResponse("{}")):
+            with self.assertRaisesRegex(watcher.DriveError, "no access token"):
+                watcher.service_account_token(key, now=10)
+
+    def test_token_mint_handles_signing_and_http_failures(self):
+        key = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "private"}
+        failed_sign = SimpleNamespace(returncode=1, stdout=b"")
+        with patch.object(watcher.subprocess, "run", return_value=failed_sign) as run:
+            with self.assertRaisesRegex(watcher.DriveError, "could not sign"):
+                watcher.service_account_token(key, now=10)
+        self.assertFalse(os.path.exists(run.call_args.args[0][-1]))
+        signed = SimpleNamespace(returncode=0, stdout=b"signature")
+        with patch.object(watcher.subprocess, "run", return_value=signed), \
+             patch.object(watcher.urllib.request, "urlopen",
+                          side_effect=urllib.error.URLError("offline")):
+            with self.assertRaisesRegex(watcher.DriveError, "could not mint"):
+                watcher.service_account_token(key, now=10)
 
     def test_watermark_is_namespaced_by_document(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,5 +189,101 @@ class GdocsFeedbackTest(unittest.TestCase):
         self.assertFalse(watcher.quiet_hours(watcher.datetime.datetime(2026, 9, 28, 14, 0, tzinfo=tz)))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class WatcherStateMachineTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.old = {
+            "WATCHER": watcher.WATCHER, "STATE_ROOT": watcher.STATE_ROOT,
+            "DATABASE": watcher.DATABASE, "PROMPT_DIR": watcher.PROMPT_DIR,
+            "LOCK_FILE": watcher.LOCK_FILE,
+        }
+        watcher.WATCHER = {
+            "owners": {"doc": {"project": "/project", "session": "session"}},
+            "trusted_author_permission_ids": ["shukant-id"],
+        }
+        watcher.STATE_ROOT = str(self.root)
+        watcher.DATABASE = str(self.root / "dept.db")
+        watcher.PROMPT_DIR = str(self.root / "prompts")
+        watcher.LOCK_FILE = str(self.root / "watcher.lock")
+
+    def tearDown(self):
+        for name, value in self.old.items():
+            setattr(watcher, name, value)
+        self.tmp.cleanup()
+
+    def run_main(self, drive, dispatch_result=("task-1", "")):
+        with patch.object(watcher, "read_service_account_key", return_value={}), \
+             patch.object(watcher, "service_account_token", return_value="token"), \
+             patch.object(watcher, "DriveClient", return_value=drive), \
+             patch.object(watcher, "dispatch", return_value=dispatch_result) as dispatch:
+            rc = watcher.main(["--force"])
+        return rc, dispatch
+
+    def test_first_run_seeds_without_acknowledging_or_dispatching(self):
+        drive = FakeDrive([human_comment("old")])
+        rc, dispatch = self.run_main(drive)
+        self.assertEqual(rc, 0)
+        self.assertEqual(drive.acks, [])
+        dispatch.assert_not_called()
+        db = watcher.connect_database()
+        self.assertTrue(watcher.comment_seen(db, "doc", "old"))
+        db.close()
+
+    def test_new_feedback_is_acked_then_dispatched_and_watermarked(self):
+        initial = FakeDrive([])
+        self.run_main(initial)
+        drive = FakeDrive([human_comment("new")])
+        rc, dispatch = self.run_main(drive)
+        self.assertEqual(rc, 0)
+        self.assertEqual(drive.acks, [("doc", "new")])
+        dispatch.assert_called_once()
+        prompt = dispatch.call_args.args[1]
+        self.assertFalse(os.path.exists(prompt))
+        db = watcher.connect_database()
+        self.assertTrue(watcher.comment_seen(db, "doc", "new"))
+        self.assertEqual(watcher.stored_ack(db, "doc", "new"), "ack-1")
+        db.close()
+
+    def test_failed_dispatch_reuses_persisted_ack_on_retry(self):
+        self.run_main(FakeDrive([]))
+        failed = FakeDrive([human_comment("new")])
+        self.run_main(failed, dispatch_result=(None, "launch failed"))
+        self.assertEqual(failed.acks, [("doc", "new")])
+        retry = FakeDrive([human_comment("new")])
+        self.run_main(retry)
+        self.assertEqual(retry.acks, [])
+        db = watcher.connect_database()
+        self.assertTrue(watcher.comment_seen(db, "doc", "new"))
+        db.close()
+
+    def test_busy_session_leaves_feedback_unwatermarked(self):
+        self.run_main(FakeDrive([]))
+        drive = FakeDrive([human_comment("new")])
+        with patch.object(watcher, "session_busy", return_value=True):
+            _, dispatch = self.run_main(drive)
+        self.assertEqual(drive.acks, [])
+        dispatch.assert_not_called()
+        db = watcher.connect_database()
+        self.assertFalse(watcher.comment_seen(db, "doc", "new"))
+        db.close()
+
+    def test_non_trusted_resolved_and_authenticated_marked_feedback_are_consumed(self):
+        self.run_main(FakeDrive([]))
+        untrusted = human_comment("untrusted")
+        untrusted["author"] = {"permissionId": "someone-else"}
+        resolved = human_comment("resolved")
+        resolved["resolved"] = True
+        marked = human_comment("marked")
+        marked["replies"] = [{
+            "id": "bot-reply", "content": watcher.ACK_TEXT,
+            "author": {"emailAddress": watcher.SERVICE_ACCOUNT},
+        }]
+        drive = FakeDrive([untrusted, resolved, marked])
+        _, dispatch = self.run_main(drive)
+        self.assertEqual(drive.acks, [])
+        dispatch.assert_not_called()
+        db = watcher.connect_database()
+        for comment_id in ("untrusted", "resolved", "marked"):
+            self.assertTrue(watcher.comment_seen(db, "doc", comment_id))
+        db.close()
