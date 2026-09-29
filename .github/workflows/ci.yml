@@ -6,6 +6,11 @@ on:
     branches: [main]
 
 jobs:
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 dept/config.py --check
   python:
     runs-on: ubuntu-latest
     steps:

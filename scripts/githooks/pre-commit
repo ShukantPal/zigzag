@@ -1,0 +1,24 @@
+#!/bin/sh
+# Convenience only: CI enforces that the materialized config is up to date.
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qx 'dept/config.py'; then
+    exit 0
+fi
+
+artifact="$repo_root/dept/config.materialized.json"
+temporary="$artifact.tmp.$$"
+
+if ! python3 "$repo_root/dept/config.py" --materialize >"$temporary"; then
+    echo "warning: unable to materialize dept/config.materialized.json; CI will check it" >&2
+    rm -f "$temporary"
+    exit 0
+fi
+
+if ! mv "$temporary" "$artifact" || ! git add "$artifact"; then
+    echo "warning: unable to stage dept/config.materialized.json; CI will check it" >&2
+    rm -f "$temporary"
+fi
+
+exit 0
