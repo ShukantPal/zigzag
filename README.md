@@ -44,6 +44,19 @@ not present here.
 zigzag timeline TASK_ID --state-file ~/.codex/zigzag/events.json
 ```
 
+## Native PR comment routing
+
+Zigzag can poll PR conversation comments, inline review comments, and review
+bodies, then resume the Codex session recorded for that PR. The Mac-local,
+reloadable session file, shadow-mode behavior, and cutover flags are described
+in [the LaunchAgent installation guide](launchd/INSTALL.md#native-comment-router-shadow-mode).
+
+The router is shadow-on by default. It keys durable comment events by GitHub's
+GraphQL `node_id` rather than the REST numeric ID, skips replies whose first
+line begins `> 🤖`, and logs the direct Codex resume it would dispatch.
+`--comment-router-live` is the explicit cutover flag. Live resumes use the
+relay supervisor and a shared session-operation gate.
+
 It renders the persisted events and named duration summaries. Durations are
 shown only when both facts came from the same `clock`; a Mac/VM handoff prints
 both timestamps as cross-clock rather than fabricating a transit time.
