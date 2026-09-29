@@ -10,7 +10,7 @@ On 2026-09-26 we sketched moving the review loop onto the Mac daemon. This docum
 
 ## Direction
 
-The Mac daemon becomes the control plane's execution site. It runs the GitHub review loops end to end — watching PR comments, dispatching 3-lens review teams, polling verdicts, running the merge gate, resuming owners, killing reviewers on merge — and it routes Google Doc comments to the assigned Codex session. Muse remains the control-plane configurer: every behavior lives in config-as-code in the zigzag repo, which Muse edits and the daemon consumes. Chat surfacing (review-ready / decision-needed) and cross-repo work stay on the VM.
+The Mac daemon becomes the control plane's execution site. It runs the GitHub review loops end to end — watching PR comments, dispatching 3-lens review teams, polling verdicts, running the merge gate, resuming owners, killing reviewers on merge — and it routes Google Doc comments to the assigned Codex session. The loops are implemented in Rust inside the relay daemon: a port of the current Python watchers, not a reuse. The only code running on the Mac is the Rust binary; Python exists only at config-authoring time (`dept/config.py` runs at commit/CI, never on the daemon). Muse remains the control-plane configurer: every behavior lives in config-as-code in the zigzag repo, which Muse edits and the daemon consumes. Chat surfacing (review-ready / decision-needed) and cross-repo work stay on the VM.
 
 ## What moves to the Mac
 
@@ -43,6 +43,8 @@ The Python config is the source; the JSON is a build artifact. Both are committe
 Chat surfacing: review-ready and decision-needed notifications still come from the VM, fed by daemon events. Cross-repo loops (leveled) stay where they are; the same pattern can follow later. Anything needing his personal Google account beyond the SA-shared docs folder stays VM-side.
 
 ## Tradeoffs
+
+**Single binary, no Python on the Mac (decided 2026-09-28).** The loops are ported to Rust inside the relay daemon — no Python watchers via launchd, no Python runtime in the daemon's path. The port cost is real (the watchers are battle-tested), but it buys one deployable, one config surface (the materialized JSON), and no split-brain between two runtimes on the same machine.
 
 **Quiet hours.** Mac-side loops pause when the laptop sleeps (10pm–7am). Overnight review latency is the price; nothing is lost, because state is on disk and loops resume on wake. This is accepted behavior, not a failure mode.
 
