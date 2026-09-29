@@ -1,0 +1,102 @@
+{
+  "design_docs_folder_id": "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3",
+  "doc_router_watch_list": [
+    "1OJdICdFEo4dwlIvo5pc-2LoG8S7jyPOigPtsKp7mLBc"
+  ],
+  "doc_routes": [
+    {
+      "assigned_session": "configurer",
+      "doc_id": "1OJdICdFEo4dwlIvo5pc-2LoG8S7jyPOigPtsKp7mLBc"
+    }
+  ],
+  "generated_by": "dept/config.py --materialize (do not hand-edit)",
+  "loop_ownership": [
+    {
+      "loop": "pr-comment-watcher",
+      "owner": "mac"
+    },
+    {
+      "loop": "review-rounds",
+      "owner": "mac"
+    },
+    {
+      "loop": "approval-gate",
+      "owner": "mac"
+    },
+    {
+      "loop": "merge-killer",
+      "owner": "mac"
+    },
+    {
+      "loop": "dependabot",
+      "owner": "mac"
+    },
+    {
+      "loop": "doc-router",
+      "owner": "mac"
+    },
+    {
+      "loop": "chat-surface",
+      "owner": "vm"
+    }
+  ],
+  "quiet_hours": {
+    "end": "07:00",
+    "start": "22:00"
+  },
+  "repos": {
+    "leveled": "leveled-inc/leveled",
+    "zigzag": "ShukantPal/zigzag"
+  },
+  "review_policy": {
+    "leveled": {
+      "full_rounds_max": 2,
+      "lenses": [
+        "correctness",
+        "simplicity",
+        "tests"
+      ],
+      "require_security_lens": false,
+      "verification_rounds_max": 2
+    },
+    "zigzag": {
+      "full_rounds_max": 2,
+      "lenses": [
+        "correctness",
+        "simplicity",
+        "tests",
+        "security"
+      ],
+      "require_security_lens": true,
+      "verification_rounds_max": 2
+    }
+  },
+  "service_account": "zigzag@shukant.iam.gserviceaccount.com",
+  "watchers": [
+    {
+      "enabled": true,
+      "interval_s": 300,
+      "name": "pr-comment-watcher"
+    },
+    {
+      "enabled": true,
+      "interval_s": 600,
+      "name": "review-rounds"
+    },
+    {
+      "enabled": true,
+      "interval_s": 300,
+      "name": "merge-killer"
+    },
+    {
+      "enabled": true,
+      "interval_s": 1800,
+      "name": "dependabot"
+    },
+    {
+      "enabled": true,
+      "interval_s": 300,
+      "name": "doc-router"
+    }
+  ]
+}
