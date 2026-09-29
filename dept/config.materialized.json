@@ -1,5 +1,5 @@
 {
-  "design_docs_folder_id": "FOLDER_ID_SHARED_WITH_SA",
+  "design_docs_folder_id": "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3",
   "doc_router_watch_list": [
     "1OJdICdFEo4dwlIvo5pc-2LoG8S7jyPOigPtsKp7mLBc"
   ],
@@ -71,7 +71,7 @@
       "verification_rounds_max": 2
     }
   },
-  "service_account": "zigzag-sa@shukant.iam.gserviceaccount.com",
+  "service_account": "zigzag@shukant.iam.gserviceaccount.com",
   "watchers": [
     {
       "enabled": true,

@@ -28,8 +28,8 @@ DEFAULT_LENSES = ["correctness", "simplicity", "tests"]
 
 QUIET_HOURS = {"start": "22:00", "end": "07:00"}
 
-SA_EMAIL = "zigzag-sa@shukant.iam.gserviceaccount.com"
-DESIGN_DOCS_FOLDER_ID = "FOLDER_ID_SHARED_WITH_SA"
+SA_EMAIL = "zigzag@shukant.iam.gserviceaccount.com"
+DESIGN_DOCS_FOLDER_ID = "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3"
 
 
 # --- Schema: the daemon's contract. Plain data, no behavior. ----------------
