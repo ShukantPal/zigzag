@@ -64,11 +64,16 @@ def read_service_account_key():
     try:
         key = json.loads(result.stdout)
     except json.JSONDecodeError:
+        value = result.stdout
+        if value.endswith("\r\n"):
+            value = value[:-2]
+        elif value.endswith(("\r", "\n")):
+            value = value[:-1]
         # JSON necessarily includes punctuation such as {}, ", or :, so a strict
         # full-string hex match cannot misidentify genuine raw JSON.
-        if re.fullmatch(r"[0-9a-fA-F]+", result.stdout) and len(result.stdout) % 2 == 0:
+        if re.fullmatch(r"[0-9a-fA-F]+", value) and len(value) % 2 == 0:
             try:
-                key = json.loads(bytes.fromhex(result.stdout))
+                key = json.loads(bytes.fromhex(value))
             except (json.JSONDecodeError, UnicodeDecodeError) as error:
                 raise DriveError(
                     "zigzag-sa keychain item could not be parsed as raw JSON or hex-decoded JSON"

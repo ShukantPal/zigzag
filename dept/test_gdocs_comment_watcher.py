@@ -147,6 +147,13 @@ class GdocsFeedbackTest(unittest.TestCase):
                 returncode=0, stdout=encoded)):
             self.assertEqual(watcher.read_service_account_key(), expected)
 
+    def test_keychain_newline_terminated_hex_json_value_parses(self):
+        expected = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "key"}
+        encoded = json.dumps(expected).encode().hex() + "\n"
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=encoded)):
+            self.assertEqual(watcher.read_service_account_key(), expected)
+
     def test_keychain_uppercase_hex_json_value_parses(self):
         expected = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "key"}
         encoded = json.dumps(expected).encode().hex().upper()
