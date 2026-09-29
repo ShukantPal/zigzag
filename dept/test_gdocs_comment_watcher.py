@@ -72,12 +72,6 @@ class GdocsFeedbackTest(unittest.TestCase):
             self.assertIsNone(watcher.stored_ack(db, "doc", "two"))
             db.close()
 
-    def test_marker_requires_authenticated_bot_author(self):
-        spoofed = {"content": watcher.ACK_TEXT, "author": {"permissionId": "human"}}
-        bot = {"content": watcher.ACK_TEXT, "author": {"emailAddress": watcher.SERVICE_ACCOUNT}}
-        self.assertFalse(watcher.bot_reply(spoofed))
-        self.assertTrue(watcher.bot_reply(bot))
-
     def test_folder_discovery_paginates_and_skips_stale_extra_share(self):
         client = watcher.DriveClient("token")
         with patch.object(client, "request", side_effect=[
@@ -118,6 +112,14 @@ class GdocsFeedbackTest(unittest.TestCase):
         with patch.object(watcher.urllib.request, "urlopen", side_effect=error):
             with self.assertRaisesRegex(watcher.DriveError, "HTTP 403"):
                 watcher.DriveClient("token").request("GET", "files")
+
+    def test_task_status_is_fail_closed_when_indeterminate(self):
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="relay unavailable")
+        with patch.object(watcher.subprocess, "run", return_value=failed):
+            self.assertIsNone(watcher.task_running("task"))
+        done = SimpleNamespace(returncode=0, stdout="DONE", stderr="")
+        with patch.object(watcher.subprocess, "run", return_value=done):
+            self.assertFalse(watcher.task_running("task"))
 
     def test_keychain_validation_rejects_malformed_or_wrong_identity(self):
         bad = SimpleNamespace(returncode=0, stdout="not json")
@@ -248,42 +250,74 @@ class WatcherStateMachineTest(unittest.TestCase):
     def test_failed_dispatch_reuses_persisted_ack_on_retry(self):
         self.run_main(FakeDrive([]))
         failed = FakeDrive([human_comment("new")])
-        self.run_main(failed, dispatch_result=(None, "launch failed"))
+        _, failed_dispatch = self.run_main(failed, dispatch_result=(None, "launch failed"))
         self.assertEqual(failed.acks, [("doc", "new")])
+        failed_dispatch.assert_called_once()
         retry = FakeDrive([human_comment("new")])
-        self.run_main(retry)
+        _, retry_dispatch = self.run_main(retry)
         self.assertEqual(retry.acks, [])
+        retry_dispatch.assert_called_once()
         db = watcher.connect_database()
         self.assertTrue(watcher.comment_seen(db, "doc", "new"))
+        self.assertEqual(
+            db.execute("SELECT task_id FROM drive_comment_session_task").fetchone()[0],
+            "task-1")
         db.close()
 
-    def test_busy_session_leaves_feedback_unwatermarked(self):
+    def test_persisted_running_session_blocks_later_feedback_and_stale_one_clears(self):
         self.run_main(FakeDrive([]))
-        drive = FakeDrive([human_comment("new")])
-        with patch.object(watcher, "session_busy", return_value=True):
-            _, dispatch = self.run_main(drive)
-        self.assertEqual(drive.acks, [])
+        first = FakeDrive([human_comment("first")])
+        self.run_main(first)
+        db = watcher.connect_database()
+        self.assertEqual(
+            db.execute("SELECT task_id FROM drive_comment_session_task WHERE session_id = 'session'").fetchone()[0],
+            "task-1")
+        db.close()
+        blocked = FakeDrive([human_comment("first"), human_comment("second")])
+        with patch.object(watcher, "task_running", return_value=True):
+            _, dispatch = self.run_main(blocked)
+        self.assertEqual(blocked.acks, [])
         dispatch.assert_not_called()
         db = watcher.connect_database()
-        self.assertFalse(watcher.comment_seen(db, "doc", "new"))
+        self.assertFalse(watcher.comment_seen(db, "doc", "second"))
+        with patch.object(watcher, "task_running", return_value=None):
+            self.assertTrue(watcher.session_busy(db, "session"))
+        with patch.object(watcher, "task_running", return_value=False):
+            self.assertFalse(watcher.session_busy(db, "session"))
+        self.assertIsNone(
+            db.execute("SELECT task_id FROM drive_comment_session_task WHERE session_id = 'session'").fetchone())
         db.close()
 
-    def test_non_trusted_resolved_and_authenticated_marked_feedback_are_consumed(self):
+    def test_non_trusted_and_resolved_feedback_are_consumed(self):
         self.run_main(FakeDrive([]))
         untrusted = human_comment("untrusted")
         untrusted["author"] = {"permissionId": "someone-else"}
         resolved = human_comment("resolved")
         resolved["resolved"] = True
-        marked = human_comment("marked")
-        marked["replies"] = [{
-            "id": "bot-reply", "content": watcher.ACK_TEXT,
-            "author": {"emailAddress": watcher.SERVICE_ACCOUNT},
-        }]
-        drive = FakeDrive([untrusted, resolved, marked])
+        drive = FakeDrive([untrusted, resolved])
         _, dispatch = self.run_main(drive)
         self.assertEqual(drive.acks, [])
         dispatch.assert_not_called()
         db = watcher.connect_database()
-        for comment_id in ("untrusted", "resolved", "marked"):
+        for comment_id in ("untrusted", "resolved"):
             self.assertTrue(watcher.comment_seen(db, "doc", comment_id))
+        db.close()
+
+    def test_trusted_reply_is_acked_on_parent_and_persisted_by_reply_id(self):
+        self.run_main(FakeDrive([]))
+        thread = human_comment("parent", "original")
+        thread["author"] = {"permissionId": "other"}
+        thread["replies"] = [{
+            "id": "trusted-reply", "content": "follow-up",
+            "author": {"permissionId": "shukant-id"},
+            "createdTime": "2026-09-28T12:01:00Z",
+        }]
+        drive = FakeDrive([thread])
+        _, dispatch = self.run_main(drive)
+        self.assertEqual(drive.acks, [("doc", "parent")])
+        dispatch.assert_called_once()
+        db = watcher.connect_database()
+        self.assertTrue(watcher.comment_seen(db, "doc", "trusted-reply"))
+        self.assertEqual(watcher.stored_ack(db, "doc", "trusted-reply"), "ack-1")
+        self.assertIsNone(watcher.stored_ack(db, "doc", "parent"))
         db.close()

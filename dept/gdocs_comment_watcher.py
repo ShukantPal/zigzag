@@ -254,19 +254,6 @@ def trusted_author(item):
             or (author.get("emailAddress") or "").casefold() in configured_values("trusted_author_emails"))
 
 
-def bot_reply(reply):
-    """A marker is meaningful only when it came from the service-account bot."""
-    author = reply.get("author") or {}
-    return (MARKER in (reply.get("content") or "")
-            and ((author.get("emailAddress") or "").casefold() == SERVICE_ACCOUNT.casefold()
-                 or (author.get("permissionId") or "").casefold()
-                 in configured_values("bot_permission_ids")))
-
-
-def has_marker_reply(comment):
-    return any(bot_reply(reply) for reply in comment.get("replies", []) or [])
-
-
 def stored_ack(db, doc_id, comment_id):
     row = db.execute(
         "SELECT ack_reply_id FROM drive_comment_ack WHERE document_id = ? AND comment_id = ?",
@@ -289,12 +276,18 @@ def owner_for(doc_id):
 
 
 def task_running(task_id):
+    """Return True/False for a known task state, None when status is unknown."""
     try:
         result = subprocess.run([sys.executable, DEPT, "status", task_id],
                                 capture_output=True, text=True, timeout=90)
     except Exception:
+        return None
+    text = result.stdout + result.stderr
+    if result.returncode != 0:
+        return None
+    if "RUNNING" in text:
         return True
-    return result.returncode == 0 and "RUNNING" in (result.stdout + result.stderr)
+    return False if "DONE" in text else None
 
 
 def session_busy(db, session_id):
@@ -302,7 +295,7 @@ def session_busy(db, session_id):
                      (session_id,)).fetchone()
     if not row:
         return False
-    if task_running(row[0]):
+    if task_running(row[0]) is not False:
         return True
     db.execute("DELETE FROM drive_comment_session_task WHERE session_id = ?", (session_id,))
     db.commit()
@@ -403,10 +396,7 @@ def main(argv=None):
         for item in feedback_items(comments):
             if comment_seen(db, doc["id"], item["id"]):
                 continue
-            thread = item.get("_thread", item)
-            if seed_only or thread.get("resolved") or not trusted_author(item):
-                mark_seen(db, doc["id"], item["id"])
-            elif has_marker_reply(thread) and not stored_ack(db, doc["id"], item["id"]):
+            if seed_only or item.get("_thread", item).get("resolved") or not trusted_author(item):
                 mark_seen(db, doc["id"], item["id"])
             else:
                 fresh.append(item)

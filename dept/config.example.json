@@ -21,7 +21,6 @@
     "additional_file_ids": ["1PF8O_BoLwKetxmcuPmQRYXq4weQGXwd6vABSd62atV4"],
     "trusted_author_permission_ids": ["stable-drive-permission-id-for-shukant"],
     "trusted_author_emails": [],
-    "bot_permission_ids": [],
     "owners": {
       "google-doc-id": {
         "project": "/absolute/path/to/owning/worktree",
