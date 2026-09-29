@@ -12,6 +12,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -62,9 +63,27 @@ def read_service_account_key():
         raise DriveError("could not read the zigzag service-account key from the login keychain")
     try:
         key = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise DriveError("zigzag service-account keychain item is not JSON") from error
-    if key.get("client_email") != SERVICE_ACCOUNT or not key.get("private_key"):
+    except json.JSONDecodeError:
+        value = result.stdout
+        if value.endswith("\r\n"):
+            value = value[:-2]
+        elif value.endswith(("\r", "\n")):
+            value = value[:-1]
+        # JSON necessarily includes punctuation such as {}, ", or :, so a strict
+        # full-string hex match cannot misidentify genuine raw JSON.
+        if re.fullmatch(r"[0-9a-fA-F]+", value) and len(value) % 2 == 0:
+            try:
+                key = json.loads(bytes.fromhex(value))
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise DriveError(
+                    "zigzag-sa keychain item could not be parsed as raw JSON or hex-decoded JSON"
+                ) from error
+        else:
+            raise DriveError(
+                "zigzag-sa keychain item could not be parsed as raw JSON or hex-decoded JSON"
+            )
+    if (not isinstance(key, dict) or key.get("client_email") != SERVICE_ACCOUNT
+            or not key.get("private_key")):
         raise DriveError("zigzag service-account keychain item has the wrong service account")
     return key
 
