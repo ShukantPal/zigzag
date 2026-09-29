@@ -87,6 +87,7 @@ class ProjectBusyTest(unittest.TestCase):
                  patch.object(watcher, "reviewer_states", return_value={"t-a": "done"}), \
                  patch.object(watcher, "project_dir_busy", return_value=False), \
                  patch.object(watcher, "mac", return_value="\n@@@t-a@@@\nclean"), \
+                 patch.object(watcher, "task_survived", return_value=True), \
                  patch.object(watcher.subprocess, "run", return_value=result) as run:
                 message = watcher.process_round(str(path))
             round_ = json.loads(path.read_text())
@@ -95,6 +96,33 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertEqual(round_["status"], "dispatched")
         self.assertEqual(run.call_args.args[0][1:3], [watcher.DEPT, "resume"])
         self.assertIn("clean", prompt)
+
+    def test_instant_dispatch_death_returns_round_to_collecting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "round.json"
+            path.write_text(json.dumps({
+                "pr": 7, "project_dir": "/project", "owning_session": "session",
+                "branch": "branch", "reviewers": {"t-a": "tests"}, "status": "collecting",
+            }))
+            result = SimpleNamespace(stdout="resumed t-owner proc=x\n", stderr="", returncode=0)
+            with patch.object(watcher, "PROMPT_DIR", tmp), \
+                 patch.object(watcher, "reviewer_states", return_value={"t-a": "done"}), \
+                 patch.object(watcher, "project_dir_busy", return_value=False), \
+                 patch.object(watcher, "mac", return_value="\n@@@t-a@@@\nclean"), \
+                 patch.object(watcher, "task_survived", return_value=False), \
+                 patch.object(watcher.subprocess, "run", return_value=result):
+                watcher.process_round(str(path))
+            round_ = json.loads(path.read_text())
+        self.assertEqual(round_["status"], "collecting")
+        self.assertEqual(round_["dispatch_misses"], 1)
+
+    def test_second_dispatch_is_refused_while_shared_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = pathlib.Path(tmp) / "dispatch.lock"
+            with patch.object(watcher, "WATCHER_LOCK", str(lock_path)):
+                with open(lock_path, "w") as lock:
+                    watcher.fcntl.flock(lock, watcher.fcntl.LOCK_EX | watcher.fcntl.LOCK_NB)
+                    self.assertIn("another watcher is dispatching", watcher.process_round("unused.json"))
 
 
 if __name__ == "__main__":
