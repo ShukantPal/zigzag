@@ -124,13 +124,44 @@ class GdocsFeedbackTest(unittest.TestCase):
     def test_keychain_validation_rejects_malformed_or_wrong_identity(self):
         bad = SimpleNamespace(returncode=0, stdout="not json")
         with patch.object(watcher.subprocess, "run", return_value=bad):
-            with self.assertRaisesRegex(watcher.DriveError, "not JSON"):
+            with self.assertRaisesRegex(
+                    watcher.DriveError, "zigzag-sa.*raw JSON.*hex-decoded JSON") as error:
                 watcher.read_service_account_key()
+        self.assertNotIn(bad.stdout, str(error.exception))
         wrong = SimpleNamespace(returncode=0, stdout=json.dumps({
             "client_email": "other@example.com", "private_key": "key"}))
         with patch.object(watcher.subprocess, "run", return_value=wrong):
             with self.assertRaisesRegex(watcher.DriveError, "wrong service account"):
                 watcher.read_service_account_key()
+
+    def test_keychain_raw_json_value_parses(self):
+        expected = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "key"}
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(expected))):
+            self.assertEqual(watcher.read_service_account_key(), expected)
+
+    def test_keychain_hex_json_value_parses_to_identical_object(self):
+        expected = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "key\nline"}
+        encoded = json.dumps(expected, indent=2).encode().hex()
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=encoded)):
+            self.assertEqual(watcher.read_service_account_key(), expected)
+
+    def test_keychain_uppercase_hex_json_value_parses(self):
+        expected = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "key"}
+        encoded = json.dumps(expected).encode().hex().upper()
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=encoded)):
+            self.assertEqual(watcher.read_service_account_key(), expected)
+
+    def test_keychain_odd_length_hex_looking_value_errors_without_leaking_value(self):
+        value = "abc"
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=value)):
+            with self.assertRaisesRegex(
+                    watcher.DriveError, "zigzag-sa.*raw JSON.*hex-decoded JSON") as error:
+                watcher.read_service_account_key()
+        self.assertNotIn(value, str(error.exception))
 
     def test_token_mint_uses_drive_scope_and_removes_temporary_key(self):
         key = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "private"}
