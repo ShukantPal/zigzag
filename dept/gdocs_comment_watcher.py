@@ -1,297 +1,454 @@
 #!/usr/bin/env python3
-"""Watch registered Google Docs for new Shukant comments, ack with 👀, dispatch a worker.
+"""Mac-side Drive watcher for Google Doc feedback.
 
-Mirrors pr_comment_watcher.py's playbook for design docs. Runs from a platform
-cron (every 5 min) — stateless, no long-lived process.
-
-The Drive API has no emoji reactions on comments, so the acknowledgment is a
-marked reply: the watcher posts "👀 Muse (AI assistant) — picked up ..." the
-moment it sees his comment (fast ack, like 🚀 on GitHub), then resumes the
-doc's owning worker session to ADDRESS the feedback.
-
-ATTRIBUTION: replies post as Shukant (shared Google auth), so every
-watcher/worker reply MUST start with the MARKER. The watcher skips comments
-already carrying a marker-bearing reply, so worker replies never re-dispatch.
-
-TOOLING SPLIT: the Mac has no Google Workspace CLI. Workers (Mac) do doc
-source + docx rebuild + code changes and report back; the main agent (VM) does
-all Docs API operations (uploads, reply updates, resolves). Dispatched prompts
-must tell the worker to put substantive reply texts + docx path in its final
-message in the parsed FORMAT below.
-
-State: <state-dir>/gdocs-watch/watermark.json
-  {"seen": [<comment-id>...], "dispatched": {<comment-id>: <watcher-reply-id>}}
-First run seeds the watermark without dispatching.
+Uses the zigzag service-account JSON held in the GUI-login keychain, discovers
+documents from the shared Drive folder, acknowledges new Shukant comments, and
+resumes their configured owner sessions. Durable watermarks live in SQLite at
+the Mac department state root.
 """
 import argparse
+import base64
+import datetime
 import fcntl
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
-from dept_config import ROOT, load_config, state_dir
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
 
-# Marker every watcher/worker Docs reply must start with. Detection is
-# substring-based and tolerant (workers paraphrase).
+from dept_config import ROOT, load_config
+
+SERVICE_ACCOUNT = "zigzag@shukant.iam.gserviceaccount.com"
+KEYCHAIN_SERVICE = "zigzag-sa"
+FOLDER_ID = "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3"
+# Used only when deployment configuration has not named an individual share.
+EXTRA_DOCUMENT_ID = "1PF8O_BoLwKetxmcuPmQRYXq4weQGXwd6vABSd62atV4"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 MARKER = "Muse (AI assistant)"
 EYES = "\U0001F440"
+ACK_TEXT = f"{EYES} {MARKER} — picked up, addressing it now."
 
 CONFIG = load_config()
 WATCHER = CONFIG.get("gdocs_comment_watcher", {})
-DOCS = WATCHER.get("docs", {})
-GWS = WATCHER.get("gws", "")
-STATE_DIR = os.path.join(state_dir(CONFIG), "gdocs-watch")
-WATERMARK = os.path.join(STATE_DIR, "watermark.json")
-PROMPT_DIR = os.path.join(state_dir(CONFIG), "prompts")
+STATE_ROOT = os.path.expanduser(WATCHER.get("state_root", "~/.zigzag/dept"))
+DATABASE = os.path.join(STATE_ROOT, "dept.db")
+PROMPT_DIR = os.path.join(STATE_ROOT, "prompts")
+LOCK_FILE = os.path.join(STATE_ROOT, "drive-comment-watcher.lock")
 DEPT = os.path.join(ROOT, "dept.py")
-LOCK_FILE = os.path.join(STATE_DIR, "watcher.lock")
-HIS_NAME = "Shukant Pal"
 
-ACK_TEXT = (
-    f"{EYES} {MARKER} \u2014 picked up, addressing it now."
-)
 
-PROMPT_TEMPLATE = """# Design-doc feedback — address Shukant's new Google Doc comments
+class DriveError(RuntimeError):
+    pass
 
-Shukant left {n} new comment(s) on the "{title}" Google Doc
-(id `{doc_id}`). I have already posted \U0001F440 acknowledgment replies on
-each (reply ids below). Your job: ADDRESS every comment — update the doc
-source, rebuild the docx with your established flow, make any matching code
-changes, and report back. Do not just report; implement.
 
-IMPORTANT TOOLING NOTE: the Mac has no Google Workspace CLI. You CANNOT touch
-the Google Doc, its comments, or replies yourself. I (main agent, on the VM)
-do all Docs API operations (docx upload, reply updates, resolves). Your
-deliverables:
-  (a) the rebuilt .docx saved in your task dir, and
-  (b) substantive reply texts in your final message, clearly delimited
-      (see FORMAT below).
-I will upload the docx, verify formatting, update your \U0001F440 replies in
-place, and resolve the threads.
+def b64url(value):
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def read_service_account_key():
+    """Read, but never print or persist, the keychain JSON."""
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+         "-a", SERVICE_ACCOUNT, "-w"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise DriveError("could not read the zigzag service-account key from the login keychain")
+    try:
+        key = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise DriveError("zigzag service-account keychain item is not JSON") from error
+    if key.get("client_email") != SERVICE_ACCOUNT or not key.get("private_key"):
+        raise DriveError("zigzag service-account keychain item has the wrong service account")
+    return key
+
+
+def secure_directory(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def secure_file(path):
+    try:
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def service_account_token(key, now=None):
+    """Mint a Drive-scoped service-account token with macOS OpenSSL."""
+    now = int(time.time() if now is None else now)
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = b64url(json.dumps({
+        "iss": key["client_email"], "scope": DRIVE_SCOPE,
+        "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600,
+    }, separators=(",", ":")).encode())
+    signing_input = f"{header}.{claims}".encode()
+    fd, key_path = tempfile.mkstemp(prefix="zigzag-drive-key-", text=True)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(key["private_key"])
+        signed = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=signing_input, capture_output=True, timeout=30)
+        if signed.returncode:
+            raise DriveError("could not sign the service-account OAuth assertion")
+    finally:
+        try:
+            os.unlink(key_path)
+        except FileNotFoundError:
+            pass
+    body = urllib.parse.urlencode({
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": f"{header}.{claims}.{b64url(signed.stdout)}",
+    }).encode()
+    try:
+        request = urllib.request.Request(
+            "https://oauth2.googleapis.com/token", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+        raise DriveError("could not mint a Google Drive service-account token") from error
+    if not payload.get("access_token"):
+        raise DriveError("Google OAuth token response had no access token")
+    return payload["access_token"]
+
+
+class DriveClient:
+    def __init__(self, token):
+        self.token = token
+        self.skipped_documents = []
+
+    def request(self, method, path, *, params=None, body=None):
+        url = "https://www.googleapis.com/drive/v3/" + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.token}", "Accept": "application/json",
+            **({"Content-Type": "application/json"} if body is not None else {}),
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            raise DriveError(f"Drive {method} {path} failed (HTTP {error.code})") from error
+        except (urllib.error.URLError, json.JSONDecodeError) as error:
+            raise DriveError(f"Drive {method} {path} failed") from error
+
+    def list_documents(self, folder_id, additional_ids):
+        docs, page_token = {}, None
+        while True:
+            page = self.request("GET", "files", params={
+                "q": f"'{folder_id}' in parents and trashed = false",
+                "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 100,
+                "pageToken": page_token or "", "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+            })
+            for item in page.get("files", []):
+                if item.get("mimeType") == GOOGLE_DOC_MIME:
+                    docs[item["id"]] = item
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
+        for doc_id in additional_ids:
+            try:
+                item = self.request("GET", f"files/{urllib.parse.quote(doc_id, safe='')}", params={
+                    "fields": "id,name,mimeType", "supportsAllDrives": "true"})
+            except DriveError as error:
+                self.skipped_documents.append((doc_id, str(error)))
+                continue
+            if item.get("mimeType") == GOOGLE_DOC_MIME:
+                docs[item["id"]] = item
+        return list(docs.values())
+
+    def list_comments(self, doc_id):
+        comments, page_token = [], None
+        while True:
+            page = self.request("GET", f"files/{urllib.parse.quote(doc_id, safe='')}/comments", params={
+                "fields": "nextPageToken,comments(id,content,quotedFileContent(value),author(displayName,emailAddress,permissionId),createdTime,resolved,replies(id,content,author(displayName,emailAddress,permissionId),createdTime))",
+                "pageSize": 100, "pageToken": page_token or "", "includeDeleted": "false"})
+            comments.extend(page.get("comments", []))
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                return comments
+
+    def post_eyes_reply(self, doc_id, comment_id):
+        reply = self.request("POST", f"files/{urllib.parse.quote(doc_id, safe='')}/comments/"
+                             f"{urllib.parse.quote(comment_id, safe='')}/replies",
+                             params={"fields": "id"},
+                             body={"content": ACK_TEXT})
+        if not reply.get("id"):
+            raise DriveError("Drive created an acknowledgment reply without an id")
+        return reply["id"]
+
+
+def connect_database(path=None):
+    path = path or DATABASE
+    secure_directory(os.path.dirname(path))
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    secure_file(path)
+    secure_file(path + "-wal")
+    secure_file(path + "-shm")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS drive_comment_watermark (
+            document_id TEXT NOT NULL, comment_id TEXT NOT NULL, seen_at TEXT NOT NULL,
+            PRIMARY KEY (document_id, comment_id));
+        CREATE TABLE IF NOT EXISTS drive_comment_ack (
+            document_id TEXT NOT NULL, comment_id TEXT NOT NULL, ack_reply_id TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY (document_id, comment_id));
+        CREATE TABLE IF NOT EXISTS drive_comment_session_task (
+            session_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS drive_comment_watcher_meta (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    """)
+    return db
+
+
+def database_initialized(db):
+    return db.execute("SELECT 1 FROM drive_comment_watcher_meta WHERE key = 'initialized'").fetchone() is not None
+
+
+def mark_initialized(db):
+    db.execute("INSERT OR REPLACE INTO drive_comment_watcher_meta(key, value) VALUES ('initialized', ?)",
+               (datetime.datetime.now(datetime.timezone.utc).isoformat(),))
+
+
+def comment_seen(db, doc_id, comment_id):
+    return db.execute("SELECT 1 FROM drive_comment_watermark WHERE document_id = ? AND comment_id = ?",
+                      (doc_id, comment_id)).fetchone() is not None
+
+
+def mark_seen(db, doc_id, comment_id):
+    db.execute("INSERT OR IGNORE INTO drive_comment_watermark VALUES (?, ?, ?)",
+               (doc_id, comment_id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+
+
+def feedback_items(comments):
+    """Flatten top-level and reply feedback, retaining the parent thread."""
+    for comment in comments:
+        yield {**comment, "_parent_id": comment["id"]}
+        for reply in comment.get("replies", []) or []:
+            yield {**reply, "quotedFileContent": comment.get("quotedFileContent"),
+                   "_parent_id": comment["id"], "_thread": comment}
+
+
+def configured_values(name):
+    values = WATCHER.get(name, [])
+    return {str(value).casefold() for value in values if value}
+
+
+def trusted_author(item):
+    """Require a stable configured Drive identity, never a display name."""
+    author = item.get("author") or {}
+    return ((author.get("permissionId") or "").casefold() in configured_values("trusted_author_permission_ids")
+            or (author.get("emailAddress") or "").casefold() in configured_values("trusted_author_emails"))
+
+
+def stored_ack(db, doc_id, comment_id):
+    row = db.execute(
+        "SELECT ack_reply_id FROM drive_comment_ack WHERE document_id = ? AND comment_id = ?",
+        (doc_id, comment_id)).fetchone()
+    return row[0] if row else None
+
+
+def save_ack(db, doc_id, comment_id, ack_reply_id):
+    db.execute("INSERT OR IGNORE INTO drive_comment_ack VALUES (?, ?, ?, ?)",
+               (doc_id, comment_id, ack_reply_id,
+                datetime.datetime.now(datetime.timezone.utc).isoformat()))
+    db.commit()
+
+
+def owner_for(doc_id):
+    """Owners are session metadata, never the watched-document registry."""
+    owners = WATCHER.get("owners") or WATCHER.get("docs", {})
+    owner = owners.get(doc_id)
+    return owner if isinstance(owner, dict) and owner.get("project") and owner.get("session") else None
+
+
+def task_running(task_id):
+    """Return True/False for a known task state, None when status is unknown."""
+    try:
+        result = subprocess.run([sys.executable, DEPT, "status", task_id],
+                                capture_output=True, text=True, timeout=90)
+    except Exception:
+        return None
+    text = result.stdout + result.stderr
+    if result.returncode != 0:
+        return None
+    if "RUNNING" in text:
+        return True
+    return False if "DONE" in text else None
+
+
+def session_busy(db, session_id):
+    row = db.execute("SELECT task_id FROM drive_comment_session_task WHERE session_id = ?",
+                     (session_id,)).fetchone()
+    if not row:
+        return False
+    if task_running(row[0]) is not False:
+        return True
+    db.execute("DELETE FROM drive_comment_session_task WHERE session_id = ?", (session_id,))
+    db.commit()
+    return False
+
+
+PROMPT_TEMPLATE = """# Google Doc feedback — address Shukant's new comments
+
+Shukant left {count} new comment(s) on {title} ({doc_id}). The Mac-side Drive
+watcher has already posted marked 👀 acknowledgments. ADDRESS every comment:
+update the document source/docx in the established workflow, make matching
+scoped code changes where needed, and report exactly what changed.
 
 ## Comments
 {comments}
 
-## Doc rebuild
-Update the markdown source, rebuild the .docx with the same flow used before
-(tables as plain text pre-upload — Drive upload drops docx tables), save it in
-your task dir, and report its exact path. Body copy 11pt Proxima Nova, no
-negative statements ("there is no X" — describe the mechanism), Mermaid
-rendered to images for surviving diagrams.
-
-## Code push rules
-If a comment changes the design, make the matching code changes in the owning
-stack, keeping each PR to its layer. Push with the git hook intact
-(no --no-verify); semgrep + Medical Scribe BuildBuddy green on each touched
-PR; verify each PR shows only its own work via `gh pr view` (commits+files).
-No merges. One heavy build at a time; thermals managed, fan stays off.
-Name your model tier in the report.
-
-## Final message FORMAT (parsed to do the Docs updates)
-DOCX_PATH: /Users/shukant/.codex/dept/<task-id>/<name>.docx
-{reply_lines}
-Resolve any thread whose comment is fully addressed with a `RESOLVE <comment-id>` line.
-Reply texts: start each with "\U0001F440 Muse (AI assistant) \u2014 ", state what
-changed and where (doc section + PR numbers), keep each under ~120 words.
+Do not post another acknowledgment. Keep substantive Drive replies marked with
+{marker} so the watcher never mistakes them for human feedback.
 """
 
 
-def gws(*args):
-    r = subprocess.run([GWS] + list(args), capture_output=True, text=True, timeout=60)
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(r.stdout)
-    except Exception:
-        raise RuntimeError(f"gws failed: {r.stdout[:500]} {r.stderr[:300]}")
-    if isinstance(obj, dict) and "error" in obj:
-        raise RuntimeError(f"gws error: {json.dumps(obj['error'])[:400]}")
-    return obj
+def write_prompt(doc, acked):
+    lines = []
+    for item, reply_id in acked:
+        anchor = ((item.get("quotedFileContent") or {}).get("value") or "")[:200].replace("\n", " ")
+        lines.append(f"- comment {item['id']} (ack {reply_id}, {item.get('createdTime', 'unknown time')})\n"
+                     f"  Anchor: {anchor}\n  Text: {item.get('content', '')}")
+    secure_directory(PROMPT_DIR)
+    with tempfile.NamedTemporaryFile(
+            mode="w", prefix=f"drive-feedback-{doc['id'][:8]}-",
+            suffix=".md", dir=PROMPT_DIR, delete=False) as handle:
+        handle.write(PROMPT_TEMPLATE.format(count=len(acked), title=doc.get("name", doc["id"]),
+                                             doc_id=doc["id"], comments="\n".join(lines), marker=MARKER))
+    secure_file(handle.name)
+    return handle.name
 
 
-def load_watermark():
-    try:
-        with open(WATERMARK) as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        d = {}
-    seen = d.get("seen", [])
-    # heal legacy bare ids (same lesson as the PR watcher: always namespaced)
-    norm = set()
-    for i in seen:
-        s = str(i)
-        norm.add(s if s.startswith("gc:") else f"gc:{s}")
-    return {"seen": norm, "dispatched": d.get("dispatched", {})}
+def dispatch(owner, prompt):
+    result = subprocess.run([sys.executable, DEPT, "resume", owner["project"], owner["session"], prompt],
+                            capture_output=True, text=True, timeout=180)
+    if result.returncode:
+        return None, (result.stdout + result.stderr).strip()
+    task_id = next((line.split()[1] for line in result.stdout.splitlines()
+                    if line.startswith("resumed ")), None)
+    return (task_id, "") if task_id else (None, (result.stdout + result.stderr).strip())
 
 
-def save_watermark(wm):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(WATERMARK, "w") as f:
-        json.dump({"seen": sorted(wm["seen"]), "dispatched": wm["dispatched"]}, f, indent=2)
+def quiet_hours(now=None):
+    hour = (now or datetime.datetime.now(ZoneInfo("America/Los_Angeles"))).hour
+    return hour >= 22 or hour < 7
 
 
-def list_comments(doc_id):
-    return gws(
-        "drive", "comments", "list", "--params", json.dumps({
-            "fileId": doc_id,
-            "fields": "comments(id,content,quotedFileContent(value),author(displayName),createdTime,resolved,"
-                      "replies(id,content,author(displayName),createdTime))",
-            "pageSize": 100,
-        }),
-    ).get("comments", [])
+def watched_documents(client):
+    folder_id = WATCHER.get("folder_id", FOLDER_ID)
+    additional = WATCHER.get("additional_file_ids")
+    if additional is None:
+        additional = [EXTRA_DOCUMENT_ID]
+    additional = list(dict.fromkeys(additional))
+    return client.list_documents(folder_id, additional)
 
 
-def post_eyes_reply(doc_id, comment_id):
-    r = gws(
-        "drive", "replies", "create", "--params", json.dumps({
-            "fileId": doc_id, "commentId": comment_id, "fields": "id",
-        }), "--json", json.dumps({"content": ACK_TEXT}),
-    )
-    return r.get("id")
-
-
-def has_marker_reply(comment):
-    for rep in comment.get("replies", []) or []:
-        if MARKER in (rep.get("content") or ""):
-            return True
-    return False
-
-
-def feedback_items(comments):
-    """Flatten top-level and reply comments, retaining the thread parent for ACKs."""
-    for comment in comments:
-        parent_id = comment["id"]
-        yield {**comment, "_parent_id": parent_id}
-        for reply in comment.get("replies", []) or []:
-            yield {
-                **reply,
-                "quotedFileContent": comment.get("quotedFileContent"),
-                "_parent_id": parent_id,
-                "_thread": comment,
-            }
-
-
-def existing_ack(item):
-    """Return this watcher's earlier ACK for a retry, if the thread has one."""
-    thread = item.get("_thread", item)
-    for reply in thread.get("replies", []) or []:
-        if reply.get("content") == ACK_TEXT and reply.get("id"):
-            return reply["id"]
-    return None
-
-
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seed", action="store_true",
-                    help="Seed watermark from current comments without dispatching.")
-    args = ap.parse_args()
+    ap.add_argument("--seed", action="store_true", help="Record current comments without dispatching.")
+    ap.add_argument("--force", action="store_true", help="Poll during the 22:00–07:00 PT quiet hours.")
+    args = ap.parse_args(argv)
+    if quiet_hours() and not args.force:
+        return 0
 
-    os.makedirs(STATE_DIR, exist_ok=True)
+    secure_directory(STATE_ROOT)
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("another watcher holds the lock; exiting")
+        print("another Drive comment watcher holds the lock; exiting")
         return 0
+    db = connect_database()
+    try:
+        client = DriveClient(service_account_token(read_service_account_key()))
+        docs = watched_documents(client)
+    except DriveError as error:
+        print(f"Drive watcher setup failed: {error}", file=sys.stderr)
+        db.close()
+        lock.close()
+        return 1
+    for doc_id, error in client.skipped_documents:
+        print(f"{doc_id}: additional document skipped: {error}", file=sys.stderr)
 
-    wm = load_watermark()
-    if args.seed:
-        for doc_id in DOCS:
-            for c in list_comments(doc_id):
-                wm["seen"].add("gc:" + c["id"])
-                for rep in c.get("replies", []) or []:
-                    wm["seen"].add("gc:" + rep["id"])
-        save_watermark(wm)
-        print(f"seeded {len(wm['seen'])} ids")
-        return 0
-
-    for doc_id, meta in DOCS.items():
+    seed_only = args.seed or not database_initialized(db)
+    dispatched = 0
+    for doc in docs:
         try:
-            comments = list_comments(doc_id)
-        except Exception as e:
-            print(f"{doc_id}: list failed: {e}", file=sys.stderr)
+            comments = client.list_comments(doc["id"])
+        except DriveError as error:
+            print(f"{doc.get('name', doc['id'])}: comment list failed: {error}", file=sys.stderr)
             continue
         fresh = []
-        for c in feedback_items(comments):
-            key = "gc:" + c["id"]
-            if key in wm["seen"]:
+        for item in feedback_items(comments):
+            if comment_seen(db, doc["id"], item["id"]):
                 continue
-            thread = c.get("_thread", c)
-            if thread.get("resolved"):
-                wm["seen"].add(key)
-                continue
-            if (c.get("author") or {}).get("displayName") != HIS_NAME:
-                wm["seen"].add(key)  # not his — never dispatch
-                continue
-            # A worker's substantive marked reply predating this poll means the
-            # thread was handled outside this watcher's retry path. An exact
-            # watcher ACK, however, is retained to retry a failed dispatch.
-            if has_marker_reply(thread) and not existing_ack(c):
-                wm["seen"].add(key)  # already acked/handled
-                continue
-            fresh.append(c)
-
-        if not fresh:
-            save_watermark(wm)
+            if seed_only or item.get("_thread", item).get("resolved") or not trusted_author(item):
+                mark_seen(db, doc["id"], item["id"])
+            else:
+                fresh.append(item)
+        db.commit()
+        if seed_only or not fresh:
             continue
-
-        # Post 👀 acks first (fast visible ack), then dispatch once for the batch.
+        owner = owner_for(doc["id"])
+        if not owner:
+            print(f"{doc.get('name', doc['id'])}: {len(fresh)} new comment(s), no owning session configured", file=sys.stderr)
+            continue
+        if session_busy(db, owner["session"]):
+            print(f"{doc.get('name', doc['id'])}: owning session is busy; will retry {len(fresh)} comment(s)")
+            continue
         acked = []
-        for c in fresh:
+        for item in fresh:
             try:
-                rid = existing_ack(c) or post_eyes_reply(doc_id, c["_parent_id"])
-            except Exception as e:
-                print(f"{c['id']}: eyes reply failed: {e}", file=sys.stderr)
-                continue
-            acked.append((c, rid))
-
+                reply_id = stored_ack(db, doc["id"], item["id"])
+                if not reply_id:
+                    reply_id = client.post_eyes_reply(doc["id"], item["_parent_id"])
+                    save_ack(db, doc["id"], item["id"], reply_id)
+                acked.append((item, reply_id))
+            except DriveError as error:
+                print(f"{doc['id']}:{item['id']}: acknowledgment failed: {error}", file=sys.stderr)
         if not acked:
-            save_watermark(wm)
             continue
-
-        comments_txt = ""
-        reply_lines = ""
-        for c, rid in acked:
-            anchor = ((c.get("quotedFileContent") or {}).get("value") or "")[:200].replace("\n", " ")
-            comments_txt += (
-                f"\n### id `{c['id']}`, 👀 reply id `{rid}` "
-                f"({c.get('createdTime')})\n"
-                f"Anchor: {anchor}\n"
-                f"Text: {c.get('content')}\n"
-            )
-            reply_lines += f"REPLY {rid}: <substantive marked reply>\n"
-
-        os.makedirs(PROMPT_DIR, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        pfile = os.path.join(PROMPT_DIR, f"gdocs-{doc_id[:8]}-{stamp}.md")
-        with open(pfile, "w") as f:
-            f.write(PROMPT_TEMPLATE.format(
-                n=len(acked), title=meta["title"], doc_id=doc_id,
-                comments=comments_txt, reply_lines=reply_lines.rstrip(),
-            ))
-
-        r = subprocess.run(
-            [DEPT, "resume", meta["project"], meta["session"], pfile],
-            capture_output=True, text=True, timeout=180,
-        )
-        m = {}
-        for line in r.stdout.splitlines():
-            if line.startswith("resumed "):
-                # "resumed t-XXXX proc=... session=... project=... (via relay)"
-                m["task"] = line.split()[1]
-        if r.returncode == 0 and m.get("task"):
-            for c, rid in acked:
-                # Only a successful dispatch consumes the feedback item. If
-                # dispatch fails, keep its ACK and retry it on the next poll.
-                wm["seen"].add("gc:" + c["id"])
-                wm["seen"].add("gc:" + rid)
-                wm["dispatched"]["gc:" + c["id"]] = rid
-            print(f"{meta['title']}: dispatched {m['task']} for {len(acked)} comment(s)")
-        else:
-            # 👀 acks are up but dispatch failed: leave out of `dispatched` so
-            # the next poll retries the resume (acks already exist, no double 👀).
-            print(f"{meta['title']}: DISPATCH FAILED: {r.stdout[:300]} {r.stderr[:300]}",
-                  file=sys.stderr)
-        save_watermark(wm)
+        prompt = write_prompt(doc, acked)
+        try:
+            task_id, error = dispatch(owner, prompt)
+        finally:
+            try:
+                os.unlink(prompt)
+            except FileNotFoundError:
+                pass
+        if not task_id:
+            print(f"{doc.get('name', doc['id'])}: dispatch failed; will retry: {error[:300]}", file=sys.stderr)
+            continue
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for item, reply_id in acked:
+            mark_seen(db, doc["id"], item["id"])
+        db.execute("INSERT OR REPLACE INTO drive_comment_session_task VALUES (?, ?, ?)",
+                   (owner["session"], task_id, now))
+        db.commit()
+        dispatched += 1
+        print(f"{doc.get('name', doc['id'])}: dispatched {task_id} for {len(acked)} comment(s)")
+    if seed_only:
+        mark_initialized(db)
+        db.commit()
+        print(f"seeded Drive comment watermark for {len(docs)} document(s)")
+    elif not dispatched:
+        print("NOTHING_NEW")
+    db.close()
+    lock.close()
     return 0
 
 
