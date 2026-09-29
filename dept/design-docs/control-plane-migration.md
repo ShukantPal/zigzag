@@ -29,6 +29,15 @@ No new credential is created. All design docs live in a single Drive folder shar
 
 Router config (doc → assigned session), watcher configs, and review policy (two-full-round cap, lens sets, the security-lens requirement) live versioned in the repo under `dept/`. Muse edits them; the daemon reads them on startup and on SIGHUP. Runtime state — watermarks, review-round files, session maps — moves to the Mac with the loops, single-homed, so there is exactly one writer.
 
+## Config materialization
+
+The Python config is the source; the JSON is a build artifact. Both are committed to the repo. The daemon reads only the JSON — it never executes Python.
+
+- **Commit time**: a versioned pre-commit hook (`scripts/githooks/pre-commit`, installed via `scripts/install-hooks.sh`) re-materializes the JSON on every commit touching the config source. The hook is convenience, not enforcement — it can be bypassed with `--no-verify`.
+- **CI enforcement**: CI re-runs materialization and diffs against the committed JSON. Any mismatch — hand-edited JSON, or Python changed without regenerating — fails the build. A stale config can never merge.
+- **Determinism contract**: materialization must be byte-identical for identical source — sorted keys, no timestamps, no environment-dependent values, no unordered iteration in the emit path. Nondeterministic output makes CI flaky and diffs unreviewable.
+- **Reviewability**: the JSON diff in a PR is plain data — it is exactly what the daemon will run, and it is what gets reviewed. The Python diff is the logic behind it.
+
 ## What stays on the VM
 
 Chat surfacing: review-ready and decision-needed notifications still come from the VM, fed by daemon events. Cross-repo loops (leveled) stay where they are; the same pattern can follow later. Anything needing his personal Google account beyond the SA-shared docs folder stays VM-side.
