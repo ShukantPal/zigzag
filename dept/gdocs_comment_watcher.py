@@ -77,7 +77,8 @@ def read_service_account_key():
             raise DriveError(
                 "zigzag-sa keychain item could not be parsed as raw JSON or hex-decoded JSON"
             )
-    if key.get("client_email") != SERVICE_ACCOUNT or not key.get("private_key"):
+    if (not isinstance(key, dict) or key.get("client_email") != SERVICE_ACCOUNT
+            or not key.get("private_key")):
         raise DriveError("zigzag service-account keychain item has the wrong service account")
     return key
 

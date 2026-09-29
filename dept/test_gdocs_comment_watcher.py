@@ -163,6 +163,21 @@ class GdocsFeedbackTest(unittest.TestCase):
                 watcher.read_service_account_key()
         self.assertNotIn(value, str(error.exception))
 
+    def test_keychain_malformed_even_length_hex_errors_without_leaking_value(self):
+        value = "6e6f74206a736f6e"
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=value)):
+            with self.assertRaisesRegex(
+                    watcher.DriveError, "zigzag-sa.*raw JSON.*hex-decoded JSON") as error:
+                watcher.read_service_account_key()
+        self.assertNotIn(value, str(error.exception))
+
+    def test_keychain_hex_json_scalar_errors_cleanly(self):
+        with patch.object(watcher.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout="6e756c6c")):
+            with self.assertRaisesRegex(watcher.DriveError, "wrong service account"):
+                watcher.read_service_account_key()
+
     def test_token_mint_uses_drive_scope_and_removes_temporary_key(self):
         key = {"client_email": watcher.SERVICE_ACCOUNT, "private_key": "private"}
         signed = SimpleNamespace(returncode=0, stdout=b"signature")
