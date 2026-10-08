@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod exec;
+mod review_loop;
 mod update;
 
 const MAX_BODY: usize = 64 * 1024;
@@ -39,6 +40,7 @@ struct Config {
     update_interval: Duration,
     update_policy: update::Policy,
     update_ready_file: Option<PathBuf>,
+    review_state_file: PathBuf,
 }
 struct Server {
     secret: String,
@@ -46,6 +48,9 @@ struct Server {
     store: Arc<Store>,
     supervisor: Supervisor,
     updater: Arc<update::Manager>,
+    review_state_file: PathBuf,
+    review_loop_shadow: bool,
+    review_config: Mutex<Option<Arc<review_loop::ReviewLoopConfig>>>,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -63,6 +68,8 @@ struct ProcEntry {
     subcommand: String,
     spawned_at: Instant,
     finished_at: Option<Instant>,
+    termination_requested_at: Option<Instant>,
+    termination_escalated: bool,
     leader_reaped: bool,
     exit_code: Option<i32>,
     stdout: Arc<Mutex<CappedOutput>>,
@@ -152,6 +159,7 @@ fn run() -> Result<(), String> {
         policy: config.update_policy.clone(),
         ready_file: config.update_ready_file.clone(),
     }));
+    let review_loop_shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
     let state = Arc::new(Server {
         secret,
         control_secret,
@@ -161,12 +169,51 @@ fn run() -> Result<(), String> {
             procs: Mutex::new(HashMap::new()),
         },
         updater: Arc::clone(&updater),
+        review_state_file: config.review_state_file.clone(),
+        review_loop_shadow,
+        review_config: Mutex::new(None),
     });
-    for agent in state.supervisor.registry.recover(process_group_running)? {
+    for agent in state
+        .supervisor
+        .registry
+        .recover(recovered_agent_identity_matches)?
+    {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
-    if !config.github_watch_repos.is_empty() {
+    let mut review_loop_authoritative = false;
+    match review_loop::default_config_path() {
+        Ok(path) => match review_loop::load_config(&path) {
+            Ok(personal) if personal.review_loop.enabled => {
+                let review_config = Arc::new(personal.review_loop);
+                match review_loop::start(
+                    Arc::clone(&state),
+                    (*review_config).clone(),
+                    config.review_state_file.clone(),
+                    review_loop_shadow,
+                ) {
+                    Ok(()) => {
+                        *state
+                            .review_config
+                            .lock()
+                            .map_err(|_| "review config lock poisoned".to_owned())? =
+                            Some(review_config);
+                        review_loop_authoritative = !review_loop_shadow;
+                    }
+                    Err(error) => eprintln!("review loop disabled: {error}"),
+                }
+            }
+            Ok(_) => eprintln!("review loop disabled by ~/.zigzag/config.yaml"),
+            Err(violations) => {
+                eprintln!("review loop disabled: invalid ~/.zigzag/config.yaml");
+                for violation in violations {
+                    eprintln!("review loop config: {violation}");
+                }
+            }
+        },
+        Err(violation) => eprintln!("review loop disabled: {violation}"),
+    }
+    if should_start_legacy_watch(review_loop_authoritative, &config.github_watch_repos) {
         let state = Arc::clone(&state);
         let repos = config.github_watch_repos.clone();
         let interval = config.github_watch_interval;
@@ -435,6 +482,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("relay")
     });
+    let review_state_file = state_file.with_extension("reviews.json");
     Ok(Config {
         secret_file,
         control_secret_file,
@@ -449,6 +497,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         update_interval,
         update_policy,
         update_ready_file,
+        review_state_file,
     })
 }
 
@@ -465,12 +514,16 @@ fn valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn should_start_legacy_watch(review_loop_authoritative: bool, repositories: &[String]) -> bool {
+    !review_loop_authoritative && !repositories.is_empty()
+}
+
 fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration) {
     loop {
         for repo in &repos {
             match github_open_pull_requests(repo) {
                 Ok(pull_requests) => {
-                    for (number, url) in pull_requests {
+                    for number in pull_requests {
                         let id = format!("github-pr-opened:{repo}:{number}");
                         let payload = Json::Object(vec![
                             ("id".to_owned(), Json::String(id.clone())),
@@ -480,7 +533,10 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
                             ),
                             ("repository".to_owned(), Json::String(repo.clone())),
                             ("pull_request".to_owned(), Json::number(number)),
-                            ("url".to_owned(), Json::String(url)),
+                            (
+                                "url".to_owned(),
+                                Json::String(format!("https://github.com/{repo}/pull/{number}")),
+                            ),
                         ]);
                         match state.store.add(payload) {
                             Ok((_, false)) => {
@@ -500,7 +556,7 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
     }
 }
 
-fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
         id: format!("github-pr-scan-{repo}"),
@@ -522,7 +578,7 @@ fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
     parse_github_open_pull_requests(&result.stdout)
 }
 
-fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, String> {
+fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
     let value = parse_json(output)
         .map_err(|_| "GitHub PR discovery did not return the expected JSON".to_owned())?;
     let Json::Array(pull_requests) = value else {
@@ -543,13 +599,7 @@ fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, S
                 .and_then(Json::as_u64)
                 .filter(|number| *number > 0)
                 .ok_or_else(|| "GitHub PR discovery result is missing a PR number".to_owned())?;
-            let url = pull_request
-                .object("html_url")
-                .or_else(|| pull_request.object("url"))
-                .and_then(Json::as_str)
-                .filter(|url| !url.is_empty())
-                .ok_or_else(|| "GitHub PR discovery result is missing a PR URL".to_owned())?;
-            Ok((number, url.to_owned()))
+            Ok(number)
         })
         .collect()
 }
@@ -610,13 +660,16 @@ fn require_gui_login_session() -> Result<(), String> {
     if is_local_gui_session(status, attributes) {
         Ok(())
     } else {
-        Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
+        Err(
+            "privileged daemon operations require Shukant's local macOS GUI login session"
+                .to_owned(),
+        )
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn require_gui_login_session() -> Result<(), String> {
-    Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
+    Err("privileged daemon operations require Shukant's local macOS GUI login session".to_owned())
 }
 
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {
@@ -659,12 +712,31 @@ fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
 }
 
 fn handle_with_policy<F>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: Arc<Server>,
     load_policy: F,
 ) -> Result<(), String>
 where
     F: Fn() -> Result<exec::Policy, String>,
+{
+    handle_with_services(stream, state, load_policy, review_loop::gate_report)
+}
+
+fn handle_with_services<F, G>(
+    mut stream: TcpStream,
+    state: Arc<Server>,
+    load_policy: F,
+    gate_report: G,
+) -> Result<(), String>
+where
+    F: Fn() -> Result<exec::Policy, String>,
+    G: Fn(
+        &str,
+        u64,
+        &std::path::Path,
+        bool,
+        &review_loop::ReviewLoopConfig,
+    ) -> Result<serde_json::Value, String>,
 {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -715,6 +787,9 @@ where
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("GET", "/v1/review-gate") => {
+            review_gate_request(&mut stream, &state, &request.target, gate_report)
+        }
         ("GET", path) if agent_route(path).is_some() => agent_request(
             &mut stream,
             &state,
@@ -733,6 +808,72 @@ where
         },
         _ => reply(&mut stream, 404, error("not_found")),
     }
+}
+
+fn review_gate_request<G>(
+    stream: &mut TcpStream,
+    state: &Server,
+    target: &str,
+    gate_report: G,
+) -> Result<(), String>
+where
+    G: Fn(
+        &str,
+        u64,
+        &std::path::Path,
+        bool,
+        &review_loop::ReviewLoopConfig,
+    ) -> Result<serde_json::Value, String>,
+{
+    let (repository, number) = match review_gate_parameters(target) {
+        Ok(parameters) => parameters,
+        Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
+    };
+    let config = match state.review_config.lock() {
+        Ok(config) => config.clone(),
+        Err(_) => return reply(stream, 500, error("review_gate_failed")),
+    };
+    let Some(config) = config else {
+        return reply(stream, 500, error("review_gate_failed"));
+    };
+    match gate_report(
+        &repository,
+        number,
+        &state.review_state_file,
+        state.review_loop_shadow,
+        &config,
+    ) {
+        Ok(report) => {
+            let encoded = serde_json::to_string(&report)
+                .map_err(|error| format!("could not encode review gate report: {error}"))?;
+            let response = parse_json(&encoded)
+                .map_err(|_| "could not convert review gate report".to_owned())?;
+            reply(stream, 200, response)
+        }
+        Err(error_message) => {
+            eprintln!("review gate failed for {repository}#{number}: {error_message}");
+            reply(stream, 500, error("review_gate_failed"))
+        }
+    }
+}
+
+fn review_gate_parameters(target: &str) -> Result<(String, u64), ()> {
+    let values = query(target).map_err(|_| ())?;
+    let allowed = ["repository", "pull_request"];
+    if values.len() != allowed.len() || values.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(());
+    }
+    let repository = values
+        .get("repository")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or(())?;
+    let number = values
+        .get("pull_request")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|number| *number > 0)
+        .ok_or(())?;
+    Ok((repository, number))
 }
 
 fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
@@ -1051,6 +1192,10 @@ fn spawn_proc(
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
     let process_group = child.id() as i32;
+    let Some(process_identity) = process_identity(process_group) else {
+        let _ = force_kill_process_group(process_group);
+        return Err("could not record spawned process identity".to_owned());
+    };
     let mut table = supervisor
         .procs
         .lock()
@@ -1064,6 +1209,7 @@ fn spawn_proc(
         execution_id: execution_id.clone(),
         leader_pid: process_group,
         process_group,
+        process_identity: Some(process_identity),
         started_at: unix_timestamp(),
         deadline_at: None,
         command: format!(
@@ -1129,6 +1275,8 @@ fn spawn_proc(
             subcommand: request.args.first().cloned().unwrap_or_default(),
             spawned_at: Instant::now(),
             finished_at: None,
+            termination_requested_at: None,
+            termination_escalated: false,
             leader_reaped: false,
             exit_code: None,
             stdout,
@@ -1218,6 +1366,9 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             false
         };
         if killed {
+            entry
+                .termination_requested_at
+                .get_or_insert_with(Instant::now);
             // Reap promptly when the signal is delivered before a subsequent
             // poll, but do not block an HTTP request waiting for cleanup.
             update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
@@ -1276,8 +1427,70 @@ fn kill_process_group(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, libc::SIGTERM) == 0 }
 }
 
+fn force_kill_process_group(process_group: i32) -> bool {
+    // Review-loop cleanup is terminal: obsolete reviewers and owners must not
+    // survive supersession or merge, including shells that ignore SIGTERM.
+    let terminated = kill_process_group(process_group);
+    let killed = unsafe { libc::kill(-process_group, libc::SIGKILL) == 0 };
+    terminated || killed
+}
+
 fn process_group_running(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, 0) == 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: i32) -> Option<String> {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size as i32,
+        )
+    };
+    (written as usize == size)
+        .then(|| format!("macos:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_command = stat.get(stat.rfind(')')? + 2..)?;
+    let start_ticks = after_command.split_whitespace().nth(19)?;
+    Some(format!("linux:{start_ticks}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_identity(_pid: i32) -> Option<String> {
+    None
+}
+
+fn recovered_agent_identity_matches(agent: &AgentRecord) -> bool {
+    process_group_running(agent.process_group)
+        && agent
+            .process_identity
+            .as_deref()
+            .zip(process_identity(agent.leader_pid).as_deref())
+            .is_some_and(|(expected, current)| expected == current)
+}
+
+fn managed_agent_running(agent: &AgentRecord) -> bool {
+    managed_agent_running_with(agent, recovered_agent_identity_matches)
+}
+
+fn managed_agent_running_with(
+    agent: &AgentRecord,
+    orphan_is_current: impl Fn(&AgentRecord) -> bool,
+) -> bool {
+    match agent.state.as_str() {
+        "running" => true,
+        "orphaned" => orphan_is_current(agent),
+        _ => false,
+    }
 }
 
 fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String> {
@@ -1461,6 +1674,19 @@ fn update_proc_status_with_handle(
     if entry.finished_at.is_some() {
         return;
     }
+    if entry
+        .termination_requested_at
+        .is_some_and(|requested| requested.elapsed() >= Duration::from_millis(500))
+        && !entry.termination_escalated
+    {
+        // Shells waiting on descendants do not consistently exit after a
+        // group-wide SIGTERM on macOS. Escalate the whole group after a short
+        // grace period so explicit kill requests always converge.
+        unsafe {
+            libc::kill(-entry.process_group, libc::SIGKILL);
+        }
+        entry.termination_escalated = true;
+    }
     if !entry.leader_reaped {
         match entry.child.try_wait() {
             Ok(Some(status)) => {
@@ -1471,7 +1697,12 @@ fn update_proc_status_with_handle(
             Err(_) => return,
         }
     }
-    if !process_group_running(entry.process_group) && output_is_complete(entry) {
+    // A fully killed group can remain visible to kill(2) while an orphaned
+    // descendant is still a zombie. Once SIGKILL was sent, a reaped leader
+    // and closed output pipes prove there are no live managed writers left.
+    if (!process_group_running(entry.process_group) || entry.termination_escalated)
+        && output_is_complete(entry)
+    {
         let state = match entry.exit_code {
             Some(0) => "succeeded",
             Some(_) => "failed",
@@ -1753,13 +1984,21 @@ fn query(target: &str) -> Result<HashMap<String, String>, String> {
     let Some((_, raw)) = target.split_once('?') else {
         return Ok(HashMap::new());
     };
-    raw.split('&')
+    let pairs: Vec<_> = raw
+        .split('&')
         .filter(|value| !value.is_empty())
         .map(|item| {
             let (key, value) = item.split_once('=').unwrap_or((item, ""));
-            Ok((percent_decode(key)?, percent_decode(value)?))
+            Ok::<_, String>((percent_decode(key)?, percent_decode(value)?))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let mut values = HashMap::new();
+    for (key, value) in pairs {
+        if values.insert(key, value).is_some() {
+            return Err("duplicate query parameter".to_owned());
+        }
+    }
+    Ok(values)
 }
 fn percent_decode(input: &str) -> Result<String, String> {
     let mut bytes = Vec::new();
@@ -1815,6 +2054,16 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_updater() -> Arc<update::Manager> {
+    Arc::new(update::Manager::new(update::Config {
+        directory: std::env::temp_dir().join("zigzag-test-updates"),
+        interval: Duration::ZERO,
+        policy: update::Policy::Enabled,
+        ready_file: None,
+    }))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1828,6 +2077,106 @@ mod tests {
             get_query("/v1/events?epoch=%ZZ").unwrap_err(),
             "invalid URL encoding"
         );
+    }
+
+    #[test]
+    fn review_gate_query_requires_one_repository_and_positive_pr() {
+        assert_eq!(
+            review_gate_parameters(
+                "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=22"
+            ),
+            Ok(("ShukantPal/zigzag".to_owned(), 22))
+        );
+        for target in [
+            "/v1/review-gate",
+            "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=0",
+            "/v1/review-gate?repository=&pull_request=22",
+            "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=22&extra=1",
+            "/v1/review-gate?repository=one%2Frepo&repository=two%2Frepo&pull_request=22",
+            "/v1/review-gate?repository=one%2Frepo&pull_request=22&pull_request=23",
+            "/v1/review-gate?repository=%ZZ&pull_request=22",
+        ] {
+            assert_eq!(review_gate_parameters(target), Err(()));
+        }
+    }
+
+    #[test]
+    fn authenticated_review_gate_route_forwards_mode_and_state_path() {
+        let (state, state_path) = test_server();
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let key = format!("owner/repo#22@{head}");
+        let durable_state = serde_json::json!({
+            "schema_version": 1,
+            "rounds": {
+                (key): {
+                    "repository": "owner/repo",
+                    "pull_request": 22,
+                    "head": head,
+                    "base": base,
+                    "generation": 1,
+                    "verification": false,
+                    "phase": "reviewing",
+                    "reviewers": {},
+                    "verdicts": {},
+                    "excluded_comment_ids": [],
+                    "pending_comment_deletions": [],
+                    "owner": null,
+                    "owner_agent_id": null,
+                    "gate_reasons": [],
+                }
+            }
+        });
+        std::fs::write(
+            &state.review_state_file,
+            serde_json::to_vec(&durable_state).unwrap(),
+        )
+        .unwrap();
+        let expected_state_path = state.review_state_file.clone();
+
+        let response = request_once_with_gate(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
+            "",
+            |repository, pull_request, review_state_path, shadow, _config| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(pull_request, 22);
+                assert_eq!(review_state_path, expected_state_path);
+                assert!(!shadow);
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(review_state_path).unwrap()).unwrap();
+                assert!(persisted["rounds"].is_object());
+                Ok(serde_json::json!({
+                    "pass": true,
+                    "head": "a".repeat(40),
+                }))
+            },
+        );
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let report = response_json(response);
+        assert_eq!(report.object("pass"), Some(&Json::Bool(true)));
+        assert_eq!(report.object("head"), Some(&Json::String("a".repeat(40))));
+
+        let unauthorized = request_once_with_gate_token(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
+            "",
+            "wrong-token",
+            |_, _, _, _, _| panic!("unauthorized gate request reached the backend"),
+        );
+        assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(expected_state_path);
     }
 
     #[test]
@@ -1987,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn github_watch_configuration_is_opt_in_and_rate_limited() {
+    fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
         let base_arguments = || {
             vec![
                 "--secret-file".to_owned(),
@@ -1997,8 +2346,10 @@ mod tests {
             ]
         };
         let config = server_config(base_arguments()).unwrap();
-        assert!(config.github_watch_repos.is_empty());
-        assert_eq!(config.github_watch_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.review_state_file,
+            PathBuf::from("/state").with_extension("reviews.json")
+        );
 
         let mut arguments = base_arguments();
         arguments.extend([
@@ -2010,26 +2361,30 @@ mod tests {
         let config = server_config(arguments).unwrap();
         assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
         assert_eq!(config.github_watch_interval, Duration::from_secs(60));
-
-        let mut arguments = base_arguments();
-        arguments.extend(["--watch-interval".to_owned(), "29".to_owned()]);
-        assert!(server_config(arguments).is_err());
+        let shadow_authoritative = review_loop::authoritative_mode(true);
+        assert!(!shadow_authoritative);
+        assert!(should_start_legacy_watch(
+            shadow_authoritative,
+            &config.github_watch_repos
+        ));
+        let cutover_authoritative = review_loop::authoritative_mode(false);
+        assert!(cutover_authoritative);
+        assert!(!should_start_legacy_watch(
+            cutover_authoritative,
+            &config.github_watch_repos
+        ));
     }
 
     #[test]
-    fn github_pr_scan_requires_numbers_and_urls() {
+    fn github_pr_scan_requires_positive_numbers() {
         assert_eq!(
             parse_github_open_pull_requests(
                 r#"[[{"number":42,"html_url":"https://github.com/leveled-inc/leveled/pull/42"}]]"#,
             )
             .unwrap(),
-            vec![(
-                42,
-                "https://github.com/leveled-inc/leveled/pull/42".to_owned()
-            )]
+            vec![42]
         );
         assert!(parse_github_open_pull_requests(r#"{"number":42}"#).is_err());
-        assert!(parse_github_open_pull_requests(r#"[{"number":42,"url":""}]"#).is_err());
         assert!(
             parse_github_open_pull_requests(r#"[{"number":0,"url":"https://example.test"}]"#)
                 .is_err()
@@ -2140,6 +2495,7 @@ mod tests {
             execution_id: "execution".to_owned(),
             leader_pid: 1,
             process_group: 1,
+            process_identity: Some("test:1".to_owned()),
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "sh -c".to_owned(),
@@ -2382,9 +2738,11 @@ mod tests {
             1
         );
 
-        // The shell leader exits immediately, leaving the sleep descendant in
-        // the dedicated process group. It must still be visible and killable.
-        let handle = spawn_for_test(&state, &policy, "sleep", "sleep 60 & exit");
+        // The shell and its background child remain in the daemon-created
+        // process group on both Linux and macOS. The endpoint cannot report
+        // completion until the group signal terminates both processes and
+        // closes the inherited output pipes.
+        let handle = spawn_for_test(&state, &policy, "sleep", "sleep 60 & wait");
         let running = response_json(request_once(
             Arc::clone(&state),
             &policy,
@@ -2393,6 +2751,12 @@ mod tests {
             "",
         ));
         assert_eq!(running.object("running"), Some(&Json::Bool(true)));
+        let recovered = state.supervisor.registry.get(&handle).unwrap();
+        assert!(recovered.process_identity.is_some());
+        assert!(recovered_agent_identity_matches(&recovered));
+        let mut reused_pid = recovered.clone();
+        reused_pid.process_identity = Some("different-process-birth".to_owned());
+        assert!(!recovered_agent_identity_matches(&reused_pid));
         let killed = response_json(request_once(
             Arc::clone(&state),
             &policy,
@@ -2437,9 +2801,24 @@ mod tests {
                     policy: update::Policy::Enabled,
                     ready_file: None,
                 })),
+                review_state_file: path.with_extension("review-state"),
+                review_loop_shadow: false,
+                review_config: Mutex::new(Some(Arc::new(test_review_config()))),
             }),
             path,
         )
+    }
+
+    fn test_review_config() -> review_loop::ReviewLoopConfig {
+        review_loop::ReviewLoopConfig {
+            enabled: true,
+            intervals: review_loop::Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: Vec::new(),
+        }
     }
 
     fn completed_entry() -> ProcEntry {
@@ -2457,6 +2836,8 @@ mod tests {
             subcommand: "-c".to_owned(),
             spawned_at: Instant::now(),
             finished_at: Some(Instant::now()),
+            termination_requested_at: None,
+            termination_escalated: false,
             leader_reaped: true,
             exit_code: Some(0),
             stdout: Arc::new(Mutex::new(CappedOutput {
@@ -2477,11 +2858,67 @@ mod tests {
         target: &str,
         body: &str,
     ) -> String {
+        request_once_with_gate(
+            state,
+            policy,
+            method,
+            target,
+            body,
+            review_loop::gate_report,
+        )
+    }
+
+    fn request_once_with_gate<G>(
+        state: Arc<Server>,
+        policy: &exec::Policy,
+        method: &str,
+        target: &str,
+        body: &str,
+        gate_report: G,
+    ) -> String
+    where
+        G: Fn(
+            &str,
+            u64,
+            &std::path::Path,
+            bool,
+            &review_loop::ReviewLoopConfig,
+        ) -> Result<serde_json::Value, String>,
+    {
+        request_once_with_gate_token(
+            state,
+            policy,
+            method,
+            target,
+            body,
+            &"x".repeat(32),
+            gate_report,
+        )
+    }
+
+    fn request_once_with_gate_token<G>(
+        state: Arc<Server>,
+        policy: &exec::Policy,
+        method: &str,
+        target: &str,
+        body: &str,
+        token: &str,
+        gate_report: G,
+    ) -> String
+    where
+        G: Fn(
+            &str,
+            u64,
+            &std::path::Path,
+            bool,
+            &review_loop::ReviewLoopConfig,
+        ) -> Result<serde_json::Value, String>,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request = format!(
             "{method} {target} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
-            "x".repeat(32),
+            token,
             body.len()
         );
         let client = thread::spawn(move || {
@@ -2492,7 +2929,7 @@ mod tests {
             response
         });
         let (server, _) = listener.accept().unwrap();
-        handle_with_policy(server, state, || Ok(policy.clone())).unwrap();
+        handle_with_services(server, state, || Ok(policy.clone()), gate_report).unwrap();
         client.join().unwrap()
     }
 
@@ -2521,7 +2958,8 @@ mod tests {
     }
 
     fn poll_until_complete(state: &Arc<Server>, policy: &exec::Policy, handle: &str) -> Json {
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
             let response = response_json(request_once(
                 Arc::clone(state),
                 policy,

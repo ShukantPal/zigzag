@@ -27,6 +27,50 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo fmt --all --check
+  rust-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+      - run: bash -n scripts/codex-review-launch.sh
+      - run: plutil -lint launchd/com.shukantpal.zigzag.plist
+      - run: cargo build --locked --workspace --all-targets
+      - run: cargo test --locked --workspace
+
+      - name: Smoke installed reviewer launcher
+        run: |
+          install -m 700 scripts/codex-review-launch.sh "$RUNNER_TEMP/codex-review-launch"
+          test "$(stat -f %Lp "$RUNNER_TEMP/codex-review-launch")" = 700
+          set +e
+          "$RUNNER_TEMP/codex-review-launch" invalid "$RUNNER_TEMP"
+          status=$?
+          set -e
+          test "$status" -eq 2
+          mkdir "$RUNNER_TEMP/reviewer-task" "$RUNNER_TEMP/reviewer-work"
+          printf '%s\n' "$RUNNER_TEMP/reviewer-work" > "$RUNNER_TEMP/reviewer-task/dir.txt"
+          printf '%s\n' 'review prompt' > "$RUNNER_TEMP/reviewer-task/prompt.txt"
+          printf '%s\n' '{}' > "$RUNNER_TEMP/reviewer-task/result-schema.json"
+          printf '%s\n' '[]' > "$RUNNER_TEMP/reviewer-work/review-material.json"
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'set -eu' \
+            'output=' \
+            'while [ "$#" -gt 0 ]; do' \
+            '  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi' \
+            'done' \
+            'cat >/dev/null' \
+            'printf '\''{"verdict":"approve"}\\n'\'' > "$output"' \
+            'printf '\''{"type":"done"}\\n'\''' \
+            > "$RUNNER_TEMP/fake-codex"
+          chmod 700 "$RUNNER_TEMP/fake-codex"
+          grep -q '^CODEX=/run/current-system/sw/bin/codex$' "$RUNNER_TEMP/codex-review-launch"
+          ! grep -q 'CODEX_REVIEW_CODEX_BIN' "$RUNNER_TEMP/codex-review-launch"
+          sed "s#/run/current-system/sw/bin/codex#$RUNNER_TEMP/fake-codex#" \
+            "$RUNNER_TEMP/codex-review-launch" > "$RUNNER_TEMP/codex-review-launch-smoke"
+          chmod 700 "$RUNNER_TEMP/codex-review-launch-smoke"
+          "$RUNNER_TEMP/codex-review-launch-smoke" run "$RUNNER_TEMP/reviewer-task"
+          grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
+          grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
   release:
     # GitHub exposes macos-14 as the supported ARM64 hosted image, not an

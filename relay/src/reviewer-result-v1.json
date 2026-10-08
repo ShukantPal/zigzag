@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "lens", "verdict", "head", "findings"],
+  "properties": {
+    "version": {"type": "integer", "const": 1},
+    "lens": {
+      "enum": ["correctness", "simplicity", "tests", "security", "performance"]
+    },
+    "verdict": {"enum": ["approve", "changes_requested"]},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "findings": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    }
+  }
+}

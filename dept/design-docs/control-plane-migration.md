@@ -10,7 +10,9 @@ On 2026-09-26 we sketched moving the review loop onto the Mac daemon. This docum
 
 ## Direction
 
-The Mac daemon becomes the control plane's execution site. It runs the GitHub review loops end to end — watching PR comments, dispatching 3-lens review teams, polling verdicts, running the merge gate, resuming owners, killing reviewers on merge — and it routes Google Doc comments to the assigned Codex session. The loops are implemented in Rust inside the relay daemon: a port of the current Python watchers, not a reuse. The only code running on the Mac is the Rust binary; Python exists only at config-authoring time (`dept/config.py` runs at commit/CI, never on the daemon). Muse remains the control-plane configurer: every behavior lives in config-as-code in the zigzag repo, which Muse edits and the daemon consumes. Chat surfacing (review-ready / decision-needed) and cross-repo work stay on the VM.
+The Mac daemon becomes the control plane's execution site. It runs the GitHub review loops end to end — watching PR comments, dispatching configured review teams, polling verdicts, running the merge gate, resuming owners, killing reviewers on merge — and it routes Google Doc comments to the assigned Codex session. The loops are implemented in Rust inside the relay daemon: a port of the current Python watchers, not a reuse. The only code running on the Mac is the Rust binary. Muse remains the control-plane configurer. Chat surfacing (review-ready / decision-needed) and cross-repo work stay on the VM.
+
+The later review-loop-specific decision for this implementation supersedes this document for review policy: that policy is hand-written personal YAML at `~/.zigzag/config.yaml`, with no Python authoring or materialization layer, and is loaded on daemon startup. Repository-authored configuration and materialization below continue to apply only to the other control-plane loops as they migrate.
 
 ## What moves to the Mac
 
@@ -27,11 +29,11 @@ No new credential is created. All design docs live in a single Drive folder shar
 
 ## Config as code
 
-Router config (doc → assigned session), watcher configs, and review policy (two-full-round cap, lens sets, the security-lens requirement) live versioned in the repo under `dept/`. Muse edits them; the daemon reads them on startup and on SIGHUP. Runtime state — watermarks, review-round files, session maps — moves to the Mac with the loops, single-homed, so there is exactly one writer.
+Router config (doc → assigned session) and non-review-loop watcher config live versioned in the repo under `dept/`. Muse edits them; their consumers read them on startup and on SIGHUP where supported. Review policy is the deliberate exception: it lives in `~/.zigzag/config.yaml` and takes effect on daemon restart. Runtime state — watermarks, review-round files, session maps — moves to the Mac with the loops, single-homed, so there is exactly one writer.
 
 ## Config materialization
 
-The Python config is the source; the JSON is a build artifact. Both are committed to the repo. The daemon reads only the JSON — it never executes Python.
+For non-review-loop control-plane configuration, the Python config is the source and JSON is a build artifact. Both are committed to the repo. The daemon never executes Python. The review loop does not consume this artifact; its personal YAML is validated directly against the daemon's embedded schema.
 
 - **Commit time**: a versioned pre-commit hook (`scripts/githooks/pre-commit`, installed via `scripts/install-hooks.sh`) re-materializes the JSON on every commit touching the config source. The hook is convenience, not enforcement — it can be bypassed with `--no-verify`.
 - **CI enforcement**: CI re-runs materialization and diffs against the committed JSON. Any mismatch — hand-edited JSON, or Python changed without regenerating — fails the build. A stale config can never merge.
@@ -44,10 +46,10 @@ Chat surfacing: review-ready and decision-needed notifications still come from t
 
 ## Tradeoffs
 
-**Single binary, no Python on the Mac (decided 2026-09-28).** The loops are ported to Rust inside the relay daemon — no Python watchers via launchd, no Python runtime in the daemon's path. The port cost is real (the watchers are battle-tested), but it buys one deployable, one config surface (the materialized JSON), and no split-brain between two runtimes on the same machine.
+**Single binary, no Python on the Mac (decided 2026-09-28).** The loops are ported to Rust inside the relay daemon — no Python watchers via launchd, no Python runtime in the daemon's path. The port cost is real (the watchers are battle-tested), but it buys one deployable and no split-brain between two runtimes on the same machine. Review-loop policy uses the personal YAML boundary defined by the later review-loop design; other migrated loops may retain repository-materialized configuration.
 
 **Quiet hours.** Mac-side loops pause when the laptop sleeps (10pm–7am). Overnight review latency is the price; nothing is lost, because state is on disk and loops resume on wake. This is accepted behavior, not a failure mode.
 
-**Migration split-brain.** During rollout, a loop runs on exactly one side. Each loop gets a config flag naming its owner; VM crons retire per loop as the daemon takes over, never both at once.
+**Migration split-brain.** During rollout, only one side owns side effects. The review loop first runs in shadow mode beside the VM tooling so decisions can be compared without duplicate dispatch or publication; observational shadow rounds accept the VM's trusted, structured, exact-head verdict comments without daemon generation markers, while authoritative rounds require their active generation marker. The VM approval-gate script delegates the complete decision through the authenticated GUI-session relay to the daemon's canonical Rust gate, so policy, verdict admission, and CI evaluation cannot drift without bypassing the local-session boundary. Authority transfers only after decisions match. Other loops use an explicit owner flag and retire their VM cron as the daemon takes over.
 
 **Rollout.** Phase 1: review loops (comment watcher, rounds, gate, merge killer). Phase 2: doc router and Dependabot watcher. Phase 3: retire the VM crons and delete the paused-watchers tracking.

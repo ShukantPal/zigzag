@@ -76,6 +76,35 @@ GUI-session Keychain allowlist are unchanged. The legacy kill route is only
 enabled when a distinct `--control-secret-file` (or
 `ZIGZAG_CONTROL_SECRET_FILE`) is configured.
 
+## Mac-owned review loop
+
+At startup, the daemon reads `~/.zigzag/config.yaml`, validates it against the
+embedded draft 2020-12 JSON Schema (including the `regex` format), and rejects
+YAML duplicate keys, custom tags, unknown fields, and duplicate repository
+entries. Configuration errors fail closed
+for reviews only and are logged with paths; the relay keeps serving.
+
+When enabled, Zigzag owns a durable state machine for each
+`(repository, pull request, head)` in `events.reviews.json`. It dispatches
+independent configured lenses through a dedicated tool-free Codex launcher,
+admits only bounded version 1 JSON results for the exact current head, and
+publishes validated verdicts under the trusted GitHub identity. It evaluates
+every matching required CI check and emits `review_ready` or bounded
+`review_findings` events. Findings resume the owning Codex session only as
+escaped, explicitly untrusted JSON claims that the owner must independently
+verify. A new head or base commit supersedes the old comparison and approvals,
+and a merge kills outstanding reviewer and owner-resume process groups,
+including recovered orphan groups. Comparisons at GitHub's 300-file response
+cap are rejected as potentially truncated and put the round in `Attention`.
+
+Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
+Shadow mode runs discovery, verdict admission, and gate decisions alongside
+the VM tooling, preserves the legacy `--watch-repo` `github_pr_opened` feed,
+and suppresses agent dispatch, owner resume, and process kills.
+Remove it only after decisions match and the VM review jobs have drained and
+stopped. See [launchd/INSTALL.md](launchd/INSTALL.md) for configuration and
+cutover.
+
 ## Build and test
 
 ```sh

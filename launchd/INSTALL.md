@@ -54,63 +54,88 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
-## GitHub PR watchdog events
+## Mac-owned review loop
 
-The relay can discover open pull requests in explicitly watched repositories
-and enqueue one durable `github_pr_opened` event per PR. This is the trigger
-for the VM department worker; it does not run Codex or mutate GitHub from the
-Mac. Add one `--watch-repo` argument for each repository to the reviewed
-LaunchAgent arguments (beginning with `leveled-inc/leveled`):
+Zigzag reads `~/.zigzag/config.yaml` once at daemon startup. The file is
+hand-written personal policy, not a generated repository artifact. Missing,
+unreadable, malformed, or schema-invalid configuration disables only the
+review loop; the relay and its other duties continue. Every validation error
+is logged with its JSON path.
 
-```sh
-zigzag --secret-file ~/.codex/zigzag/zigzag.token \
-  --state-file ~/.codex/zigzag/events.json \
-  --watch-repo leveled-inc/leveled \
-  --watch-interval 30
-```
-
-The supplied LaunchAgent template includes this initial repository; add
-additional `--watch-repo` argument pairs only after reviewing their scope.
-
-The template starts the scan, but it fails closed (and logs a policy error)
-until the owner installs the `gh` policy fragment below. Each scan then runs
-exactly this read-only command through the policy boundary:
+Create the directory, install the version 1 policy from the design, and then
+restart the LaunchAgent:
 
 ```sh
-gh api --paginate --slurp repos/leveled-inc/leveled/pulls?state=open\&per_page=100
+mkdir -p ~/.zigzag
+chmod 700 ~/.zigzag
+$EDITOR ~/.zigzag/config.yaml
+chmod 600 ~/.zigzag/config.yaml
 ```
 
-Newly discovered PRs produce a stable event id such as
-`github-pr-opened:leveled-inc/leveled:42` and this payload:
+Current Zigzag policy:
 
-```json
-{"id":"github-pr-opened:leveled-inc/leveled:42","kind":"github_pr_opened","repository":"leveled-inc/leveled","pull_request":42,"url":"https://github.com/leveled-inc/leveled/pull/42"}
+```yaml
+schema_version: 1
+review_loop:
+  enabled: true
+  intervals:
+    discovery_seconds: 300
+    review_seconds: 600
+    merge_seconds: 300
+  repositories:
+    - repository: ShukantPal/zigzag
+      full_rounds_max: 2
+      verification_rounds_max: 2
+      lenses: [correctness, simplicity, tests, security]
+      require_security_lens: true
+      required_ci_checks:
+        - label: semgrep
+          name_pattern: semgrep
+        - label: BuildBuddy
+          name_pattern: buildbuddy
+      trusted_verdict_identity: ShukantPal
+      result_limits:
+        max_findings_per_lens: 20
+        max_bytes_per_lens: 16384
 ```
 
-On a relay restart, and after bounded event-queue eviction, already-open PRs
-may be rediscovered. `dept.py` must use the repository/PR pair as a durable
-watchdog lease key (with the event id as its idempotency key), so recovery can
-re-offer delivery without creating a second active watchdog.
+The daemon persists one round per repository/PR/head as
+`events.reviews.json`, dispatches independent reviewers, accepts only
+versioned exact-head verdicts from the configured identity, checks required
+CI, and resumes the owning Codex session with bounded findings. New heads
+supersede old approvals, and merge polling terminates reviewer process groups.
 
-### Department handoff
+For the migration comparison period, set `ZIGZAG_REVIEW_LOOP_SHADOW=1` in the
+LaunchAgent environment. Shadow mode evaluates and emits decisions but never
+dispatches, resumes, or kills agents. Keep the existing `--watch-repo` and
+`--watch-interval` arguments during this period: Zigzag continues emitting the
+durable `github_pr_opened` feed that drives the VM review worker. At cutover,
+drain and stop the VM review jobs, remove the environment variable, and restart
+Zigzag; the active Mac review loop then suppresses the legacy watcher even if
+the compatibility arguments remain in the LaunchAgent.
+`review_loop.enabled: false` is different: it starts no review loop at all.
 
-Run the existing VM poller continuously and send its JSON Lines to the
-department event adapter. For a `github_pr_opened` event, that adapter creates
-or resumes a Codex worker using the repository/PR lease key and event id from
-the payload. The worker must remain active until CI is green and then keep
-polling for later feedback. Its required loop is:
+Install the dedicated reviewer launcher beside the department launcher:
 
-1. Read PR state and checks through Zigzag's read-only `gh` endpoint.
-2. On every poll, read both issue comments and pull-request review comments.
-3. For each unacknowledged comment by `ShukantPal`, add an eyes reaction in
-   that same poll cycle, address the requested change on the PR branch, push
-   the branch, and return to the CI watch.
-4. Persist the GitHub comment id in the department task state before the next
-   poll, so a restart cannot acknowledge or apply the same feedback twice.
+```sh
+cp scripts/codex-review-launch.sh ~/.codex/dept/
+chmod 700 ~/.codex/dept/codex-review-launch.sh
+```
 
-The reaction and branch push are intentionally performed by the VM-side Codex
-worker using its GitHub credentials, not by the Mac relay. The relay policy
-below is read-only and cannot create reactions, merge PRs, or push code.
+Reviewer agents use this launcher with Codex's shell tool and web search
+disabled, a read-only sandbox, approval policy `never`, no user config/rules,
+an empty process environment, and a JSON output schema. They receive only a
+bounded PR patch as untrusted prompt data and cannot access credentials, run
+commands, or post to GitHub. The daemon validates their result, then performs
+the narrow trusted comment publication step. Owner resume continues to use
+`codex-launch resume`, with findings encoded as untrusted JSON claims behind
+an explicit instruction barrier. Reviewer input uses a pinned base/head
+comparison and rejects GitHub's 300-file cap rather than approving potentially
+truncated material.
+
+GitHub discovery and gate reads remain read-only at the public execution
+boundary. Every repository in the YAML must also be present in the
+Keychain-held `gh_read_repos` policy.
 
 ### Owner approval required: proposed `gh` policy addition
 
@@ -129,7 +154,11 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 +        ["pr", "checks"],
 +        ["api"]
 +      ],
-+      "gh_read_repos": ["leveled-inc/leveled"]
++      "gh_read_repos": ["ShukantPal/zigzag"]
++    },
++    "codex-review-launch": {
++      "path": "/Users/REPLACE/.codex/dept/codex-review-launch.sh",
++      "commands": [["run"]]
 +    },
      "existing-binary": { "path": "/existing/path", "commands": [["existing-command"]] }
    }
@@ -137,12 +166,14 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 ```
 
 `/opt/homebrew/bin/gh` must be replaced with the owner's actual absolute `gh`
-path. Zigzag additionally restricts the `gh` entry to the repositories named
-in `gh_read_repos`, `pr list`, `pr view`, `pr checks`, and GET-only `api` calls
-for PR discovery, issue comments, review comments, and reviews. It rejects
+path. Zigzag additionally restricts the public `gh` entry to repositories in
+`gh_read_repos`, `pr list`, `pr view`, `pr checks`, and GET-only `api` calls
+(including exact-SHA compare reads). It rejects
 `--method`, `-X`, body flags, all other `gh` subcommands, and `--web` (including
 `--web=true`), so this policy cannot be used to write GitHub state or read a
-different repository.
+different repository. The daemon's internal verdict publisher reuses only the
+configured `gh` path and repository scope after validating a reviewer result;
+`/v1/exec` still cannot invoke `gh pr comment`.
 The policy is deliberately not stored in this repository and this change does
 not touch the live Keychain item.
 

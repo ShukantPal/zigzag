@@ -21,29 +21,12 @@ config = importlib.import_module("config")
 
 class ConfigValidationTest(unittest.TestCase):
     def setUp(self):
-        self.review_policy = dict(config.REVIEW_POLICY)
         self.loop_ownership = list(config.LOOP_OWNERSHIP)
         self.doc_routes = list(config.DOC_ROUTES)
 
     def tearDown(self):
-        config.REVIEW_POLICY.clear()
-        config.REVIEW_POLICY.update(self.review_policy)
         config.LOOP_OWNERSHIP[:] = self.loop_ownership
         config.DOC_ROUTES[:] = self.doc_routes
-
-    def test_unknown_lens_is_rejected(self):
-        config.REVIEW_POLICY["leveled"] = config.ReviewPolicy(2, 2, ["unknown"], False)
-
-        self.assertIn("leveled: unknown lenses ['unknown']", config.validate())
-
-    def test_zigzag_requires_security_lens(self):
-        config.REVIEW_POLICY["zigzag"] = config.ReviewPolicy(
-            2, 2, ["correctness", "tests"], True
-        )
-
-        self.assertIn(
-            "zigzag: security lens required but missing", config.validate()
-        )
 
     def test_duplicate_loop_ownership_is_rejected(self):
         config.LOOP_OWNERSHIP.append(config.LoopOwnership("doc-router", "vm"))
@@ -56,9 +39,9 @@ class ConfigValidationTest(unittest.TestCase):
         self.assertIn("doc another-doc: no assigned session", config.validate())
 
     def test_materialize_enforces_validation(self):
-        config.REVIEW_POLICY["zigzag"] = config.ReviewPolicy(2, 2, ["tests"], True)
+        config.DOC_ROUTES.append(config.DocRoute("invalid-doc", ""))
 
-        with self.assertRaisesRegex(SystemExit, "security lens required but missing"):
+        with self.assertRaisesRegex(SystemExit, "no assigned session"):
             config.materialize()
 
 
@@ -71,7 +54,7 @@ class ConfigMaterializationTest(unittest.TestCase):
             {
                 "design_docs_folder_id", "doc_router_watch_list", "doc_routes",
                 "generated_by", "loop_ownership", "quiet_hours", "repos",
-                "review_policy", "service_account", "watchers",
+                "service_account", "watchers",
             },
         )
         self.assertEqual(payload["repos"], {
@@ -79,8 +62,13 @@ class ConfigMaterializationTest(unittest.TestCase):
         })
         self.assertEqual(payload["service_account"], "zigzag@shukant.iam.gserviceaccount.com")
         self.assertEqual(payload["design_docs_folder_id"], "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3")
-        self.assertTrue(payload["review_policy"]["zigzag"]["require_security_lens"])
-        self.assertIn("security", payload["review_policy"]["zigzag"]["lenses"])
+        self.assertNotIn("review_policy", payload)
+        self.assertNotIn(
+            "review-rounds", [entry["loop"] for entry in payload["loop_ownership"]]
+        )
+        self.assertNotIn(
+            "merge-killer", [entry["name"] for entry in payload["watchers"]]
+        )
         self.assertEqual(
             payload["doc_router_watch_list"],
             [route["doc_id"] for route in payload["doc_routes"]],
@@ -142,15 +130,15 @@ class HookTest(unittest.TestCase):
 
     def test_hook_materializes_the_staged_source_not_working_tree(self):
         config_path = self.repo / "dept" / "config.py"
-        staged_source = config_path.read_text().replace("FULL_ROUNDS_MAX = 2", "FULL_ROUNDS_MAX = 3")
+        staged_source = config_path.read_text().replace('"start": "22:00"', '"start": "21:00"')
         config_path.write_text(staged_source)
         self.git(["add", "dept/config.py"])
-        config_path.write_text(staged_source.replace("FULL_ROUNDS_MAX = 3", "FULL_ROUNDS_MAX = 4"))
+        config_path.write_text(staged_source.replace('"start": "21:00"', '"start": "20:00"'))
 
         self.command([str(self.repo / "scripts" / "githooks" / "pre-commit")])
 
         artifact = json.loads(self.git(["show", ":dept/config.materialized.json"]).stdout)
-        self.assertEqual(artifact["review_policy"]["zigzag"]["full_rounds_max"], 3)
+        self.assertEqual(artifact["quiet_hours"]["start"], "21:00")
         self.assertEqual(self.staged_names(), ["dept/config.materialized.json", "dept/config.py"])
 
     def test_hook_skips_unrelated_staged_changes(self):
@@ -164,8 +152,8 @@ class HookTest(unittest.TestCase):
     def test_hook_fails_open_when_staged_config_is_invalid(self):
         config_path = self.repo / "dept" / "config.py"
         config_path.write_text(config_path.read_text().replace(
-            'ZIGZAG_LENSES = ["correctness", "simplicity", "tests", "security"]',
-            'ZIGZAG_LENSES = ["correctness", "simplicity", "tests"]',
+            'LoopOwnership("dependabot", "mac"),',
+            'LoopOwnership("doc-router", "mac"),',
         ))
         self.git(["add", "dept/config.py"])
 

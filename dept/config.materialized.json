@@ -16,18 +16,6 @@
       "owner": "mac"
     },
     {
-      "loop": "review-rounds",
-      "owner": "mac"
-    },
-    {
-      "loop": "approval-gate",
-      "owner": "mac"
-    },
-    {
-      "loop": "merge-killer",
-      "owner": "mac"
-    },
-    {
       "loop": "dependabot",
       "owner": "mac"
     },
@@ -48,45 +36,12 @@
     "leveled": "leveled-inc/leveled",
     "zigzag": "ShukantPal/zigzag"
   },
-  "review_policy": {
-    "leveled": {
-      "full_rounds_max": 2,
-      "lenses": [
-        "correctness",
-        "simplicity",
-        "tests"
-      ],
-      "require_security_lens": false,
-      "verification_rounds_max": 2
-    },
-    "zigzag": {
-      "full_rounds_max": 2,
-      "lenses": [
-        "correctness",
-        "simplicity",
-        "tests",
-        "security"
-      ],
-      "require_security_lens": true,
-      "verification_rounds_max": 2
-    }
-  },
   "service_account": "zigzag@shukant.iam.gserviceaccount.com",
   "watchers": [
     {
       "enabled": true,
       "interval_s": 300,
       "name": "pr-comment-watcher"
-    },
-    {
-      "enabled": true,
-      "interval_s": 600,
-      "name": "review-rounds"
-    },
-    {
-      "enabled": true,
-      "interval_s": 300,
-      "name": "merge-killer"
     },
     {
       "enabled": true,
