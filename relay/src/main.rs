@@ -2348,17 +2348,11 @@ mod tests {
             1
         );
 
-        // Linux /bin/sh leaves this non-interactive background child in the
-        // dedicated group, exercising leader-exit recovery. Hosted macOS
-        // shells do not provide that job-control invariant, so macOS still
-        // verifies the daemon's native group signal and reap path with sleep
-        // as the group leader.
-        let group_command = if cfg!(target_os = "macos") {
-            "exec sleep 60"
-        } else {
-            "sleep 60 & exit"
-        };
-        let handle = spawn_for_test(&state, &policy, "sleep", group_command);
+        // The shell and its background child remain in the daemon-created
+        // process group on both Linux and macOS. The endpoint cannot report
+        // completion until the group signal terminates both processes and
+        // closes the inherited output pipes.
+        let handle = spawn_for_test(&state, &policy, "sleep", "sleep 60 & wait");
         let running = response_json(request_once(
             Arc::clone(&state),
             &policy,

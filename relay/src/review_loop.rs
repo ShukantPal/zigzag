@@ -215,6 +215,7 @@ enum RoundPhase {
     Ready,
     Attention,
     Superseded,
+    Closed,
     Merged,
 }
 
@@ -428,11 +429,19 @@ fn supersede_rounds_for_head(
         .iter_mut()
         .filter(|(_, round)| round.repository == repository && round.pull_request == number)
     {
-        if key == current_key || !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded)
+        if key == current_key
+            || !matches!(
+                round.phase,
+                RoundPhase::Merged | RoundPhase::Closed | RoundPhase::Superseded
+            )
         {
             agents.extend(round_agent_ids(round));
         }
-        if key != current_key && !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded)
+        if key != current_key
+            && !matches!(
+                round.phase,
+                RoundPhase::Merged | RoundPhase::Closed | RoundPhase::Superseded
+            )
         {
             round.phase = RoundPhase::Superseded;
         }
@@ -449,15 +458,6 @@ fn round_agent_ids(round: &ReviewRound) -> Vec<String> {
         .collect();
     agents.extend(round.owner_agent_id.clone());
     agents.sort();
-    agents
-}
-
-fn mark_round_merged(state: &mut DurableState, key: &str) -> Vec<String> {
-    let Some(round) = state.rounds.get_mut(key) else {
-        return Vec::new();
-    };
-    let agents = round_agent_ids(round);
-    round.phase = RoundPhase::Merged;
     agents
 }
 
@@ -489,6 +489,14 @@ fn comparison_matches(round: &ReviewRound, snapshot: &PullRequestSnapshot) -> bo
     round.head == snapshot.head_ref_oid && round.base == snapshot.base_ref_oid
 }
 
+fn pull_request_is_open(snapshot: &PullRequestSnapshot) -> bool {
+    snapshot.merged_at.is_none() && snapshot.state.eq_ignore_ascii_case("open")
+}
+
+fn pull_request_is_merged(snapshot: &PullRequestSnapshot) -> bool {
+    snapshot.merged_at.is_some() || snapshot.state.eq_ignore_ascii_case("merged")
+}
+
 fn mark_round_superseded(state: &mut DurableState, key: &str) -> Vec<String> {
     let Some(round) = state.rounds.get_mut(key) else {
         return Vec::new();
@@ -518,6 +526,31 @@ fn supersede_stale_round(
     Ok(true)
 }
 
+fn terminalize_closed_round(
+    store: &mut StateStore,
+    key: &str,
+    snapshot: &PullRequestSnapshot,
+    mut kill: impl FnMut(&[String]),
+) -> Result<Option<&'static str>, String> {
+    if pull_request_is_open(snapshot) {
+        return Ok(None);
+    }
+    let Some(round) = store.state.rounds.get_mut(key) else {
+        return Ok(None);
+    };
+    let agents = round_agent_ids(round);
+    let event = if pull_request_is_merged(snapshot) {
+        round.phase = RoundPhase::Merged;
+        "review_merged"
+    } else {
+        round.phase = RoundPhase::Closed;
+        "review_closed"
+    };
+    store.save()?;
+    kill(&agents);
+    Ok(Some(event))
+}
+
 fn resolve_reviewer_agent(
     task_id: &str,
     find_existing: impl FnOnce(&str) -> Option<String>,
@@ -529,6 +562,63 @@ fn resolve_reviewer_agent(
     }
 }
 
+fn dispatch_reviewer_attempt(
+    store: &mut StateStore,
+    key: &str,
+    lens: &str,
+    maximum: u64,
+    find_existing: impl FnOnce(&str) -> Option<String>,
+    spawn: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<bool, String> {
+    let existing = store.state.rounds[key].reviewers.get(lens).cloned();
+    let Some(attempt) = planned_attempt(existing.as_ref(), maximum) else {
+        let round = store.state.rounds.get_mut(key).expect("round exists");
+        mark_reviewer_exhausted(round, lens, maximum);
+        store.save()?;
+        return Ok(false);
+    };
+    let task_id = {
+        let round = &store.state.rounds[key];
+        reviewer_task_id(
+            &round.repository,
+            round.pull_request,
+            &round.head,
+            round.generation,
+            lens,
+            attempt,
+        )
+    };
+    if existing
+        .as_ref()
+        .is_none_or(|reviewer| reviewer.agent_id.is_some())
+    {
+        store
+            .state
+            .rounds
+            .get_mut(key)
+            .expect("round exists")
+            .reviewers
+            .insert(
+                lens.to_owned(),
+                ReviewerState {
+                    attempt,
+                    agent_id: None,
+                },
+            );
+        store.save()?;
+    }
+    let agent_id = resolve_reviewer_agent(&task_id, find_existing, || spawn(&task_id))?;
+    let round = store.state.rounds.get_mut(key).expect("round exists");
+    round
+        .reviewers
+        .get_mut(lens)
+        .expect("planned reviewer exists")
+        .agent_id = Some(agent_id);
+    round.phase = RoundPhase::Reviewing;
+    store.save()?;
+    Ok(true)
+}
+
 fn discover(
     server: &Arc<Server>,
     config: &ReviewLoopConfig,
@@ -538,10 +628,16 @@ fn discover(
     for policy in &config.repositories {
         for number in super::github_open_pull_requests(&policy.repository)? {
             let snapshot = fetch_pr(&policy.repository, number)?;
+            if !pull_request_is_open(&snapshot) {
+                continue;
+            }
             let key = round_key(&policy.repository, number, &snapshot.head_ref_oid);
             if store.state.rounds.get(&key).is_some_and(|round| {
                 comparison_matches(round, &snapshot)
-                    && !matches!(round.phase, RoundPhase::Superseded | RoundPhase::Merged)
+                    && !matches!(
+                        round.phase,
+                        RoundPhase::Superseded | RoundPhase::Closed | RoundPhase::Merged
+                    )
             }) {
                 continue;
             }
@@ -613,7 +709,7 @@ fn dispatch_missing_reviewers(
     store: &mut StateStore,
     key: &str,
 ) -> Result<(), String> {
-    let (repository, number, head, base, generation, verification) = {
+    let (repository, number, head, base, verification) = {
         let round = store
             .state
             .rounds
@@ -624,7 +720,6 @@ fn dispatch_missing_reviewers(
             round.pull_request,
             round.head.clone(),
             round.base.clone(),
-            round.generation,
             round.verification,
         )
     };
@@ -655,42 +750,22 @@ fn dispatch_missing_reviewers(
         if store.state.rounds[key].verdicts.contains_key(lens) || active {
             continue;
         }
-        let Some(attempt) = planned_attempt(existing.as_ref(), maximum) else {
-            let round = store.state.rounds.get_mut(key).expect("round exists");
-            mark_reviewer_exhausted(round, lens, maximum);
-            store.save()?;
-            continue;
-        };
-        let task_id = reviewer_task_id(&repository, number, &head, generation, lens, attempt);
-        if existing
-            .as_ref()
-            .is_none_or(|reviewer| reviewer.agent_id.is_some())
-        {
-            store
-                .state
-                .rounds
-                .get_mut(key)
-                .expect("round exists")
-                .reviewers
-                .insert(
-                    lens.clone(),
-                    ReviewerState {
-                        attempt,
-                        agent_id: None,
-                    },
-                );
-            store.save()?;
-        }
-        let agent_id = match resolve_reviewer_agent(
-            &task_id,
+        let dispatched = match dispatch_reviewer_attempt(
+            store,
+            key,
+            lens,
+            maximum,
             |task_id| latest_agent_for_task(&server.supervisor.registry, task_id),
-            || {
+            |task_id| {
                 let prompt = reviewer_prompt(&repository, number, &head, lens);
-                let project_dir = review_workspace(&task_id)?;
+                let project_dir = review_workspace(task_id)?;
                 if review_patch.is_none() {
                     review_patch = Some(fetch_pr_diff(&repository, number, &base, &head)?);
                     let current = fetch_pr(&repository, number)?;
-                    if current.head_ref_oid != head || current.base_ref_oid != base {
+                    if !pull_request_is_open(&current)
+                        || current.head_ref_oid != head
+                        || current.base_ref_oid != base
+                    {
                         return Err(
                             "PR comparison changed while preparing reviewer input".to_owned()
                         );
@@ -698,7 +773,7 @@ fn dispatch_missing_reviewers(
                 }
                 spawn_codex_task(
                     server,
-                    &task_id,
+                    task_id,
                     &project_dir,
                     None,
                     &prompt,
@@ -711,7 +786,7 @@ fn dispatch_missing_reviewers(
                 )
             },
         ) {
-            Ok(agent_id) => agent_id,
+            Ok(dispatched) => dispatched,
             Err(error) => {
                 let round = store.state.rounds.get_mut(key).expect("round exists");
                 round.phase = RoundPhase::Attention;
@@ -723,12 +798,9 @@ fn dispatch_missing_reviewers(
                 return Err(error);
             }
         };
-        let round = store.state.rounds.get_mut(key).expect("round exists");
-        if let Some(reviewer) = round.reviewers.get_mut(lens) {
-            reviewer.agent_id = Some(agent_id);
+        if !dispatched {
+            continue;
         }
-        round.phase = RoundPhase::Reviewing;
-        store.save()?;
     }
     Ok(())
 }
@@ -773,6 +845,14 @@ fn poll_reviews(
             continue;
         };
         let mut snapshot = fetch_pr(&repository, number)?;
+        if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
+            if !shadow {
+                kill_agents(server, agent_ids);
+            }
+        })? {
+            emit_decision(server, &key, generation, event, shadow, Vec::new())?;
+            continue;
+        }
         if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
@@ -798,6 +878,14 @@ fn poll_reviews(
         // force-push or base retarget. Fence every downstream decision and
         // owner resume with a fresh comparison read.
         snapshot = fetch_pr(&repository, number)?;
+        if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
+            if !shadow {
+                kill_agents(server, agent_ids);
+            }
+        })? {
+            emit_decision(server, &key, generation, event, shadow, Vec::new())?;
+            continue;
+        }
         if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
@@ -893,7 +981,12 @@ fn poll_merges(
         .state
         .rounds
         .iter()
-        .filter(|(_, round)| !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded))
+        .filter(|(_, round)| {
+            !matches!(
+                round.phase,
+                RoundPhase::Merged | RoundPhase::Closed | RoundPhase::Superseded
+            )
+        })
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
@@ -913,22 +1006,15 @@ fn poll_merges(
             continue;
         }
         let snapshot = fetch_pr(&repository, number)?;
-        if snapshot.merged_at.is_none() && !snapshot.state.eq_ignore_ascii_case("merged") {
+        let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
+            if !shadow {
+                kill_agents(server, agent_ids);
+            }
+        })?
+        else {
             continue;
-        }
-        let agent_ids = mark_round_merged(&mut store.state, &key);
-        store.save()?;
-        if !shadow {
-            kill_agents(server, &agent_ids);
-        }
-        emit_decision(
-            server,
-            &key,
-            generation,
-            "review_merged",
-            shadow,
-            Vec::new(),
-        )?;
+        };
+        emit_decision(server, &key, generation, event, shadow, Vec::new())?;
     }
     Ok(())
 }
@@ -955,7 +1041,10 @@ fn fetch_pr_diff(
     expected_head: &str,
 ) -> Result<String, String> {
     let snapshot = fetch_pr(repository, number)?;
-    if snapshot.head_ref_oid != expected_head || snapshot.base_ref_oid != expected_base {
+    if !pull_request_is_open(&snapshot)
+        || snapshot.head_ref_oid != expected_head
+        || snapshot.base_ref_oid != expected_base
+    {
         return Err("pull request comparison changed before reviewer dispatch".to_owned());
     }
     let endpoint = format!("repos/{repository}/compare/{expected_base}...{expected_head}");
@@ -990,6 +1079,23 @@ fn bounded_compare_material(response: &str) -> Result<String, String> {
     // conservatively because the daemon cannot prove the material is complete.
     if count >= 300 {
         return Err("GitHub comparison may be truncated at 300 files".to_owned());
+    }
+    for file in files {
+        let filename = file
+            .get("filename")
+            .and_then(Value::as_str)
+            .filter(|filename| !filename.is_empty())
+            .ok_or_else(|| "GitHub comparison file is missing its name".to_owned())?;
+        if file
+            .get("patch")
+            .and_then(Value::as_str)
+            .filter(|patch| !patch.is_empty())
+            .is_none()
+        {
+            return Err(format!(
+                "GitHub comparison omits reviewable patch material for {filename}"
+            ));
+        }
     }
     serde_json::to_string(files)
         .map_err(|_| "GitHub comparison files could not be encoded".to_owned())
@@ -1142,12 +1248,13 @@ fn collect_completed_reviewers(
     key: &str,
     comments: &[Comment],
 ) -> Result<(), String> {
-    let (repository, number, head, generation) = {
+    let (repository, number, head, base, generation) = {
         let round = &store.state.rounds[key];
         (
             round.repository.clone(),
             round.pull_request,
             round.head.clone(),
+            round.base.clone(),
             round.generation,
         )
     };
@@ -1199,6 +1306,17 @@ fn collect_completed_reviewers(
             // The current GitHub snapshot decides which comment is latest.
             // Do not re-admit an older generated result after a correction.
             continue;
+        }
+        // The reviewer may finish after the PR closes, merges, force-pushes,
+        // or retargets. Re-fence immediately before the external comment
+        // side effect; the caller then persists the terminal/superseded
+        // transition from its post-collection snapshot.
+        let current = fetch_pr(&repository, number)?;
+        if !pull_request_is_open(&current)
+            || current.head_ref_oid != head
+            || current.base_ref_oid != base
+        {
+            return Ok(());
         }
         post_verdict_comment(policy, number, &result, &marker, &task_id)?;
         store
@@ -2079,30 +2197,21 @@ review_loop:
         );
         store.save().unwrap();
         let mut reopened = StateStore::open(path.clone()).unwrap();
-        let round = &mut reopened.state.rounds.get_mut(&key).unwrap();
-        assert_eq!(round.head, head);
-        assert_eq!(round.reviewers["tests"].attempt, 1);
-        assert_eq!(planned_attempt(round.reviewers.get("tests"), 2), Some(1));
-        let recovered_task_id = reviewer_task_id(
-            "owner/repo",
-            7,
-            &round.head,
-            round.generation,
-            "tests",
-            round.reviewers["tests"].attempt,
-        );
-        assert_eq!(recovered_task_id, expected_task_id);
         let mut spawn_count = 0;
-        let recovered_agent = resolve_reviewer_agent(
-            &recovered_task_id,
+        let dispatched = dispatch_reviewer_attempt(
+            &mut reopened,
+            &key,
+            "tests",
+            2,
             |task_id| latest_agent_for_task(&registry, task_id),
-            || {
+            |_| {
                 spawn_count += 1;
                 Ok("new-agent".to_owned())
             },
         )
         .unwrap();
-        round.reviewers.get_mut("tests").unwrap().agent_id = Some(recovered_agent);
+        assert!(dispatched);
+        let round = &reopened.state.rounds[&key];
         assert_eq!(round.reviewers["tests"].attempt, 1);
         assert_eq!(
             round.reviewers["tests"].agent_id.as_deref(),
@@ -2183,7 +2292,7 @@ review_loop:
     }
 
     #[test]
-    fn merge_returns_every_reviewer_for_process_group_cleanup() {
+    fn terminal_pr_state_is_persisted_before_every_process_group_cleanup() {
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
         let mut round = test_round(&head, RoundPhase::Reviewing, Some("agent-a"));
@@ -2195,17 +2304,59 @@ review_loop:
                 agent_id: Some("agent-b".to_owned()),
             },
         );
-        let mut state = DurableState {
-            schema_version: 1,
-            rounds: BTreeMap::from([(key.clone(), round)]),
-        };
-        let agents = mark_round_merged(&mut state, &key);
-        assert_eq!(agents, ["agent-a", "agent-b", "owner-agent"]);
-        assert_eq!(state.rounds[&key].phase, RoundPhase::Merged);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-terminal-state-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+        let mut merged = snapshot(&head);
+        merged.state = "MERGED".to_owned();
+        merged.merged_at = Some("2026-01-01T00:00:00Z".to_owned());
+        let mut killed = Vec::new();
+        let event = terminalize_closed_round(&mut store, &key, &merged, |agent_ids| {
+            let persisted = StateStore::open(state_path.clone()).unwrap();
+            assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Merged);
+            killed.extend_from_slice(agent_ids);
+        })
+        .unwrap();
+        assert_eq!(event, Some("review_merged"));
+        assert_eq!(killed, ["agent-a", "agent-b", "owner-agent"]);
+        assert_eq!(store.state.rounds[&key].phase, RoundPhase::Merged);
         assert_ne!(
             owner_task_id("owner/repo", 7, &head, 1),
             owner_task_id("owner/repo", 7, &head, 2)
         );
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn unmerged_closed_pr_is_terminalized_and_cleaned_up() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let mut round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
+        round.owner_agent_id = Some("owner".to_owned());
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-closed-state-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+        let mut closed = snapshot(&head);
+        closed.state = "CLOSED".to_owned();
+        let mut killed = Vec::new();
+        let event = terminalize_closed_round(&mut store, &key, &closed, |agent_ids| {
+            let persisted = StateStore::open(state_path.clone()).unwrap();
+            assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Closed);
+            killed.extend_from_slice(agent_ids);
+        })
+        .unwrap();
+        assert_eq!(event, Some("review_closed"));
+        assert_eq!(killed, ["owner", "reviewer"]);
+        assert_eq!(store.state.rounds[&key].phase, RoundPhase::Closed);
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]
@@ -2334,6 +2485,26 @@ review_loop:
                 .unwrap_err()
                 .contains("truncated")
         );
+        for incomplete in [
+            serde_json::json!({
+                "file_count": 1,
+                "files": [{"filename": "asset.bin"}],
+            }),
+            serde_json::json!({
+                "file_count": 1,
+                "files": [{"filename": "large.rs", "patch": null}],
+            }),
+            serde_json::json!({
+                "file_count": 1,
+                "files": [{"filename": "mode-only", "patch": ""}],
+            }),
+        ] {
+            assert!(
+                bounded_compare_material(&incomplete.to_string())
+                    .unwrap_err()
+                    .contains("omits reviewable patch material")
+            );
+        }
     }
 
     #[test]

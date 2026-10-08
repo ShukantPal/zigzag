@@ -46,6 +46,27 @@ jobs:
           status=$?
           set -e
           test "$status" -eq 2
+          mkdir "$RUNNER_TEMP/reviewer-task" "$RUNNER_TEMP/reviewer-work"
+          printf '%s\n' "$RUNNER_TEMP/reviewer-work" > "$RUNNER_TEMP/reviewer-task/dir.txt"
+          printf '%s\n' 'review prompt' > "$RUNNER_TEMP/reviewer-task/prompt.txt"
+          printf '%s\n' '{}' > "$RUNNER_TEMP/reviewer-task/result-schema.json"
+          printf '%s\n' 'diff material' > "$RUNNER_TEMP/reviewer-work/review.patch"
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'set -eu' \
+            'output=' \
+            'while [ "$#" -gt 0 ]; do' \
+            '  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi' \
+            'done' \
+            'cat >/dev/null' \
+            'printf '\''{"verdict":"approve"}\\n'\'' > "$output"' \
+            'printf '\''{"type":"done"}\\n'\''' \
+            > "$RUNNER_TEMP/fake-codex"
+          chmod 700 "$RUNNER_TEMP/fake-codex"
+          CODEX_REVIEW_CODEX_BIN="$RUNNER_TEMP/fake-codex" \
+            "$RUNNER_TEMP/codex-review-launch" run "$RUNNER_TEMP/reviewer-task"
+          grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
+          grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
   release:
     # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
