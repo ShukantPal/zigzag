@@ -2,7 +2,8 @@
 """Approval-gate check for Codex PRs (oversight system, 2026-09-20).
 
 A PR passes the gate only when BOTH hold on the CURRENT head:
-  1. Required CI is green: semgrep + BuildBuddy successful. The
+  1. Every CI check required by the daemon's validated personal YAML policy is
+     green. The
      `scribes-stg-preview-deploy` manual trigger (ACTION_REQUIRED/NEUTRAL) and
      gcbrun noise are not blockers (Shukant's leveled CI rule).
   2. Every required review lens has a latest model-advisory verdict comment of
@@ -20,19 +21,23 @@ Verdict comments are top-level PR comments posted by review-team workers
   LENSES: <comma-separated lenses seeded for this round>
   <short summary; findings when CHANGES REQUESTED>
 
-Lenses: correctness, simplicity, tests (+ security when the round seeds it).
+Lenses and required CI checks come from the same validated
+`~/.zigzag/config.yaml` policy used by the daemon. The VM does not parse YAML;
+it asks the Mac binary for the selected repository policy. This keeps shadow
+decisions comparable without adding a second policy source.
 The PR comment watcher skips marker-bearing comments, so verdicts never
 re-dispatch. Model verdicts are never treated as human proof. Human approval
 must be a formal GitHub review from an actor named in the deployment-only
 `approval_gate.human_review_actors` config; shared automation actors are
 explicitly excluded from that allowlist.
 
-Usage: approval_gate.py <owner/repo> <pr> [--lenses correctness,simplicity,tests]
+Usage: approval_gate.py <owner/repo> <pr>
 Exit 0 with {"pass": true, ...}; exit 1 with {"pass": false, "reasons": [...]}.
 Runs gh over SSH on Shukant's Mac (same transport as the other watchers).
 """
 import json
 import re
+import shlex
 import subprocess
 import sys
 from dept_config import load_config, ssh_base, ssh_env
@@ -41,11 +46,6 @@ from dispatch_review_round import stored_rounds
 CONFIG = load_config()
 SSH_BASE = ssh_base(CONFIG.get("connection", {}))
 
-# Checks that must be green for the gate. Everything else failing is a warning.
-REQUIRED_CHECKS = {
-    "semgrep": re.compile(r"semgrep", re.IGNORECASE),
-    "BuildBuddy": re.compile(r"buildbuddy", re.IGNORECASE),
-}
 # Known noise: never a blocker.
 IGNORED_CHECKS = re.compile(r"scribes-stg-preview-deploy", re.IGNORECASE)
 
@@ -97,10 +97,17 @@ def fetch_pr(repo, pr):
     return data
 
 
-def latest_verdicts(comments):
-    """Latest unambiguous model verdict per lens."""
+def fetch_policy(repo):
+    """Read the daemon-validated personal policy without parsing YAML here."""
+    return json.loads(mac(f"zigzag review-policy {shlex.quote(repo)}"))
+
+
+def latest_verdicts(comments, trusted_identity):
+    """Latest unambiguous verdict per lens from the configured identity."""
     verdicts = {}
     for c in comments:
+        if c.get("author") != trusted_identity:
+            continue
         body = c.get("body") or ""
         # GitHub comments normally retain newlines, but a reviewer once posted
         # literal `\\n` separators. Parse that harmless formatting mistake too.
@@ -170,15 +177,20 @@ def latest_seeded_round(repo, pr):
             "lenses": lenses, "status": data.get("status")}
 
 
-def check(repo, pr, lenses):
+def check(repo, pr, policy):
     data = fetch_pr(repo, pr)
     head = (data.get("head") or "").lower()
     reasons = []
     warnings = []
+    lenses = policy["lenses"]
+    required_checks = {
+        required["label"]: re.compile(required["name_pattern"], re.IGNORECASE)
+        for required in policy["required_ci_checks"]
+    }
 
     # --- CI gate ---
     checks = data.get("checks") or []
-    for label, pattern in REQUIRED_CHECKS.items():
+    for label, pattern in required_checks.items():
         matches = [ch for ch in checks if pattern.search(ch.get("name") or "")]
         if not matches:
             reasons.append(f"required check missing: {label}")
@@ -203,11 +215,12 @@ def check(repo, pr, lenses):
                  (status == "COMPLETED" and conclusion not in ("SUCCESS", "SKIPPED", "NEUTRAL"))
         if not failed:
             continue
-        if not any(pattern.search(name) for pattern in REQUIRED_CHECKS.values()):
+        if not any(pattern.search(name) for pattern in required_checks.values()):
             warnings.append(f"non-blocking check failing: {name} ({conclusion or status})")
 
     # --- review-team approvals ---
-    verdicts = latest_verdicts(data.get("comments") or [])
+    verdicts = latest_verdicts(data.get("comments") or [],
+                               policy["trusted_verdict_identity"])
     seeded_round = latest_seeded_round(repo, pr)
     latest_round = (seeded_round["round"] if seeded_round else
                     max((v[3] for v in verdicts.values()), default=None))
@@ -264,15 +277,12 @@ def check(repo, pr, lenses):
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
-        sys.exit("usage: approval_gate.py <owner/repo> <pr> "
-                 "[--lenses correctness,simplicity,tests]")
+    if len(sys.argv) != 3 or sys.argv[1] in ("-h", "--help"):
+        sys.exit("usage: approval_gate.py <owner/repo> <pr>")
     repo, pr = sys.argv[1], sys.argv[2]
-    lenses = ["correctness", "simplicity", "tests"]
-    if "--lenses" in sys.argv:
-        lenses = sys.argv[sys.argv.index("--lenses") + 1].split(",")
     try:
-        result = check(repo, pr, lenses)
+        policy = fetch_policy(repo)
+        result = check(repo, pr, policy)
     except Exception as e:
         print(json.dumps({"pass": False, "reasons": [f"gate check error: {e}"]},
                          indent=2))

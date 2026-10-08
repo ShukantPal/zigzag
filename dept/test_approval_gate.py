@@ -35,6 +35,15 @@ class ApprovalGateChecksTest(unittest.TestCase):
         seeded.start()
         self.addCleanup(seeded.stop)
 
+    policy = {
+        "lenses": ["correctness", "simplicity", "tests"],
+        "trusted_verdict_identity": "ShukantPal",
+        "required_ci_checks": [
+            {"label": "semgrep", "name_pattern": "semgrep"},
+            {"label": "BuildBuddy", "name_pattern": "buildbuddy"},
+        ],
+    }
+
     def result_for(self, checks):
         return {
             "head": HEAD,
@@ -50,7 +59,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("required check missing: BuildBuddy", result["reasons"])
 
@@ -60,7 +69,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertTrue(any("semgrep" in reason for reason in result["reasons"]))
 
@@ -70,7 +79,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ])
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertTrue(result["pass"])
 
     def test_literal_newlines_in_verdict_are_accepted(self):
@@ -78,7 +87,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                 f"VERDICT: APPROVE\\nHEAD: {HEAD}\\nROUND: 1\\n"
                 "LENSES: correctness,simplicity,tests")
         verdicts = gate.latest_verdicts([{"body": body, "createdAt": "now", "id": 1,
-                                          "author": "ShukantPal"}])
+                                          "author": "ShukantPal"}], "ShukantPal")
         self.assertEqual(verdicts["tests"][:2], ("APPROVE", HEAD))
 
     def test_untrusted_marker_comment_cannot_satisfy_gate(self):
@@ -88,7 +97,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
         ]) | {"comments": comments}):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no verdict from [correctness] reviewer", result["reasons"])
 
@@ -99,7 +108,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         ])
         with patch.object(gate, "fetch_pr", return_value=data), \
              patch.object(gate, "human_review_actors", return_value=frozenset()):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no separate human review actors configured", result["reasons"])
 
@@ -110,7 +119,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         ])
         data["reviews"][0]["commit"] = "b" * 40
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no current-head APPROVED review from an allowlisted human",
                       result["reasons"])
@@ -124,7 +133,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                                 "commit": HEAD, "submittedAt": "2026-01-01T02:00:00Z",
                                 "id": 2})
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
 
     def test_later_dismissal_revokes_human_approval(self):
@@ -136,7 +145,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                                 "commit": HEAD, "submittedAt": "2026-01-01T02:00:00Z",
                                 "id": 2})
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no current-head APPROVED review from an allowlisted human",
                       result["reasons"])
@@ -150,7 +159,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                                 "state": "CHANGES_REQUESTED", "commit": HEAD,
                                 "submittedAt": "2026-01-01T01:00:00Z", "id": 2})
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
 
     def test_paginated_later_review_revokes_approval(self):
@@ -171,8 +180,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         with patch.object(gate, "mac",
                           side_effect=[json.dumps(pr_data),
                                        json.dumps(review_pages)]):
-            result = gate.check("owner/repo", "1",
-                                ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no current-head APPROVED review from an allowlisted human",
                       result["reasons"])
@@ -185,7 +193,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         data["comments"][2]["body"] = data["comments"][2]["body"].replace(
             "ROUND: 1", "ROUND: 2")
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("[correctness] verdict is from round 1; latest round is 2",
                       result["reasons"])
@@ -200,7 +208,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         ])
         data["comments"] = comments
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("[tests] latest verdict is CHANGES REQUESTED (not APPROVE)",
                       result["reasons"])
@@ -211,7 +219,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                 "ROUND: 1\nLENSES: correctness,simplicity,tests")
         self.assertNotIn("tests", gate.latest_verdicts([
             {"body": body, "createdAt": "now", "id": 1, "author": "ShukantPal"}
-        ]))
+        ], "ShukantPal"))
 
     def test_higher_round_wins_even_when_older_round_posts_later(self):
         newer_round = {
@@ -228,7 +236,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             "createdAt": "2026-01-01T01:00:00Z", "id": "round-1-late",
             "author": "ShukantPal",
         }
-        verdict = gate.latest_verdicts([newer_round, late_old_round])["tests"]
+        verdict = gate.latest_verdicts([newer_round, late_old_round], "ShukantPal")["tests"]
         self.assertEqual(verdict, ("CHANGES REQUESTED", HEAD, "ShukantPal", 2,
                                    ("correctness", "simplicity", "tests")))
 
@@ -242,8 +250,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                 "LENSES: correctness,simplicity,tests",
                 "LENSES: correctness,security,simplicity,tests")
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1",
-                                ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("no verdict from [security] reviewer", result["reasons"])
 
@@ -256,8 +263,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             "LENSES: correctness,simplicity,tests",
             "LENSES: correctness,security,simplicity,tests")
         with patch.object(gate, "fetch_pr", return_value=data):
-            result = gate.check("owner/repo", "1",
-                                ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertIn("latest review round has no single consistent lens manifest",
                       result["reasons"])
@@ -272,8 +278,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                   "status": "collecting"}
         with patch.object(gate, "fetch_pr", return_value=data), \
              patch.object(gate, "latest_seeded_round", return_value=seeded):
-            result = gate.check("owner/repo", "1",
-                                ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertFalse(result["pass"])
         self.assertEqual(result["review_round"], 2)
         self.assertEqual(result["seeded_round"], seeded)
@@ -290,8 +295,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
                   "status": "published"}
         with patch.object(gate, "fetch_pr", return_value=data), \
              patch.object(gate, "latest_seeded_round", return_value=seeded):
-            result = gate.check("owner/repo", "1",
-                                ["correctness", "simplicity", "tests"])
+            result = gate.check("owner/repo", "1", self.policy)
         self.assertTrue(result["pass"])
 
     def test_latest_seeded_round_reads_all_statuses(self):
@@ -317,6 +321,33 @@ class ApprovalGateChecksTest(unittest.TestCase):
                  self.assertRaisesRegex(RuntimeError,
                                        "cannot read review round state"):
                 self.real_latest_seeded_round("owner/repo", "1")
+
+    def test_policy_lenses_are_required(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        policy = dict(self.policy, lenses=self.policy["lenses"] + ["security"])
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1", policy)
+        self.assertFalse(result["pass"])
+        self.assertIn("no verdict from [security] reviewer", result["reasons"])
+
+    def test_fetch_policy_uses_daemon_cli(self):
+        with patch.object(gate, "mac", return_value='{"lenses": []}') as run:
+            self.assertEqual(gate.fetch_policy("owner/repo"), {"lenses": []})
+        run.assert_called_once_with("zigzag review-policy owner/repo")
+
+    def test_untrusted_verdict_author_is_rejected(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        data["comments"][0]["author"] = "someone-else"
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1", self.policy)
+        self.assertFalse(result["pass"])
+        self.assertIn("no verdict from [correctness] reviewer", result["reasons"])
 
 
 class HumanActorConfigTest(unittest.TestCase):

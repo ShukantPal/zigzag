@@ -20,14 +20,14 @@ const REVIEWER_BIN: &str = "codex-review-launch";
 const OWNER_BIN: &str = "codex-launch";
 const COMPARE_FILES_JQ: &str = r#"{file_count: (.files | length), files: (.files | map({filename, previous_filename, status, additions, deletions, patch}))}"#;
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PersonalConfig {
     pub schema_version: u64,
     pub review_loop: ReviewLoopConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLoopConfig {
     pub enabled: bool,
@@ -35,7 +35,7 @@ pub struct ReviewLoopConfig {
     pub repositories: Vec<RepositoryPolicy>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Intervals {
     pub discovery_seconds: u64,
@@ -43,7 +43,7 @@ pub struct Intervals {
     pub merge_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryPolicy {
     pub repository: String,
@@ -56,14 +56,14 @@ pub struct RepositoryPolicy {
     pub result_limits: ResultLimits,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequiredCheck {
     pub label: String,
     pub name_pattern: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResultLimits {
     pub max_findings_per_lens: usize,
@@ -162,6 +162,33 @@ pub fn load_config(path: &Path) -> Result<PersonalConfig, Vec<ConfigViolation>> 
             reason: format!("configuration does not match its data model: {error}"),
         }]
     })
+}
+
+pub fn print_policy(arguments: &[String]) -> Result<(), String> {
+    if arguments.len() != 1 || matches!(arguments[0].as_str(), "--help" | "-h") {
+        return Err("usage: zigzag review-policy <owner/repository>".to_owned());
+    }
+    let path = default_config_path().map_err(|violation| violation.to_string())?;
+    let config = load_config(&path).map_err(|violations| {
+        violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let repository = &arguments[0];
+    let policy = config
+        .review_loop
+        .repositories
+        .iter()
+        .find(|policy| policy.repository == *repository)
+        .ok_or_else(|| format!("no review policy configured for {repository}"))?;
+    println!(
+        "{}",
+        serde_json::to_string(policy)
+            .map_err(|error| format!("could not serialize review policy: {error}"))?
+    );
+    Ok(())
 }
 
 fn reject_yaml_tags(value: &serde_yaml::Value, path: &str, errors: &mut Vec<ConfigViolation>) {
@@ -1073,9 +1100,9 @@ fn poll_reviews(
         }
         let verdicts = latest_verdicts(
             policy,
-            &expected_head,
+            &store.state.rounds[&key],
             &snapshot.comments,
-            &store.state.rounds[&key].excluded_comment_ids,
+            !shadow,
         );
         {
             let round = store.state.rounds.get_mut(&key).expect("round exists");
@@ -1336,16 +1363,16 @@ fn run_allowed(bin: &str, args: Vec<String>, id: String) -> Result<String, Strin
 
 fn latest_verdicts(
     policy: &RepositoryPolicy,
-    head: &str,
+    round: &ReviewRound,
     comments: &[Comment],
-    excluded_comment_ids: &BTreeSet<String>,
+    require_active_marker: bool,
 ) -> BTreeMap<String, AdmittedVerdict> {
     let marker = Regex::new(r"^> 🤖 Codex \(AI assistant\) — \[([a-z]+)\] review verdict$")
         .expect("verdict marker regex is valid");
     let mut candidates: BTreeMap<String, (String, String, Option<AdmittedVerdict>)> =
         BTreeMap::new();
     for comment in comments {
-        if excluded_comment_ids.contains(&comment.id) {
+        if round.excluded_comment_ids.contains(&comment.id) {
             continue;
         }
         if comment.author.as_ref().map(|author| author.login.as_str())
@@ -1366,7 +1393,23 @@ fn latest_verdicts(
         if !policy.lenses.contains(&lens) {
             continue;
         }
-        let parsed = parse_verdict_comment(&comment.body, head, &policy.result_limits)
+        if require_active_marker {
+            let Some(reviewer) = round.reviewers.get(&lens) else {
+                continue;
+            };
+            let active_marker = verdict_id(
+                &round.repository,
+                round.pull_request,
+                &round.head,
+                round.generation,
+                &lens,
+                reviewer.attempt,
+            );
+            if !comment.body.contains(&active_marker) {
+                continue;
+            }
+        }
+        let parsed = parse_verdict_comment(&comment.body, &round.head, &policy.result_limits)
             .map(|(_, verdict)| verdict);
         let replace = candidates.get(&lens).is_none_or(|(created_at, id, _)| {
             (&comment.created_at, &comment.id) > (created_at, id)
@@ -2551,8 +2594,10 @@ review_loop:
     #[test]
     fn latest_verdicts_ignore_untrusted_stale_and_oversized_comments() {
         let head = "a".repeat(40);
+        let round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
+        let active_marker = verdict_id("owner/repo", 7, &head, 1, "tests", 1);
         let body = format!(
-            "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking issues."
+            "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking issues.\n{active_marker}"
         );
         let comments = vec![
             Comment {
@@ -2572,7 +2617,7 @@ review_loop:
                 id: "2".to_owned(),
             },
         ];
-        let verdicts = latest_verdicts(&policy(), &head, &comments, &BTreeSet::new());
+        let verdicts = latest_verdicts(&policy(), &round, &comments, true);
         assert_eq!(verdicts.len(), 1);
         assert!(verdicts.contains_key("tests"));
 
@@ -2590,12 +2635,35 @@ review_loop:
             created_at: "2026-01-03".to_owned(),
             id: "3".to_owned(),
         });
+        assert!(latest_verdicts(&limited, &round, &with_oversized_latest, true).is_empty());
+
+        let mut excluded_round = round.clone();
+        excluded_round.excluded_comment_ids = BTreeSet::from(["2".to_owned(), "3".to_owned()]);
         assert!(
-            latest_verdicts(&limited, &head, &with_oversized_latest, &BTreeSet::new(),).is_empty()
+            latest_verdicts(&policy(), &excluded_round, &with_oversized_latest, true).is_empty()
         );
 
-        let excluded = BTreeSet::from(["2".to_owned(), "3".to_owned()]);
-        assert!(latest_verdicts(&policy(), &head, &with_oversized_latest, &excluded).is_empty());
+        let legacy_body = format!(
+            "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nLegacy VM shadow verdict."
+        );
+        let legacy_comment = Comment {
+            author: Some(Author {
+                login: "ShukantPal".to_owned(),
+            }),
+            body: legacy_body,
+            created_at: "2026-01-04".to_owned(),
+            id: "legacy-shadow".to_owned(),
+        };
+        assert!(
+            latest_verdicts(
+                &policy(),
+                &round,
+                std::slice::from_ref(&legacy_comment),
+                true,
+            )
+            .is_empty()
+        );
+        assert!(latest_verdicts(&policy(), &round, &[legacy_comment], false).contains_key("tests"));
     }
 
     #[test]
@@ -2766,23 +2834,22 @@ review_loop:
         assert!(
             latest_verdicts(
                 &policy(),
-                &head_a,
+                &state.rounds[&key_a],
                 std::slice::from_ref(&old_comment),
-                &state.rounds[&key_a].excluded_comment_ids,
+                true,
             )
             .is_empty()
         );
         let mut new_comment = old_comment;
         new_comment.id = "new-a-approval".to_owned();
         new_comment.created_at = "2026-01-02T00:00:00Z".to_owned();
+        let active_marker = verdict_id("owner/repo", 7, &head_a, 2, "tests", 1);
+        new_comment.body = format!(
+            "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head_a}\nNo blocking issues.\n{active_marker}"
+        );
         assert!(
-            latest_verdicts(
-                &policy(),
-                &head_a,
-                &[new_comment],
-                &state.rounds[&key_a].excluded_comment_ids,
-            )
-            .contains_key("tests")
+            latest_verdicts(&policy(), &state.rounds[&key_a], &[new_comment], true)
+                .contains_key("tests")
         );
     }
 

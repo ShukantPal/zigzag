@@ -50,6 +50,6 @@ Chat surfacing: review-ready and decision-needed notifications still come from t
 
 **Quiet hours.** Mac-side loops pause when the laptop sleeps (10pm–7am). Overnight review latency is the price; nothing is lost, because state is on disk and loops resume on wake. This is accepted behavior, not a failure mode.
 
-**Migration split-brain.** During rollout, only one side owns side effects. The review loop first runs in shadow mode beside the VM tooling so decisions can be compared without duplicate dispatch or publication; authority transfers only after they match. Other loops use an explicit owner flag and retire their VM cron as the daemon takes over.
+**Migration split-brain.** During rollout, only one side owns side effects. The review loop first runs in shadow mode beside the VM tooling so decisions can be compared without duplicate dispatch or publication; observational shadow rounds accept the VM's trusted, structured, exact-head verdict comments without daemon generation markers, while authoritative rounds require their active generation marker. The VM approval gate queries the Mac binary's validated personal YAML policy so the comparison cannot drift on lenses, trusted identity, or CI requirements. Authority transfers only after decisions match. Other loops use an explicit owner flag and retire their VM cron as the daemon takes over.
 
 **Rollout.** Phase 1: review loops (comment watcher, rounds, gate, merge killer). Phase 2: doc router and Dependabot watcher. Phase 3: retire the VM crons and delete the paused-watchers tracking.

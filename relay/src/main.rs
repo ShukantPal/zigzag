@@ -143,7 +143,10 @@ fn run() -> Result<(), String> {
     if arguments.first().map(String::as_str) == Some("update-watchdog") {
         return update::run_watchdog(&arguments[1..]);
     }
-    let config = server_config(arguments.clone())?;
+    if arguments.first().map(String::as_str) == Some("review-policy") {
+        return review_loop::print_policy(&arguments[1..]);
+    }
+    let config = server_config(arguments)?;
     let secret = read_secret_file(&config.secret_file)?;
     let control_secret = config
         .control_secret_file

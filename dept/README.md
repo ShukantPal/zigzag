@@ -28,12 +28,12 @@ management layer that decides what to run.
   `GET /v1/agents?state=running` and cursor event endpoint plus the Mac-local
   durable audit directory beside `events.json`; it never invokes a control
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
-- **`approval_gate.py`** — the merge gate for Muse-owned PRs: required CI
-  green on the latest head **and** every lens declared by the latest review
-  round (correctness, simplicity, tests, plus security when seeded) showing
-  APPROVE on that head, plus a formal
-  current-head approval from a separately authenticated human reviewer.
-  The newest persisted seeded round is authoritative even before its comments
+- **`approval_gate.py`** — the shadow-mode merge gate for Muse-owned PRs. It
+  asks the Mac `zigzag review-policy` command for the daemon-validated personal
+  YAML policy, then requires its CI checks and every lens declared by the latest
+  review round to be green and approved on the latest head, plus a formal
+  current-head approval from a separately authenticated human reviewer. The
+  newest persisted seeded round is authoritative even before its comments
   publish; stale-head, lower-round verdicts and shared-automation approvals
   don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
