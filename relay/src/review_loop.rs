@@ -662,8 +662,9 @@ fn supersede_stale_round(
     {
         return Ok(false);
     }
+    let previous = store.state.clone();
     let agents = mark_round_superseded(&mut store.state, key, cleanup_required);
-    store.save()?;
+    save_or_restore(store, previous)?;
     if cleanup_required {
         kill(&agents);
         complete_agent_cleanup(store, &agents)?;
@@ -681,6 +682,7 @@ fn terminalize_closed_round(
     if pull_request_is_open(snapshot) {
         return Ok(None);
     }
+    let previous = store.state.clone();
     let Some(round) = store.state.rounds.get_mut(key) else {
         return Ok(None);
     };
@@ -692,12 +694,23 @@ fn terminalize_closed_round(
         round.phase = RoundPhase::Closed;
         "review_closed"
     };
-    store.save()?;
+    save_or_restore(store, previous)?;
     if cleanup_required {
         kill(&agents);
         complete_agent_cleanup(store, &agents)?;
     }
     Ok(Some(event))
+}
+
+// A failed rename or directory fsync means the next pass must still be able to
+// persist the transition and replay its cleanup. Do not leave a terminal phase
+// only in memory, where the active polling loops deliberately skip it.
+fn save_or_restore(store: &mut StateStore, previous: DurableState) -> Result<(), String> {
+    if let Err(error) = store.save() {
+        store.state = previous;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn resolve_reviewer_agent(
@@ -793,97 +806,112 @@ fn discover_with(
     mut fetch_snapshot: impl FnMut(&str, u64) -> Result<PullRequestSnapshot, String>,
 ) -> Result<(), String> {
     for policy in &config.repositories {
-        for number in open_pull_requests(&policy.repository)? {
-            let snapshot = fetch_snapshot(&policy.repository, number)?;
-            if !pull_request_is_open(&snapshot) {
+        let numbers = match open_pull_requests(&policy.repository) {
+            Ok(numbers) => numbers,
+            Err(error) => {
+                eprintln!("review discovery failed for {}: {error}", policy.repository);
                 continue;
             }
-            let key = round_key(&policy.repository, number, &snapshot.head_ref_oid);
-            if store.state.rounds.get(&key).is_some_and(|round| {
-                comparison_matches(round, &snapshot)
-                    && !matches!(
-                        round.phase,
-                        RoundPhase::Superseded | RoundPhase::Closed | RoundPhase::Merged
-                    )
-            }) {
-                continue;
-            }
-            // The first observed head gets the full-round budget. Every later
-            // head for the same PR is a verification round, regardless of
-            // whether the change landed before the prior verdict poll.
-            let verification =
-                store.state.rounds.values().any(|round| {
+        };
+        for number in numbers {
+            let result = (|| -> Result<(), String> {
+                let snapshot = fetch_snapshot(&policy.repository, number)?;
+                if !pull_request_is_open(&snapshot) {
+                    return Ok(());
+                }
+                let key = round_key(&policy.repository, number, &snapshot.head_ref_oid);
+                if store.state.rounds.get(&key).is_some_and(|round| {
+                    comparison_matches(round, &snapshot)
+                        && !matches!(
+                            round.phase,
+                            RoundPhase::Superseded | RoundPhase::Closed | RoundPhase::Merged
+                        )
+                }) {
+                    return Ok(());
+                }
+                // The first observed head gets the full-round budget. Every later
+                // head for the same PR is a verification round, regardless of
+                // whether the change landed before the prior verdict poll.
+                let verification = store.state.rounds.values().any(|round| {
                     round.repository == policy.repository && round.pull_request == number
                 });
-            let prior_generation = store.state.rounds.get(&key).map(|round| round.generation);
-            let generation = prior_generation.map_or(1, |generation| generation + 1);
-            // Exact-head keys can recur after a force-push A→B→A. In
-            // that case, watermark every comment visible when the new
-            // generation begins so an approval from the old A generation can
-            // never be inherited.
-            prepare_superseded_comment_cleanup(
-                policy,
-                store,
-                &policy.repository,
-                number,
-                &snapshot.comments,
-                shadow,
-            )?;
-            let (excluded_comment_ids, pending_comment_deletions) =
-                replacement_comment_state(store.state.rounds.get(&key), &snapshot.comments);
-            let superseded_agents = supersede_rounds_for_head(
-                &mut store.state,
-                &policy.repository,
-                number,
-                &key,
-                authoritative_mode(shadow),
-            );
-            let owner = find_owner_context(
-                &policy.repository,
-                &snapshot.head_ref_name,
-                &snapshot.head_ref_oid,
-            );
-            store.state.rounds.insert(
-                key.clone(),
-                ReviewRound {
-                    repository: policy.repository.clone(),
-                    pull_request: number,
-                    head: snapshot.head_ref_oid.clone(),
-                    base: snapshot.base_ref_oid.clone(),
-                    generation,
-                    verification,
-                    phase: RoundPhase::Dispatching,
-                    reviewers: BTreeMap::new(),
-                    verdicts: BTreeMap::new(),
-                    excluded_comment_ids,
-                    pending_comment_deletions,
-                    pending_agent_cleanup: if authoritative_mode(shadow) {
-                        superseded_agents.iter().cloned().collect()
-                    } else {
-                        BTreeSet::new()
-                    },
-                    owner,
-                    owner_agent_id: None,
-                    gate_reasons: Vec::new(),
-                },
-            );
-            store.save()?;
-            if authoritative_mode(shadow) {
-                kill_agents(server, &superseded_agents);
-                complete_agent_cleanup(store, &superseded_agents)?;
-            }
-            if !authoritative_mode(shadow) {
-                emit_decision(
-                    server,
-                    &key,
-                    generation,
-                    "shadow_round_observed",
-                    true,
-                    Vec::new(),
+                let prior_generation = store.state.rounds.get(&key).map(|round| round.generation);
+                let generation = prior_generation.map_or(1, |generation| generation + 1);
+                // Exact-head keys can recur after a force-push A→B→A. In
+                // that case, watermark every comment visible when the new
+                // generation begins so an approval from the old A generation can
+                // never be inherited.
+                prepare_superseded_comment_cleanup(
+                    policy,
+                    store,
+                    &policy.repository,
+                    number,
+                    &snapshot.comments,
+                    shadow,
                 )?;
-                continue;
+                let (excluded_comment_ids, pending_comment_deletions) =
+                    replacement_comment_state(store.state.rounds.get(&key), &snapshot.comments);
+                let superseded_agents = supersede_rounds_for_head(
+                    &mut store.state,
+                    &policy.repository,
+                    number,
+                    &key,
+                    authoritative_mode(shadow),
+                );
+                let owner = find_owner_context(
+                    &policy.repository,
+                    &snapshot.head_ref_name,
+                    &snapshot.head_ref_oid,
+                );
+                store.state.rounds.insert(
+                    key.clone(),
+                    ReviewRound {
+                        repository: policy.repository.clone(),
+                        pull_request: number,
+                        head: snapshot.head_ref_oid.clone(),
+                        base: snapshot.base_ref_oid.clone(),
+                        generation,
+                        verification,
+                        phase: RoundPhase::Dispatching,
+                        reviewers: BTreeMap::new(),
+                        verdicts: BTreeMap::new(),
+                        excluded_comment_ids,
+                        pending_comment_deletions,
+                        pending_agent_cleanup: if authoritative_mode(shadow) {
+                            superseded_agents.iter().cloned().collect()
+                        } else {
+                            BTreeSet::new()
+                        },
+                        owner,
+                        owner_agent_id: None,
+                        gate_reasons: Vec::new(),
+                    },
+                );
+                store.save()?;
+                if authoritative_mode(shadow) {
+                    kill_agents(server, &superseded_agents);
+                    complete_agent_cleanup(store, &superseded_agents)?;
+                }
+                if !authoritative_mode(shadow) {
+                    emit_decision(
+                        server,
+                        &key,
+                        generation,
+                        "shadow_round_observed",
+                        true,
+                        Vec::new(),
+                    )?;
+                    return Ok(());
+                }
+                dispatch_missing_reviewers(server, policy, store, &key)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!(
+                    "review discovery failed for {}#{number}: {error}",
+                    policy.repository
+                );
             }
-            dispatch_missing_reviewers(server, policy, store, &key)?;
         }
     }
     Ok(())
@@ -1188,155 +1216,161 @@ fn poll_reviews_with(
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
-        let (repository, number, expected_head, generation) = {
-            let round = &store.state.rounds[&key];
-            (
-                round.repository.clone(),
-                round.pull_request,
-                round.head.clone(),
-                round.generation,
-            )
-        };
-        let Some(policy) = config
-            .repositories
-            .iter()
-            .find(|policy| policy.repository == repository)
-        else {
-            continue;
-        };
-        let mut snapshot = fetch_snapshot(&repository, number)?;
-        if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
-            prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
-        }
-        if let Some(event) = terminalize_closed_round(
-            store,
-            &key,
-            &snapshot,
-            authoritative_mode(shadow),
-            |agent_ids| cleanup_agents(agent_ids),
-        )? {
-            emit_decision(server, &key, generation, event, shadow, Vec::new())?;
-            continue;
-        }
-        if supersede_stale_round(
-            store,
-            &key,
-            &snapshot,
-            authoritative_mode(shadow),
-            |agent_ids| cleanup_agents(agent_ids),
-        )? {
-            continue;
-        }
-        let verdicts = latest_verdicts(
-            policy,
-            &store.state.rounds[&key],
-            &snapshot.comments,
-            authoritative_mode(shadow),
-        );
-        {
-            let round = store.state.rounds.get_mut(&key).expect("round exists");
-            round.verdicts = verdicts;
-        }
-        store.save()?;
-        if authoritative_mode(shadow) {
-            collect_completed_reviewers(server, policy, store, &key, &snapshot.comments)?;
-        }
-        // Reviewer collection can post a comment and take long enough for a
-        // force-push or base retarget. Fence every downstream decision and
-        // owner resume with a fresh comparison read.
-        snapshot = fetch_snapshot(&repository, number)?;
-        if let Some(event) = terminalize_closed_round(
-            store,
-            &key,
-            &snapshot,
-            authoritative_mode(shadow),
-            |agent_ids| cleanup_agents(agent_ids),
-        )? {
-            emit_decision(server, &key, generation, event, shadow, Vec::new())?;
-            continue;
-        }
-        if supersede_stale_round(
-            store,
-            &key,
-            &snapshot,
-            authoritative_mode(shadow),
-            |agent_ids| cleanup_agents(agent_ids),
-        )? {
-            continue;
-        }
-        let changes: Vec<_> = store.state.rounds[&key]
-            .verdicts
-            .iter()
-            .filter(|(_, verdict)| verdict.verdict == Verdict::ChangesRequested)
-            .map(|(lens, verdict)| (lens.clone(), verdict.findings.clone()))
-            .collect();
-        if !changes.is_empty() {
-            store
-                .state
-                .rounds
-                .get_mut(&key)
-                .expect("round exists")
-                .phase = RoundPhase::Findings;
-            store.save()?;
-            emit_decision(
-                server,
-                &key,
-                generation,
-                "review_findings",
-                shadow,
-                changes
-                    .iter()
-                    .flat_map(|(lens, findings)| {
-                        findings
-                            .iter()
-                            .map(move |finding| format!("[{lens}] {finding}"))
-                    })
-                    .collect(),
-            )?;
-            if authoritative_mode(shadow) {
-                resume_owner(server, store, &key, &changes)?;
+        let result = (|| -> Result<(), String> {
+            let (repository, number, expected_head, generation) = {
+                let round = &store.state.rounds[&key];
+                (
+                    round.repository.clone(),
+                    round.pull_request,
+                    round.head.clone(),
+                    round.generation,
+                )
+            };
+            let Some(policy) = config
+                .repositories
+                .iter()
+                .find(|policy| policy.repository == repository)
+            else {
+                return Ok(());
+            };
+            let mut snapshot = fetch_snapshot(&repository, number)?;
+            if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
+                prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
             }
-            continue;
-        }
-        let all_approved = policy.lenses.iter().all(|lens| {
-            store.state.rounds[&key]
-                .verdicts
-                .get(lens)
-                .is_some_and(|verdict| verdict.verdict == Verdict::Approve)
-        });
-        if all_approved {
-            let decision = evaluate_gate(
-                policy,
-                &expected_head,
+            if let Some(event) = terminalize_closed_round(
+                store,
+                &key,
                 &snapshot,
-                &store.state.rounds[&key].verdicts,
+                authoritative_mode(shadow),
+                |agent_ids| cleanup_agents(agent_ids),
+            )? {
+                emit_decision(server, &key, generation, event, shadow, Vec::new())?;
+                return Ok(());
+            }
+            if supersede_stale_round(
+                store,
+                &key,
+                &snapshot,
+                authoritative_mode(shadow),
+                |agent_ids| cleanup_agents(agent_ids),
+            )? {
+                return Ok(());
+            }
+            let verdicts = latest_verdicts(
+                policy,
+                &store.state.rounds[&key],
+                &snapshot.comments,
+                authoritative_mode(shadow),
             );
             {
                 let round = store.state.rounds.get_mut(&key).expect("round exists");
-                apply_gate_decision(round, &decision);
+                round.verdicts = verdicts;
             }
             store.save()?;
-            emit_decision(
-                server,
+            if authoritative_mode(shadow) {
+                collect_completed_reviewers(server, policy, store, &key, &snapshot.comments)?;
+            }
+            // Reviewer collection can post a comment and take long enough for a
+            // force-push or base retarget. Fence every downstream decision and
+            // owner resume with a fresh comparison read.
+            snapshot = fetch_snapshot(&repository, number)?;
+            if let Some(event) = terminalize_closed_round(
+                store,
                 &key,
-                generation,
-                if decision.ready {
-                    "review_ready"
-                } else {
-                    "review_gate_waiting"
-                },
-                shadow,
-                decision.reasons,
-            )?;
-        } else if authoritative_mode(shadow) {
-            store
-                .state
-                .rounds
-                .get_mut(&key)
-                .expect("round exists")
-                .phase = RoundPhase::Reviewing;
-            store.save()?;
-            dispatch_missing_reviewers(server, policy, store, &key)?;
+                &snapshot,
+                authoritative_mode(shadow),
+                |agent_ids| cleanup_agents(agent_ids),
+            )? {
+                emit_decision(server, &key, generation, event, shadow, Vec::new())?;
+                return Ok(());
+            }
+            if supersede_stale_round(
+                store,
+                &key,
+                &snapshot,
+                authoritative_mode(shadow),
+                |agent_ids| cleanup_agents(agent_ids),
+            )? {
+                return Ok(());
+            }
+            let changes: Vec<_> = store.state.rounds[&key]
+                .verdicts
+                .iter()
+                .filter(|(_, verdict)| verdict.verdict == Verdict::ChangesRequested)
+                .map(|(lens, verdict)| (lens.clone(), verdict.findings.clone()))
+                .collect();
+            if !changes.is_empty() {
+                store
+                    .state
+                    .rounds
+                    .get_mut(&key)
+                    .expect("round exists")
+                    .phase = RoundPhase::Findings;
+                store.save()?;
+                emit_decision(
+                    server,
+                    &key,
+                    generation,
+                    "review_findings",
+                    shadow,
+                    changes
+                        .iter()
+                        .flat_map(|(lens, findings)| {
+                            findings
+                                .iter()
+                                .map(move |finding| format!("[{lens}] {finding}"))
+                        })
+                        .collect(),
+                )?;
+                if authoritative_mode(shadow) {
+                    resume_owner(server, store, &key, &changes)?;
+                }
+                return Ok(());
+            }
+            let all_approved = policy.lenses.iter().all(|lens| {
+                store.state.rounds[&key]
+                    .verdicts
+                    .get(lens)
+                    .is_some_and(|verdict| verdict.verdict == Verdict::Approve)
+            });
+            if all_approved {
+                let decision = evaluate_gate(
+                    policy,
+                    &expected_head,
+                    &snapshot,
+                    &store.state.rounds[&key].verdicts,
+                );
+                {
+                    let round = store.state.rounds.get_mut(&key).expect("round exists");
+                    apply_gate_decision(round, &decision);
+                }
+                store.save()?;
+                emit_decision(
+                    server,
+                    &key,
+                    generation,
+                    if decision.ready {
+                        "review_ready"
+                    } else {
+                        "review_gate_waiting"
+                    },
+                    shadow,
+                    decision.reasons,
+                )?;
+            } else if authoritative_mode(shadow) {
+                store
+                    .state
+                    .rounds
+                    .get_mut(&key)
+                    .expect("round exists")
+                    .phase = RoundPhase::Reviewing;
+                store.save()?;
+                dispatch_missing_reviewers(server, policy, store, &key)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("review poll failed for {key}: {error}");
         }
     }
     Ok(())
@@ -1374,38 +1408,44 @@ fn poll_merges_with(
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
-        let (repository, number, head, base, generation) = {
-            let round = &store.state.rounds[&key];
-            (
-                round.repository.clone(),
-                round.pull_request,
-                round.head.clone(),
-                round.base.clone(),
-                round.generation,
-            )
-        };
-        let Some(policy) = config
-            .repositories
-            .iter()
-            .find(|policy| policy.repository == repository)
-        else {
-            continue;
-        };
-        let snapshot = fetch_snapshot(&repository, number)?;
-        if !open_comparison_matches(&snapshot, &base, &head) {
-            prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
+        let result = (|| -> Result<(), String> {
+            let (repository, number, head, base, generation) = {
+                let round = &store.state.rounds[&key];
+                (
+                    round.repository.clone(),
+                    round.pull_request,
+                    round.head.clone(),
+                    round.base.clone(),
+                    round.generation,
+                )
+            };
+            let Some(policy) = config
+                .repositories
+                .iter()
+                .find(|policy| policy.repository == repository)
+            else {
+                return Ok(());
+            };
+            let snapshot = fetch_snapshot(&repository, number)?;
+            if !open_comparison_matches(&snapshot, &base, &head) {
+                prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
+            }
+            let Some(event) = terminalize_closed_round(
+                store,
+                &key,
+                &snapshot,
+                authoritative_mode(shadow),
+                |agent_ids| cleanup_agents(agent_ids),
+            )?
+            else {
+                return Ok(());
+            };
+            emit_decision(server, &key, generation, event, shadow, Vec::new())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("review merge poll failed for {key}: {error}");
         }
-        let Some(event) = terminalize_closed_round(
-            store,
-            &key,
-            &snapshot,
-            authoritative_mode(shadow),
-            |agent_ids| cleanup_agents(agent_ids),
-        )?
-        else {
-            continue;
-        };
-        emit_decision(server, &key, generation, event, shadow, Vec::new())?;
     }
     Ok(())
 }
@@ -3988,6 +4028,107 @@ review_loop:
             owner_task_id("owner/repo", 7, &head, 1),
             owner_task_id("owner/repo", 7, &head, 2)
         );
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn failed_transition_persistence_restores_the_active_round() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-unwritable-transition-{}",
+            super::super::random_hex_128().unwrap()
+        ));
+        fs::create_dir(&state_path).unwrap();
+        let mut store = StateStore {
+            path: state_path.clone(),
+            state: DurableState {
+                schema_version: state_schema_version(),
+                rounds: BTreeMap::from([(
+                    key.clone(),
+                    test_round(&head, RoundPhase::Reviewing, Some("reviewer")),
+                )]),
+            },
+        };
+        let mut closed = snapshot(&head);
+        closed.state = "CLOSED".to_owned();
+
+        assert!(terminalize_closed_round(&mut store, &key, &closed, true, |_| {}).is_err());
+        let round = &store.state.rounds[&key];
+        assert_eq!(round.phase, RoundPhase::Reviewing);
+        assert!(round.pending_agent_cleanup.is_empty());
+
+        let _ = fs::remove_file(state_path.with_extension("tmp"));
+        fs::remove_dir(state_path).unwrap();
+    }
+
+    #[test]
+    fn merge_poll_continues_after_another_round_fetch_fails() {
+        let first_head = "a".repeat(40);
+        let second_head = "b".repeat(40);
+        let first_key = round_key("owner/repo", 7, &first_head);
+        let second_key = round_key("owner/repo", 8, &second_head);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-isolated-merge-poll-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry_path = state_path.with_extension("agents");
+        let event_path = state_path.with_extension("events");
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry,
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(
+            first_key,
+            test_round(&first_head, RoundPhase::Reviewing, None),
+        );
+        let mut second_round = test_round(&second_head, RoundPhase::Reviewing, None);
+        second_round.pull_request = 8;
+        store.state.rounds.insert(second_key.clone(), second_round);
+        store.save().unwrap();
+        let mut repository_policy = policy();
+        repository_policy.repository = "owner/repo".to_owned();
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: vec![repository_policy],
+        };
+        let mut closed = snapshot(&second_head);
+        closed.state = "CLOSED".to_owned();
+
+        poll_merges_with(
+            &server,
+            &config,
+            &mut store,
+            false,
+            |_, number| {
+                if number == 7 {
+                    Err("simulated malformed PR".to_owned())
+                } else {
+                    Ok(closed.clone())
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(store.state.rounds[&second_key].phase, RoundPhase::Closed);
+
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(registry_path);
         let _ = fs::remove_file(event_path);
