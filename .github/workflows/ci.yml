@@ -38,7 +38,7 @@ jobs:
           chmod 600 "$SMOKE_DIR/token"
           ./target/debug/zigzag --secret-file "$SMOKE_DIR/token" \
             --state-file "$SMOKE_DIR/events.json" --port 18923 \
-            --tailscale-ip 127.0.0.1 \
+            --tailscale-ip 100.100.100.100 \
             > "$SMOKE_DIR/out.log" 2>&1 &
           DAEMON_PID=$!
           sleep 4
