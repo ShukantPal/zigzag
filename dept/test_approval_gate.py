@@ -15,7 +15,7 @@ HEAD = "a" * 40
 
 def approvals():
     return [
-        {"body": f"🤖 Codex (AI assistant) — [{lens}] review verdict\nVERDICT: APPROVE\nHEAD: {HEAD}\nROUND: 1",
+        {"body": f"🤖 Codex (AI assistant) — [{lens}] review verdict\nVERDICT: APPROVE\nHEAD: {HEAD}\nROUND: 1\nLENSES: correctness,simplicity,tests",
          "createdAt": "2026-01-01T00:00:00Z", "id": lens, "author": "ShukantPal"}
         for lens in ("correctness", "simplicity", "tests")
     ]
@@ -68,7 +68,8 @@ class ApprovalGateChecksTest(unittest.TestCase):
 
     def test_literal_newlines_in_verdict_are_accepted(self):
         body = (f"🤖 Codex (AI assistant) — [tests] review verdict\\n"
-                f"VERDICT: APPROVE\\nHEAD: {HEAD}\\nROUND: 1")
+                f"VERDICT: APPROVE\\nHEAD: {HEAD}\\nROUND: 1\\n"
+                "LENSES: correctness,simplicity,tests")
         verdicts = gate.latest_verdicts([{"body": body, "createdAt": "now", "id": 1,
                                           "author": "ShukantPal"}])
         self.assertEqual(verdicts["tests"][:2], ("APPROVE", HEAD))
@@ -176,7 +177,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
     def test_conflicting_structured_verdict_is_ignored(self):
         body = (f"🤖 Codex (AI assistant) — [tests] review verdict\n"
                 f"VERDICT: APPROVE\nVERDICT: CHANGES REQUESTED\nHEAD: {HEAD}\n"
-                "ROUND: 1")
+                "ROUND: 1\nLENSES: correctness,simplicity,tests")
         self.assertNotIn("tests", gate.latest_verdicts([
             {"body": body, "createdAt": "now", "id": 1, "author": "ShukantPal"}
         ]))
@@ -184,18 +185,51 @@ class ApprovalGateChecksTest(unittest.TestCase):
     def test_higher_round_wins_even_when_older_round_posts_later(self):
         newer_round = {
             "body": (f"🤖 Codex (AI assistant) — [tests] review verdict\n"
-                     f"VERDICT: CHANGES REQUESTED\nHEAD: {HEAD}\nROUND: 2"),
+                     f"VERDICT: CHANGES REQUESTED\nHEAD: {HEAD}\nROUND: 2\n"
+                     "LENSES: correctness,simplicity,tests"),
             "createdAt": "2026-01-01T00:00:00Z", "id": "round-2",
             "author": "ShukantPal",
         }
         late_old_round = {
             "body": (f"🤖 Codex (AI assistant) — [tests] review verdict\n"
-                     f"VERDICT: APPROVE\nHEAD: {HEAD}\nROUND: 1"),
+                     f"VERDICT: APPROVE\nHEAD: {HEAD}\nROUND: 1\n"
+                     "LENSES: correctness,simplicity,tests"),
             "createdAt": "2026-01-01T01:00:00Z", "id": "round-1-late",
             "author": "ShukantPal",
         }
         verdict = gate.latest_verdicts([newer_round, late_old_round])["tests"]
-        self.assertEqual(verdict, ("CHANGES REQUESTED", HEAD, "ShukantPal", 2))
+        self.assertEqual(verdict, ("CHANGES REQUESTED", HEAD, "ShukantPal", 2,
+                                   ("correctness", "simplicity", "tests")))
+
+    def test_seeded_security_lens_cannot_be_omitted_from_default_gate(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        for comment in data["comments"]:
+            comment["body"] = comment["body"].replace(
+                "LENSES: correctness,simplicity,tests",
+                "LENSES: correctness,security,simplicity,tests")
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1",
+                                ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertIn("no verdict from [security] reviewer", result["reasons"])
+
+    def test_conflicting_round_manifests_fail_closed(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        data["comments"][0]["body"] = data["comments"][0]["body"].replace(
+            "LENSES: correctness,simplicity,tests",
+            "LENSES: correctness,security,simplicity,tests")
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1",
+                                ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertIn("latest review round has no single consistent lens manifest",
+                      result["reasons"])
 
 
 class HumanActorConfigTest(unittest.TestCase):

@@ -115,7 +115,7 @@ STATUS_RE = re.compile(r":\s*(RUNNING|DONE)(?:\s+\(exit\s+([^\)]+)\))?\s*$")
 
 
 def task_status(text):
-    """Parse status without treating an ambiguous completion as safe."""
+    """Parse liveness separately from whether completion was successful."""
     if text.strip().endswith(": MISSING"):
         return "missing"
     if text.strip().endswith(": DONE (pruned)"):
@@ -130,7 +130,7 @@ def task_status(text):
         return "succeeded"
     if exit_code and exit_code.isdigit():
         return "failed"
-    return "unknown"
+    return "terminated_unknown"
 
 
 def project_dir_busy(project_dir):
@@ -180,6 +180,9 @@ def reviewer_states(task_ids):
             states[tid] = "failed"
         elif status == "missing":
             states[tid] = "missing"
+        elif status == "terminated_unknown":
+            raise RuntimeError(
+                f"reviewer {tid} terminated without a recorded exit: {text[:200]}")
         else:
             raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")
     if not completed:
@@ -232,9 +235,11 @@ def validated_verdict(text, head):
     return verdicts[0].upper()
 
 
-def verdict_body(lens, head, verdict, task_id, round_number):
+def verdict_body(lens, head, verdict, task_id, round_number, round_lenses):
+    manifest = ",".join(sorted(round_lenses))
     return (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
-            f"VERDICT: {verdict}\nHEAD: {head}\nROUND: {round_number}\n\n"
+            f"VERDICT: {verdict}\nHEAD: {head}\nROUND: {round_number}\n"
+            f"LENSES: {manifest}\n\n"
             "ATTESTATION: MODEL_ADVISORY\n\n"
             f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
             "requires a formal review from an allowlisted human before it can "
@@ -248,8 +253,10 @@ def verdict_already_posted(repo, pr, body):
                c.get("body") == body for c in comments)
 
 
-def post_verdict(repo, pr, lens, head, verdict, task_id, round_number):
-    body = verdict_body(lens, head, verdict, task_id, round_number)
+def post_verdict(repo, pr, lens, head, verdict, task_id, round_number,
+                 round_lenses):
+    body = verdict_body(lens, head, verdict, task_id, round_number,
+                        round_lenses)
     if verdict_already_posted(repo, pr, body):
         return False
     mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
@@ -328,10 +335,11 @@ def _process_round_locked(path):
     if DRY_RUN:
         return f"#{rnd['pr']}: DRY RUN — would publish {len(verdicts)} validated verdicts"
     posted = set(rnd.get("posted_lenses", []))
+    round_lenses = tuple(rnd["reviewers"].values())
     for lens, (verdict, tid) in verdicts.items():
         if lens not in posted:
             post_verdict(rnd["repo"], rnd["pr"], lens, rnd["head"], verdict,
-                         tid, rnd["round"])
+                         tid, rnd["round"], round_lenses)
             posted.add(lens)
             rnd["posted_lenses"] = sorted(posted)
             save_round(path, rnd)

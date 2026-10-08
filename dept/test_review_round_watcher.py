@@ -35,7 +35,7 @@ class ProjectBusyTest(unittest.TestCase):
              patch.object(watcher.subprocess, "run", return_value=result):
             self.assertTrue(watcher.project_dir_busy("/work/project"))
 
-    def test_project_unknown_exit_is_busy(self):
+    def test_project_known_terminated_unknown_exit_does_not_stay_busy(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as ledger:
             ledger.write(json.dumps({"id": "t-unknown", "project": "/work/project"}) + "\n")
             ledger_path = ledger.name
@@ -43,7 +43,7 @@ class ProjectBusyTest(unittest.TestCase):
         result = SimpleNamespace(stdout="t-unknown: DONE (exit unknown)\n", stderr="", returncode=0)
         with patch.object(watcher, "LEDGER", ledger_path), \
              patch.object(watcher.subprocess, "run", return_value=result):
-            self.assertTrue(watcher.project_dir_busy("/work/project"))
+            self.assertFalse(watcher.project_dir_busy("/work/project"))
 
     def test_pruned_relay_history_does_not_block_project(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as ledger:
@@ -89,6 +89,15 @@ class ProjectBusyTest(unittest.TestCase):
                              {"t-relay": "failed"})
         mac.assert_not_called()
 
+    def test_terminated_reviewer_without_exit_code_cannot_publish(self):
+        result = SimpleNamespace(stdout="t-legacy: DONE (exit unknown)\n",
+                                 stderr="", returncode=0)
+        with patch.object(watcher.subprocess, "run", return_value=result), \
+             patch.object(watcher, "mac") as mac, \
+             self.assertRaisesRegex(RuntimeError, "without a recorded exit"):
+            watcher.reviewer_states(["t-legacy"])
+        mac.assert_not_called()
+
     def test_fetch_findings_parses_multiple_outputs_without_trailing_newline(self):
         output = "\n@@@t-correct@@@\nfirst finding\n@@@t-tests@@@\nsecond finding"
         with patch.object(watcher, "mac", return_value=output) as mac:
@@ -129,7 +138,7 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertIn("published validated review verdicts", message)
         self.assertEqual(round_["status"], "published")
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
-                                     "APPROVE", "t-a", 1)
+                                     "APPROVE", "t-a", 1, ("tests",))
 
     def test_changes_requested_is_published_as_blocking_verdict(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,7 +154,7 @@ class ProjectBusyTest(unittest.TestCase):
                  patch.object(watcher, "post_verdict") as post:
                 watcher.process_round(str(path))
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
-                                     "CHANGES REQUESTED", "t-a", 1)
+                                     "CHANGES REQUESTED", "t-a", 1, ("tests",))
 
     def test_partial_publication_retry_does_not_duplicate_posted_lenses(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,7 +184,8 @@ class ProjectBusyTest(unittest.TestCase):
                 watcher.process_round(str(path))
             final = json.loads(path.read_text())
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
-                                     "APPROVE", "t-t", 1)
+                                     "APPROVE", "t-t", 1,
+                                     ("correctness", "tests"))
         self.assertEqual(final["status"], "published")
 
     def test_retry_after_post_before_state_save_is_idempotent(self):
@@ -189,7 +199,8 @@ class ProjectBusyTest(unittest.TestCase):
             states = {"t-a": "done"}
             findings = {"t-a": "VERDICT: APPROVE\nHEAD: " + "a" * 40}
             posted = []
-            body = watcher.verdict_body("tests", "a" * 40, "APPROVE", "t-a", 1)
+            body = watcher.verdict_body("tests", "a" * 40, "APPROVE", "t-a", 1,
+                                        ("tests",))
 
             def mac(command):
                 if "--json comments" in command:
@@ -258,10 +269,11 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertEqual(watcher.task_status("t-a: RUNNING"), "running")
         self.assertEqual(watcher.task_status("t-a: DONE (exit 0)"), "succeeded")
         self.assertEqual(watcher.task_status("t-a: DONE (exit 7)"), "failed")
-        self.assertEqual(watcher.task_status("t-a: DONE (exit unknown)"), "unknown")
+        self.assertEqual(watcher.task_status("t-a: DONE (exit unknown)"),
+                         "terminated_unknown")
         self.assertEqual(watcher.task_status("t-a: DONE (pruned)"), "pruned")
         self.assertEqual(watcher.task_status("t-a: MISSING"), "missing")
-        self.assertEqual(watcher.task_status("t-a: DONE"), "unknown")
+        self.assertEqual(watcher.task_status("t-a: DONE"), "terminated_unknown")
 
     def test_dispatching_round_reconciles_persisted_launch_intent(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -29,8 +29,9 @@ management layer that decides what to run.
   durable audit directory beside `events.json`; it never invokes a control
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
 - **`approval_gate.py`** — the merge gate for Muse-owned PRs: required CI
-  green on the latest head **and** a 3-lens review team (correctness,
-  simplicity, tests) each showing APPROVE on that head, plus a formal
+  green on the latest head **and** every lens declared by the latest review
+  round (correctness, simplicity, tests, plus security when seeded) showing
+  APPROVE on that head, plus a formal
   current-head approval from a separately authenticated human reviewer.
   Stale-head, lower-round verdicts and shared-automation approvals don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):

@@ -1,7 +1,11 @@
 import importlib
+import os
 import pathlib
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -132,6 +136,53 @@ class CommandDispatchTest(unittest.TestCase):
         self.assertIn("child-pid.txt", calls)
         self.assertIn("trap cleanup TERM INT", calls)
         self.assertIn('kill \"$child\"', calls)
+
+    def test_ssh_worker_persists_nonzero_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = department.ssh_worker_script(tmp, "sh -c 'exit 7'")
+            result = subprocess.run(["sh", "-c", script], timeout=5)
+            task = pathlib.Path(tmp)
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual((task / "exit-code.txt").read_text(), "7")
+            self.assertTrue((task / "child-pid.txt").read_text().isdigit())
+
+    def test_ssh_worker_terminates_child_and_records_cancellation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = pathlib.Path(tmp)
+            fake = task / "fake_worker.py"
+            fake.write_text(
+                "import signal, time\n"
+                "def stop(*_):\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "time.sleep(30)\n")
+            command = f"{department.shq(sys.executable)} {department.shq(str(fake))}"
+            script = department.ssh_worker_script(tmp, command)
+            process = subprocess.Popen(["sh", "-c", script])
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                child_file = task / "child-pid.txt"
+                while time.monotonic() < deadline and not child_file.exists():
+                    if process.poll() is not None:
+                        self.fail("SSH worker exited before recording its child")
+                    time.sleep(0.01)
+                self.assertTrue(child_file.exists())
+                child_pid = int(child_file.read_text())
+                process.terminate()
+                self.assertEqual(process.wait(timeout=5), 143)
+                self.assertEqual((task / "exit-code.txt").read_text(), "143")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_read_only_reaches_ssh_launch_without_approval_bypass(self):
         result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")

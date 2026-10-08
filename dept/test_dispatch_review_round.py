@@ -117,10 +117,22 @@ class DispatchReviewRoundTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             calls = 0
+            lock_attempts = 0
             guard = threading.Lock()
             first_entered = threading.Event()
             release_first = threading.Event()
+            second_lock_attempted = threading.Event()
             second_entered = threading.Event()
+            real_flock = dispatcher.fcntl.flock
+
+            def observed_flock(file, operation):
+                nonlocal lock_attempts
+                with guard:
+                    lock_attempts += 1
+                    attempt = lock_attempts
+                if attempt == 2:
+                    second_lock_attempted.set()
+                return real_flock(file, operation)
 
             def pr_info(_pr, _repo):
                 nonlocal calls
@@ -141,12 +153,16 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", side_effect=pr_info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=dispatch), \
+                 patch.object(dispatcher.fcntl, "flock", side_effect=observed_flock), \
                  ThreadPoolExecutor(max_workers=2) as pool:
                 first = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
                 self.assertTrue(first_entered.wait(1))
                 second = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
-                self.assertFalse(second_entered.wait(0.1))
-                release_first.set()
+                try:
+                    self.assertTrue(second_lock_attempted.wait(1))
+                    self.assertFalse(second_entered.is_set())
+                finally:
+                    release_first.set()
                 results = [first.result(), second.result()]
                 self.assertTrue(second_entered.wait(1))
         self.assertEqual(len({path.name for path, _ in results}), 2)

@@ -193,6 +193,21 @@ def validate_model(model):
         sys.exit("invalid model identifier: use letters, digits, '.', '_', ':', '/', or '-'")
 
 
+def ssh_worker_script(rdir, codex):
+    """Wrap one SSH-launched command with durable exit and child state."""
+    exit_file = shq(f"{rdir}/exit-code.txt")
+    child_file = shq(f"{rdir}/child-pid.txt")
+    return (
+        "child=; cleanup() { "
+        "if [ -n \"$child\" ]; then kill \"$child\" 2>/dev/null; "
+        "wait \"$child\" 2>/dev/null; fi; "
+        f"printf %s 143 > {exit_file}; exit 143; }}; "
+        "trap cleanup TERM INT; "
+        f"{codex} & child=$!; printf %s \"$child\" > {child_file}; "
+        "wait \"$child\"; rc=$?; trap - TERM INT; "
+        f"printf %s \"$rc\" > {exit_file}; exit \"$rc\"")
+
+
 def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
@@ -239,17 +254,7 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
                         if read_only else "--approve-for-me ")
         codex = (f"codex exec --json {safety_flags}--skip-git-repo-check "
                  f"{model_flag}{command}")
-        exit_file = shq(f"{rdir}/exit-code.txt")
-        child_file = shq(f"{rdir}/child-pid.txt")
-        wrapped = (
-            "child=; cleanup() { "
-            "if [ -n \"$child\" ]; then kill \"$child\" 2>/dev/null; "
-            "wait \"$child\" 2>/dev/null; fi; "
-            f"printf %s 143 > {exit_file}; exit 143; }}; "
-            "trap cleanup TERM INT; "
-            f"{codex} & child=$!; printf %s \"$child\" > {child_file}; "
-            "wait \"$child\"; rc=$?; trap - TERM INT; "
-            f"printf %s \"$rc\" > {exit_file}; exit \"$rc\"")
+        wrapped = ssh_worker_script(rdir, codex)
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
                   f'nohup sh -c {shq(wrapped)} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '

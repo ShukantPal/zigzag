@@ -17,6 +17,7 @@ Verdict comments are top-level PR comments posted by review-team workers
   VERDICT: APPROVE
   HEAD: <full 40-hex sha reviewed>
   ROUND: <positive review-round number>
+  LENSES: <comma-separated lenses seeded for this round>
   <short summary; findings when CHANGES REQUESTED>
 
 Lenses: correctness, simplicity, tests (+ security when the round seeds it).
@@ -56,6 +57,7 @@ VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$",
 HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 LENS_RE = re.compile(r"\[([a-z]+)\]\s+review verdict", re.IGNORECASE)
 ROUND_RE = re.compile(r"^ROUND:\s*([1-9][0-9]*)\s*$", re.MULTILINE)
+LENSES_RE = re.compile(r"^LENSES:\s*([a-z]+(?:,[a-z]+)*)\s*$", re.MULTILINE)
 
 
 def human_review_actors():
@@ -108,16 +110,18 @@ def latest_verdicts(comments):
         verdicts_found = VERDICT_RE.findall(body)
         heads = HEAD_RE.findall(body)
         rounds = ROUND_RE.findall(body)
+        manifests = LENSES_RE.findall(body)
         if (len(lenses) != 1 or len(verdicts_found) != 1 or len(heads) != 1 or
-                len(rounds) != 1):
+                len(rounds) != 1 or len(manifests) != 1):
             continue
         lens = lenses[0].lower()
         round_number = int(rounds[0])
+        manifest = tuple(sorted(manifests[0].split(",")))
         key = (round_number, c.get("createdAt") or "", c.get("id") or 0)
-        if lens not in verdicts or key > verdicts[lens][4]:
+        if lens not in verdicts or key > verdicts[lens][5]:
             verdicts[lens] = (verdicts_found[0].upper(), heads[0].lower(),
-                              c.get("author"), round_number, key)
-    return {l: v[:4] for l, v in verdicts.items()}
+                              c.get("author"), round_number, manifest, key)
+    return {l: v[:5] for l, v in verdicts.items()}
 
 
 def current_human_approval(reviews, head, actors):
@@ -181,14 +185,21 @@ def check(repo, pr, lenses):
     # --- review-team approvals ---
     verdicts = latest_verdicts(data.get("comments") or [])
     latest_round = max((v[3] for v in verdicts.values()), default=None)
+    manifests = {v[4] for v in verdicts.values() if v[3] == latest_round}
+    declared_lenses = set()
+    if len(manifests) != 1:
+        reasons.append("latest review round has no single consistent lens manifest")
+    else:
+        declared_lenses.update(next(iter(manifests)))
+    required_lenses = list(dict.fromkeys([*lenses, *sorted(declared_lenses)]))
     approvals = {}
-    for lens in lenses:
+    for lens in required_lenses:
         v = verdicts.get(lens)
         if v is None:
             reasons.append(f"no verdict from [{lens}] reviewer")
             approvals[lens] = {"verdict": None}
             continue
-        verdict, vhead, author, round_number = v
+        verdict, vhead, author, round_number, manifest = v
         approvals[lens] = {"verdict": verdict, "head": vhead,
                            "on_current_head": vhead == head,
                            "round": round_number}
