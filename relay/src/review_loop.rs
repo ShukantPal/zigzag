@@ -307,6 +307,11 @@ struct OwnerSpawnFence<'a> {
     owner: &'a OwnerContext,
 }
 
+struct OwnerResolution<IsCurrent, Resolve> {
+    is_current: IsCurrent,
+    resolve: Resolve,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ReviewRound {
     repository: String,
@@ -2091,7 +2096,10 @@ fn resume_owner(
         key,
         findings,
         fetch_pr,
-        owner_context_is_current,
+        OwnerResolution {
+            is_current: owner_context_is_current,
+            resolve: find_owner_context,
+        },
         |task_id, owner, prompt, repository, number, base, head| {
             spawn_codex_task(
                 server,
@@ -2112,16 +2120,20 @@ fn resume_owner(
     )
 }
 
-fn resume_owner_with(
+fn resume_owner_with<IsCurrent, Resolve>(
     server: &Arc<Server>,
     store: &mut StateStore,
     key: &str,
     findings: &[(String, Vec<String>)],
     fetch_snapshot: impl FnOnce(&str, u64) -> Result<PullRequestSnapshot, String>,
-    owner_is_current: impl FnOnce(&OwnerContext, &str, &str) -> bool,
+    mut owner_resolution: OwnerResolution<IsCurrent, Resolve>,
     spawn_owner: impl FnOnce(&str, &OwnerContext, &str, &str, u64, &str, &str) -> Result<String, String>,
-) -> Result<(), String> {
-    let (repository, number, head, base, generation, owner, owner_agent_id) = {
+) -> Result<(), String>
+where
+    IsCurrent: FnMut(&OwnerContext, &str, &str) -> bool,
+    Resolve: FnOnce(&str, &str, &str) -> Option<OwnerContext>,
+{
+    let (repository, number, head, base, generation, mut owner, owner_agent_id) = {
         let round = &store.state.rounds[key];
         (
             round.repository.clone(),
@@ -2147,6 +2159,19 @@ fn resume_owner_with(
             .owner_agent_id = None;
         store.save()?;
     }
+    let current = fetch_snapshot(&repository, number)?;
+    if !open_comparison_matches(&current, &base, &head) {
+        return Ok(());
+    }
+    if owner
+        .as_ref()
+        .is_none_or(|candidate| !(owner_resolution.is_current)(candidate, &repository, &head))
+    {
+        owner = (owner_resolution.resolve)(&repository, &current.head_ref_name, &head)
+            .filter(|candidate| (owner_resolution.is_current)(candidate, &repository, &head));
+        store.state.rounds.get_mut(key).expect("round exists").owner = owner.clone();
+        store.save()?;
+    }
     let Some(owner) = owner else {
         let round = store.state.rounds.get_mut(key).expect("round exists");
         round.phase = RoundPhase::Attention;
@@ -2164,14 +2189,10 @@ fn resume_owner_with(
     {
         return Ok(());
     }
-    let current = fetch_snapshot(&repository, number)?;
-    if !open_comparison_matches(&current, &base, &head) {
-        return Ok(());
-    }
     let task_id = owner_task_id(&repository, number, &head, generation);
     store.save()?;
     let prompt = owner_prompt(&repository, number, &base, &head, generation, findings);
-    if !owner_is_current(&owner, &repository, &head) {
+    if !(owner_resolution.is_current)(&owner, &repository, &head) {
         let round = store.state.rounds.get_mut(key).expect("round exists");
         round.phase = RoundPhase::Attention;
         round.gate_reasons = vec![
@@ -3591,11 +3612,16 @@ review_loop:
                 assert_eq!(number, 7);
                 Ok(snapshot(&head))
             },
-            |owner, repository, expected_head| {
-                assert_eq!(owner.session_id, "session-1");
-                assert_eq!(repository, "owner/repo");
-                assert_eq!(expected_head, head);
-                true
+            OwnerResolution {
+                is_current: |owner: &OwnerContext, repository: &str, expected_head: &str| {
+                    assert_eq!(owner.session_id, "session-1");
+                    assert_eq!(repository, "owner/repo");
+                    assert_eq!(expected_head, head);
+                    true
+                },
+                resolve: |_: &str, _: &str, _: &str| -> Option<OwnerContext> {
+                    panic!("a current cached owner must not be rediscovered")
+                },
             },
             |task_id, owner, prompt, repository, number, expected_base, expected_head| {
                 spawns += 1;
@@ -3631,10 +3657,129 @@ review_loop:
             &key,
             &[],
             |_, _| panic!("a live owner must suppress refetch and duplicate resume"),
-            |_, _, _| panic!("a live owner must suppress owner revalidation"),
+            OwnerResolution {
+                is_current: |_: &OwnerContext, _: &str, _: &str| {
+                    panic!("a live owner must suppress owner revalidation")
+                },
+                resolve: |_: &str, _: &str, _: &str| -> Option<OwnerContext> {
+                    panic!("a live owner must suppress owner rediscovery")
+                },
+            },
             |_, _, _, _, _, _, _| panic!("a live owner must not be duplicated"),
         )
         .unwrap();
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
+    fn missing_and_stale_owners_are_rediscovered_for_the_current_comparison() {
+        let head = "a".repeat(40);
+        let base = "c".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-owner-rediscovery-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry_path = state_path.with_extension("agents");
+        let event_path = state_path.with_extension("events");
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(
+            key.clone(),
+            test_round(&head, RoundPhase::Findings, Some("reviewer")),
+        );
+        store.save().unwrap();
+
+        for (expected_previous, recovered_session, spawned_id) in [
+            (None, "recovered-session-1", "resumed-owner-1"),
+            (
+                Some("stale-session"),
+                "recovered-session-2",
+                "resumed-owner-2",
+            ),
+        ] {
+            if let Some(stale_session) = expected_previous {
+                let round = store.state.rounds.get_mut(&key).unwrap();
+                round.owner = Some(OwnerContext {
+                    session_id: stale_session.to_owned(),
+                    project_dir: PathBuf::from("/private/tmp/stale-owner"),
+                    department_task_id: "stale-department".to_owned(),
+                    branch: "codex/branch".to_owned(),
+                });
+                round.owner_agent_id = None;
+                round.phase = RoundPhase::Findings;
+                store.save().unwrap();
+            }
+            let mut resolutions = 0;
+            let recovered_session = recovered_session.to_owned();
+            resume_owner_with(
+                &server,
+                &mut store,
+                &key,
+                &[("correctness".to_owned(), vec!["fix recovery".to_owned()])],
+                |repository, number| {
+                    assert_eq!(repository, "owner/repo");
+                    assert_eq!(number, 7);
+                    Ok(snapshot(&head))
+                },
+                OwnerResolution {
+                    is_current: |owner: &OwnerContext, repository: &str, expected_head: &str| {
+                        assert_eq!(repository, "owner/repo");
+                        assert_eq!(expected_head, head);
+                        owner.session_id.starts_with("recovered-session-")
+                    },
+                    resolve: |repository: &str, branch: &str, expected_head: &str| {
+                        resolutions += 1;
+                        assert_eq!(repository, "owner/repo");
+                        assert_eq!(branch, "codex/branch");
+                        assert_eq!(expected_head, head);
+                        Some(OwnerContext {
+                            session_id: recovered_session.clone(),
+                            project_dir: PathBuf::from("/private/tmp/recovered-owner"),
+                            department_task_id: "recovered-department".to_owned(),
+                            branch: branch.to_owned(),
+                        })
+                    },
+                },
+                |task_id, owner, _, repository, number, expected_base, expected_head| {
+                    assert_eq!(task_id, owner_task_id("owner/repo", 7, &head, 1));
+                    assert_eq!(owner.session_id, recovered_session);
+                    assert_eq!(repository, "owner/repo");
+                    assert_eq!(number, 7);
+                    assert_eq!(expected_base, base);
+                    assert_eq!(expected_head, head);
+                    assert_eq!(
+                        StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                            .owner
+                            .as_ref()
+                            .map(|owner| owner.session_id.as_str()),
+                        Some(recovered_session.as_str()),
+                        "the refreshed exact-fenced owner must be durable before spawn"
+                    );
+                    Ok(spawned_id.to_owned())
+                },
+            )
+            .unwrap();
+            assert_eq!(resolutions, 1);
+            assert_eq!(
+                store.state.rounds[&key].owner_agent_id.as_deref(),
+                Some(spawned_id)
+            );
+        }
 
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(registry_path);
