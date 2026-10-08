@@ -879,15 +879,27 @@ fn stage_unadmitted_generated_comments(
             reviewer.attempt,
         );
         for comment in comments.iter().filter(|comment| {
-            comment.author.as_ref().map(|author| author.login.as_str())
-                == Some(policy.trusted_verdict_identity.as_str())
-                && comment.body.contains(&marker)
+            trusted_generated_comment(policy, comment, &marker, lens, &round.head)
         }) {
             changed |= round.excluded_comment_ids.insert(comment.id.clone());
             changed |= round.pending_comment_deletions.insert(comment.id.clone());
         }
     }
     changed
+}
+
+fn trusted_generated_comment(
+    policy: &RepositoryPolicy,
+    comment: &Comment,
+    marker: &str,
+    lens: &str,
+    head: &str,
+) -> bool {
+    comment.author.as_ref().map(|author| author.login.as_str())
+        == Some(policy.trusted_verdict_identity.as_str())
+        && comment.body.contains(marker)
+        && parse_verdict_comment(&comment.body, head, &policy.result_limits)
+            .is_some_and(|(comment_lens, _)| comment_lens == lens)
 }
 
 fn retry_pending_comment_deletions(
@@ -1503,7 +1515,7 @@ fn collect_completed_reviewers(
         );
         if comments
             .iter()
-            .any(|comment| comment.body.contains(&marker))
+            .any(|comment| trusted_generated_comment(policy, comment, &marker, lens, &head))
         {
             // The current GitHub snapshot decides which comment is latest.
             // Do not re-admit an older generated result after a correction.
@@ -2497,6 +2509,46 @@ review_loop:
     }
 
     #[test]
+    fn generated_marker_requires_trusted_exact_verdict_comment() {
+        let head = "a".repeat(40);
+        let policy = policy();
+        let marker = verdict_id("ShukantPal/zigzag", 7, &head, 1, "tests", 1);
+        let body = format!(
+            "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking issues.\n\n{marker}"
+        );
+        let comment = |login: &str, body: String| Comment {
+            author: Some(Author {
+                login: login.to_owned(),
+            }),
+            body,
+            created_at: "2026-01-01".to_owned(),
+            id: login.to_owned(),
+        };
+
+        assert!(!trusted_generated_comment(
+            &policy,
+            &comment("untrusted-user", body.clone()),
+            &marker,
+            "tests",
+            &head
+        ));
+        assert!(!trusted_generated_comment(
+            &policy,
+            &comment("ShukantPal", format!("ordinary comment\n{marker}")),
+            &marker,
+            "tests",
+            &head
+        ));
+        assert!(trusted_generated_comment(
+            &policy,
+            &comment("ShukantPal", body),
+            &marker,
+            "tests",
+            &head
+        ));
+    }
+
+    #[test]
     fn latest_verdicts_ignore_untrusted_stale_and_oversized_comments() {
         let head = "a".repeat(40);
         let body = format!(
@@ -2965,7 +3017,9 @@ review_loop:
             author: Some(Author {
                 login: "ShukantPal".to_owned(),
             }),
-            body: format!("generated verdict\n{marker}"),
+            body: format!(
+                "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking issues.\n\n{marker}"
+            ),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             id: "IC_pending".to_owned(),
         };
@@ -3061,7 +3115,9 @@ review_loop:
             author: Some(Author {
                 login: "ShukantPal".to_owned(),
             }),
-            body: format!("generated verdict\n{marker}"),
+            body: format!(
+                "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking issues.\n\n{marker}"
+            ),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             id: "IC_retarget".to_owned(),
         };
