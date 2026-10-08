@@ -1,6 +1,7 @@
 import importlib
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ from unittest.mock import patch
 DEPT_DIR = pathlib.Path(__file__).parent
 sys.path.insert(0, str(DEPT_DIR))
 gate = importlib.import_module("approval_gate")
+round_store = importlib.import_module("dispatch_review_round")
 
 
 HEAD = "a" * 40
@@ -280,6 +282,16 @@ class ApprovalGateChecksTest(unittest.TestCase):
             "round": 2, "head": "b" * 40,
             "lenses": ("correctness", "security"), "status": "attention",
         })
+
+    def test_latest_seeded_round_rejects_truncated_matching_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rounds = pathlib.Path(tmp)
+            key = round_store.repo_key("owner/repo")
+            (rounds / f"{key}-pr1-round2.json").write_text("{")
+            with patch.object(round_store, "ROUNDS_DIR", rounds), \
+                 self.assertRaisesRegex(RuntimeError,
+                                       "cannot read review round state"):
+                self.real_latest_seeded_round("owner/repo", "1")
 
 
 class HumanActorConfigTest(unittest.TestCase):

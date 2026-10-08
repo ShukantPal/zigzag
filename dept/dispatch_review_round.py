@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -77,12 +78,30 @@ def stored_rounds(repo, pr):
     for path in ROUNDS_DIR.glob(f"{repo_key(repo)}-pr{pr}-*.json"):
         try:
             data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if data.get("repo") != repo:
-            continue
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"cannot read review round state {path}: {error}")
+        if not isinstance(data, dict) or data.get("repo") != repo:
+            raise RuntimeError(f"invalid review round state {path}")
         rounds.append((path, data))
     return rounds
+
+
+def write_round(path, data):
+    """Atomically replace a round file so readers never observe partial JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", dir=path.parent, prefix=f".{path.name}.", delete=False) as out:
+            temporary = Path(out.name)
+            json.dump(data, out, indent=2)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def round_files(repo, pr):
@@ -148,7 +167,7 @@ def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
     }
     # Persist before the first launch: a later failure must not orphan earlier
     # reviewer tasks or let a retry dispatch duplicates invisibly.
-    round_path.write_text(json.dumps(round_data, indent=2))
+    write_round(round_path, round_data)
     try:
       for planned_task_id, lens in reviewers.items():
         prompt = FULL_TEMPLATE.format(pr=pr, repo=repo, project_dir=project_dir,
@@ -158,10 +177,10 @@ def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
         dispatch_reviewer(project_dir, prompt_file, planned_task_id)
     except Exception as e:
         round_data.update({"status": "attention", "attention_reason": f"reviewer dispatch failed: {e}"})
-        round_path.write_text(json.dumps(round_data, indent=2))
+        write_round(round_path, round_data)
         raise
     round_data["status"] = "collecting"
-    round_path.write_text(json.dumps(round_data, indent=2))
+    write_round(round_path, round_data)
     return round_path, reviewers
 
 

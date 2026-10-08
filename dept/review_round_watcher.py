@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
+from dispatch_review_round import write_round
 
 CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
@@ -68,8 +69,7 @@ def load_round(path):
 
 
 def save_round(path, rnd):
-    with open(path, "w") as f:
-        json.dump(rnd, f, indent=2)
+    write_round(path, rnd)
 
 
 def session_key(repo, pr):

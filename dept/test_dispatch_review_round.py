@@ -49,6 +49,29 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertEqual(second.name, f"{key}-pr12-round2.json")
         self.assertEqual(first_status, "superseded")
 
+    def test_round_state_writes_replace_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "round.json"
+            path.write_text('{"old": true}')
+            with patch.object(dispatcher.os, "replace",
+                              wraps=dispatcher.os.replace) as replace:
+                dispatcher.write_round(path, {"new": True})
+            source, destination = replace.call_args.args
+            self.assertNotEqual(pathlib.Path(source), path)
+            self.assertEqual(pathlib.Path(destination), path)
+            self.assertEqual(json.loads(path.read_text()), {"new": True})
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*")), [])
+
+    def test_matching_corrupt_round_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rounds = pathlib.Path(tmp)
+            key = dispatcher.repo_key("owner/repo")
+            (rounds / f"{key}-pr12-round2.json").write_text("{")
+            with patch.object(dispatcher, "ROUNDS_DIR", rounds), \
+                 self.assertRaisesRegex(RuntimeError,
+                                       "cannot read review round state"):
+                dispatcher.stored_rounds("owner/repo", 12)
+
     def test_prompt_uses_checked_out_diff_not_untrusted_pr_metadata(self):
         prompt = dispatcher.FULL_TEMPLATE.format(pr=12, repo="owner/repo", project_dir="/work",
                                                  lens="tests", head="a" * 40)
