@@ -21,7 +21,8 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
-from review_round_watcher import project_dir_busy, set_active_task, session_key, worker_dispatch_lock
+from review_round_watcher import (project_dir_busy, set_active_task, session_key,
+                                  task_status, worker_dispatch_lock)
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -101,6 +102,11 @@ def dept_status_text(tid):
         return None
 
 
+def task_finished(status):
+    """Only a completion with a known exit code releases the dispatch guard."""
+    return status is not None and task_status(status) in ("succeeded", "failed")
+
+
 def pr_task_running(pr):
     """Task id if a dept task for this PR is genuinely still running (serialization:
     one worker per PR, no two agents on the same branch). Primary signal is the
@@ -112,7 +118,7 @@ def pr_task_running(pr):
         tid = sess.get("active_task")
         if tid:
             status = dept_status_text(tid)
-            if status is None or "RUNNING" in status or "DONE" not in status:
+            if not task_finished(status):
                 return tid
     except Exception:
         pass
@@ -133,7 +139,7 @@ def pr_task_running(pr):
         tid = e.get("id")
         try:
             status = dept_status_text(tid)
-            if status is None or "RUNNING" in status or "DONE" not in status:
+            if not task_finished(status):
                 return tid
         except Exception:
             return tid  # fail closed: don't dispatch if we can't verify

@@ -18,7 +18,8 @@ management layer that decides what to run.
   Codex Desktop app) with a new prompt; `status` / `list` / `result` /
   `tokens` / `check` / `kill` inspect and manage tasks. Task state is kept
   in the configured state directory (local runtime state, gitignored).
-  `start` and `resume` accept `--model <name>` for a per-task override.
+  `start` and `resume` accept `--model <name>` for a per-task override and
+  `--read-only` for a sandboxed task without approval bypass.
 - **`codex-launch.sh`** — the Mac GUI-session relay wrapper. It reads each
   task's optional `model.txt` override and writes wrapper diagnostics to the
   task directory before invoking `codex exec`.
@@ -29,8 +30,8 @@ management layer that decides what to run.
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
 - **`approval_gate.py`** — the merge gate for Muse-owned PRs: required CI
   green on the latest head **and** a 3-lens review team (correctness,
-  simplicity, tests) each showing APPROVE on that head. Stale-head approvals
-  don't count.
+  simplicity, tests) each showing a human-attested APPROVE on that head.
+  Stale-head and model-advisory approvals don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in
@@ -42,7 +43,9 @@ management layer that decides what to run.
   token minted with the GUI-login keychain key.
 - **`review_round_watcher.py`** — validates and publishes constrained verdicts
   from a seeded 3-lens review round. It never forwards raw reviewer output into
-  a write-capable owner session; the owner inspects findings on the PR.
+  a write-capable owner session; model verdicts are marked advisory so an
+  injected reviewer cannot manufacture a gate-satisfying approval. The owner
+  inspects findings on the PR and posts `ATTESTATION: HUMAN` to approve.
 - **`dispatch_review_round.py`** — seeds independent read-only correctness,
   simplicity, and tests reviewers from the checked-out diff over non-GUI SSH
   (no keychain). PR metadata is excluded from their prompts and trusted watcher

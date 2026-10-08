@@ -46,7 +46,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "pr_info", return_value=info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=["t-a", RuntimeError("nope")]):
                 with self.assertRaisesRegex(RuntimeError, "nope"):
-                    dispatcher.seed(12, "owner/repo", "/work", "session")
+                    dispatcher.seed(12, "owner/repo", "/work")
             data = json.loads(next((root / "rounds").glob("*.json")).read_text())
         self.assertEqual(data["status"], "attention")
         self.assertEqual(data["reviewers"], {"t-a": "correctness"})
@@ -59,7 +59,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=["t-c", "t-s", "t-t"]):
-                path, reviewers = dispatcher.seed(12, "owner/repo", "/work", "session")
+                path, reviewers = dispatcher.seed(12, "owner/repo", "/work")
             data = json.loads(path.read_text())
             prompts = [prompt.read_text() for prompt in (root / "prompts").glob("*.md")]
         self.assertEqual(data["status"], "collecting")
@@ -77,8 +77,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=["a", "b", "c", "d", "e", "f"]):
-                one, _ = dispatcher.seed(12, "owner/one", "/work", "session")
-                two, _ = dispatcher.seed(12, "owner/two", "/work", "session")
+                one, _ = dispatcher.seed(12, "owner/one", "/work")
+                two, _ = dispatcher.seed(12, "owner/two", "/work")
         self.assertNotEqual(one.name, two.name)
 
     def test_reviewer_dispatch_is_read_only_and_non_gui(self):
@@ -95,7 +95,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=["a", "b", "c", "s"]):
-                _, reviewers = dispatcher.seed(12, "owner/repo", "/work", "session",
+                _, reviewers = dispatcher.seed(12, "owner/repo", "/work",
                                                lenses=dispatcher.LENSES + ("security",))
         self.assertEqual(set(reviewers.values()), {"correctness", "simplicity", "tests", "security"})
 

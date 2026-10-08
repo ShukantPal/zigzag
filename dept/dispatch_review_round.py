@@ -101,7 +101,7 @@ def dispatch_reviewer(project_dir, prompt_file):
     return task_id(result.stdout + result.stderr)
 
 
-def seed(pr, repo, project_dir, owning_session, max_rounds=3, lenses=LENSES):
+def seed(pr, repo, project_dir, max_rounds=3, lenses=LENSES):
     existing = round_files(repo, pr)
     if len(existing) >= max_rounds:
         raise RuntimeError(f"PR #{pr} already has {len(existing)} active review rounds (cap {max_rounds})")
@@ -115,7 +115,7 @@ def seed(pr, repo, project_dir, owning_session, max_rounds=3, lenses=LENSES):
     round_path = ROUNDS_DIR / f"{repo_key(repo)}-pr{pr}-round{number}.json"
     round_data = {
         "pr": pr, "round": number, "repo": repo, "head": head, "branch": branch,
-        "project_dir": project_dir, "owning_session": owning_session,
+        "project_dir": project_dir,
         "reviewers": reviewers, "queued_comments": [], "status": "dispatching",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -144,14 +144,12 @@ def main(argv=None):
     parser.add_argument("pr", type=int)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--project-dir", required=True)
-    parser.add_argument("--owning-session", required=True)
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--security", action="store_true",
                         help="add the security lens for auth, credential, network, crypto, or PII changes")
     args = parser.parse_args(argv)
     lenses = LENSES + (("security",) if args.security else ())
-    path, reviewers = seed(args.pr, args.repo, args.project_dir, args.owning_session,
-                           args.max_rounds, lenses)
+    path, reviewers = seed(args.pr, args.repo, args.project_dir, args.max_rounds, lenses)
     print(f"seeded {path}: " + ", ".join(f"{lens}={tid}" for tid, lens in reviewers.items()))
 
 

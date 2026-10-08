@@ -33,6 +33,16 @@ class WatermarkTest(unittest.TestCase):
                  patch.object(watcher, "dept_status_text", return_value=None):
                 self.assertEqual(watcher.pr_task_running(3), "t-live")
 
+    def test_pr_task_running_fails_closed_when_exit_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = pathlib.Path(tmp) / "sessions.json"
+            sessions.write_text(json.dumps({watcher.session_key("owner/repo", 3): {"active_task": "t-live"}}))
+            with patch.object(watcher, "REPO", "owner/repo"), \
+                 patch.object(watcher, "SESSIONS_FILE", str(sessions)), \
+                 patch.object(watcher, "dept_status_text",
+                              return_value="t-live: DONE (exit unknown)\n"):
+                self.assertEqual(watcher.pr_task_running(3), "t-live")
+
     def test_dispatch_records_repo_scoped_active_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             prompt_dir = pathlib.Path(tmp) / "prompts"

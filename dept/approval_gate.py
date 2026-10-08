@@ -15,6 +15,7 @@ Verdict comments are top-level PR comments posted by review-team workers
   > \U0001F916 Codex (AI assistant) \u2014 [correctness] review verdict
   VERDICT: APPROVE
   HEAD: <full 40-hex sha reviewed>
+  ATTESTATION: HUMAN
   <short summary; findings when CHANGES REQUESTED>
 
 Lenses: correctness, simplicity, tests (+ security when the round seeds it).
@@ -51,6 +52,8 @@ VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 LENS_RE = re.compile(r"\[([a-z]+)\]\s+review verdict", re.IGNORECASE)
+ATTESTATION_RE = re.compile(r"^ATTESTATION:\s*(HUMAN|MODEL_ADVISORY)\s*$",
+                            re.IGNORECASE | re.MULTILINE)
 
 
 def mac(cmd):
@@ -73,7 +76,7 @@ def fetch_pr(repo, pr):
 
 
 def latest_verdicts(comments):
-    """Latest verdict per lens. Returns {lens: (verdict, head, createdAt)}."""
+    """Latest unambiguous verdict per lens, including its attestation class."""
     verdicts = {}
     for c in comments:
         body = c.get("body") or ""
@@ -82,17 +85,19 @@ def latest_verdicts(comments):
         body = re.sub(r"\\+n", "\n", body)
         if MARKER not in body or c.get("author") not in TRUSTED_REVIEW_ACTORS:
             continue
-        lens_m = LENS_RE.search(body)
-        verdict_m = VERDICT_RE.search(body)
-        head_m = HEAD_RE.search(body)
-        if not (lens_m and verdict_m and head_m):
+        lenses = LENS_RE.findall(body)
+        verdicts_found = VERDICT_RE.findall(body)
+        heads = HEAD_RE.findall(body)
+        attestations = ATTESTATION_RE.findall(body)
+        if len(lenses) != 1 or len(verdicts_found) != 1 or len(heads) != 1:
             continue
-        lens = lens_m.group(1).lower()
+        lens = lenses[0].lower()
+        attestation = attestations[0].upper() if len(attestations) == 1 else "UNATTESTED"
         key = (c.get("createdAt") or "", c.get("id") or 0)
         if lens not in verdicts or key > verdicts[lens][3]:
-            verdicts[lens] = (verdict_m.group(1).upper(), head_m.group(1).lower(),
-                              c.get("author"), key)
-    return {l: v[:3] for l, v in verdicts.items()}
+            verdicts[lens] = (verdicts_found[0].upper(), heads[0].lower(),
+                              c.get("author"), key, attestation)
+    return {l: (v[0], v[1], v[2], v[4]) for l, v in verdicts.items()}
 
 
 def check(repo, pr, lenses):
@@ -140,14 +145,17 @@ def check(repo, pr, lenses):
             reasons.append(f"no verdict from [{lens}] reviewer")
             approvals[lens] = {"verdict": None}
             continue
-        verdict, vhead, author = v
+        verdict, vhead, author, attestation = v
         approvals[lens] = {"verdict": verdict, "head": vhead,
-                           "on_current_head": vhead == head}
+                           "on_current_head": vhead == head,
+                           "attestation": attestation}
         if verdict != "APPROVE":
             reasons.append(f"[{lens}] latest verdict is {verdict} (not APPROVE)")
         elif vhead != head:
             reasons.append(f"[{lens}] APPROVE is stale: reviewed {vhead[:8]}, "
                            f"PR head is {head[:8]}")
+        elif attestation != "HUMAN":
+            reasons.append(f"[{lens}] APPROVE is advisory; human attestation required")
 
     result = {"pass": not reasons, "reasons": reasons, "warnings": warnings,
               "repo": repo, "pr": pr, "head": head, "approvals": approvals}

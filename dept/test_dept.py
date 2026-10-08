@@ -77,6 +77,18 @@ class ResumeCliTest(unittest.TestCase):
             ["resume", "/explicit/project", "session-id", self.prompt.name],
             "/explicit/project", resolved=False)
 
+    def test_resume_forwards_read_only_for_relay_and_ssh(self):
+        for transport in ([], ["--ssh"]):
+            with self.subTest(transport=transport), \
+                 patch.object(department, "remote_isdir", return_value=True), \
+                 patch.object(department, "dispatch_task") as dispatch:
+                department.main(["resume", "/project", "session-id", self.prompt.name,
+                                 "--no-sop", "--read-only", *transport])
+            self.assertEqual(dispatch.call_args.args[:5],
+                             ("/project", b"continue the task\n", bool(transport),
+                              "session-id", None))
+            self.assertTrue(dispatch.call_args.args[5])
+
 
 class CommandDispatchTest(unittest.TestCase):
     def test_tunnel_proxy_is_empty_without_https_proxy(self):
@@ -100,7 +112,25 @@ class CommandDispatchTest(unittest.TestCase):
             department.dispatch_task("/project", b"prompt", True, model="test-model")
         calls = "\n".join(str(c.args[0]) for c in ssh.call_args_list)
         self.assertIn("model.txt", calls)
-        self.assertIn("-m 'test-model'", calls)
+        self.assertIn("-m", calls)
+        self.assertIn("test-model", calls)
+        self.assertIn("exit-code.txt", calls)
+
+    def test_read_only_reaches_ssh_launch_without_approval_bypass(self):
+        result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
+        with patch.object(department.uuid, "uuid4", return_value=SimpleNamespace(hex="abc123")), \
+             patch.object(department, "ssh", return_value=result) as ssh, \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", b"prompt", True, read_only=True)
+        launch = str(ssh.call_args_list[-1].args[0])
+        self.assertIn("--sandbox read-only", launch)
+        self.assertNotIn("--approve-for-me", launch)
+
+    def test_invalid_model_is_rejected_before_remote_setup(self):
+        with patch.object(department, "ssh") as ssh, self.assertRaises(SystemExit):
+            department.dispatch_task("/project", b"prompt", False,
+                                     model="model --approve-for-me")
+        ssh.assert_not_called()
 
     def test_model_reaches_relay_for_resume(self):
         result = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
@@ -120,6 +150,15 @@ class CommandDispatchTest(unittest.TestCase):
              patch("builtins.print") as output:
             department.cmd_status(["t-one"])
         poll.assert_called_once_with("proc")
+        output.assert_called_once_with("t-one: DONE (exit 7)")
+
+    def test_status_reports_ssh_exit_code(self):
+        entry = {"id": "t-one", "via": "ssh"}
+        result = SimpleNamespace(returncode=0, stdout=b"DONE 7\n", stderr=b"")
+        with patch.object(department, "ledger_read", return_value=[entry]), \
+             patch.object(department, "ssh", return_value=result), \
+             patch("builtins.print") as output:
+            department.cmd_status(["t-one"])
         output.assert_called_once_with("t-one: DONE (exit 7)")
 
     def test_result_prints_relay_failure_and_task_stderr(self):

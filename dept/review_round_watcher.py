@@ -5,11 +5,10 @@ Runs from a platform cron (every 10 min) — stateless polling via SSH, no
 long-lived process to die. Reviewers run without GUI-keychain access and their
 raw output is never sent to a write-capable owner task.
 
-Seeding a round: write <state-dir>/review_rounds/<pr>.json:
+Seeding a round: write <state-dir>/review_rounds/<repo>-pr<pr>-round<n>.json:
 {
   "pr": 922,
   "repo": "leveled-inc/leveled",
-  "owning_session": "01a0c0ec-5e74-7ef0-8108-c64384c7e5ab",
   "project_dir": "/Users/shukant/.codex/worktrees/stale-engine-race",
   "branch": "codex/audiorecorder-stale-engine-race",
   "reviewers": {"t-c6fb36": "concurrency", "t-3868f8": "simplicity", "t-4c19a0": "tests"},
@@ -18,7 +17,7 @@ Seeding a round: write <state-dir>/review_rounds/<pr>.json:
   "created_at": "2026-09-20T22:30:00-07:00",
   "status": "collecting"
 }
-status: collecting -> dispatched (terminal) | attention (needs a human).
+status: collecting -> published (terminal) | attention (needs a human).
 
 Rules honored:
 - Never two workers on the same project_dir at once (ledger scan, fail closed).
@@ -44,7 +43,6 @@ CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
 STATE_DIR = state_dir(CONFIG)
 ROUNDS_DIR = os.path.join(STATE_DIR, "review_rounds")
-PROMPT_DIR = os.path.join(STATE_DIR, "task-prompts")
 DEPT = os.path.join(ROOT, "dept.py")
 LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
 REMOTE_DEPT = CONNECTION.get("remote_dept", "~/.codex/dept")
@@ -109,15 +107,22 @@ def worker_dispatch_lock():
             yield True
 
 
-def task_survived(task_id, delay=30):
-    """Confirm a dispatched relay task did not die before it reached Codex."""
-    time.sleep(delay)
-    p = subprocess.run([sys.executable, DEPT, "status", task_id],
-                       capture_output=True, text=True, timeout=90)
-    text = p.stdout + p.stderr
-    # A completed relay task is healthy only with an explicit successful exit.
-    # `DONE` alone includes signal exits and pruned/unknown relay payloads.
-    return p.returncode == 0 and ("RUNNING" in text or "DONE (exit 0)" in text)
+STATUS_RE = re.compile(r":\s*(RUNNING|DONE)(?:\s+\(exit\s+([^\)]+)\))?\s*$")
+
+
+def task_status(text):
+    """Parse status without treating an ambiguous completion as safe."""
+    match = STATUS_RE.search(text.strip())
+    if not match:
+        return "unknown"
+    if match.group(1) == "RUNNING":
+        return "running"
+    exit_code = match.group(2)
+    if exit_code == "0":
+        return "succeeded"
+    if exit_code and exit_code.isdigit():
+        return "failed"
+    return "unknown"
 
 
 def project_dir_busy(project_dir):
@@ -140,9 +145,8 @@ def project_dir_busy(project_dir):
             p = subprocess.run([sys.executable, DEPT, "status", tid],
                                capture_output=True, text=True, timeout=90)
             text = p.stdout + p.stderr
-            if p.returncode != 0 or "RUNNING" in text:
-                return True
-            if "DONE" not in text:
+            status = task_status(text) if p.returncode == 0 else "unknown"
+            if status in ("running", "unknown"):
                 return True
         except Exception:
             return True  # fail closed: can't verify, don't dispatch
@@ -159,10 +163,13 @@ def reviewer_states(task_ids):
         text = p.stdout + p.stderr
         if p.returncode != 0:
             raise RuntimeError(f"could not determine reviewer {tid} state: {text[:200]}")
-        if "RUNNING" in text:
+        status = task_status(text)
+        if status == "running":
             states[tid] = "running"
-        elif "DONE" in text:
+        elif status == "succeeded":
             completed.append(tid)
+        elif status == "failed":
+            states[tid] = "failed"
         else:
             raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")
     if not completed:
@@ -205,25 +212,41 @@ HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILIN
 
 
 def validated_verdict(text, head):
-    """Accept only the two constrained fields; raw model output stays untrusted."""
-    verdict = VERDICT_RE.search(text)
-    reviewed = HEAD_RE.search(text)
-    if not (verdict and reviewed) or reviewed.group(1).lower() != head.lower():
+    """Accept one unambiguous pair of constrained fields from advisory output."""
+    verdicts = VERDICT_RE.findall(text)
+    reviewed_heads = HEAD_RE.findall(text)
+    if len(verdicts) != 1 or len(reviewed_heads) != 1:
         return None
-    return verdict.group(1).upper()
+    if reviewed_heads[0].lower() != head.lower():
+        return None
+    return verdicts[0].upper()
 
 
 def post_verdict(repo, pr, lens, head, verdict, task_id):
     body = (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
             f"VERDICT: {verdict}\nHEAD: {head}\n\n"
-            f"Validated read-only reviewer task: {task_id}.")
+            "ATTESTATION: MODEL_ADVISORY\n\n"
+            f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
+            "requires separate human attestation before it can satisfy the gate.")
     mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
 
 
+@contextmanager
+def round_publish_lock(path):
+    """Serialize duplicate polls of one round without blocking worker launches."""
+    with open(f"{path}.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+
+
 def process_round(path):
-    with worker_dispatch_lock() as acquired:
+    with round_publish_lock(path) as acquired:
         if not acquired:
-            return f"{os.path.basename(path)}: another watcher is dispatching"
+            return f"{os.path.basename(path)}: another poll is publishing this round"
         return _process_round_locked(path)
 
 
@@ -247,6 +270,12 @@ def _process_round_locked(path):
     if worst:
         rnd["status"] = "attention"
         rnd["attention_reason"] = f"reviewer tasks dead with no output: {', '.join(worst)}"
+        save_round(path, rnd)
+        return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+    failed = [t for t in tids if states.get(t) == "failed"]
+    if failed:
+        rnd["status"] = "attention"
+        rnd["attention_reason"] = f"reviewer tasks exited unsuccessfully: {', '.join(failed)}"
         save_round(path, rnd)
         return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
     if any(states.get(t) != "done" for t in tids):

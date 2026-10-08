@@ -14,24 +14,25 @@ d="$(cat "$rdir/dir.txt")"
 [ -d "$d" ] || exit 3
 cd "$d" || exit 3
 
-# macOS /bin/bash is 3.2: expanding an empty array under set -u is fatal.
-MODEL_FLAG=""
-if [ -f "$rdir/model.txt" ]; then
-  MODEL_FLAG="-m $(cat "$rdir/model.txt")"
-fi
 CODEX="${CODEX:-/run/current-system/sw/bin/codex}"
-SAFETY_FLAGS="--approve-for-me"
 if [ -f "$rdir/read-only.txt" ]; then
-  SAFETY_FLAGS="--sandbox read-only"
+  set -- exec --json --sandbox read-only --skip-git-repo-check
+else
+  set -- exec --json --approve-for-me --skip-git-repo-check
+fi
+if [ -f "$rdir/model.txt" ]; then
+  model="$(cat "$rdir/model.txt")"
+  case "$model" in
+    ""|-*|*[!A-Za-z0-9._:/-]*) echo "invalid model identifier" >&2; exit 2 ;;
+  esac
+  set -- "$@" -m "$model"
 fi
 if [ "$mode" = "resume" ]; then
   [ -f "$rdir/resume.txt" ] || exit 2
   sid="$(cat "$rdir/resume.txt")"
-  exec "$CODEX" exec --json $SAFETY_FLAGS --skip-git-repo-check \
-    $MODEL_FLAG resume "$sid" "$(cat "$rdir/prompt.txt")" \
+  exec "$CODEX" "$@" resume "$sid" "$(cat "$rdir/prompt.txt")" \
     -o "$rdir/last-message.txt" < /dev/null > "$rdir/events.jsonl"
 else
-  exec "$CODEX" exec --json $SAFETY_FLAGS --skip-git-repo-check \
-    $MODEL_FLAG -C "$d" -o "$rdir/last-message.txt" "$(cat "$rdir/prompt.txt")" \
+  exec "$CODEX" "$@" -C "$d" -o "$rdir/last-message.txt" "$(cat "$rdir/prompt.txt")" \
     < /dev/null > "$rdir/events.jsonl"
 fi

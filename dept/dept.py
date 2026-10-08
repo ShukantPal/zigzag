@@ -3,7 +3,7 @@
 
 Usage:
   dept.py start <project-dir> <prompt-file> [--model <name>] [--read-only]
-  dept.py resume [project-dir] <session-id> <prompt-file> [--model <name>]
+  dept.py resume [project-dir] <session-id> <prompt-file> [--model <name>] [--read-only]
       (project-dir optional: resolved from the session file's recorded cwd)
   dept.py status <task-id>
   dept.py list
@@ -12,7 +12,7 @@ Usage:
 
 All long-running work happens detached on the Mac (nohup), so it survives this VM.
 """
-import json, os, subprocess, sys, time, uuid, datetime
+import json, os, re, subprocess, sys, time, uuid, datetime
 
 try:  # `python3 dept/dept.py` and `python3 -m dept.dept` are both supported.
     from .dept_config import ROOT, load_config, state_dir
@@ -183,6 +183,14 @@ def decorated_prompt(ns):
     return prompt
 
 
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
+
+
+def validate_model(model):
+    if model and not MODEL_RE.fullmatch(model):
+        sys.exit("invalid model identifier: use letters, digits, '.', '_', ':', '/', or '-'")
+
+
 def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
@@ -205,6 +213,7 @@ def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_o
 
 def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, read_only=False):
     """Launch start/resume through one preparation, transport, and ledger path."""
+    validate_model(model)
     tid = "t-" + uuid.uuid4().hex[:6]
     relay_path = asset_path("relay-announce.md")
     if os.path.exists(relay_path):
@@ -214,15 +223,20 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, rea
     rdir = setup_task_dir(tid, project_dir, prompt, session_id, model, read_only)
     action = "resumed" if session_id else "started"
     if use_ssh:
-        command = (f'resume "$(cat {rdir}/resume.txt)" "$(cat {rdir}/prompt.txt)" '
-                   f'-o {rdir}/last-message.txt'
+        command = (f'resume "$(cat {shq(f"{rdir}/resume.txt")})" '
+                   f'"$(cat {shq(f"{rdir}/prompt.txt")})" '
+                   f'-o {shq(f"{rdir}/last-message.txt")}'
                    if session_id else
-                   f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)"')
+                   f'-C "$PWD" -o {shq(f"{rdir}/last-message.txt")} '
+                   f'"$(cat {shq(f"{rdir}/prompt.txt")})"')
         model_flag = f"-m {shq(model)} " if model else ""
         safety_flags = "--sandbox read-only " if read_only else "--approve-for-me "
+        codex = (f"codex exec --json {safety_flags}--skip-git-repo-check "
+                 f"{model_flag}{command}")
+        wrapped = (f"{codex}; rc=$?; printf %s \"$rc\" > "
+                   f"{shq(f'{rdir}/exit-code.txt')}; exit \"$rc\"")
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
-                  f'nohup codex exec --json {safety_flags}--skip-git-repo-check '
-                  f'{model_flag}{command} '
+                  f'nohup sh -c {shq(wrapped)} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
                   f'echo $! > {rdir}/pid && cat {rdir}/pid')
         r = ssh(launch, timeout=60)
@@ -332,9 +346,15 @@ def remote_status_detail(entry):
         return ("RUNNING" if payload.get("running") else "DONE"), payload
     r = ssh(f"rdir={REMOTE_DEPT}/{tid}; "
             f"if [ ! -f $rdir/pid ]; then echo MISSING; exit 0; fi; "
-            f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; else echo DONE; fi",
+            f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; "
+            f"elif [ -f $rdir/exit-code.txt ]; then printf 'DONE '; cat $rdir/exit-code.txt; echo; "
+            f"else echo DONE; fi",
             timeout=60)
-    return r.stdout.decode().strip(), None
+    output = r.stdout.decode().strip()
+    if output.startswith("DONE "):
+        value = output.partition(" ")[2]
+        return "DONE", {"exit_code": int(value)} if value.isdigit() else None
+    return output, None
 
 
 def remote_status(entry):
@@ -361,7 +381,7 @@ def cmd_status(args):
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
     status, payload = remote_status_detail(entry)
     suffix = ""
-    if status == "DONE" and entry.get("via") == "relay" and entry.get("proc"):
+    if status == "DONE":
         exit_code = None if payload is None else payload.get("exit_code")
         suffix = f" (exit {exit_code if exit_code is not None else 'unknown'})"
     print(f"{tid}: {status}{suffix}")
@@ -445,7 +465,8 @@ def cmd_resume(args):
     if not remote_isdir(project_dir):
         sys.exit(f"project_dir does not exist on the Mac: {project_dir} "
                  f"(refusing to dispatch a dead task)")
-    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id, ns.model)
+    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id, ns.model,
+                  ns.read_only)
 
 
 def cmd_check(args):
