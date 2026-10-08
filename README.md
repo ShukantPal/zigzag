@@ -90,10 +90,12 @@ independent configured lenses through a dedicated tool-free Codex launcher,
 admits only bounded version 1 JSON results for the exact current head, and
 publishes validated verdicts under the trusted GitHub identity. It evaluates
 every matching required CI check and emits `review_ready` or bounded
-`review_findings` events. Findings resume the owning Codex session. A new head
-or base commit supersedes the old comparison and approvals, and a merge kills
-outstanding reviewer and owner-resume process groups, including recovered
-orphan groups.
+`review_findings` events. Findings resume the owning Codex session only as
+escaped, explicitly untrusted JSON claims that the owner must independently
+verify. A new head or base commit supersedes the old comparison and approvals,
+and a merge kills outstanding reviewer and owner-resume process groups,
+including recovered orphan groups. Comparisons at GitHub's 300-file response
+cap are rejected as potentially truncated and put the round in `Attention`.
 
 Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
 Shadow mode runs discovery, verdict admission, and gate decisions alongside

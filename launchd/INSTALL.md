@@ -124,7 +124,10 @@ an empty process environment, and a JSON output schema. They receive only a
 bounded PR patch as untrusted prompt data and cannot access credentials, run
 commands, or post to GitHub. The daemon validates their result, then performs
 the narrow trusted comment publication step. Owner resume continues to use
-`codex-launch resume`.
+`codex-launch resume`, with findings encoded as untrusted JSON claims behind
+an explicit instruction barrier. Reviewer input uses a pinned base/head
+comparison and rejects GitHub's 300-file cap rather than approving potentially
+truncated material.
 
 GitHub discovery and gate reads remain read-only at the public execution
 boundary. Every repository in the YAML must also be present in the
