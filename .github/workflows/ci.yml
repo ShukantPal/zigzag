@@ -36,10 +36,7 @@ jobs:
           printf '{"epoch":"00000000000000000000000000000001","next_sequence":1,"events":[]}' > "$SMOKE_DIR/events.json"
           head -c 48 /dev/urandom | base64 > "$SMOKE_DIR/token"
           chmod 600 "$SMOKE_DIR/token"
-          ./target/debug/zigzag --secret-file "$SMOKE_DIR/token" \
-            --state-file "$SMOKE_DIR/events.json" --port 18923 \
-            --tailscale-ip 100.100.100.100 \
-            > "$SMOKE_DIR/out.log" 2>&1 &
+          ./target/debug/zigzag --secret-file "$SMOKE_DIR/token" --state-file "$SMOKE_DIR/events.json" --port 18923 --tailscale-ip 100.100.100.100 > "$SMOKE_DIR/out.log" 2>&1 &
           DAEMON_PID=$!
           sleep 4
           if grep -q "invalid agent registry" "$SMOKE_DIR/out.log"; then
