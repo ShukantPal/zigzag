@@ -1,4 +1,5 @@
 import importlib
+from contextlib import nullcontext
 import json
 import pathlib
 import sys
@@ -10,9 +11,19 @@ from unittest.mock import patch
 DEPT_DIR = pathlib.Path(__file__).parent
 sys.path.insert(0, str(DEPT_DIR))
 dispatcher = importlib.import_module("dispatch_review_round")
+round_state = importlib.import_module("round_state")
 
 
 class DispatchReviewRoundTest(unittest.TestCase):
+    def setUp(self):
+        busy = patch.object(dispatcher, "project_dir_busy", return_value=False)
+        worker_lock = patch.object(
+            dispatcher, "worker_dispatch_lock", return_value=nullcontext(True))
+        busy.start()
+        worker_lock.start()
+        self.addCleanup(busy.stop)
+        self.addCleanup(worker_lock.stop)
+
     def test_pr_info_scopes_gh_to_repo(self):
         result = '{"headRefOid": "a"}'
         with patch.object(dispatcher, "mac", return_value=result) as mac:
@@ -53,8 +64,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text('{"old": true}')
-            with patch.object(dispatcher.os, "replace",
-                              wraps=dispatcher.os.replace) as replace:
+            with patch.object(round_state.os, "replace",
+                              wraps=round_state.os.replace) as replace:
                 dispatcher.write_round(path, {"new": True})
             source, destination = replace.call_args.args
             self.assertNotEqual(pathlib.Path(source), path)
@@ -87,6 +98,10 @@ class DispatchReviewRoundTest(unittest.TestCase):
 
             def dispatch(_project, _prompt, planned):
                 nonlocal launches
+                state = json.loads(next((root / "rounds").glob("*.json")).read_text())
+                self.assertEqual(state["status"], "dispatching")
+                self.assertEqual(set(state["reviewers"].values()),
+                                 {"correctness", "simplicity", "tests"})
                 launches += 1
                 if launches == 2:
                     raise RuntimeError("nope")
@@ -102,6 +117,15 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertEqual(data["status"], "attention")
         self.assertEqual(set(data["reviewers"].values()),
                          {"correctness", "simplicity", "tests"})
+
+    def test_seed_refuses_to_overlap_an_active_project_worker(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(dispatcher, "ROUNDS_DIR", pathlib.Path(tmp)), \
+             patch.object(dispatcher, "project_dir_busy", return_value=True), \
+             patch.object(dispatcher, "pr_info") as pr_info, \
+             self.assertRaisesRegex(RuntimeError, "active writing or review task"):
+            dispatcher.seed(12, "owner/repo", "/work")
+        pr_info.assert_not_called()
 
     def test_seed_records_all_reviewers_and_repo_scoped_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:

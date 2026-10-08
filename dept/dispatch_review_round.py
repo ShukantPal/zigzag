@@ -10,11 +10,12 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
+from review_round_watcher import project_dir_busy, worker_dispatch_lock
+from round_state import write_round
 
 CONFIG = load_config()
 STATE_DIR = state_dir(CONFIG)
@@ -86,24 +87,6 @@ def stored_rounds(repo, pr):
     return rounds
 
 
-def write_round(path, data):
-    """Atomically replace a round file so readers never observe partial JSON."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-                "w", dir=path.parent, prefix=f".{path.name}.", delete=False) as out:
-            temporary = Path(out.name)
-            json.dump(data, out, indent=2)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
 def round_files(repo, pr):
     """Return non-superseded rounds; superseded rounds do not consume the cap."""
     return [(path, data) for path, data in stored_rounds(repo, pr)
@@ -146,7 +129,13 @@ def dispatch_reviewer(project_dir, prompt_file, planned_task_id):
 
 def seed(pr, repo, project_dir, max_rounds=3, lenses=LENSES):
     with round_seed_lock(repo, pr):
-        return _seed_locked(pr, repo, project_dir, max_rounds, lenses)
+        with worker_dispatch_lock() as acquired:
+            if not acquired:
+                raise RuntimeError("another worker dispatch is in progress")
+            if project_dir_busy(project_dir):
+                raise RuntimeError(
+                    f"project has an active writing or review task: {project_dir}")
+            return _seed_locked(pr, repo, project_dir, max_rounds, lenses)
 
 
 def _seed_locked(pr, repo, project_dir, max_rounds, lenses):

@@ -1,4 +1,5 @@
 import importlib
+import json
 import pathlib
 import sys
 import tempfile
@@ -151,6 +152,30 @@ class ApprovalGateChecksTest(unittest.TestCase):
         with patch.object(gate, "fetch_pr", return_value=data):
             result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
         self.assertFalse(result["pass"])
+
+    def test_paginated_later_review_revokes_approval(self):
+        pr_data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        pr_data.pop("reviews")
+        review_pages = [[{
+            "user": {"login": "HumanReviewer"}, "state": "APPROVED",
+            "submitted_at": "2026-01-01T01:00:00Z", "id": 1,
+            "commit_id": HEAD,
+        }], [{
+            "user": {"login": "HumanReviewer"}, "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-01-01T02:00:00Z", "id": 2,
+            "commit_id": HEAD,
+        }]]
+        with patch.object(gate, "mac",
+                          side_effect=[json.dumps(pr_data),
+                                       json.dumps(review_pages)]):
+            result = gate.check("owner/repo", "1",
+                                ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertIn("no current-head APPROVED review from an allowlisted human",
+                      result["reasons"])
 
     def test_gate_never_mixes_approvals_across_rounds(self):
         data = self.result_for([

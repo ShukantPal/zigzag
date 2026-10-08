@@ -33,7 +33,7 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
-from dispatch_review_round import write_round
+from round_state import write_round
 
 CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
