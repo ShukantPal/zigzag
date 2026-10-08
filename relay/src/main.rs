@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod exec;
 mod update;
+mod review_loop;
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_FINISHED_PROCS: usize = 128;
@@ -39,6 +40,7 @@ struct Config {
     update_interval: Duration,
     update_policy: update::Policy,
     update_ready_file: Option<PathBuf>,
+    review_state_file: PathBuf,
 }
 struct Server {
     secret: String,
@@ -166,11 +168,26 @@ fn run() -> Result<(), String> {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
-    if !config.github_watch_repos.is_empty() {
-        let state = Arc::clone(&state);
-        let repos = config.github_watch_repos.clone();
-        let interval = config.github_watch_interval;
-        thread::spawn(move || github_watch_loop(state, repos, interval));
+    match review_loop::default_config_path() {
+        Ok(path) => match review_loop::load_config(&path) {
+            Ok(personal) if personal.review_loop.enabled => {
+                let shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
+                review_loop::start(
+                    Arc::clone(&state),
+                    personal.review_loop,
+                    config.review_state_file.clone(),
+                    shadow,
+                );
+            }
+            Ok(_) => eprintln!("review loop disabled by ~/.zigzag/config.yaml"),
+            Err(violations) => {
+                eprintln!("review loop disabled: invalid ~/.zigzag/config.yaml");
+                for violation in violations {
+                    eprintln!("review loop config: {violation}");
+                }
+            }
+        },
+        Err(violation) => eprintln!("review loop disabled: {violation}"),
     }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -435,6 +452,7 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("relay")
     });
+    let review_state_file = state_file.with_extension("reviews.json");
     Ok(Config {
         secret_file,
         control_secret_file,
@@ -449,9 +467,11 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         update_interval,
         update_policy,
         update_ready_file,
+        review_state_file,
     })
 }
 
+#[cfg(test)]
 fn valid_github_repo(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {
         return false;
@@ -465,42 +485,7 @@ fn valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration) {
-    loop {
-        for repo in &repos {
-            match github_open_pull_requests(repo) {
-                Ok(pull_requests) => {
-                    for (number, url) in pull_requests {
-                        let id = format!("github-pr-opened:{repo}:{number}");
-                        let payload = Json::Object(vec![
-                            ("id".to_owned(), Json::String(id.clone())),
-                            (
-                                "kind".to_owned(),
-                                Json::String("github_pr_opened".to_owned()),
-                            ),
-                            ("repository".to_owned(), Json::String(repo.clone())),
-                            ("pull_request".to_owned(), Json::number(number)),
-                            ("url".to_owned(), Json::String(url)),
-                        ]);
-                        match state.store.add(payload) {
-                            Ok((_, false)) => {
-                                eprintln!("queued GitHub PR watchdog event for {repo}#{number}")
-                            }
-                            Ok((_, true)) => {}
-                            Err(_) => eprintln!(
-                                "could not persist GitHub PR watchdog event for {repo}#{number}"
-                            ),
-                        }
-                    }
-                }
-                Err(error) => eprintln!("GitHub PR watch for {repo} failed: {error}"),
-            }
-        }
-        thread::sleep(interval);
-    }
-}
-
-fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
         id: format!("github-pr-scan-{repo}"),
@@ -1987,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn github_watch_configuration_is_opt_in_and_rate_limited() {
+    fn review_state_is_derived_from_event_state_and_old_watch_flags_are_rejected() {
         let base_arguments = || {
             vec![
                 "--secret-file".to_owned(),
@@ -1997,22 +1982,13 @@ mod tests {
             ]
         };
         let config = server_config(base_arguments()).unwrap();
-        assert!(config.github_watch_repos.is_empty());
-        assert_eq!(config.github_watch_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.review_state_file,
+            PathBuf::from("/state").with_extension("reviews.json")
+        );
 
         let mut arguments = base_arguments();
-        arguments.extend([
-            "--watch-repo".to_owned(),
-            "leveled-inc/leveled".to_owned(),
-            "--watch-interval".to_owned(),
-            "60".to_owned(),
-        ]);
-        let config = server_config(arguments).unwrap();
-        assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
-        assert_eq!(config.github_watch_interval, Duration::from_secs(60));
-
-        let mut arguments = base_arguments();
-        arguments.extend(["--watch-interval".to_owned(), "29".to_owned()]);
+        arguments.extend(["--watch-repo".to_owned(), "leveled-inc/leveled".to_owned()]);
         assert!(server_config(arguments).is_err());
     }
 
