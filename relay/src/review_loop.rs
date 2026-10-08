@@ -9,13 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CONFIG_SCHEMA: &str = include_str!("config-v1.json");
 const REVIEWER_RESULT_SCHEMA: &str = include_str!("reviewer-result-v1.json");
-const RESULT_VERSION: u64 = 1;
 const REVIEWER_BIN: &str = "codex-review-launch";
 const OWNER_BIN: &str = "codex-launch";
 const GITHUB_CONNECTION_LIMIT: usize = 100;
@@ -1680,18 +1679,31 @@ fn parse_reviewer_result(
     if body.len() > limits.max_bytes_per_lens {
         return None;
     }
-    let result: ReviewerResult = serde_json::from_str(body).ok()?;
-    if result.version != RESULT_VERSION
-        || result.lens != lens
+    let instance: Value = serde_json::from_str(body).ok()?;
+    if !reviewer_result_validator().is_valid(&instance) {
+        return None;
+    }
+    let result: ReviewerResult = serde_json::from_value(instance).ok()?;
+    if result.lens != lens
         || result.head != expected_head.to_ascii_lowercase()
-        || result.findings.len() > limits.max_findings_per_lens.min(4)
-        || result.findings.iter().any(|finding| finding.is_empty())
+        || result.findings.len() > limits.max_findings_per_lens
         || (result.verdict == Verdict::Approve && !result.findings.is_empty())
         || (result.verdict == Verdict::ChangesRequested && result.findings.is_empty())
     {
         return None;
     }
     Some(result)
+}
+
+fn reviewer_result_validator() -> &'static jsonschema::Validator {
+    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+    VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(REVIEWER_RESULT_SCHEMA)
+            .expect("embedded reviewer result schema is valid JSON");
+        jsonschema::draft202012::options()
+            .build(&schema)
+            .expect("embedded reviewer result schema is valid")
+    })
 }
 
 fn collect_completed_reviewers(
@@ -3050,6 +3062,19 @@ review_loop:
                 .len(),
             1
         );
+        let oversized_finding = serde_json::json!({
+            "version": 1,
+            "lens": "correctness",
+            "verdict": "changes_requested",
+            "head": head.clone(),
+            "findings": ["x".repeat(4097)],
+        })
+        .to_string();
+        assert!(
+            oversized_finding.len() < limits.max_bytes_per_lens,
+            "the per-finding schema limit must be tested independently of the aggregate byte cap"
+        );
+        assert!(parse_reviewer_result(&oversized_finding, "correctness", &head, &limits).is_none());
     }
 
     #[test]
@@ -4494,7 +4519,7 @@ review_loop:
         retargeted.base_ref_oid = "d".repeat(40);
         let mut snapshots = vec![current, retargeted].into_iter();
         let result = ReviewerResult {
-            version: RESULT_VERSION,
+            version: 1,
             lens: "tests".to_owned(),
             verdict: Verdict::Approve,
             head: head.clone(),
