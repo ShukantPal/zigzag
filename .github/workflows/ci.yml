@@ -37,7 +37,7 @@ jobs:
           head -c 48 /dev/urandom | base64 > "$SMOKE_DIR/token"
           chmod 600 "$SMOKE_DIR/token"
           mkdir -p "$SMOKE_DIR/bin"
-          printf '#!/bin/sh\necho "127.0.0.1"\n' > "$SMOKE_DIR/bin/tailscale"
+          printf '#!/bin/sh\necho "127.0.0.2"\n' > "$SMOKE_DIR/bin/tailscale"
           chmod +x "$SMOKE_DIR/bin/tailscale"
           PATH="$SMOKE_DIR/bin:$PATH" ./target/debug/zigzag --secret-file "$SMOKE_DIR/token" --state-file "$SMOKE_DIR/events.json" --port 18923 > "$SMOKE_DIR/out.log" 2>&1 &
           DAEMON_PID=$!
