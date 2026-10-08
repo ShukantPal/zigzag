@@ -11,8 +11,7 @@ d="$(cat "$rdir/dir.txt")"
 cd "$d" || exit 3
 exec 2> "$rdir/stderr.log"
 echo "codex-review-launch start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$" >&2
-CODEX="${CODEX_REVIEW_CODEX_BIN:-/run/current-system/sw/bin/codex}"
-[ -x "$CODEX" ] || exit 4
+CODEX=/run/current-system/sw/bin/codex
 {
   cat "$rdir/prompt.txt"
   printf '\n\n<untrusted_patch>\n'

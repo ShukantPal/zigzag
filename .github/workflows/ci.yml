@@ -63,8 +63,12 @@ jobs:
             'printf '\''{"type":"done"}\\n'\''' \
             > "$RUNNER_TEMP/fake-codex"
           chmod 700 "$RUNNER_TEMP/fake-codex"
-          CODEX_REVIEW_CODEX_BIN="$RUNNER_TEMP/fake-codex" \
-            "$RUNNER_TEMP/codex-review-launch" run "$RUNNER_TEMP/reviewer-task"
+          grep -q '^CODEX=/run/current-system/sw/bin/codex$' "$RUNNER_TEMP/codex-review-launch"
+          ! grep -q 'CODEX_REVIEW_CODEX_BIN' "$RUNNER_TEMP/codex-review-launch"
+          sed "s#/run/current-system/sw/bin/codex#$RUNNER_TEMP/fake-codex#" \
+            "$RUNNER_TEMP/codex-review-launch" > "$RUNNER_TEMP/codex-review-launch-smoke"
+          chmod 700 "$RUNNER_TEMP/codex-review-launch-smoke"
+          "$RUNNER_TEMP/codex-review-launch-smoke" run "$RUNNER_TEMP/reviewer-task"
           grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
           grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
