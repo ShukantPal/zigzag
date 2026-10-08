@@ -172,12 +172,15 @@ fn run() -> Result<(), String> {
         Ok(path) => match review_loop::load_config(&path) {
             Ok(personal) if personal.review_loop.enabled => {
                 let shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
-                review_loop::start(
+                match review_loop::start(
                     Arc::clone(&state),
                     personal.review_loop,
                     config.review_state_file.clone(),
                     shadow,
-                );
+                ) {
+                    Ok(()) => review_loop_authoritative = !shadow,
+                    Err(error) => eprintln!("review loop disabled: {error}"),
+                }
             }
             Ok(_) => eprintln!("review loop disabled by ~/.zigzag/config.yaml"),
             Err(violations) => {

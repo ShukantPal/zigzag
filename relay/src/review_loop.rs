@@ -389,15 +389,14 @@ struct GateDecision {
     reasons: Vec<String>,
 }
 
-pub fn start(state: Arc<Server>, config: ReviewLoopConfig, state_path: PathBuf, shadow: bool) {
+pub fn start(
+    state: Arc<Server>,
+    config: ReviewLoopConfig,
+    state_path: PathBuf,
+    shadow: bool,
+) -> Result<(), String> {
+    let mut store = StateStore::open(state_path)?;
     thread::spawn(move || {
-        let mut store = match StateStore::open(state_path) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("review loop disabled: {error}");
-                return;
-            }
-        };
         let mut discovery_due = Instant::now();
         let mut review_due = Instant::now();
         let mut merge_due = Instant::now();
@@ -429,6 +428,7 @@ pub fn start(state: Arc<Server>, config: ReviewLoopConfig, state_path: PathBuf, 
             thread::sleep(Duration::from_secs(1));
         }
     });
+    Ok(())
 }
 
 fn supersede_rounds_for_head(
@@ -685,6 +685,14 @@ fn discover(
                     .map(|comment| comment.id.clone())
                     .collect()
             });
+            prepare_superseded_comment_cleanup(
+                policy,
+                store,
+                &policy.repository,
+                number,
+                &snapshot.comments,
+                shadow,
+            )?;
             let superseded_agents =
                 supersede_rounds_for_head(&mut store.state, &policy.repository, number, &key);
             let owner = find_owner_context(&policy.repository, &snapshot.head_ref_name);
@@ -940,6 +948,27 @@ fn prepare_inactive_comment_cleanup(
     }
     if !shadow && let Err(error) = retry_pending_comment_deletions(policy, store, key) {
         eprintln!("review comment cleanup failed for {key}: {error}");
+    }
+    Ok(())
+}
+
+fn prepare_superseded_comment_cleanup(
+    policy: &RepositoryPolicy,
+    store: &mut StateStore,
+    repository: &str,
+    number: u64,
+    comments: &[Comment],
+    shadow: bool,
+) -> Result<(), String> {
+    let keys: Vec<_> = store
+        .state
+        .rounds
+        .iter()
+        .filter(|(_, round)| round.repository == repository && round.pull_request == number)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        prepare_inactive_comment_cleanup(policy, store, &key, comments, shadow)?;
     }
     Ok(())
 }
@@ -2677,7 +2706,7 @@ review_loop:
     }
 
     #[test]
-    fn merge_cleanup_seam_stages_and_retries_unadmitted_comment_deletion() {
+    fn discovery_and_merge_cleanup_seam_stages_unadmitted_comment_deletion() {
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
         let round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
@@ -2697,7 +2726,15 @@ review_loop:
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
         store.save().unwrap();
-        prepare_inactive_comment_cleanup(&policy(), &mut store, &key, &[comment], true).unwrap();
+        prepare_superseded_comment_cleanup(
+            &policy(),
+            &mut store,
+            "owner/repo",
+            7,
+            &[comment],
+            true,
+        )
+        .unwrap();
         assert!(
             store.state.rounds[&key]
                 .excluded_comment_ids
