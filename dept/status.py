@@ -7,14 +7,25 @@ import curses
 import datetime as dt
 import json
 import os
+import shlex
 import sys
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+try:  # `python3 dept/status.py` and `python3 -m dept.status` are both supported.
+    from .dept_config import load_config
+except ImportError:  # pragma: no cover - direct script execution path
+    from dept_config import load_config
+
 DEFAULT_STATE_FILE = Path("~/.codex/zigzag/events.json").expanduser()
 DEFAULT_TOKEN_FILE = Path("~/.codex/zigzag/zigzag.token").expanduser()
+# Keep this in step with relay-core's bounded durable agent spool.  Requesting
+# its complete retained window means a few large pipe-read chunks cannot hide
+# the latest 40 logical lines from the transcript view.
+RELAY_OUTPUT_TAIL_BYTES = 32 * 1024 * 1024
 
 
 def parse_time(value: object) -> dt.datetime | None:
@@ -99,6 +110,7 @@ class Execution:
     task_id: str = "?"
     events: list[dict[str, Any]] = field(default_factory=list)
     agent_state: str = "not observed"
+    agent_id: str | None = None
     degraded: list[str] = field(default_factory=list)
     relay_lost: bool = False
 
@@ -138,6 +150,9 @@ def build_executions(
             continue
         execution = grouped.setdefault(execution_id, Execution(execution_id, str(agent.get("task_id") or "?")))
         execution.agent_state = str(agent.get("state") or "not observed")
+        agent_id = agent.get("id")
+        if isinstance(agent_id, str) and agent_id:
+            execution.agent_id = agent_id
         if agent.get("audit_degraded"):
             execution.degraded.append("audit degraded")
         if agent.get("log_degraded"):
@@ -235,17 +250,66 @@ def relay_snapshot(url: str, token_file: Path) -> tuple[list[dict[str, Any]], li
     except (OSError, ValueError, json.JSONDecodeError) as error:
         warnings.append(f"recent relay events unavailable: {error}")
     try:
-        message = get_json(root + "/v1/agents?state=running", token)
+        message = get_json(root + "/v1/agents", token)
         values = message.get("agents", [])
         if not isinstance(values, list):
-            warnings.append("running agents unavailable: agents is not an array")
+            warnings.append("relay agents unavailable: agents is not an array")
         else:
             agents = [agent for agent in values if isinstance(agent, dict)]
             if len(agents) != len(values):
-                warnings.append("running agents unavailable: invalid agent record")
+                warnings.append("relay agents unavailable: invalid agent record")
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        warnings.append(f"running agents unavailable: {error}")
+        warnings.append(f"relay agents unavailable: {error}")
     return recent, agents, lost, warnings
+
+
+def mac_dept_root() -> Path:
+    """Return the configured Mac task root, not the host running this UI."""
+    configured = os.environ.get("CODEX_DEPT_REMOTE_DIR")
+    if not configured:
+        connection = load_config().get("connection", {})
+        configured = connection.get("remote_dept") if isinstance(connection, dict) else None
+    return Path(configured) if isinstance(configured, str) and configured else Path("~/.codex/dept").expanduser()
+
+
+def transcript_path(task_id: str, root: Path | None = None) -> Path:
+    """Return the Mac-local final-message path created for every dept task."""
+    return (root or mac_dept_root()) / task_id / "last-message.txt"
+
+
+def transcript_command(task_id: str, root: Path | None = None) -> str:
+    # BSD tail exits when a path has not been created yet; -F retries it.
+    return f"tail -F {shlex.quote(str(transcript_path(task_id, root)))}"
+
+
+def relay_output(
+    url: str, token_file: Path, agent_id: str, *, tail: int = RELAY_OUTPUT_TAIL_BYTES,
+) -> tuple[list[str], str | None]:
+    """Read a bounded, read-only relay spool window and keep its last 40 lines."""
+    try:
+        token = token_file.read_text().strip()
+    except (OSError, UnicodeError) as error:
+        return [], f"relay credentials unavailable: {error}"
+    if not token:
+        return [], "relay credentials unavailable: token is empty"
+    try:
+        message = get_json(
+            f"{url.rstrip('/')}/v1/agents/{urllib.parse.quote(agent_id, safe='')}/logs?stream=both&tail={tail}&follow=0",
+            token,
+        )
+        records = message.get("records")
+        if not isinstance(records, list):
+            return [], "relay output unavailable: records is not an array"
+        # Relay records are pipe-read chunks, rather than line records.  Join
+        # them in cursor order before splitting so a logical line that crosses
+        # a read (or stream) boundary is rendered once, intact.
+        chunks: list[str] = []
+        for record in records:
+            if isinstance(record, dict) and isinstance(record.get("data"), str):
+                chunks.append(record["data"])
+        return "".join(chunks).splitlines()[-40:], None
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return [], f"relay output unavailable: {error}"
 
 
 def merged_events(audit: Iterable[dict[str, Any]], recent: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -286,13 +350,39 @@ def detail_lines(execution: Execution, limit: int = 12) -> list[str]:
     return lines
 
 
+def transcript_lines(
+    execution: Execution, output: list[str], error: str | None, root: Path | None = None,
+) -> list[str]:
+    path = transcript_path(execution.task_id, root)
+    lines = [
+        f"Transcript for {execution.task_id} / {execution.execution_id}",
+        f"Source: {path}",
+        f"Command: {transcript_command(execution.task_id, root)}",
+    ]
+    if execution.agent_id is None:
+        lines.append("Relay output unavailable: no retained supervised agent matches this execution.")
+    elif error:
+        lines.append(error)
+    elif output:
+        lines.extend(["Relay output (last 40 lines):", *output])
+    else:
+        lines.append("Relay output: no spool output yet.")
+    return lines
+
+
 class StatusScreen:
-    def __init__(self, url: str, state_file: Path, token_file: Path, interval: float) -> None:
+    def __init__(
+        self, url: str, state_file: Path, token_file: Path, interval: float, task_root: Path | None = None,
+    ) -> None:
         self.url, self.state_file, self.token_file, self.interval = url, state_file, token_file, interval
+        self.task_root = task_root or mac_dept_root()
         self.executions: list[Execution] = []
         self.warnings: list[str] = []
         self.selected = 0
         self.offset = 0
+        self.show_transcript = False
+        self.transcript_output: list[str] = []
+        self.transcript_error: str | None = None
 
     def refresh(self) -> None:
         audit, audit_warnings = read_audit_events(self.state_file)
@@ -301,13 +391,32 @@ class StatusScreen:
         self.warnings = [*audit_warnings, *relay_warnings]
         self.selected = min(self.selected, max(len(self.executions) - 1, 0))
         self.offset = min(self.offset, self.selected)
+        if self.show_transcript and self.executions:
+            execution = self.executions[self.selected]
+            if execution.agent_id is None:
+                self.transcript_output, self.transcript_error = [], None
+            else:
+                self.transcript_output, self.transcript_error = relay_output(
+                    self.url, self.token_file, execution.agent_id,
+                )
 
     def move_selection(self, delta: int, rows: int) -> None:
+        previous = self.selected
         self.selected = min(max(self.selected + delta, 0), max(len(self.executions) - 1, 0))
         if self.selected < self.offset:
             self.offset = self.selected
         elif self.selected >= self.offset + rows:
             self.offset = self.selected - rows + 1
+        if self.selected != previous:
+            self.transcript_output, self.transcript_error = [], None
+
+    def visible_rows(self, height: int) -> int:
+        return 1 if self.show_transcript else max(1, height // 2 - 2)
+
+    def toggle_transcript(self) -> None:
+        self.show_transcript = not self.show_transcript
+        self.offset = self.selected
+        self.transcript_output, self.transcript_error = [], None
 
     def run(self, screen: curses.window) -> None:
         curses.curs_set(0)
@@ -317,20 +426,27 @@ class StatusScreen:
             self.draw(screen)
             key = screen.getch()
             if key in (ord("q"), 27):
-                return
-            if key in (curses.KEY_UP, ord("k")):
-                self.move_selection(-1, max(1, screen.getmaxyx()[0] // 2 - 2))
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.move_selection(1, max(1, screen.getmaxyx()[0] // 2 - 2))
+                if self.show_transcript:
+                    self.toggle_transcript()
+                else:
+                    return
+            elif key in (curses.KEY_ENTER, 10, 13, ord("t")):
+                self.toggle_transcript()
+            elif key in (curses.KEY_UP, ord("k")):
+                self.move_selection(-1, self.visible_rows(screen.getmaxyx()[0]))
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.move_selection(1, self.visible_rows(screen.getmaxyx()[0]))
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
         height, width = screen.getmaxyx()
-        header = "dept status — read-only  ↑↓ select  q quit"
+        header = "dept status — read-only  ↑↓ select  Enter/t transcript  q quit"
+        if self.show_transcript:
+            header = "dept status — transcript (read-only)  q/Esc back"
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
         columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
         screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
-        rows = max(1, height // 2 - 2)
+        rows = self.visible_rows(height)
         for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
@@ -338,7 +454,11 @@ class StatusScreen:
             screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
-        if self.executions:
+        if self.executions and self.show_transcript:
+            lines = transcript_lines(
+                self.executions[self.selected], self.transcript_output, self.transcript_error, self.task_root,
+            )
+        elif self.executions:
             lines = detail_lines(self.executions[self.selected], max(1, height - divider - 3))
         else:
             lines = ["No execution events observed."]

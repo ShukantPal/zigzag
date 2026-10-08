@@ -10,16 +10,22 @@ from unittest.mock import patch
 from dept import dept
 from dept.status import (
     Execution,
+    RELAY_OUTPUT_TAIL_BYTES,
     StatusScreen,
     build_executions,
     detail_lines,
     duration_between,
     flags,
+    mac_dept_root,
     merged_events,
     observed_duration,
     read_audit_events,
+    relay_output,
     relay_snapshot,
     main as status_main,
+    transcript_command,
+    transcript_lines,
+    transcript_path,
 )
 
 
@@ -34,6 +40,35 @@ def event(kind, when, clock="vm:boot", **extra):
         "source": "vm-department",
         **extra,
     }
+
+
+class FakeScreen:
+    def __init__(self, keys: list[int], height: int = 12, width: int = 120):
+        self.keys = iter(keys)
+        self.height, self.width = height, width
+        self.frame: list[str] = []
+        self.frames: list[list[str]] = []
+
+    def timeout(self, _value):
+        pass
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def erase(self):
+        self.frame = []
+
+    def addnstr(self, _row, _column, text, _width, _style=0):
+        self.frame.append(text)
+
+    def hline(self, *_args):
+        pass
+
+    def refresh(self):
+        self.frames.append(self.frame[:])
+
+    def getch(self):
+        return next(self.keys)
 
 
 class PhaseDurationTests(unittest.TestCase):
@@ -117,7 +152,7 @@ class SnapshotIngestionTests(unittest.TestCase):
                 "dept.status.get_json",
                 side_effect=[
                     {"events": [event("process_spawned", "2026-01-01T00:00:00.000Z")], "lost": True},
-                    {"agents": [{"execution_id": "execution", "state": "running"}]},
+                    {"agents": [{"id": "agent", "execution_id": "execution", "state": "running"}]},
                 ],
             ) as get_json:
                 recent, agents, lost, warnings = relay_snapshot("http://relay/", token)
@@ -127,7 +162,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(
             [call.args[0] for call in get_json.call_args_list],
-            ["http://relay/v1/events?after=0&timeout=0", "http://relay/v1/agents?state=running"],
+            ["http://relay/v1/events?after=0&timeout=0", "http://relay/v1/agents"],
         )
 
     def test_malformed_relay_shapes_warn_without_aborting(self):
@@ -145,7 +180,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         merged = merged_events([first], [latest])
         execution = build_executions(
             merged,
-            [{"execution_id": "execution", "task_id": "task", "state": "running", "audit_degraded": True, "log_degraded": True}],
+            [{"id": "agent", "execution_id": "execution", "task_id": "task", "state": "running", "audit_degraded": True, "log_degraded": True}],
             relay_lost=True,
         )
         self.assertEqual(len(merged), 1)
@@ -155,6 +190,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertIn("audit degraded", flags(merged_execution))
         self.assertIn("agent log degraded", flags(merged_execution))
         self.assertIn("relay events lost", flags(merged_execution))
+        self.assertEqual(merged_execution.agent_id, "agent")
 
     def test_status_refresh_keeps_audit_events_when_relay_requests_fail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -177,6 +213,101 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual((screen.selected, screen.offset), (3, 2))
         screen.move_selection(-3, 2)
         self.assertEqual((screen.selected, screen.offset), (0, 0))
+
+
+class TranscriptTests(unittest.TestCase):
+    def test_transcript_source_and_command_use_the_mac_dept_layout(self):
+        self.assertEqual(
+            transcript_path("t-example"),
+            Path.home() / ".codex/dept/t-example/last-message.txt",
+        )
+        self.assertEqual(
+            transcript_command("t-example"),
+            f"tail -F {Path.home() / '.codex/dept/t-example/last-message.txt'}",
+        )
+
+    def test_transcript_source_uses_configured_mac_task_root(self):
+        with patch("dept.status.load_config", return_value={"connection": {"remote_dept": "/Users/mac/.codex/dept"}}):
+            root = mac_dept_root()
+        self.assertEqual(root, Path("/Users/mac/.codex/dept"))
+        self.assertEqual(transcript_path("t-example", root), root / "t-example/last-message.txt")
+
+    def test_relay_output_reads_bounded_spool_and_keeps_last_40_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("token")
+            text = "".join(f"line {number}\n" for number in range(45))
+            records = [
+                {"data": text[:17]},
+                {"data": text[17:101]},
+                {"data": text[101:]},
+            ]
+            with patch("dept.status.get_json", return_value={"records": records}) as get_json:
+                lines, error = relay_output("http://relay/", token, "agent id")
+        self.assertIsNone(error)
+        self.assertEqual(lines, [f"line {number}" for number in range(5, 45)])
+        self.assertEqual(
+            get_json.call_args.args[0],
+            f"http://relay/v1/agents/agent%20id/logs?stream=both&tail={RELAY_OUTPUT_TAIL_BYTES}&follow=0",
+        )
+
+    def test_transcript_detail_shows_path_command_and_spool(self):
+        execution = Execution("execution", "t-example", agent_id="agent")
+        lines = transcript_lines(execution, ["first", "second"], None)
+        self.assertIn(f"Source: {transcript_path('t-example')}", lines)
+        self.assertIn(f"Command: {transcript_command('t-example')}", lines)
+        self.assertEqual(lines[-3:], ["Relay output (last 40 lines):", "first", "second"])
+
+    def test_relay_output_degradations_replace_stale_transcript_content(self):
+        execution = Execution("execution", "t-example", agent_id="agent")
+        missing, error = relay_output("http://relay", Path("/not/a/token"), "agent")
+        self.assertEqual(missing, [])
+        self.assertIn("credentials unavailable", error)
+        self.assertEqual(transcript_lines(execution, ["stale"], error)[-1], error)
+
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("token")
+            with patch("dept.status.get_json", side_effect=OSError("relay down")):
+                output, error = relay_output("http://relay", token, "agent")
+            self.assertEqual(output, [])
+            self.assertIn("relay output unavailable", error)
+            self.assertEqual(transcript_lines(execution, ["stale"], error)[-1], error)
+
+            with patch("dept.status.get_json", return_value={"records": None}):
+                output, error = relay_output("http://relay", token, "agent")
+            self.assertEqual(output, [])
+            self.assertEqual(error, "relay output unavailable: records is not an array")
+            self.assertEqual(transcript_lines(execution, ["stale"], error)[-1], error)
+
+            with patch("dept.status.get_json", return_value={"records": []}):
+                output, error = relay_output("http://relay", token, "agent")
+            self.assertEqual((output, error), ([], None))
+            self.assertEqual(transcript_lines(execution, output, error)[-1], "Relay output: no spool output yet.")
+
+    def test_transcript_mode_fetches_selected_spool_and_keeps_selected_row_visible(self):
+        events = [
+            event("first", "2026-01-01T00:00:00.000Z", task_id="task-zero", execution_id="zero"),
+            event("second", "2026-01-01T00:00:01.000Z", task_id="task-one", execution_id="one"),
+        ]
+        agents = [
+            {"id": "agent-zero", "execution_id": "zero", "task_id": "task-zero", "state": "running"},
+            {"id": "agent-one", "execution_id": "one", "task_id": "task-one", "state": "running"},
+        ]
+        screen = StatusScreen("http://relay", Path("events.json"), Path("token"), 1, Path("/Mac/dept"))
+        fake = FakeScreen([10, ord("j"), ord("q"), 10, 27, ord("q")])
+        with patch("dept.status.curses.curs_set"), \
+             patch("dept.status.read_audit_events", return_value=(events, [])), \
+             patch("dept.status.relay_snapshot", return_value=([], agents, False, [])), \
+             patch("dept.status.relay_output", side_effect=[(["one output"], None), (["zero output"], None), (["zero output"], None)]) as output:
+            screen.run(fake)
+        self.assertEqual([call.args[2] for call in output.call_args_list], ["agent-one", "agent-zero", "agent-zero"])
+        self.assertIn("task-one", "\n".join(fake.frames[1]))
+        self.assertIn("one output", "\n".join(fake.frames[1]))
+        self.assertIn("task-zero", "\n".join(fake.frames[2]))
+        self.assertIn("zero output", "\n".join(fake.frames[2]))
+        self.assertTrue(any("read-only  ↑↓ select" in "\n".join(frame) for frame in fake.frames[3:]))
+        self.assertEqual((screen.selected, screen.offset, screen.show_transcript), (1, 1, False))
 
 
 class CommandTests(unittest.TestCase):
