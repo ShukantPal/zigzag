@@ -773,7 +773,7 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
     let mut current_link = None;
     let mut status_directory = None;
     let mut candidate_version = None;
-    let mut secret = None;
+    let mut credential_path = None;
     let mut port = None;
     while let Some(arg) = values.next() {
         if arg == "--" {
@@ -790,7 +790,7 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
             "--candidate-version" if valid_version(value) => {
                 candidate_version = Some(value.clone())
             }
-            "--secret-file" => secret = Some(PathBuf::from(value)),
+            "--secret-file" => credential_path = Some(PathBuf::from(value)),
             "--port" => port = Some(value.parse::<u16>().map_err(|_| "invalid watchdog port")?),
             _ => return Err("invalid update watchdog arguments".to_owned()),
         }
@@ -801,7 +801,7 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
         current_link: current_link.ok_or("missing current release link")?,
         status_directory: status_directory.ok_or("missing watchdog status directory")?,
         candidate_version: candidate_version.ok_or("missing watchdog candidate version")?,
-        secret_file: secret.ok_or("missing watchdog secret")?,
+        secret_file: credential_path.ok_or("missing watchdog credential file")?,
         port: port.ok_or("missing watchdog port")?,
         relay_args: values.cloned().collect(),
     })
