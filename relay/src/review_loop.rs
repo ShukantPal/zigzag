@@ -18,16 +18,17 @@ const REVIEWER_RESULT_SCHEMA: &str = include_str!("reviewer-result-v1.json");
 const RESULT_VERSION: u64 = 1;
 const REVIEWER_BIN: &str = "codex-review-launch";
 const OWNER_BIN: &str = "codex-launch";
+const GITHUB_CONNECTION_LIMIT: usize = 100;
 const COMPARE_FILES_JQ: &str = r#"{file_count: (.files | length), files: (.files | map({filename, previous_filename, status, additions, deletions, patch}))}"#;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PersonalConfig {
     pub schema_version: u64,
     pub review_loop: ReviewLoopConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLoopConfig {
     pub enabled: bool,
@@ -35,7 +36,7 @@ pub struct ReviewLoopConfig {
     pub repositories: Vec<RepositoryPolicy>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Intervals {
     pub discovery_seconds: u64,
@@ -43,7 +44,7 @@ pub struct Intervals {
     pub merge_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryPolicy {
     pub repository: String,
@@ -56,14 +57,14 @@ pub struct RepositoryPolicy {
     pub result_limits: ResultLimits,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequiredCheck {
     pub label: String,
     pub name_pattern: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ResultLimits {
     pub max_findings_per_lens: usize,
@@ -164,10 +165,16 @@ pub fn load_config(path: &Path) -> Result<PersonalConfig, Vec<ConfigViolation>> 
     })
 }
 
-pub fn print_policy(arguments: &[String]) -> Result<(), String> {
-    if arguments.len() != 1 || matches!(arguments[0].as_str(), "--help" | "-h") {
-        return Err("usage: zigzag review-policy <owner/repository>".to_owned());
+pub fn print_gate(arguments: &[String]) -> Result<(), String> {
+    if arguments.len() != 2 || matches!(arguments[0].as_str(), "--help" | "-h") {
+        return Err("usage: zigzag review-gate <owner/repository> <pull-request>".to_owned());
     }
+    let repository = &arguments[0];
+    let number = arguments[1]
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "pull request must be a positive integer".to_owned())?;
     let path = default_config_path().map_err(|violation| violation.to_string())?;
     let config = load_config(&path).map_err(|violations| {
         violations
@@ -176,18 +183,14 @@ pub fn print_policy(arguments: &[String]) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("; ")
     })?;
-    let repository = &arguments[0];
     let policy = config
         .review_loop
         .repositories
         .iter()
         .find(|policy| policy.repository == *repository)
         .ok_or_else(|| format!("no review policy configured for {repository}"))?;
-    println!(
-        "{}",
-        serde_json::to_string(policy)
-            .map_err(|error| format!("could not serialize review policy: {error}"))?
-    );
+    let snapshot = fetch_pr(repository, number)?;
+    println!("{}", shadow_gate_report(policy, number, &snapshot));
     Ok(())
 }
 
@@ -1273,8 +1276,23 @@ fn fetch_pr(repository: &str, number: u64) -> Result<PullRequestSnapshot, String
         "headRefOid,baseRefOid,headRefName,state,mergedAt,comments,statusCheckRollup".to_owned(),
     ];
     let result = run_allowed("gh", args, format!("review-pr-{repository}-{number}"))?;
-    serde_json::from_str(&result)
-        .map_err(|error| format!("GitHub PR response was not expected JSON: {error}"))
+    parse_pr_snapshot(&result)
+}
+
+fn parse_pr_snapshot(result: &str) -> Result<PullRequestSnapshot, String> {
+    let snapshot: PullRequestSnapshot = serde_json::from_str(result)
+        .map_err(|error| format!("GitHub PR response was not expected JSON: {error}"))?;
+    if snapshot.comments.len() >= GITHUB_CONNECTION_LIMIT {
+        return Err(format!(
+            "GitHub PR comments may be truncated at {GITHUB_CONNECTION_LIMIT} entries"
+        ));
+    }
+    if snapshot.status_check_rollup.len() >= GITHUB_CONNECTION_LIMIT {
+        return Err(format!(
+            "GitHub status checks may be truncated at {GITHUB_CONNECTION_LIMIT} entries"
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn fetch_pr_diff(
@@ -1803,6 +1821,64 @@ fn evaluate_gate(
         ready: reasons.is_empty(),
         reasons,
     }
+}
+
+fn shadow_gate_report(
+    policy: &RepositoryPolicy,
+    number: u64,
+    snapshot: &PullRequestSnapshot,
+) -> Value {
+    let round = ReviewRound {
+        repository: policy.repository.clone(),
+        pull_request: number,
+        head: snapshot.head_ref_oid.clone(),
+        base: snapshot.base_ref_oid.clone(),
+        generation: 1,
+        verification: false,
+        phase: RoundPhase::Reviewing,
+        reviewers: BTreeMap::new(),
+        verdicts: BTreeMap::new(),
+        excluded_comment_ids: BTreeSet::new(),
+        pending_comment_deletions: BTreeSet::new(),
+        owner: None,
+        owner_agent_id: None,
+        gate_reasons: Vec::new(),
+    };
+    let verdicts = latest_verdicts(policy, &round, &snapshot.comments, false);
+    let mut decision = evaluate_gate(policy, &snapshot.head_ref_oid, snapshot, &verdicts);
+    if !pull_request_is_open(snapshot) {
+        decision.ready = false;
+        decision.reasons.push("pull request is not open".to_owned());
+    }
+    let approvals: serde_json::Map<String, Value> = policy
+        .lenses
+        .iter()
+        .map(|lens| {
+            let value = verdicts.get(lens).map_or_else(
+                || serde_json::json!({"verdict": null}),
+                |verdict| {
+                    serde_json::json!({
+                        "verdict": match verdict.verdict {
+                            Verdict::Approve => "APPROVE",
+                            Verdict::ChangesRequested => "CHANGES REQUESTED",
+                        },
+                        "head": verdict.head,
+                        "on_current_head": verdict.head == snapshot.head_ref_oid.to_ascii_lowercase(),
+                    })
+                },
+            );
+            (lens.clone(), value)
+        })
+        .collect();
+    serde_json::json!({
+        "pass": decision.ready,
+        "reasons": decision.reasons,
+        "warnings": [],
+        "repo": policy.repository,
+        "pr": number,
+        "head": snapshot.head_ref_oid.to_ascii_lowercase(),
+        "approvals": approvals,
+    })
 }
 
 fn resume_owner(
@@ -2694,6 +2770,39 @@ review_loop:
         assert!(!evaluate_gate(&policy, &head, &failed, &verdicts).ready);
     }
 
+    #[test]
+    fn shadow_gate_uses_canonical_strict_verdict_admission() {
+        let policy = policy();
+        let head = "a".repeat(40);
+        let exact = |lens: &str| Comment {
+            author: Some(Author {
+                login: "ShukantPal".to_owned(),
+            }),
+            body: format!(
+                "> 🤖 Codex (AI assistant) — [{lens}] review verdict\nVERDICT: APPROVE\nHEAD: {head}\nNo blocking findings."
+            ),
+            created_at: format!("2026-01-01T00:00:0{}Z", lens.len()),
+            id: lens.to_owned(),
+        };
+        let mut accepted = snapshot(&head);
+        accepted.comments = policy.lenses.iter().map(|lens| exact(lens)).collect();
+        assert_eq!(shadow_gate_report(&policy, 7, &accepted)["pass"], true);
+
+        let mut flexible_legacy = accepted;
+        flexible_legacy.comments[0].body = format!(
+            "preface containing 🤖\n> 🤖 Codex (AI assistant) — [correctness] review verdict\nverdict: approve\nHEAD: {head}\nNo blocking findings."
+        );
+        let report = shadow_gate_report(&policy, 7, &flexible_legacy);
+        assert_eq!(report["pass"], false);
+        assert!(
+            report["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "no admitted [correctness] verdict")
+        );
+    }
+
     fn test_round(head: &str, phase: RoundPhase, agent_id: Option<&str>) -> ReviewRound {
         ReviewRound {
             repository: "owner/repo".to_owned(),
@@ -3432,6 +3541,44 @@ review_loop:
                     .contains("omits reviewable patch material")
             );
         }
+    }
+
+    #[test]
+    fn pr_snapshot_rejects_capped_comment_and_status_connections() {
+        let comment = serde_json::json!({
+            "author": {"login": "ShukantPal"},
+            "body": "body",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "id": "comment",
+        });
+        let check = serde_json::json!({
+            "name": "CI",
+            "conclusion": "SUCCESS",
+            "status": "COMPLETED",
+        });
+        let response = |comments: usize, checks: usize| {
+            serde_json::json!({
+                "headRefOid": "a".repeat(40),
+                "baseRefOid": "b".repeat(40),
+                "headRefName": "codex/branch",
+                "state": "OPEN",
+                "mergedAt": null,
+                "comments": vec![comment.clone(); comments],
+                "statusCheckRollup": vec![check.clone(); checks],
+            })
+            .to_string()
+        };
+        assert!(parse_pr_snapshot(&response(99, 99)).is_ok());
+        assert!(
+            parse_pr_snapshot(&response(100, 0))
+                .unwrap_err()
+                .contains("comments may be truncated")
+        );
+        assert!(
+            parse_pr_snapshot(&response(0, 100))
+                .unwrap_err()
+                .contains("status checks may be truncated")
+        );
     }
 
     #[test]

@@ -146,6 +146,9 @@ fn run() -> Result<(), String> {
     if arguments.first().map(String::as_str) == Some("review-policy") {
         return review_loop::print_policy(&arguments[1..]);
     }
+    if arguments.first().map(String::as_str) == Some("review-gate") {
+        return review_loop::print_gate(&arguments[1..]);
+    }
     let config = server_config(arguments)?;
     let secret = read_secret_file(&config.secret_file)?;
     let control_secret = config
