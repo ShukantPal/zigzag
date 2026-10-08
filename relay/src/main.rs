@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod exec;
+mod update;
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_FINISHED_PROCS: usize = 128;
@@ -34,12 +35,17 @@ struct Config {
     max_events: usize,
     github_watch_repos: Vec<String>,
     github_watch_interval: Duration,
+    update_directory: PathBuf,
+    update_interval: Duration,
+    update_policy: update::Policy,
+    update_ready_file: Option<PathBuf>,
 }
 struct Server {
     secret: String,
     control_secret: Option<String>,
     store: Arc<Store>,
     supervisor: Supervisor,
+    updater: Arc<update::Manager>,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -127,13 +133,25 @@ fn run() -> Result<(), String> {
     if arguments.first().map(String::as_str) == Some("timeline") {
         return run_timeline(&arguments[1..]);
     }
-    let config = server_config(arguments)?;
+    if arguments.first().map(String::as_str) == Some("updates") {
+        return update::run_control(&arguments[1..]);
+    }
+    if arguments.first().map(String::as_str) == Some("update-watchdog") {
+        return update::run_watchdog(&arguments[1..]);
+    }
+    let config = server_config(arguments.clone())?;
     let secret = read_secret_file(&config.secret_file)?;
     let control_secret = config
         .control_secret_file
         .as_deref()
         .map(read_secret_file)
         .transpose()?;
+    let updater = Arc::new(update::Manager::new(update::Config {
+        directory: config.update_directory.clone(),
+        interval: config.update_interval,
+        policy: config.update_policy.clone(),
+        ready_file: config.update_ready_file.clone(),
+    }));
     let state = Arc::new(Server {
         secret,
         control_secret,
@@ -142,6 +160,7 @@ fn run() -> Result<(), String> {
             registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
             procs: Mutex::new(HashMap::new()),
         },
+        updater: Arc::clone(&updater),
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
         replay_recovered_lifecycle(&state.store, &agent)?;
@@ -165,6 +184,52 @@ fn run() -> Result<(), String> {
         println!("zigzag listening on http://{address}");
         thread::spawn(move || serve(listener, state));
     }
+    // The replacement only signals readiness after it has opened durable state
+    // and rebound both listeners. The watchdog rolls back if this does not
+    // happen; no launchctl restart is involved.
+    let replacement_version = env::var("ZIGZAG_UPDATE_VERSION").ok();
+    updater.acknowledge_ready(replacement_version.as_deref())?;
+    if let Some(version) = replacement_version {
+        let execution_id = new_execution_id()?;
+        state.store.add(relay_event(
+            "relay_update_applied",
+            "relay-update",
+            &execution_id,
+            Json::Object(vec![("new_version".to_owned(), Json::String(version))]),
+        ))?;
+    }
+    let update_state = Arc::clone(&state);
+    let update_audit_state = Arc::clone(&state);
+    let update_execution = Mutex::new(None::<String>);
+    let update_arguments = update::persistent_server_args(&arguments);
+    updater.start(
+        Arc::new(move || {
+            !update_state
+                .supervisor
+                .registry
+                .list(Some("running"), None)
+                .is_empty()
+        }),
+        Arc::new(move |kind, payload| {
+            let Ok(mut execution_id) = update_execution.lock() else {
+                return;
+            };
+            if kind == "relay_update_check_started" || execution_id.is_none() {
+                *execution_id = new_execution_id().ok();
+            }
+            if let Some(execution_id) = execution_id.as_deref() {
+                let _ = update_audit_state.store.add(relay_event(
+                    kind,
+                    "relay-update",
+                    execution_id,
+                    payload,
+                ));
+            }
+        }),
+        update_arguments,
+        config.secret_file.clone(),
+        config.port,
+    );
     loop {
         thread::park();
     }
@@ -290,6 +355,19 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut max_events = 1000;
     let mut github_watch_repos = Vec::new();
     let mut github_watch_interval = Duration::from_secs(30);
+    let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);
+    let mut update_interval = env::var("ZIGZAG_UPDATE_INTERVAL")
+        .ok()
+        .map(|value| value.parse::<u64>().map(Duration::from_secs))
+        .transpose()
+        .map_err(|_| "ZIGZAG_UPDATE_INTERVAL must be an integer".to_owned())?
+        .unwrap_or(Duration::from_secs(60 * 60));
+    let mut update_policy = env::var("ZIGZAG_UPDATE_POLICY")
+        .ok()
+        .map(|value| update::Policy::parse(&value))
+        .transpose()?
+        .unwrap_or(update::Policy::Enabled);
+    let mut update_ready_file = None;
     let mut values = arguments.into_iter();
     while let Some(argument) = values.next() {
         let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
@@ -330,7 +408,16 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
                 github_watch_interval = Duration::from_secs(seconds);
             }
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30]".to_owned()),
+            "--update-dir" => update_directory = Some(PathBuf::from(value(&mut values, "--update-dir")?)),
+            "--update-interval" => {
+                let seconds = value(&mut values, "--update-interval")?.parse::<u64>()
+                    .map_err(|_| "--update-interval must be an integer".to_owned())?;
+                if seconds > 24 * 60 * 60 { return Err("--update-interval must be at most 86400 seconds".to_owned()); }
+                update_interval = Duration::from_secs(seconds);
+            }
+            "--update-policy" => update_policy = update::Policy::parse(&value(&mut values, "--update-policy")?)?,
+            "--update-ready-file" => update_ready_file = Some(PathBuf::from(value(&mut values, "--update-ready-file")?)),
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -342,6 +429,12 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         return Err("--max-events must be greater than zero".to_owned());
     }
     let agent_registry_file = state_file.with_extension("agents.json");
+    let update_directory = update_directory.unwrap_or_else(|| {
+        state_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("relay")
+    });
     Ok(Config {
         secret_file,
         control_secret_file,
@@ -352,6 +445,10 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         max_events,
         github_watch_repos,
         github_watch_interval,
+        update_directory,
+        update_interval,
+        update_policy,
+        update_ready_file,
     })
 }
 
@@ -609,6 +706,11 @@ where
         return Ok(());
     }
     match (request.method.as_str(), request_path) {
+        ("GET", "/v1/health") => reply(
+            &mut stream,
+            200,
+            Json::Object(vec![("status".to_owned(), Json::String("ok".to_owned()))]),
+        ),
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
@@ -815,6 +917,9 @@ fn spawn_request(
     body: Vec<u8>,
     policy: Result<exec::Policy, String>,
 ) -> Result<(), String> {
+    if state.updater.is_draining() {
+        return reply(stream, 503, error("updates_draining"));
+    }
     let request = match parse_spawn_request(&body) {
         Ok(request) => request,
         Err(denial) => return reply(stream, 200, denial),
@@ -858,6 +963,16 @@ fn spawn_request(
     let path = match policy_path_or_denial(&policy, &request.command) {
         Ok(path) => path,
         Err(denial) => return reply(stream, 200, denial),
+    };
+    // The updater takes the same gate while setting `draining`, so a child
+    // cannot appear between the drain check and its durable registry record.
+    let _spawn_admission = match state.updater.spawn_admission() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 503, error("updates_draining")),
+        Err(message) => {
+            eprintln!("spawn admission failed: {message}");
+            return reply(stream, 500, error("could_not_admit_process"));
+        }
     };
     if state
         .store
@@ -1693,6 +1808,7 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
@@ -1932,6 +2048,26 @@ mod tests {
             assert!(!entries.contains_key(&handle));
             assert!(handles.insert(handle));
         }
+    }
+
+    #[test]
+    fn spawn_is_rejected_while_update_drain_is_active() {
+        let (state, state_path) = test_server();
+        state.updater.begin_drain().unwrap();
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/spawn",
+            r#"{"id":"during-drain","bin":"sh","args":["-c","true"]}"#,
+        );
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.ends_with(r#"{"error":"updates_draining"}"#));
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
@@ -2295,6 +2431,12 @@ mod tests {
                     registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                     procs: Mutex::new(HashMap::new()),
                 },
+                updater: Arc::new(update::Manager::new(update::Config {
+                    directory: path.with_extension("updates"),
+                    interval: Duration::ZERO,
+                    policy: update::Policy::Enabled,
+                    ready_file: None,
+                })),
             }),
             path,
         )

@@ -5,22 +5,81 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: python3 dept/config.py --check
       - run: python3 -c "import pathlib; [compile(p.read_text(), str(p), 'exec') for p in pathlib.Path('dept').glob('*.py')]"
       - run: python3 -m unittest discover -s dept -p 'test_*.py'
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
         with:
           components: clippy, rustfmt
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --locked --workspace --all-targets
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo fmt --all --check
+
+  release:
+    # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
+    # immutable image digest. The Actions, toolchain, signed binary, and
+    # provenance below are pinned verification boundaries.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [python, rust]
+    runs-on: macos-14
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+        with:
+          toolchain: 1.90.0
+      - uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3
+        with:
+          p12-file-base64: ${{ secrets.ZIGZAG_APPLE_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.ZIGZAG_APPLE_CERTIFICATE_PASSWORD }}
+      - name: Build and sign the ARM64 relay
+        env:
+          SIGNING_IDENTITY: ${{ secrets.ZIGZAG_SIGNING_IDENTITY }}
+        run: |
+          test -n "$SIGNING_IDENTITY"
+          cargo build --release --locked -p zigzag
+          cp target/release/zigzag zigzag-macos-aarch64
+          codesign --force --sign "$SIGNING_IDENTITY" \
+            --identifier com.shukantpal.zigzag --options runtime --timestamp \
+            zigzag-macos-aarch64
+          codesign --verify --strict --deep --verbose=2 zigzag-macos-aarch64
+      - name: Produce release manifest
+        id: manifest
+        run: |
+          VERSION="v0.1.${GITHUB_RUN_NUMBER}"
+          DIGEST="$(shasum -a 256 zigzag-macos-aarch64 | awk '{print $1}')"
+          printf '{"version":"%s","target":"aarch64-apple-darwin","sha256":"%s","commit":"%s"}\n' \
+            "$VERSION" "$DIGEST" "$GITHUB_SHA" > zigzag-macos-aarch64.manifest.json
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: zigzag-macos-aarch64
+      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          # The updater verifies this before trusting its version or commit.
+          subject-path: zigzag-macos-aarch64.manifest.json
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.manifest.outputs.version }}
+          name: Zigzag ${{ steps.manifest.outputs.version }}
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            zigzag-macos-aarch64
+            zigzag-macos-aarch64.manifest.json
