@@ -115,6 +115,9 @@ class CommandDispatchTest(unittest.TestCase):
         self.assertIn("-m", calls)
         self.assertIn("test-model", calls)
         self.assertIn("exit-code.txt", calls)
+        self.assertIn("child-pid.txt", calls)
+        self.assertIn("trap cleanup TERM INT", calls)
+        self.assertIn('kill \"$child\"', calls)
 
     def test_read_only_reaches_ssh_launch_without_approval_bypass(self):
         result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
@@ -160,6 +163,18 @@ class CommandDispatchTest(unittest.TestCase):
              patch("builtins.print") as output:
             department.cmd_status(["t-one"])
         output.assert_called_once_with("t-one: DONE (exit 7)")
+
+    def test_kill_stops_ssh_wrapper_and_tracked_child(self):
+        entry = {"id": "t-one", "via": "ssh"}
+        result = SimpleNamespace(returncode=0, stdout=b"killed\n", stderr=b"")
+        with patch.object(department, "ledger_read", return_value=[entry]), \
+             patch.object(department, "ssh", return_value=result) as ssh, \
+             patch("builtins.print") as output:
+            department.cmd_kill(["t-one"])
+        command = ssh.call_args.args[0]
+        self.assertIn("child-pid.txt", command)
+        self.assertIn("child-pid.txt pid", command)
+        output.assert_called_once_with("t-one: killed (via ssh)")
 
     def test_result_prints_relay_failure_and_task_stderr(self):
         entry = {"id": "t-one", "via": "relay", "proc": "proc"}

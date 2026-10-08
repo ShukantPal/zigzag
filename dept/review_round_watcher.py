@@ -9,23 +9,17 @@ Seeding a round: write <state-dir>/review_rounds/<repo>-pr<pr>-round<n>.json:
 {
   "pr": 922,
   "repo": "leveled-inc/leveled",
+  "head": "0123456789abcdef0123456789abcdef01234567",
   "project_dir": "/Users/shukant/.codex/worktrees/stale-engine-race",
-  "branch": "codex/audiorecorder-stale-engine-race",
   "reviewers": {"t-c6fb36": "concurrency", "t-3868f8": "simplicity", "t-4c19a0": "tests"},
-  "queued_comments": ["AudioRecorder.swift:506 -- \"Explain when this would happen\"", "..."],
-  "force_push_authorized": true,
   "created_at": "2026-09-20T22:30:00-07:00",
   "status": "collecting"
 }
 status: collecting -> published (terminal) | attention (needs a human).
 
 Rules honored:
-- Never two workers on the same project_dir at once (ledger scan, fail closed).
-- force-push on Codex-owned PR branches is standing pre-authorized
-  (2026-09-20, Shukant's rule): the worker decides, using --force-with-lease.
-  Set "force_push_authorized": false in the round file only for a PR Shukant
-  opened himself or that belongs to someone else — then the worker commits
-  locally and reports that a force-push is needed.
+- Only an explicit zero exit permits reviewer output to be published.
+- Model output is constrained to one verdict and one exact reviewed head.
 - A reviewer task dead with no output after ~2h of polls -> status "attention".
 """
 import json
@@ -231,14 +225,28 @@ def validated_verdict(text, head):
     return verdicts[0].upper()
 
 
-def post_verdict(repo, pr, lens, head, verdict, task_id):
-    body = (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
+def verdict_body(lens, head, verdict, task_id):
+    return (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
             f"VERDICT: {verdict}\nHEAD: {head}\n\n"
             "ATTESTATION: MODEL_ADVISORY\n\n"
             f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
             "requires a formal review from an allowlisted human before it can "
             "satisfy the gate.")
+
+
+def verdict_already_posted(repo, pr, body):
+    output = mac(f"gh pr view {int(pr)} --repo {shlex.quote(repo)} --json comments")
+    comments = json.loads(output).get("comments", [])
+    return any((c.get("author") or {}).get("login") == "ShukantPal" and
+               c.get("body") == body for c in comments)
+
+
+def post_verdict(repo, pr, lens, head, verdict, task_id):
+    body = verdict_body(lens, head, verdict, task_id)
+    if verdict_already_posted(repo, pr, body):
+        return False
     mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
+    return True
 
 
 @contextmanager

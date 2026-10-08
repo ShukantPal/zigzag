@@ -18,11 +18,11 @@ dispatcher = importlib.import_module("dispatch_review_round")
 
 class DispatchReviewRoundTest(unittest.TestCase):
     def test_pr_info_scopes_gh_to_repo(self):
-        result = '{"headRefOid": "a", "headRefName": "branch"}'
+        result = '{"headRefOid": "a"}'
         with patch.object(dispatcher, "mac", return_value=result) as mac:
             dispatcher.pr_info(12, "owner/repo")
         self.assertEqual(mac.call_args.args[0],
-                         "gh pr view 12 --repo owner/repo --json headRefOid,headRefName")
+                         "gh pr view 12 --repo owner/repo --json headRefOid")
 
     def test_superseded_rounds_do_not_count_or_consume_numbers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +44,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_seed_persists_each_reviewer_and_marks_failure_attention(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "a" * 40, "headRefName": "branch"}
+            info = {"headRefOid": "a" * 40}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
@@ -58,7 +58,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_seed_records_all_reviewers_and_repo_scoped_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "b" * 40, "headRefName": "fetched-branch"}
+            info = {"headRefOid": "b" * 40}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
@@ -69,14 +69,13 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertEqual(data["status"], "collecting")
         self.assertEqual(reviewers, {"t-c": "correctness", "t-s": "simplicity", "t-t": "tests"})
         self.assertEqual(data["head"], "b" * 40)
-        self.assertEqual(data["branch"], "fetched-branch")
         self.assertEqual(len(prompts), 3)
         self.assertTrue(all("Do not invoke `gh`" in prompt for prompt in prompts))
 
     def test_same_number_different_repositories_use_distinct_round_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "c" * 40, "headRefName": "branch"}
+            info = {"headRefOid": "c" * 40}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
@@ -101,7 +100,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
                 time.sleep(0.05)
                 with guard:
                     active -= 1
-                return {"headRefOid": "e" * 40, "headRefName": "branch"}
+                return {"headRefOid": "e" * 40}
 
             def dispatch(_project, _prompt):
                 return f"t-{next(task_numbers)}"
@@ -125,7 +124,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_seed_can_include_security_lens(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "d" * 40, "headRefName": "branch"}
+            info = {"headRefOid": "d" * 40}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \

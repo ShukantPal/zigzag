@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed a read-only review team and its follow-up revision round."""
+"""Seed a read-only review team and its verdict-collection state."""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -60,7 +60,7 @@ def pr_info(pr, repo):
     """Read PR metadata with explicit repo scope, never checkout-relative gh."""
     output = mac(
         f"gh pr view {int(pr)} --repo {shlex.quote(repo)} "
-        "--json headRefOid,headRefName")
+        "--json headRefOid")
     return json.loads(output)
 
 
@@ -124,16 +124,14 @@ def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
         raise RuntimeError(f"PR #{pr} already has {len(existing)} active review rounds (cap {max_rounds})")
     info = pr_info(pr, repo)
     head = info["headRefOid"]
-    branch = info["headRefName"]
     number = next_round_number(repo, pr)
     ROUNDS_DIR.mkdir(parents=True, exist_ok=True)
     PROMPT_DIR.mkdir(parents=True, exist_ok=True)
     reviewers = {}
     round_path = ROUNDS_DIR / f"{repo_key(repo)}-pr{pr}-round{number}.json"
     round_data = {
-        "pr": pr, "round": number, "repo": repo, "head": head, "branch": branch,
-        "project_dir": project_dir,
-        "reviewers": reviewers, "queued_comments": [], "status": "dispatching",
+        "pr": pr, "round": number, "repo": repo, "head": head,
+        "project_dir": project_dir, "reviewers": reviewers, "status": "dispatching",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     # Persist before the first launch: a later failure must not orphan earlier

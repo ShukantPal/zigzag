@@ -233,8 +233,17 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, rea
         safety_flags = "--sandbox read-only " if read_only else "--approve-for-me "
         codex = (f"codex exec --json {safety_flags}--skip-git-repo-check "
                  f"{model_flag}{command}")
-        wrapped = (f"{codex}; rc=$?; printf %s \"$rc\" > "
-                   f"{shq(f'{rdir}/exit-code.txt')}; exit \"$rc\"")
+        exit_file = shq(f"{rdir}/exit-code.txt")
+        child_file = shq(f"{rdir}/child-pid.txt")
+        wrapped = (
+            "child=; cleanup() { "
+            "if [ -n \"$child\" ]; then kill \"$child\" 2>/dev/null; "
+            "wait \"$child\" 2>/dev/null; fi; "
+            f"printf %s 143 > {exit_file}; exit 143; }}; "
+            "trap cleanup TERM INT; "
+            f"{codex} & child=$!; printf %s \"$child\" > {child_file}; "
+            "wait \"$child\"; rc=$?; trap - TERM INT; "
+            f"printf %s \"$rc\" > {exit_file}; exit \"$rc\"")
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
                   f'nohup sh -c {shq(wrapped)} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
@@ -371,8 +380,14 @@ def cmd_kill(args):
         killed = zigzag_kill(entry["proc"])
         print(f"{tid}: kill requested via relay (killed={killed})")
     else:
-        r = ssh(f"kill $(cat {REMOTE_DEPT}/{tid}/pid) 2>/dev/null && echo killed || echo 'not running'",
-                timeout=60)
+        rdir = f"{REMOTE_DEPT}/{tid}"
+        r = ssh(
+            f"rdir={shq(rdir)}; killed=0; "
+            "for f in child-pid.txt pid; do "
+            "if [ -f \"$rdir/$f\" ] && kill $(cat \"$rdir/$f\") 2>/dev/null; "
+            "then killed=1; fi; done; "
+            "[ \"$killed\" -eq 1 ] && echo killed || echo 'not running'",
+            timeout=60)
         print(f"{tid}: {r.stdout.decode().strip()} (via ssh)")
 
 
