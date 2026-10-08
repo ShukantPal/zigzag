@@ -5,19 +5,18 @@
 //! the repository, workflow, source ref, and the bundled Sigstore trust root.
 
 use relay_core::{Json, parse_json};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub const REPOSITORY: &str = "ShukantPal/zigzag";
-const WORKFLOW: &str =
-    "https://github.com/ShukantPal/zigzag/.github/workflows/release.yml@refs/heads/main";
+const WORKFLOW: &str = "ShukantPal/zigzag/.github/workflows/ci.yml";
 const TARGET: &str = "aarch64-apple-darwin";
 const BINARY: &str = "zigzag-macos-aarch64";
 const MANIFEST: &str = "zigzag-macos-aarch64.manifest.json";
@@ -66,10 +65,94 @@ pub struct Config {
 pub struct Manager {
     config: Config,
     draining: Arc<AtomicBool>,
+    spawn_gate: Mutex<()>,
+    runtime: Arc<dyn Runtime>,
 }
 type ActiveWork = dyn Fn() -> bool + Send + Sync;
 type Audit = dyn Fn(&str, Json) + Send + Sync;
-type WatchdogArgs = (PathBuf, PathBuf, PathBuf, PathBuf, u16, Vec<String>);
+
+struct WatchdogConfig {
+    ready: PathBuf,
+    rollback: PathBuf,
+    current_link: PathBuf,
+    status_directory: PathBuf,
+    candidate_version: String,
+    secret_file: PathBuf,
+    port: u16,
+    relay_args: Vec<String>,
+}
+
+struct CommandOutput {
+    stdout: String,
+    stderr: String,
+}
+
+trait Runtime: Send + Sync {
+    fn output(&self, command: &str, args: &[String]) -> Result<CommandOutput, String>;
+    fn status(&self, command: &str, args: &[String]) -> Result<(), String>;
+    fn spawn(&self, command: &Path, args: &[String]) -> Result<(), String>;
+    fn exec(
+        &self,
+        command: &Path,
+        args: &[String],
+        environment: Option<(&str, &str)>,
+    ) -> Result<(), String>;
+}
+
+struct SystemRuntime;
+
+impl Runtime for SystemRuntime {
+    fn output(&self, command: &str, args: &[String]) -> Result<CommandOutput, String> {
+        let output = Command::new(command)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run {command}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!("{command} failed"));
+        }
+        Ok(CommandOutput {
+            stdout: String::from_utf8(output.stdout)
+                .map_err(|_| format!("{command} returned non-UTF-8 output"))?,
+            stderr: String::from_utf8(output.stderr)
+                .map_err(|_| format!("{command} returned non-UTF-8 output"))?,
+        })
+    }
+
+    fn status(&self, command: &str, args: &[String]) -> Result<(), String> {
+        let status = Command::new(command)
+            .args(args)
+            .status()
+            .map_err(|e| format!("could not run {command}: {e}"))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("{command} verification failed"))
+    }
+
+    fn spawn(&self, command: &Path, args: &[String]) -> Result<(), String> {
+        Command::new(command)
+            .args(args)
+            .env_remove("ZIGZAG_UPDATE_VERSION")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not start update watchdog: {e}"))
+    }
+
+    fn exec(
+        &self,
+        command: &Path,
+        args: &[String],
+        environment: Option<(&str, &str)>,
+    ) -> Result<(), String> {
+        let mut process = Command::new(command);
+        process.args(args);
+        if let Some((name, value)) = environment {
+            process.env(name, value);
+        }
+        let error = process.exec();
+        Err(format!("could not exec {}: {error}", command.display()))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -92,11 +175,44 @@ impl Manager {
         Self {
             config,
             draining: Arc::new(AtomicBool::new(false)),
+            spawn_gate: Mutex::new(()),
+            runtime: Arc::new(SystemRuntime),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runtime(config: Config, runtime: Arc<dyn Runtime>) -> Self {
+        Self {
+            config,
+            draining: Arc::new(AtomicBool::new(false)),
+            spawn_gate: Mutex::new(()),
+            runtime,
         }
     }
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
+    }
+
+    /// Serializes the drain transition with child creation and registry
+    /// registration. Callers hold this guard until the running record commits.
+    pub fn spawn_admission(&self) -> Result<Option<MutexGuard<'_, ()>>, String> {
+        let guard = self
+            .spawn_gate
+            .lock()
+            .map_err(|_| "update spawn gate lock poisoned".to_owned())?;
+        Ok((!self.is_draining()).then_some(guard))
+    }
+
+    pub(crate) fn begin_drain(&self) -> Result<bool, String> {
+        let _gate = self
+            .spawn_gate
+            .lock()
+            .map_err(|_| "update spawn gate lock poisoned".to_owned())?;
+        Ok(self
+            .draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
     }
 
     pub fn status(&self) -> Status {
@@ -117,18 +233,24 @@ impl Manager {
     }
 
     /// Called only after listeners are bound in the replacement process.
-    pub fn acknowledge_ready(&self) -> Result<(), String> {
+    pub fn acknowledge_ready(&self, version: Option<&str>) -> Result<(), String> {
         let Some(path) = &self.config.ready_file else {
             return Ok(());
         };
-        atomic_write(path, b"ready\n")?;
+        let version = version
+            .filter(|value| valid_version(value))
+            .ok_or_else(|| "replacement version is unavailable".to_owned())?;
         let current = self.config.directory.join("current");
         let current =
             fs::canonicalize(current).map_err(|_| "current release is unavailable".to_owned())?;
         replace_symlink(&current, &self.config.directory.join("last-known-good"))?;
         let mut status = self.status();
+        status.accepted_version = Some(version.to_owned());
         status.last_result = Some("applied".to_owned());
         save_status(&self.config.directory, &status)?;
+        // The watchdog may only declare success after every durable transition
+        // above has committed.
+        atomic_write(path, b"ready\n")?;
         Ok(())
     }
 
@@ -175,8 +297,19 @@ impl Manager {
             return Ok(());
         }
         status.last_check = Some(relay_core::rfc3339_timestamp());
-        audit("relay_update_started", Json::Object(vec![]));
-        let result = self.fetch_candidate(&status)?;
+        audit("relay_update_check_started", Json::Object(vec![]));
+        let result = match self.fetch_candidate(&status) {
+            Ok(result) => result,
+            Err(error) => {
+                status.last_result = Some(format!("check_failed:{error}"));
+                save_status(&self.config.directory, &status)?;
+                audit(
+                    "relay_update_failed",
+                    Json::Object(vec![("reason".to_owned(), Json::String(error.clone()))]),
+                );
+                return Err(error);
+            }
+        };
         let Some((manifest, candidate)) = result else {
             status.last_result = Some("no_new_release".to_owned());
             save_status(&self.config.directory, &status)?;
@@ -197,11 +330,7 @@ impl Manager {
         );
         // Set this before the drain so simultaneous authenticated spawns are
         // rejected, while reads and event delivery remain available.
-        if self
-            .draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !self.begin_drain()? {
             return Ok(());
         }
         while active_work() {
@@ -220,10 +349,11 @@ impl Manager {
             save_status(&self.config.directory, &status)?;
             audit(
                 "relay_update_failed",
-                update_payload(
+                failure_payload(
                     &status.accepted_version,
                     &manifest.version,
                     &manifest.sha256,
+                    error,
                 ),
             );
         }
@@ -232,6 +362,7 @@ impl Manager {
 
     fn fetch_candidate(&self, status: &Status) -> Result<Option<(Manifest, PathBuf)>, String> {
         let release = command_output(
+            self.runtime.as_ref(),
             "curl",
             [
                 "--fail",
@@ -256,16 +387,18 @@ impl Manager {
             return Ok(None);
         }
         let asset_url = release_asset_url(&release, MANIFEST)?;
-        let manifest_text = command_output(
-            "curl",
-            [
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                &asset_url,
-            ],
+        let manifest_path = self.config.directory.join("candidate-manifest.json");
+        download(self.runtime.as_ref(), &asset_url, &manifest_path)?;
+        // The manifest is itself an attested subject. This binds its version to
+        // the trusted workflow before release metadata can influence monotonicity.
+        verify_attestation(
+            self.runtime.as_ref(),
+            &manifest_path,
+            None,
+            &self.config.directory,
         )?;
+        let manifest_text = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("could not read release manifest: {e}"))?;
         let manifest = parse_manifest(&manifest_text)?;
         if manifest.version != tag || manifest.target != TARGET {
             return Err("release manifest version or target does not match".to_owned());
@@ -279,13 +412,18 @@ impl Manager {
         fs::create_dir_all(&candidate_dir)
             .map_err(|e| format!("could not create update directory: {e}"))?;
         let candidate = candidate_dir.join("zigzag");
-        download(&binary_url, &candidate)?;
-        if sha256_file(&candidate)? != manifest.sha256 {
+        download(self.runtime.as_ref(), &binary_url, &candidate)?;
+        if sha256_file(self.runtime.as_ref(), &candidate)? != manifest.sha256 {
             let _ = fs::remove_file(&candidate);
             return Err("release binary digest does not match manifest".to_owned());
         }
-        verify_codesign(&candidate)?;
-        verify_attestation(&candidate, &manifest.commit, &self.config.directory)?;
+        verify_codesign(self.runtime.as_ref(), &candidate)?;
+        verify_attestation(
+            self.runtime.as_ref(),
+            &candidate,
+            Some(&manifest.commit),
+            &self.config.directory,
+        )?;
         Ok(Some((manifest, candidate)))
     }
 
@@ -302,37 +440,49 @@ impl Manager {
         replace_symlink(candidate, &current)?;
         let ready = self.config.directory.join("candidate-ready");
         let _ = fs::remove_file(&ready);
-        let mut args = original_args.to_vec();
-        args.push("--update-ready-file".to_owned());
-        args.push(ready.to_string_lossy().into_owned());
+        let mut candidate_args = original_args.to_vec();
+        candidate_args.push("--update-ready-file".to_owned());
+        candidate_args.push(ready.to_string_lossy().into_owned());
         let watchdog = std::env::current_exe().map_err(|e| e.to_string())?;
-        Command::new(&watchdog)
-            .arg("update-watchdog")
-            .arg("--ready-file")
-            .arg(&ready)
-            .arg("--rollback")
-            .arg(&previous)
-            .arg("--current-link")
-            .arg(&current)
-            .arg("--secret-file")
-            .arg(secret_file)
-            .arg("--port")
-            .arg(health_port.to_string())
-            .arg("--")
-            .args(&args)
-            .spawn()
-            .map_err(|e| format!("could not start update watchdog: {e}"))?;
         let mut status = self.status();
-        status.accepted_version = Some(manifest.version.clone());
         status.last_result = Some("exec_pending_health_check".to_owned());
         save_status(&self.config.directory, &status)?;
+        let mut watchdog_args = vec![
+            "update-watchdog".to_owned(),
+            "--ready-file".to_owned(),
+            ready.to_string_lossy().into_owned(),
+            "--rollback".to_owned(),
+            previous.to_string_lossy().into_owned(),
+            "--current-link".to_owned(),
+            current.to_string_lossy().into_owned(),
+            "--status-dir".to_owned(),
+            self.config.directory.to_string_lossy().into_owned(),
+            "--candidate-version".to_owned(),
+            manifest.version.clone(),
+            "--secret-file".to_owned(),
+            secret_file.to_string_lossy().into_owned(),
+            "--port".to_owned(),
+            health_port.to_string(),
+            "--".to_owned(),
+        ];
+        // Rollback must receive the original arguments, never the candidate's
+        // readiness flag, or the old image could acknowledge a failed update.
+        watchdog_args.extend_from_slice(original_args);
+        if let Err(error) = self.runtime.spawn(&watchdog, &watchdog_args) {
+            replace_symlink(&previous, &current)?;
+            return Err(error);
+        }
         // Replacing this process preserves the LaunchAgent GUI session and its
         // Keychain access.  Never bootstrap/bootout the agent here.
-        let error = Command::new(candidate)
-            .env("ZIGZAG_UPDATE_VERSION", &manifest.version)
-            .args(args)
-            .exec();
-        Err(format!("could not exec verified candidate: {error}"))
+        if let Err(error) = self.runtime.exec(
+            candidate,
+            &candidate_args,
+            Some(("ZIGZAG_UPDATE_VERSION", &manifest.version)),
+        ) {
+            replace_symlink(&previous, &current)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn ensure_last_known_good(&self) -> Result<PathBuf, String> {
@@ -389,20 +539,50 @@ pub fn run_control(arguments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn persistent_server_args(arguments: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(arguments.len());
+    let mut values = arguments.iter();
+    while let Some(argument) = values.next() {
+        if argument == "--update-ready-file" {
+            let _ = values.next();
+        } else {
+            kept.push(argument.clone());
+        }
+    }
+    kept
+}
+
 pub fn run_watchdog(arguments: &[String]) -> Result<(), String> {
-    let (ready, rollback, current_link, secret_file, port, relay_args) = parse_watchdog(arguments)?;
-    let token =
-        fs::read_to_string(secret_file).map_err(|_| "could not read watchdog token".to_owned())?;
-    for _ in 0..60 {
-        if ready.exists() && healthy(port, token.trim()) {
+    run_watchdog_with(
+        parse_watchdog(arguments)?,
+        &SystemRuntime,
+        60,
+        || std::thread::sleep(Duration::from_secs(1)),
+        healthy,
+    )
+}
+
+fn run_watchdog_with(
+    config: WatchdogConfig,
+    runtime: &dyn Runtime,
+    attempts: usize,
+    wait: impl Fn(),
+    health_check: impl Fn(u16, &str) -> bool,
+) -> Result<(), String> {
+    let token = fs::read_to_string(&config.secret_file)
+        .map_err(|_| "could not read watchdog token".to_owned())?;
+    for _ in 0..attempts {
+        if config.ready.exists() && health_check(config.port, token.trim()) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(1));
+        wait();
     }
     eprintln!("candidate did not become healthy; rolling back");
-    replace_symlink(&rollback, &current_link)?;
-    let error = Command::new(rollback).args(relay_args).exec();
-    Err(format!("could not exec rollback binary: {error}"))
+    replace_symlink(&config.rollback, &config.current_link)?;
+    let mut status = read_status(&config.status_directory)?;
+    status.last_result = Some(format!("health_check_failed:{}", config.candidate_version));
+    save_status(&config.status_directory, &status)?;
+    runtime.exec(&config.rollback, &config.relay_args, None)
 }
 
 fn release_asset_url(release: &Json, expected: &str) -> Result<String, String> {
@@ -448,22 +628,31 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
-fn verify_codesign(candidate: &Path) -> Result<(), String> {
+fn verify_codesign(runtime: &dyn Runtime, candidate: &Path) -> Result<(), String> {
+    let requirement = format!(
+        "=designated => anchor apple generic and identifier \"com.shukantpal.zigzag\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
+    );
     command_status(
+        runtime,
         "codesign",
         [
             "--verify",
             "--strict",
             "--deep",
             "--verbose=2",
+            &format!("-R={requirement}"),
             &candidate.to_string_lossy(),
         ],
     )?;
-    let output = Command::new("codesign")
-        .args(["-d", "--verbose=4", &candidate.to_string_lossy()])
-        .output()
-        .map_err(|e| e.to_string())?;
-    let detail = String::from_utf8_lossy(&output.stderr);
+    let output = runtime.output(
+        "codesign",
+        &[
+            "-d".to_owned(),
+            "--verbose=4".to_owned(),
+            candidate.to_string_lossy().into_owned(),
+        ],
+    )?;
+    let detail = output.stderr;
     if !detail.contains("Identifier=com.shukantpal.zigzag")
         || !detail.contains(&format!("TeamIdentifier={TEAM_ID}"))
     {
@@ -472,37 +661,47 @@ fn verify_codesign(candidate: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_attestation(candidate: &Path, commit: &str, directory: &Path) -> Result<(), String> {
+fn verify_attestation(
+    runtime: &dyn Runtime,
+    candidate: &Path,
+    commit: Option<&str>,
+    directory: &Path,
+) -> Result<(), String> {
     let root = directory.join("sigstore-trusted-root.json");
-    if !root.exists() {
-        atomic_write(&root, TRUST_ROOT.as_bytes())?;
+    // Always use the reviewed roots embedded in the running verified image.
+    atomic_write(&root, TRUST_ROOT.as_bytes())?;
+    let mut args = vec![
+        "attestation".to_owned(),
+        "verify".to_owned(),
+        candidate.to_string_lossy().into_owned(),
+        "--repo".to_owned(),
+        REPOSITORY.to_owned(),
+        "--signer-workflow".to_owned(),
+        WORKFLOW.to_owned(),
+        "--source-ref".to_owned(),
+        "refs/heads/main".to_owned(),
+    ];
+    if let Some(commit) = commit {
+        args.extend(["--source-digest".to_owned(), commit.to_owned()]);
     }
-    command_status(
-        "gh",
-        [
-            "attestation",
-            "verify",
-            &candidate.to_string_lossy(),
-            "--repo",
-            REPOSITORY,
-            "--signer-workflow",
-            WORKFLOW,
-            "--source-ref",
-            "refs/heads/main",
-            "--source-digest",
-            commit,
-            "--predicate-type",
-            "https://slsa.dev/provenance/v1",
-            "--custom-trusted-root",
-            &root.to_string_lossy(),
-        ],
-    )
+    args.extend([
+        "--predicate-type".to_owned(),
+        "https://slsa.dev/provenance/v1".to_owned(),
+        "--custom-trusted-root".to_owned(),
+        root.to_string_lossy().into_owned(),
+    ]);
+    runtime.status("gh", &args)
 }
 
-fn download(url: &str, output: &Path) -> Result<(), String> {
+fn download(runtime: &dyn Runtime, url: &str, output: &Path) -> Result<(), String> {
+    let parent = output
+        .parent()
+        .ok_or_else(|| "download path has no parent".to_owned())?;
+    fs::create_dir_all(parent).map_err(|e| format!("could not create update directory: {e}"))?;
     let temporary = output.with_extension("download");
     let _ = fs::remove_file(&temporary);
     command_status(
+        runtime,
         "curl",
         [
             "--fail",
@@ -520,30 +719,20 @@ fn download(url: &str, output: &Path) -> Result<(), String> {
 }
 
 fn command_output<'a>(
+    runtime: &dyn Runtime,
     command: &str,
     args: impl IntoIterator<Item = &'a str>,
 ) -> Result<String, String> {
-    let output = Command::new(command)
-        .args(args)
-        .output()
-        .map_err(|e| format!("could not run {command}: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("{command} failed"));
-    }
-    String::from_utf8(output.stdout).map_err(|_| format!("{command} returned non-UTF-8 output"))
+    let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    runtime.output(command, &args).map(|output| output.stdout)
 }
 fn command_status<'a>(
+    runtime: &dyn Runtime,
     command: &str,
     args: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), String> {
-    let status = Command::new(command)
-        .args(args)
-        .status()
-        .map_err(|e| format!("could not run {command}: {e}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("{command} verification failed"))
+    let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    runtime.status(command, &args)
 }
 
 fn update_payload(old: &Option<String>, new: &str, digest: &str) -> Json {
@@ -555,6 +744,14 @@ fn update_payload(old: &Option<String>, new: &str, digest: &str) -> Json {
         ("new_version".to_owned(), Json::String(new.to_owned())),
         ("sha256".to_owned(), Json::String(digest.to_owned())),
     ])
+}
+
+fn failure_payload(old: &Option<String>, new: &str, digest: &str, reason: &str) -> Json {
+    let Json::Object(mut values) = update_payload(old, new, digest) else {
+        unreachable!("update payload is an object")
+    };
+    values.push(("reason".to_owned(), Json::String(reason.to_owned())));
+    Json::Object(values)
 }
 
 fn parse_control(arguments: &[String]) -> Result<(PathBuf, Vec<String>), String> {
@@ -569,11 +766,13 @@ fn parse_control(arguments: &[String]) -> Result<(PathBuf, Vec<String>), String>
     }
     Ok((PathBuf::from(directory), rest.to_vec()))
 }
-fn parse_watchdog(arguments: &[String]) -> Result<WatchdogArgs, String> {
+fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
     let mut values = arguments.iter();
     let mut ready = None;
     let mut rollback = None;
     let mut current_link = None;
+    let mut status_directory = None;
+    let mut candidate_version = None;
     let mut secret = None;
     let mut port = None;
     while let Some(arg) = values.next() {
@@ -587,19 +786,25 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogArgs, String> {
             "--ready-file" => ready = Some(PathBuf::from(value)),
             "--rollback" => rollback = Some(PathBuf::from(value)),
             "--current-link" => current_link = Some(PathBuf::from(value)),
+            "--status-dir" => status_directory = Some(PathBuf::from(value)),
+            "--candidate-version" if valid_version(value) => {
+                candidate_version = Some(value.clone())
+            }
             "--secret-file" => secret = Some(PathBuf::from(value)),
             "--port" => port = Some(value.parse::<u16>().map_err(|_| "invalid watchdog port")?),
             _ => return Err("invalid update watchdog arguments".to_owned()),
         }
     }
-    Ok((
-        ready.ok_or("missing watchdog ready file")?,
-        rollback.ok_or("missing rollback binary")?,
-        current_link.ok_or("missing current release link")?,
-        secret.ok_or("missing watchdog secret")?,
-        port.ok_or("missing watchdog port")?,
-        values.cloned().collect(),
-    ))
+    Ok(WatchdogConfig {
+        ready: ready.ok_or("missing watchdog ready file")?,
+        rollback: rollback.ok_or("missing rollback binary")?,
+        current_link: current_link.ok_or("missing current release link")?,
+        status_directory: status_directory.ok_or("missing watchdog status directory")?,
+        candidate_version: candidate_version.ok_or("missing watchdog candidate version")?,
+        secret_file: secret.ok_or("missing watchdog secret")?,
+        port: port.ok_or("missing watchdog port")?,
+        relay_args: values.cloned().collect(),
+    })
 }
 
 fn healthy(port: u16, token: &str) -> bool {
@@ -716,6 +921,8 @@ fn replace_symlink(target: &Path, link: &Path) -> Result<(), String> {
         link.file_name().unwrap_or_default().to_string_lossy()
     ));
     let _ = fs::remove_file(&temporary);
+    let target = fs::canonicalize(target)
+        .map_err(|e| format!("could not resolve symlink target {}: {e}", target.display()))?;
     symlink(target, &temporary).map_err(|e| e.to_string())?;
     fs::rename(temporary, link).map_err(|e| e.to_string())
 }
@@ -743,155 +950,546 @@ fn valid_commit(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
-    loop {
-        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finish().iter().map(|b| format!("{b:02x}")).collect())
+fn sha256_file(runtime: &dyn Runtime, path: &Path) -> Result<String, String> {
+    let output = command_output(runtime, "shasum", ["-a", "256", &path.to_string_lossy()])?;
+    output
+        .split_whitespace()
+        .next()
+        .filter(|digest| valid_sha256(digest))
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "shasum returned an invalid digest".to_owned())
 }
-struct Sha256 {
-    state: [u32; 8],
-    data: Vec<u8>,
-    length: u64,
-}
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            data: Vec::new(),
-            length: 0,
-        }
-    }
-    fn update(&mut self, input: &[u8]) {
-        self.length += input.len() as u64;
-        self.data.extend_from_slice(input);
-        while self.data.len() >= 64 {
-            let block: self::Block = self.data[..64].try_into().expect("block");
-            self.block(&block);
-            self.data.drain(..64);
-        }
-    }
-    fn finish(mut self) -> [u8; 32] {
-        let bits = self.length * 8;
-        self.data.push(0x80);
-        while self.data.len() % 64 != 56 {
-            self.data.push(0);
-        }
-        self.data.extend_from_slice(&bits.to_be_bytes());
-        while !self.data.is_empty() {
-            let block: Block = self.data[..64].try_into().expect("block");
-            self.block(&block);
-            self.data.drain(..64);
-        }
-        let mut output = [0; 32];
-        for (i, value) in self.state.iter().enumerate() {
-            output[i * 4..i * 4 + 4].copy_from_slice(&value.to_be_bytes());
-        }
-        output
-    }
-    fn block(&mut self, block: &Block) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut w = [0u32; 64];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            let offset = i * 4;
-            *word = u32::from_be_bytes(block[offset..offset + 4].try_into().expect("word"));
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
-            self.state[0],
-            self.state[1],
-            self.state[2],
-            self.state[3],
-            self.state[4],
-            self.state[5],
-            self.state[6],
-            self.state[7],
-        );
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
-        self.state[5] = self.state[5].wrapping_add(f);
-        self.state[6] = self.state[6].wrapping_add(g);
-        self.state[7] = self.state[7].wrapping_add(h);
-    }
-}
-type Block = [u8; 64];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    #[derive(Clone, Debug)]
+    struct Call {
+        operation: &'static str,
+        command: String,
+        args: Vec<String>,
+    }
+
+    struct MockRuntime {
+        release: String,
+        downloads: Mutex<VecDeque<Vec<u8>>>,
+        digest: String,
+        codesign_detail: String,
+        calls: Mutex<Vec<Call>>,
+        status_index: AtomicUsize,
+        fail_status_at: Option<usize>,
+        fail_spawn: bool,
+    }
+
+    impl MockRuntime {
+        fn release(manifest: &str, binary: &[u8], digest: &str) -> Arc<Self> {
+            Arc::new(Self {
+                release: r#"{"tag_name":"v2.0.0","assets":[{"name":"zigzag-macos-aarch64.manifest.json","browser_download_url":"https://example.test/manifest"},{"name":"zigzag-macos-aarch64","browser_download_url":"https://example.test/binary"}]}"#.to_owned(),
+                downloads: Mutex::new(VecDeque::from([
+                    manifest.as_bytes().to_vec(),
+                    binary.to_vec(),
+                ])),
+                digest: digest.to_owned(),
+                codesign_detail:
+                    "Identifier=com.shukantpal.zigzag\nTeamIdentifier=NH5F3PDHQ8\n".to_owned(),
+                calls: Mutex::new(Vec::new()),
+                status_index: AtomicUsize::new(0),
+                fail_status_at: None,
+                fail_spawn: false,
+            })
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn exec_calls(&self) -> Vec<Call> {
+            self.calls()
+                .into_iter()
+                .filter(|call| call.operation == "exec")
+                .collect()
+        }
+    }
+
+    impl Runtime for MockRuntime {
+        fn output(&self, command: &str, args: &[String]) -> Result<CommandOutput, String> {
+            self.calls.lock().unwrap().push(Call {
+                operation: "output",
+                command: command.to_owned(),
+                args: args.to_vec(),
+            });
+            match command {
+                "curl" => Ok(CommandOutput {
+                    stdout: self.release.clone(),
+                    stderr: String::new(),
+                }),
+                "shasum" => Ok(CommandOutput {
+                    stdout: format!("{}  {}\n", self.digest, args.last().unwrap()),
+                    stderr: String::new(),
+                }),
+                "codesign" => Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: self.codesign_detail.clone(),
+                }),
+                _ => Err(format!("unexpected output command: {command}")),
+            }
+        }
+
+        fn status(&self, command: &str, args: &[String]) -> Result<(), String> {
+            let index = self.status_index.fetch_add(1, AtomicOrdering::SeqCst);
+            self.calls.lock().unwrap().push(Call {
+                operation: "status",
+                command: command.to_owned(),
+                args: args.to_vec(),
+            });
+            if command == "curl" {
+                let output_index = args
+                    .iter()
+                    .position(|arg| arg == "--output")
+                    .expect("curl output argument")
+                    + 1;
+                let bytes = self
+                    .downloads
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("queued download");
+                fs::write(&args[output_index], bytes).unwrap();
+            }
+            if self.fail_status_at == Some(index) {
+                return Err(if command == "gh" {
+                    "attestation verification failed".to_owned()
+                } else {
+                    format!("{command} verification failed")
+                });
+            }
+            Ok(())
+        }
+
+        fn spawn(&self, command: &Path, args: &[String]) -> Result<(), String> {
+            self.calls.lock().unwrap().push(Call {
+                operation: "spawn",
+                command: command.to_string_lossy().into_owned(),
+                args: args.to_vec(),
+            });
+            if self.fail_spawn {
+                Err("watchdog spawn failed".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn exec(
+            &self,
+            command: &Path,
+            args: &[String],
+            environment: Option<(&str, &str)>,
+        ) -> Result<(), String> {
+            let mut recorded = args.to_vec();
+            if let Some((name, value)) = environment {
+                recorded.push(format!("{name}={value}"));
+            }
+            self.calls.lock().unwrap().push(Call {
+                operation: "exec",
+                command: command.to_string_lossy().into_owned(),
+                args: recorded,
+            });
+            Err("exec intercepted".to_owned())
+        }
+    }
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let id = TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("zigzag-update-{label}-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn manager(dir: &Path, runtime: Arc<dyn Runtime>, ready_file: Option<PathBuf>) -> Manager {
+        Manager::with_runtime(
+            Config {
+                directory: dir.to_path_buf(),
+                interval: Duration::ZERO,
+                policy: Policy::Enabled,
+                ready_file,
+            },
+            runtime,
+        )
+    }
+
+    fn manifest(version: &str, target: &str, digest: &str) -> String {
+        format!(
+            r#"{{"version":"{version}","target":"{target}","sha256":"{digest}","commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#
+        )
+    }
+
+    fn empty_status() -> Status {
+        Status {
+            policy: Policy::Enabled,
+            accepted_version: Some("v1.0.0".to_owned()),
+            last_check: None,
+            last_result: None,
+        }
+    }
+
     #[test]
     fn parses_only_safe_manifest() {
-        let m=parse_manifest(r#"{"version":"v1.2.3","target":"aarch64-apple-darwin","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#).unwrap();
-        assert_eq!(m.version, "v1.2.3");
+        let parsed = parse_manifest(&manifest(
+            "v1.2.3",
+            TARGET,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+        .unwrap();
+        assert_eq!(parsed.version, "v1.2.3");
         assert!(
             parse_manifest(r#"{"version":"later","target":"x","sha256":"no","commit":"no"}"#)
                 .is_err()
         );
     }
+
+    #[test]
+    fn fetch_candidate_verifies_every_authenticated_boundary() {
+        let dir = temp_dir("fetch-ok");
+        let digest = "a".repeat(64);
+        let runtime =
+            MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary", &digest);
+        let updater = manager(&dir, runtime.clone(), None);
+
+        let (verified, candidate) = updater
+            .fetch_candidate(&empty_status())
+            .unwrap()
+            .expect("new candidate");
+        assert_eq!(verified.version, "v2.0.0");
+        assert_eq!(fs::read(candidate).unwrap(), b"binary");
+
+        let calls = runtime.calls();
+        let attestations = calls
+            .iter()
+            .filter(|call| call.command == "gh")
+            .collect::<Vec<_>>();
+        assert_eq!(attestations.len(), 2);
+        for call in &attestations {
+            let joined = call.args.join(" ");
+            assert!(joined.contains("--repo ShukantPal/zigzag"));
+            assert!(
+                joined.contains("--signer-workflow ShukantPal/zigzag/.github/workflows/ci.yml")
+            );
+            assert!(joined.contains("--source-ref refs/heads/main"));
+            assert!(joined.contains("--custom-trusted-root"));
+        }
+        assert!(
+            !attestations[0]
+                .args
+                .iter()
+                .any(|arg| arg == "--source-digest"),
+            "the manifest is authenticated before its claimed commit is trusted"
+        );
+        assert!(attestations[1].args.windows(2).any(|args| {
+            args == [
+                "--source-digest",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ]
+        }));
+        let codesign = calls
+            .iter()
+            .find(|call| call.command == "codesign" && call.operation == "status")
+            .unwrap();
+        assert!(codesign.args.iter().any(|arg| {
+            arg.contains("anchor apple generic")
+                && arg.contains("identifier \"com.shukantpal.zigzag\"")
+                && arg.contains("certificate leaf[subject.OU] = \"NH5F3PDHQ8\"")
+        }));
+        let root = fs::read_to_string(dir.join("sigstore-trusted-root.json")).unwrap();
+        assert!(root.contains("fulcio.githubapp.com"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fetch_candidate_rejects_tag_target_digest_codesign_and_attestation_mismatches() {
+        let digest = "a".repeat(64);
+        let cases = [
+            (
+                "v1.9.0",
+                TARGET,
+                digest.clone(),
+                None,
+                None,
+                "version or target",
+            ),
+            (
+                "v2.0.0",
+                "x86_64-apple-darwin",
+                digest.clone(),
+                None,
+                None,
+                "version or target",
+            ),
+            ("v2.0.0", TARGET, "b".repeat(64), None, None, "digest"),
+            (
+                "v2.0.0",
+                TARGET,
+                digest.clone(),
+                Some("bad identity"),
+                None,
+                "code-signing",
+            ),
+            (
+                "v2.0.0",
+                TARGET,
+                digest.clone(),
+                None,
+                Some(4),
+                "attestation",
+            ),
+        ];
+        for (tag, target, manifest_digest, detail, fail_at, expected) in cases {
+            let dir = temp_dir(expected);
+            let mut runtime =
+                MockRuntime::release(&manifest(tag, target, &manifest_digest), b"binary", &digest);
+            let inner = Arc::get_mut(&mut runtime).unwrap();
+            if let Some(detail) = detail {
+                inner.codesign_detail = detail.to_owned();
+            }
+            inner.fail_status_at = fail_at;
+            let updater = manager(&dir, runtime, None);
+            let error = updater.fetch_candidate(&empty_status()).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn failed_discovery_persists_status_and_emits_an_audit_fact() {
+        let dir = temp_dir("failed-check");
+        let runtime = Arc::new(MockRuntime {
+            release: "not json".to_owned(),
+            downloads: Mutex::new(VecDeque::new()),
+            digest: String::new(),
+            codesign_detail: String::new(),
+            calls: Mutex::new(Vec::new()),
+            status_index: AtomicUsize::new(0),
+            fail_status_at: None,
+            fail_spawn: false,
+        });
+        let updater = manager(&dir, runtime, None);
+        save_status(&dir, &empty_status()).unwrap();
+        let events = Mutex::new(Vec::new());
+        let result = updater.check_and_apply(
+            &|| false,
+            &|kind, _| events.lock().unwrap().push(kind.to_owned()),
+            &[],
+            &dir.join("secret"),
+            1,
+        );
+        assert!(result.is_err());
+        let status = read_status(&dir).unwrap();
+        assert!(status.last_check.is_some());
+        assert!(status.last_result.unwrap().starts_with("check_failed:"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["relay_update_check_started", "relay_update_failed"]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_waits_for_admitted_spawn_and_active_work_before_exec() {
+        let dir = temp_dir("drain");
+        let digest = "a".repeat(64);
+        let runtime =
+            MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary", &digest);
+        let updater = Arc::new(manager(&dir, runtime.clone(), None));
+        save_status(&dir, &empty_status()).unwrap();
+
+        let admission = updater.spawn_admission().unwrap().unwrap();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let drain_updater = Arc::clone(&updater);
+        let drain = thread::spawn(move || {
+            let result = drain_updater.begin_drain().unwrap();
+            drained_tx.send(result).unwrap();
+        });
+        assert!(drained_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(admission);
+        assert!(drained_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        drain.join().unwrap();
+        assert!(updater.spawn_admission().unwrap().is_none());
+
+        updater.draining.store(false, Ordering::Release);
+        let active = Arc::new(AtomicBool::new(true));
+        let active_for_check = Arc::clone(&active);
+        let check_updater = Arc::clone(&updater);
+        let secret = dir.join("secret");
+        let check = thread::spawn(move || {
+            check_updater.check_and_apply(
+                &|| active_for_check.load(Ordering::Acquire),
+                &|_, _| {},
+                &[],
+                &secret,
+                1,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !updater.is_draining() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(updater.is_draining());
+        assert!(runtime.exec_calls().is_empty());
+        active.store(false, Ordering::Release);
+        assert!(check.join().unwrap().is_err());
+        assert_eq!(runtime.exec_calls().len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn watchdog_spawn_failure_restores_current_pointer() {
+        let dir = temp_dir("watchdog-spawn");
+        let previous = dir.join("previous");
+        let candidate = dir.join("candidate");
+        fs::write(&previous, b"old").unwrap();
+        fs::write(&candidate, b"new").unwrap();
+        replace_symlink(&previous, &dir.join("last-known-good")).unwrap();
+        let mut runtime = MockRuntime::release("", b"", "");
+        Arc::get_mut(&mut runtime).unwrap().fail_spawn = true;
+        let updater = manager(&dir, runtime, None);
+        let result = updater.activate_and_exec(
+            &Manifest {
+                version: "v2.0.0".to_owned(),
+                target: TARGET.to_owned(),
+                sha256: "a".repeat(64),
+                commit: "b".repeat(40),
+            },
+            &candidate,
+            &[],
+            &dir.join("secret"),
+            1,
+        );
+        assert!(result.unwrap_err().contains("watchdog spawn failed"));
+        assert_eq!(
+            fs::canonicalize(dir.join("current")).unwrap(),
+            fs::canonicalize(previous).unwrap()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readiness_commits_acceptance_and_unhealthy_candidate_rolls_back() {
+        let dir = temp_dir("watchdog");
+        let previous = dir.join("previous");
+        let candidate = dir.join("candidate");
+        let current = dir.join("current");
+        let ready = dir.join("ready");
+        let secret = dir.join("secret");
+        fs::write(&previous, b"old").unwrap();
+        fs::write(&candidate, b"new").unwrap();
+        fs::write(&secret, b"token\n").unwrap();
+        replace_symlink(&candidate, &current).unwrap();
+        save_status(&dir, &empty_status()).unwrap();
+
+        let runtime = MockRuntime::release("", b"", "");
+        let updater = manager(&dir, runtime.clone(), Some(ready.clone()));
+        updater.acknowledge_ready(Some("v2.0.0")).unwrap();
+        let applied = read_status(&dir).unwrap();
+        assert_eq!(applied.accepted_version.as_deref(), Some("v2.0.0"));
+        assert_eq!(applied.last_result.as_deref(), Some("applied"));
+        assert!(ready.exists());
+        assert_eq!(
+            fs::canonicalize(dir.join("last-known-good")).unwrap(),
+            fs::canonicalize(&candidate).unwrap()
+        );
+
+        // Recreate the pending state for an unhealthy replacement. Accepted
+        // remains the previous version and rollback never receives a ready flag.
+        let mut pending = empty_status();
+        pending.last_result = Some("exec_pending_health_check".to_owned());
+        save_status(&dir, &pending).unwrap();
+        fs::remove_file(&ready).unwrap();
+        replace_symlink(&candidate, &current).unwrap();
+        let result = run_watchdog_with(
+            WatchdogConfig {
+                ready,
+                rollback: previous.clone(),
+                current_link: current.clone(),
+                status_directory: dir.clone(),
+                candidate_version: "v2.0.0".to_owned(),
+                secret_file: secret,
+                port: 1,
+                relay_args: vec!["--port".to_owned(), "8765".to_owned()],
+            },
+            runtime.as_ref(),
+            1,
+            || {},
+            |_, _| false,
+        );
+        assert!(result.unwrap_err().contains("exec intercepted"));
+        assert_eq!(
+            fs::canonicalize(current).unwrap(),
+            fs::canonicalize(previous).unwrap()
+        );
+        let rolled_back = read_status(&dir).unwrap();
+        assert_eq!(rolled_back.accepted_version.as_deref(), Some("v1.0.0"));
+        assert_eq!(
+            rolled_back.last_result.as_deref(),
+            Some("health_check_failed:v2.0.0")
+        );
+        let rollback_exec = runtime.exec_calls().pop().unwrap();
+        assert!(
+            !rollback_exec
+                .args
+                .iter()
+                .any(|arg| arg == "--update-ready-file")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn health_probe_requires_the_authenticated_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 1024];
+                let length = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                let status = if request.contains("Authorization: Bearer token\r\n") {
+                    "200 OK"
+                } else {
+                    "401 Unauthorized"
+                };
+                stream
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .unwrap();
+            }
+        });
+        assert!(!healthy(port, "wrong"));
+        assert!(healthy(port, "token"));
+        server.join().unwrap();
+    }
+
     #[test]
     fn sha256_matches_known_vector() {
-        let path = std::env::temp_dir().join("zigzag-sha256-test");
+        let path = temp_dir("sha").join("value");
         fs::write(&path, b"abc").unwrap();
         assert_eq!(
-            sha256_file(&path).unwrap(),
+            sha256_file(&SystemRuntime, &path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
+
     #[test]
     fn status_controls_persist() {
-        let dir = std::env::temp_dir().join(format!("zigzag-update-status-{}", std::process::id()));
+        let dir = temp_dir("status");
         let args = vec![
             "--dir".to_owned(),
             dir.to_string_lossy().into_owned(),
@@ -905,11 +1503,25 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+
     #[test]
-    fn rollback_pointer_is_replaced_atomically() {
-        let dir =
-            std::env::temp_dir().join(format!("zigzag-update-pointer-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+    fn readiness_argument_is_not_forwarded_to_later_candidates_or_rollbacks() {
+        assert_eq!(
+            persistent_server_args(&[
+                "--port".to_owned(),
+                "8765".to_owned(),
+                "--update-ready-file".to_owned(),
+                "/tmp/old-ready".to_owned(),
+                "--max-events".to_owned(),
+                "100".to_owned(),
+            ]),
+            ["--port", "8765", "--max-events", "100"]
+        );
+    }
+
+    #[test]
+    fn rollback_pointer_is_replaced_atomically_with_an_absolute_target() {
+        let dir = temp_dir("pointer");
         let old = dir.join("old");
         let new = dir.join("new");
         fs::write(&old, b"old").unwrap();
@@ -917,7 +1529,7 @@ mod tests {
         let link = dir.join("current");
         replace_symlink(&old, &link).unwrap();
         replace_symlink(&new, &link).unwrap();
-        assert_eq!(fs::read_link(link).unwrap(), new);
+        assert_eq!(fs::read_link(link).unwrap(), fs::canonicalize(new).unwrap());
         let _ = fs::remove_dir_all(dir);
     }
 }

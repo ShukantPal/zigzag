@@ -88,16 +88,17 @@ cargo fmt --all --check
 ## Verified relay updates
 
 On every successful `main` build, CI produces a signed ARM64 relay binary, a
-SHA-256 manifest, and a GitHub SLSA provenance attestation. The newest
+SHA-256 manifest, and GitHub SLSA provenance attestations for both files. The newest
 non-prerelease GitHub Release is the floating discovery location; it is never
 trusted merely because it is named `latest`.
 
 The relay checks hourly by default. Before accepting an update it requires the
 release target/version to be newer, the manifest digest to match, the expected
-Apple code-signing identifier and team, and a GitHub attestation verified with
-the bundled Sigstore trust root. Verification constrains the repository,
-`release.yml` workflow, and `main` source ref/commit. A root rotation is a
-reviewed source change: downloaded release metadata cannot replace it.
+Apple-anchored code-signing identifier and team, an attested manifest, and an
+attested binary verified with the bundled GitHub and Sigstore trust roots.
+Verification constrains the repository, `ci.yml` workflow, and `main` source
+ref/commit. A root rotation is a reviewed source change embedded in each relay;
+downloaded release metadata and stale on-disk material cannot replace it.
 
 Install the initial relay under the managed directory and configure the
 LaunchAgent to execute its stable `current` symlink, for example
@@ -130,8 +131,8 @@ failed result are schema-v1 `mac-relay` audit events under `task_id=relay-update
 Auto-update is deliberate remote code execution. A network attacker, a forged
 manifest, an altered release asset, or an unrelated GitHub workflow cannot
 pass the digest and identity-constrained attestation verification. Shipping a
-malicious relay requires a valid provenance record from the pinned Zigzag
-release workflow (or compromise of the local trusted binary/state). A
+malicious relay requires valid provenance records from the pinned Zigzag CI
+workflow (or compromise of the local trusted binary/state). A
 repository maintainer, protected workflow, GitHub Actions credential, or GitHub
 organization compromise can still produce a trusted malicious release; those
 are the remaining trust assumptions, not claims this mechanism eliminates.

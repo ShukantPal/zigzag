@@ -188,7 +188,7 @@ fn run() -> Result<(), String> {
     // and rebound both listeners. The watchdog rolls back if this does not
     // happen; no launchctl restart is involved.
     let replacement_version = env::var("ZIGZAG_UPDATE_VERSION").ok();
-    updater.acknowledge_ready()?;
+    updater.acknowledge_ready(replacement_version.as_deref())?;
     if let Some(version) = replacement_version {
         let execution_id = new_execution_id()?;
         state.store.add(relay_event(
@@ -200,7 +200,8 @@ fn run() -> Result<(), String> {
     }
     let update_state = Arc::clone(&state);
     let update_audit_state = Arc::clone(&state);
-    let update_execution = new_execution_id()?;
+    let update_execution = Mutex::new(None::<String>);
+    let update_arguments = update::persistent_server_args(&arguments);
     updater.start(
         Arc::new(move || {
             !update_state
@@ -210,14 +211,22 @@ fn run() -> Result<(), String> {
                 .is_empty()
         }),
         Arc::new(move |kind, payload| {
-            let _ = update_audit_state.store.add(relay_event(
-                kind,
-                "relay-update",
-                &update_execution,
-                payload,
-            ));
+            let Ok(mut execution_id) = update_execution.lock() else {
+                return;
+            };
+            if kind == "relay_update_check_started" || execution_id.is_none() {
+                *execution_id = new_execution_id().ok();
+            }
+            if let Some(execution_id) = execution_id.as_deref() {
+                let _ = update_audit_state.store.add(relay_event(
+                    kind,
+                    "relay-update",
+                    execution_id,
+                    payload,
+                ));
+            }
         }),
-        arguments,
+        update_arguments,
         config.secret_file.clone(),
         config.port,
     );
@@ -954,6 +963,16 @@ fn spawn_request(
     let path = match policy_path_or_denial(&policy, &request.command) {
         Ok(path) => path,
         Err(denial) => return reply(stream, 200, denial),
+    };
+    // The updater takes the same gate while setting `draining`, so a child
+    // cannot appear between the drain check and its durable registry record.
+    let _spawn_admission = match state.updater.spawn_admission() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 503, error("updates_draining")),
+        Err(message) => {
+            eprintln!("spawn admission failed: {message}");
+            return reply(stream, 500, error("could_not_admit_process"));
+        }
     };
     if state
         .store
@@ -1789,6 +1808,7 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
@@ -2028,6 +2048,26 @@ mod tests {
             assert!(!entries.contains_key(&handle));
             assert!(handles.insert(handle));
         }
+    }
+
+    #[test]
+    fn spawn_is_rejected_while_update_drain_is_active() {
+        let (state, state_path) = test_server();
+        state.updater.begin_drain().unwrap();
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/spawn",
+            r#"{"id":"during-drain","bin":"sh","args":["-c","true"]}"#,
+        );
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.ends_with(r#"{"error":"updates_draining"}"#));
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
