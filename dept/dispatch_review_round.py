@@ -71,22 +71,29 @@ def repo_key(repo):
     return f"{slug}-{hashlib.sha256(repo.encode()).hexdigest()[:12]}"
 
 
-def round_files(repo, pr):
-    """Return non-superseded rounds; superseded rounds do not consume the cap."""
+def stored_rounds(repo, pr):
+    """Return every persisted round for monotonic numbering."""
     rounds = []
     for path in ROUNDS_DIR.glob(f"{repo_key(repo)}-pr{pr}-*.json"):
         try:
             data = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if data.get("repo") != repo or str(data.get("status", "")).startswith("superseded"):
+        if data.get("repo") != repo:
             continue
         rounds.append((path, data))
     return rounds
 
 
+def round_files(repo, pr):
+    """Return non-superseded rounds; superseded rounds do not consume the cap."""
+    return [(path, data) for path, data in stored_rounds(repo, pr)
+            if not str(data.get("status", "")).startswith("superseded")]
+
+
 def next_round_number(repo, pr):
-    return max((int(data.get("round", 0)) for _, data in round_files(repo, pr)), default=0) + 1
+    return max((int(data.get("round", 0)) for _, data in stored_rounds(repo, pr)),
+               default=0) + 1
 
 
 def task_id(output):

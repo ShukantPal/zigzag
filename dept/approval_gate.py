@@ -77,14 +77,21 @@ def mac(cmd):
 def fetch_pr(repo, pr):
     out = mac(
         f"gh pr view {pr} --repo {repo} "
-        "--json headRefOid,comments,reviews,statusCheckRollup "
+        "--json headRefOid,comments,statusCheckRollup "
         "-q '{head: .headRefOid, comments: [.comments[] | "
         "{author: .author.login, body, createdAt, id}], "
-        "reviews: [.reviews[] | {author: .author.login, state, submittedAt, id, "
-        "commit: .commit.oid}], "
         "checks: [.statusCheckRollup[] | {name, conclusion, status}]}'"
     )
-    return json.loads(out)
+    data = json.loads(out)
+    pages = json.loads(mac(
+        f"gh api --paginate --slurp repos/{repo}/pulls/{pr}/reviews"))
+    data["reviews"] = [
+        {"author": (review.get("user") or {}).get("login"),
+         "state": review.get("state"), "submittedAt": review.get("submitted_at"),
+         "id": review.get("id"), "commit": review.get("commit_id")}
+        for page in pages for review in page
+    ]
+    return data
 
 
 def latest_verdicts(comments):
@@ -116,13 +123,15 @@ def latest_verdicts(comments):
 def current_human_approval(reviews, head, actors):
     """Return a latest current-head approval from a distinct trusted actor."""
     latest = {}
-    for review in reviews:
+    for position, review in enumerate(reviews):
         author = review.get("author")
         state = (review.get("state") or "").upper()
         if author not in actors or state not in ("APPROVED", "CHANGES_REQUESTED",
                                                  "DISMISSED"):
             continue
-        key = (review.get("submittedAt") or "", review.get("id") or "")
+        review_id = review.get("id")
+        key = (review.get("submittedAt") or "",
+               review_id if isinstance(review_id, int) else position)
         if author not in latest or key > latest[author][0]:
             latest[author] = (key, review)
     for author, (_, review) in latest.items():
@@ -171,6 +180,7 @@ def check(repo, pr, lenses):
 
     # --- review-team approvals ---
     verdicts = latest_verdicts(data.get("comments") or [])
+    latest_round = max((v[3] for v in verdicts.values()), default=None)
     approvals = {}
     for lens in lenses:
         v = verdicts.get(lens)
@@ -182,7 +192,10 @@ def check(repo, pr, lenses):
         approvals[lens] = {"verdict": verdict, "head": vhead,
                            "on_current_head": vhead == head,
                            "round": round_number}
-        if verdict != "APPROVE":
+        if round_number != latest_round:
+            reasons.append(f"[{lens}] verdict is from round {round_number}; "
+                           f"latest round is {latest_round}")
+        elif verdict != "APPROVE":
             reasons.append(f"[{lens}] latest verdict is {verdict} (not APPROVE)")
         elif vhead != head:
             reasons.append(f"[{lens}] APPROVE is stale: reviewed {vhead[:8]}, "
@@ -197,7 +210,7 @@ def check(repo, pr, lenses):
 
     result = {"pass": not reasons, "reasons": reasons, "warnings": warnings,
               "repo": repo, "pr": pr, "head": head, "approvals": approvals,
-              "human_approval": human_approval}
+              "review_round": latest_round, "human_approval": human_approval}
     return result
 
 

@@ -29,7 +29,8 @@ cd "$d" || exit 3
 
 CODEX="${CODEX:-/run/current-system/sw/bin/codex}"
 if [ -f "$rdir/read-only.txt" ]; then
-  set -- exec --json --sandbox read-only --skip-git-repo-check
+  set -- exec --json --sandbox read-only --ignore-user-config --ignore-rules \
+    --skip-git-repo-check
 else
   set -- exec --json --approve-for-me --skip-git-repo-check
 fi

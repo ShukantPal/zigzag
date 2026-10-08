@@ -141,6 +141,7 @@ class CommandDispatchTest(unittest.TestCase):
             department.dispatch_task("/project", b"prompt", True, read_only=True)
         launch = str(ssh.call_args_list[-1].args[0])
         self.assertIn("--sandbox read-only", launch)
+        self.assertIn("--ignore-user-config --ignore-rules", launch)
         self.assertNotIn("--approve-for-me", launch)
 
     def test_read_only_prompt_omits_relay_announcement(self):

@@ -313,14 +313,5 @@ class ProjectBusyTest(unittest.TestCase):
             "session_id": "legacy-session", "active_task": "t-new",
         })
 
-    def test_duplicate_poll_is_refused_while_round_lock_is_held(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "round.json"
-            path.write_text("{}")
-            with open(f"{path}.lock", "w") as lock:
-                watcher.fcntl.flock(lock, watcher.fcntl.LOCK_EX | watcher.fcntl.LOCK_NB)
-                self.assertIn("another poll is publishing", watcher.process_round(str(path)))
-
-
 if __name__ == "__main__":
     unittest.main()

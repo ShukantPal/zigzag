@@ -34,7 +34,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
             "comments": approvals(),
             "reviews": [{"author": "HumanReviewer", "state": "APPROVED",
                          "commit": HEAD, "submittedAt": "2026-01-01T01:00:00Z",
-                         "id": "human-approval"}],
+                         "id": 1}],
             "checks": checks,
         }
 
@@ -114,7 +114,7 @@ class ApprovalGateChecksTest(unittest.TestCase):
         ])
         data["reviews"].append({"author": "HumanReviewer", "state": "CHANGES_REQUESTED",
                                 "commit": HEAD, "submittedAt": "2026-01-01T02:00:00Z",
-                                "id": "later-review"})
+                                "id": 2})
         with patch.object(gate, "fetch_pr", return_value=data):
             result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
         self.assertFalse(result["pass"])
@@ -126,11 +126,36 @@ class ApprovalGateChecksTest(unittest.TestCase):
         ])
         data["reviews"].append({"author": "HumanReviewer", "state": "DISMISSED",
                                 "commit": HEAD, "submittedAt": "2026-01-01T02:00:00Z",
-                                "id": "dismissed-review"})
+                                "id": 2})
         with patch.object(gate, "fetch_pr", return_value=data):
             result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
         self.assertFalse(result["pass"])
         self.assertIn("no current-head APPROVED review from an allowlisted human",
+                      result["reasons"])
+
+    def test_same_timestamp_uses_numeric_review_id_order(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        data["reviews"].append({"author": "HumanReviewer",
+                                "state": "CHANGES_REQUESTED", "commit": HEAD,
+                                "submittedAt": "2026-01-01T01:00:00Z", "id": 2})
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+
+    def test_gate_never_mixes_approvals_across_rounds(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        data["comments"][2]["body"] = data["comments"][2]["body"].replace(
+            "ROUND: 1", "ROUND: 2")
+        with patch.object(gate, "fetch_pr", return_value=data):
+            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertIn("[correctness] verdict is from round 1; latest round is 2",
                       result["reasons"])
 
     def test_changes_requested_blocks_gate(self):

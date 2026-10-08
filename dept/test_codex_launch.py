@@ -24,10 +24,12 @@ class LauncherTest(unittest.TestCase):
                 (task / "read-only.txt").touch()
                 canonical_task = task.resolve()
                 expected = (["exec", "--json", "--sandbox", "read-only",
+                             "--ignore-user-config", "--ignore-rules",
                              "--skip-git-repo-check", "-m", "model", "-C",
                              str(project), "-o", str(canonical_task / "last-message.txt"), "hello"]
                             if mode == "run" else
                             ["exec", "--json", "--sandbox", "read-only",
+                             "--ignore-user-config", "--ignore-rules",
                              "--skip-git-repo-check", "-m", "model", "resume",
                              "sid", "hello", "-o", str(canonical_task / "last-message.txt")])
                 capture = root / mode

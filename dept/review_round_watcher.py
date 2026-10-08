@@ -256,23 +256,8 @@ def post_verdict(repo, pr, lens, head, verdict, task_id, round_number):
     return True
 
 
-@contextmanager
-def round_publish_lock(path):
-    """Serialize duplicate polls of one round without blocking worker launches."""
-    with open(f"{path}.lock", "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
-            yield True
-
-
 def process_round(path):
-    with round_publish_lock(path) as acquired:
-        if not acquired:
-            return f"{os.path.basename(path)}: another poll is publishing this round"
-        return _process_round_locked(path)
+    return _process_round_locked(path)
 
 
 def _process_round_locked(path):

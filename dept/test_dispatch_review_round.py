@@ -5,7 +5,6 @@ import pathlib
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +31,25 @@ class DispatchReviewRoundTest(unittest.TestCase):
             with patch.object(dispatcher, "ROUNDS_DIR", path):
                 self.assertEqual(len(dispatcher.round_files("owner/repo", 12)), 1)
                 self.assertEqual(dispatcher.next_round_number("owner/repo", 12), 3)
+
+    def test_seed_never_overwrites_a_superseded_round_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            rounds = root / "rounds"; rounds.mkdir()
+            key = dispatcher.repo_key("owner/repo")
+            first = rounds / f"{key}-pr12-round1.json"
+            first.write_text(json.dumps({"repo": "owner/repo", "round": 1,
+                                         "status": "superseded"}))
+            with patch.object(dispatcher, "ROUNDS_DIR", rounds), \
+                 patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
+                 patch.object(dispatcher, "pr_info",
+                              return_value={"headRefOid": "f" * 40}), \
+                 patch.object(dispatcher, "dispatch_reviewer",
+                              side_effect=lambda _p, _f, planned: planned):
+                second, _ = dispatcher.seed(12, "owner/repo", "/work")
+            first_status = json.loads(first.read_text())["status"]
+        self.assertEqual(second.name, f"{key}-pr12-round2.json")
+        self.assertEqual(first_status, "superseded")
 
     def test_prompt_uses_checked_out_diff_not_untrusted_pr_metadata(self):
         prompt = dispatcher.FULL_TEMPLATE.format(pr=12, repo="owner/repo", project_dir="/work",
@@ -98,18 +116,22 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_concurrent_seeds_allocate_distinct_rounds_without_overlapping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            active = 0
-            max_active = 0
+            calls = 0
             guard = threading.Lock()
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
 
             def pr_info(_pr, _repo):
-                nonlocal active, max_active
+                nonlocal calls
                 with guard:
-                    active += 1
-                    max_active = max(max_active, active)
-                time.sleep(0.05)
-                with guard:
-                    active -= 1
+                    calls += 1
+                    call = calls
+                if call == 1:
+                    first_entered.set()
+                    self.assertTrue(release_first.wait(2))
+                else:
+                    second_entered.set()
                 return {"headRefOid": "e" * 40}
 
             def dispatch(_project, _prompt, planned):
@@ -120,9 +142,13 @@ class DispatchReviewRoundTest(unittest.TestCase):
                  patch.object(dispatcher, "pr_info", side_effect=pr_info), \
                  patch.object(dispatcher, "dispatch_reviewer", side_effect=dispatch), \
                  ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(
-                    lambda _: dispatcher.seed(12, "owner/repo", "/work"), range(2)))
-        self.assertEqual(max_active, 1)
+                first = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
+                self.assertTrue(first_entered.wait(1))
+                second = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
+                self.assertFalse(second_entered.wait(0.1))
+                release_first.set()
+                results = [first.result(), second.result()]
+                self.assertTrue(second_entered.wait(1))
         self.assertEqual(len({path.name for path, _ in results}), 2)
 
     def test_reviewer_dispatch_is_read_only_and_non_gui(self):

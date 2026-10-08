@@ -235,7 +235,8 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
                    f'-C "$PWD" -o {shq(f"{rdir}/last-message.txt")} '
                    f'"$(cat {shq(f"{rdir}/prompt.txt")})"')
         model_flag = f"-m {shq(model)} " if model else ""
-        safety_flags = "--sandbox read-only " if read_only else "--approve-for-me "
+        safety_flags = ("--sandbox read-only --ignore-user-config --ignore-rules "
+                        if read_only else "--approve-for-me ")
         codex = (f"codex exec --json {safety_flags}--skip-git-repo-check "
                  f"{model_flag}{command}")
         exit_file = shq(f"{rdir}/exit-code.txt")
