@@ -163,12 +163,15 @@ class CommandDispatchTest(unittest.TestCase):
             try:
                 deadline = time.monotonic() + 5
                 child_file = task / "child-pid.txt"
-                while time.monotonic() < deadline and not child_file.exists():
+                while time.monotonic() < deadline and child_pid is None:
                     if process.poll() is not None:
                         self.fail("SSH worker exited before recording its child")
+                    value = child_file.read_text().strip() if child_file.exists() else ""
+                    if value.isdigit():
+                        child_pid = int(value)
+                        break
                     time.sleep(0.01)
-                self.assertTrue(child_file.exists())
-                child_pid = int(child_file.read_text())
+                self.assertIsNotNone(child_pid)
                 process.terminate()
                 self.assertEqual(process.wait(timeout=5), 143)
                 self.assertEqual((task / "exit-code.txt").read_text(), "143")

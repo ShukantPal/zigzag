@@ -201,22 +201,13 @@ def reviewer_states(task_ids):
 
 
 def fetch_findings(task_ids):
-    """Cat every reviewer's last-message.txt in one SSH call, delimited.
-
-    Delimiter is matched with a regex anchored on newlines: a findings file
-    may not end with a trailing newline, which would glue the next delimiter
-    onto its last line and break line-based parsing.
-    """
-    script = "; ".join(
-        f'printf "\\n@@@{tid}@@@\\n"; cat {REMOTE_DEPT}/{tid}/last-message.txt'
-        for tid in task_ids
-    )
-    out = mac(script)
-    parts = re.split(r"\n@@@([A-Za-z0-9_-]+)@@@\n", out)
-    # parts: [pre, tid1, body1, tid2, body2, ...]
+    """Fetch each reviewer output independently so content cannot reframe it."""
     findings = {}
-    for i in range(1, len(parts) - 1, 2):
-        findings[parts[i]] = parts[i + 1].strip()
+    for tid in task_ids:
+        if not re.fullmatch(r"t-[0-9a-f]{6}", tid):
+            raise RuntimeError(f"invalid reviewer task id: {tid}")
+        findings[tid] = mac(
+            f"cat {REMOTE_DEPT}/{tid}/last-message.txt").strip()
     return findings
 
 
