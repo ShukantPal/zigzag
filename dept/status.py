@@ -22,6 +22,10 @@ except ImportError:  # pragma: no cover - direct script execution path
 
 DEFAULT_STATE_FILE = Path("~/.codex/zigzag/events.json").expanduser()
 DEFAULT_TOKEN_FILE = Path("~/.codex/zigzag/zigzag.token").expanduser()
+# Keep this in step with relay-core's bounded durable agent spool.  Requesting
+# its complete retained window means a few large pipe-read chunks cannot hide
+# the latest 40 logical lines from the transcript view.
+RELAY_OUTPUT_TAIL_BYTES = 32 * 1024 * 1024
 
 
 def parse_time(value: object) -> dt.datetime | None:
@@ -274,10 +278,13 @@ def transcript_path(task_id: str, root: Path | None = None) -> Path:
 
 
 def transcript_command(task_id: str, root: Path | None = None) -> str:
-    return f"tail -f {shlex.quote(str(transcript_path(task_id, root)))}"
+    # BSD tail exits when a path has not been created yet; -F retries it.
+    return f"tail -F {shlex.quote(str(transcript_path(task_id, root)))}"
 
 
-def relay_output(url: str, token_file: Path, agent_id: str, *, tail: int = 12_000) -> tuple[list[str], str | None]:
+def relay_output(
+    url: str, token_file: Path, agent_id: str, *, tail: int = RELAY_OUTPUT_TAIL_BYTES,
+) -> tuple[list[str], str | None]:
     """Read a bounded, read-only relay spool window and keep its last 40 lines."""
     try:
         token = token_file.read_text().strip()
@@ -293,11 +300,14 @@ def relay_output(url: str, token_file: Path, agent_id: str, *, tail: int = 12_00
         records = message.get("records")
         if not isinstance(records, list):
             return [], "relay output unavailable: records is not an array"
-        output: list[str] = []
+        # Relay records are pipe-read chunks, rather than line records.  Join
+        # them in cursor order before splitting so a logical line that crosses
+        # a read (or stream) boundary is rendered once, intact.
+        chunks: list[str] = []
         for record in records:
             if isinstance(record, dict) and isinstance(record.get("data"), str):
-                output.extend(record["data"].splitlines())
-        return output[-40:], None
+                chunks.append(record["data"])
+        return "".join(chunks).splitlines()[-40:], None
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return [], f"relay output unavailable: {error}"
 

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from dept import dept
 from dept.status import (
     Execution,
+    RELAY_OUTPUT_TAIL_BYTES,
     StatusScreen,
     build_executions,
     detail_lines,
@@ -222,7 +223,7 @@ class TranscriptTests(unittest.TestCase):
         )
         self.assertEqual(
             transcript_command("t-example"),
-            f"tail -f {Path.home() / '.codex/dept/t-example/last-message.txt'}",
+            f"tail -F {Path.home() / '.codex/dept/t-example/last-message.txt'}",
         )
 
     def test_transcript_source_uses_configured_mac_task_root(self):
@@ -235,14 +236,19 @@ class TranscriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             token = Path(directory) / "token"
             token.write_text("token")
-            records = [{"data": f"line {number}\n"} for number in range(45)]
+            text = "".join(f"line {number}\n" for number in range(45))
+            records = [
+                {"data": text[:17]},
+                {"data": text[17:101]},
+                {"data": text[101:]},
+            ]
             with patch("dept.status.get_json", return_value={"records": records}) as get_json:
                 lines, error = relay_output("http://relay/", token, "agent id")
         self.assertIsNone(error)
         self.assertEqual(lines, [f"line {number}" for number in range(5, 45)])
         self.assertEqual(
             get_json.call_args.args[0],
-            "http://relay/v1/agents/agent%20id/logs?stream=both&tail=12000&follow=0",
+            f"http://relay/v1/agents/agent%20id/logs?stream=both&tail={RELAY_OUTPUT_TAIL_BYTES}&follow=0",
         )
 
     def test_transcript_detail_shows_path_command_and_spool(self):
@@ -293,7 +299,7 @@ class TranscriptTests(unittest.TestCase):
         with patch("dept.status.curses.curs_set"), \
              patch("dept.status.read_audit_events", return_value=(events, [])), \
              patch("dept.status.relay_snapshot", return_value=([], agents, False, [])), \
-             patch("dept.status.relay_output", side_effect=[(["zero output"], None), (["one output"], None), (["one output"], None)]) as output:
+             patch("dept.status.relay_output", side_effect=[(["one output"], None), (["zero output"], None), (["zero output"], None)]) as output:
             screen.run(fake)
         self.assertEqual([call.args[2] for call in output.call_args_list], ["agent-one", "agent-zero", "agent-zero"])
         self.assertIn("task-one", "\n".join(fake.frames[1]))
