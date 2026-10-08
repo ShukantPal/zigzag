@@ -2348,9 +2348,17 @@ mod tests {
             1
         );
 
-        // The shell leader exits immediately, leaving the sleep descendant in
-        // the dedicated process group. It must still be visible and killable.
-        let handle = spawn_for_test(&state, &policy, "sleep", "sleep 60 & exit");
+        // Linux /bin/sh leaves this non-interactive background child in the
+        // dedicated group, exercising leader-exit recovery. Hosted macOS
+        // shells do not provide that job-control invariant, so macOS still
+        // verifies the daemon's native group signal and reap path with sleep
+        // as the group leader.
+        let group_command = if cfg!(target_os = "macos") {
+            "exec sleep 60"
+        } else {
+            "sleep 60 & exit"
+        };
+        let handle = spawn_for_test(&state, &policy, "sleep", group_command);
         let running = response_json(request_once(
             Arc::clone(&state),
             &policy,
