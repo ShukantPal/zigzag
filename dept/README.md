@@ -33,7 +33,9 @@ management layer that decides what to run.
   round (correctness, simplicity, tests, plus security when seeded) showing
   APPROVE on that head, plus a formal
   current-head approval from a separately authenticated human reviewer.
-  Stale-head, lower-round verdicts and shared-automation approvals don't count.
+  The newest persisted seeded round is authoritative even before its comments
+  publish; stale-head, lower-round verdicts and shared-automation approvals
+  don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in

@@ -78,7 +78,8 @@ task's changes.
    Address every CHANGES REQUESTED finding, push, then re-dispatch the reviewers
    on the new head for a fresh verdict.
    **Approval gate**: the PR is review-ready ONLY when required CI is green on
-   the latest head AND every required lens shows a latest verdict of APPROVE
+   the latest head AND the newest persisted review round is complete and every
+   lens it seeded shows a verdict of APPROVE
    whose HEAD equals the PR's current head, AND an actor configured in
    `approval_gate.human_review_actors` has submitted a formal APPROVED review on
    that exact head. Shared automation actors and stale approvals do not count.

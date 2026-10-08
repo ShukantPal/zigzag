@@ -23,10 +23,14 @@ def approvals():
 
 class ApprovalGateChecksTest(unittest.TestCase):
     def setUp(self):
+        self.real_latest_seeded_round = gate.latest_seeded_round
         actors = patch.object(gate, "human_review_actors",
                               return_value=frozenset({"HumanReviewer"}))
         actors.start()
         self.addCleanup(actors.stop)
+        seeded = patch.object(gate, "latest_seeded_round", return_value=None)
+        seeded.start()
+        self.addCleanup(seeded.stop)
 
     def result_for(self, checks):
         return {
@@ -230,6 +234,52 @@ class ApprovalGateChecksTest(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertIn("latest review round has no single consistent lens manifest",
                       result["reasons"])
+
+    def test_new_seeded_round_blocks_prior_same_head_approvals(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        seeded = {"round": 2, "head": HEAD,
+                  "lenses": ("correctness", "security", "simplicity", "tests"),
+                  "status": "collecting"}
+        with patch.object(gate, "fetch_pr", return_value=data), \
+             patch.object(gate, "latest_seeded_round", return_value=seeded):
+            result = gate.check("owner/repo", "1",
+                                ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["review_round"], 2)
+        self.assertEqual(result["seeded_round"], seeded)
+        self.assertIn("latest seeded review round is collecting", result["reasons"])
+        self.assertIn("no verdict from [security] reviewer", result["reasons"])
+
+    def test_published_seeded_round_with_matching_approvals_passes(self):
+        data = self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ])
+        seeded = {"round": 1, "head": HEAD,
+                  "lenses": ("correctness", "simplicity", "tests"),
+                  "status": "published"}
+        with patch.object(gate, "fetch_pr", return_value=data), \
+             patch.object(gate, "latest_seeded_round", return_value=seeded):
+            result = gate.check("owner/repo", "1",
+                                ["correctness", "simplicity", "tests"])
+        self.assertTrue(result["pass"])
+
+    def test_latest_seeded_round_reads_all_statuses(self):
+        rounds = [
+            (None, {"round": 1, "head": "a" * 40, "status": "published",
+                    "reviewers": {"t-a": "tests"}}),
+            (None, {"round": 2, "head": "b" * 40, "status": "attention",
+                    "reviewers": {"t-b": "security", "t-c": "correctness"}}),
+        ]
+        with patch.object(gate, "stored_rounds", return_value=rounds):
+            latest = self.real_latest_seeded_round("owner/repo", "1")
+        self.assertEqual(latest, {
+            "round": 2, "head": "b" * 40,
+            "lenses": ("correctness", "security"), "status": "attention",
+        })
 
 
 class HumanActorConfigTest(unittest.TestCase):

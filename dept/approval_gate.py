@@ -36,6 +36,7 @@ import re
 import subprocess
 import sys
 from dept_config import load_config, ssh_base, ssh_env
+from dispatch_review_round import stored_rounds
 
 CONFIG = load_config()
 SSH_BASE = ssh_base(CONFIG.get("connection", {}))
@@ -146,6 +147,29 @@ def current_human_approval(reviews, head, actors):
     return None
 
 
+def latest_seeded_round(repo, pr):
+    """Return the newest persisted review-round contract, if one exists."""
+    candidates = []
+    for _path, data in stored_rounds(repo, pr):
+        reviewers = data.get("reviewers")
+        try:
+            number = int(data.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if number < 1 or not isinstance(reviewers, dict):
+            continue
+        lenses = tuple(sorted({lens for lens in reviewers.values()
+                               if isinstance(lens, str) and lens}))
+        if not lenses:
+            continue
+        candidates.append((number, data, lenses))
+    if not candidates:
+        return None
+    number, data, lenses = max(candidates, key=lambda item: item[0])
+    return {"round": number, "head": (data.get("head") or "").lower(),
+            "lenses": lenses, "status": data.get("status")}
+
+
 def check(repo, pr, lenses):
     data = fetch_pr(repo, pr)
     head = (data.get("head") or "").lower()
@@ -184,10 +208,23 @@ def check(repo, pr, lenses):
 
     # --- review-team approvals ---
     verdicts = latest_verdicts(data.get("comments") or [])
-    latest_round = max((v[3] for v in verdicts.values()), default=None)
+    seeded_round = latest_seeded_round(repo, pr)
+    latest_round = (seeded_round["round"] if seeded_round else
+                    max((v[3] for v in verdicts.values()), default=None))
     manifests = {v[4] for v in verdicts.values() if v[3] == latest_round}
     declared_lenses = set()
-    if len(manifests) != 1:
+    if seeded_round:
+        declared_lenses.update(seeded_round["lenses"])
+        if seeded_round["status"] != "published":
+            reasons.append(
+                f"latest seeded review round is {seeded_round['status'] or 'status unknown'}")
+        if seeded_round["head"] != head:
+            reasons.append(
+                f"latest seeded review round targets {seeded_round['head'][:8]}, "
+                f"PR head is {head[:8]}")
+        if manifests and manifests != {seeded_round["lenses"]}:
+            reasons.append("latest review verdicts do not match the seeded lens manifest")
+    elif len(manifests) != 1:
         reasons.append("latest review round has no single consistent lens manifest")
     else:
         declared_lenses.update(next(iter(manifests)))
@@ -221,7 +258,8 @@ def check(repo, pr, lenses):
 
     result = {"pass": not reasons, "reasons": reasons, "warnings": warnings,
               "repo": repo, "pr": pr, "head": head, "approvals": approvals,
-              "review_round": latest_round, "human_approval": human_approval}
+              "review_round": latest_round, "seeded_round": seeded_round,
+              "human_approval": human_approval}
     return result
 
 

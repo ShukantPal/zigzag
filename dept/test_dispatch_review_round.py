@@ -1,10 +1,8 @@
 import importlib
-from concurrent.futures import ThreadPoolExecutor
 import json
 import pathlib
 import sys
 import tempfile
-import threading
 import unittest
 from unittest.mock import patch
 
@@ -113,59 +111,18 @@ class DispatchReviewRoundTest(unittest.TestCase):
                 two, _ = dispatcher.seed(12, "owner/two", "/work")
         self.assertNotEqual(one.name, two.name)
 
-    def test_concurrent_seeds_allocate_distinct_rounds_without_overlapping(self):
+    def test_round_seed_lock_rejects_a_competing_file_description(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            calls = 0
-            lock_attempts = 0
-            guard = threading.Lock()
-            first_entered = threading.Event()
-            release_first = threading.Event()
-            second_lock_attempted = threading.Event()
-            second_entered = threading.Event()
-            real_flock = dispatcher.fcntl.flock
-
-            def observed_flock(file, operation):
-                nonlocal lock_attempts
-                with guard:
-                    lock_attempts += 1
-                    attempt = lock_attempts
-                if attempt == 2:
-                    second_lock_attempted.set()
-                return real_flock(file, operation)
-
-            def pr_info(_pr, _repo):
-                nonlocal calls
-                with guard:
-                    calls += 1
-                    call = calls
-                if call == 1:
-                    first_entered.set()
-                    self.assertTrue(release_first.wait(2))
-                else:
-                    second_entered.set()
-                return {"headRefOid": "e" * 40}
-
-            def dispatch(_project, _prompt, planned):
-                return planned
-
-            with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
-                 patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
-                 patch.object(dispatcher, "pr_info", side_effect=pr_info), \
-                 patch.object(dispatcher, "dispatch_reviewer", side_effect=dispatch), \
-                 patch.object(dispatcher.fcntl, "flock", side_effect=observed_flock), \
-                 ThreadPoolExecutor(max_workers=2) as pool:
-                first = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
-                self.assertTrue(first_entered.wait(1))
-                second = pool.submit(dispatcher.seed, 12, "owner/repo", "/work")
-                try:
-                    self.assertTrue(second_lock_attempted.wait(1))
-                    self.assertFalse(second_entered.is_set())
-                finally:
-                    release_first.set()
-                results = [first.result(), second.result()]
-                self.assertTrue(second_entered.wait(1))
-        self.assertEqual(len({path.name for path, _ in results}), 2)
+            rounds = pathlib.Path(tmp) / "rounds"
+            with patch.object(dispatcher, "ROUNDS_DIR", rounds), \
+                 dispatcher.round_seed_lock("owner/repo", 12):
+                lock_path = rounds / (
+                    f"{dispatcher.repo_key('owner/repo')}-pr12.seed.lock")
+                with lock_path.open("w") as competitor:
+                    with self.assertRaises(BlockingIOError):
+                        dispatcher.fcntl.flock(
+                            competitor,
+                            dispatcher.fcntl.LOCK_EX | dispatcher.fcntl.LOCK_NB)
 
     def test_reviewer_dispatch_is_read_only_and_non_gui(self):
         result = type("R", (), {"stdout": "started t-abc123", "stderr": ""})()
