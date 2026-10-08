@@ -7,29 +7,46 @@ decision, keeping admission and policy semantics identical on both sides.
 
 Usage: approval_gate.py <owner/repo> <pr>
 Exit 0 with {"pass": true, ...}; exit 1 with {"pass": false, "reasons": [...]}.
-Runs the canonical gate over SSH on Shukant's Mac.
+Runs the canonical gate through the authenticated GUI-session Zigzag relay.
 """
 import json
-import shlex
-import subprocess
+import os
 import sys
-from dept_config import load_config, ssh_base, ssh_env
+import urllib.error
+import urllib.parse
+import urllib.request
+from dept_config import load_config
 
 CONFIG = load_config()
-SSH_BASE = ssh_base(CONFIG.get("connection", {}))
+CONNECTION = CONFIG.get("connection", {})
+ZIGZAG_URL = os.environ.get("ZIGZAG_URL", CONNECTION.get("zigzag_url", ""))
+ZIGZAG_TOKEN_FILE = os.path.expanduser(CONNECTION.get("zigzag_token_file", ""))
 
 
-def mac(cmd):
-    p = subprocess.run(SSH_BASE + [cmd], capture_output=True, text=True,
-                       env=ssh_env(), timeout=180)
-    if p.returncode != 0:
-        raise RuntimeError(f"mac cmd failed: {cmd[:100]} :: {p.stderr.strip()[:200]}")
-    return p.stdout
+def relay_call(path):
+    if not ZIGZAG_URL or not ZIGZAG_TOKEN_FILE:
+        raise RuntimeError("zigzag relay connection is not configured")
+    with open(ZIGZAG_TOKEN_FILE) as f:
+        token = f.read().strip()
+    request = urllib.request.Request(
+        ZIGZAG_URL + path,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    proxy = os.environ.get("HTTPS_PROXY", "")
+    proxy = proxy.rsplit(":", 1)[0] + ":3130" if ":" in proxy else ""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    try:
+        with opener.open(request, timeout=180) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"review gate failed with HTTP {error.code}") from error
 
 
 def fetch_gate(repo, pr):
-    command = f"zigzag review-gate {shlex.quote(repo)} {shlex.quote(str(pr))}"
-    return json.loads(mac(command))
+    query = urllib.parse.urlencode({"repository": repo, "pull_request": str(pr)})
+    return relay_call(f"/v1/review-gate?{query}")
 
 
 def main():

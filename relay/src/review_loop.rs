@@ -165,16 +165,7 @@ pub fn load_config(path: &Path) -> Result<PersonalConfig, Vec<ConfigViolation>> 
     })
 }
 
-pub fn print_gate(arguments: &[String]) -> Result<(), String> {
-    if arguments.len() != 2 || matches!(arguments[0].as_str(), "--help" | "-h") {
-        return Err("usage: zigzag review-gate <owner/repository> <pull-request>".to_owned());
-    }
-    let repository = &arguments[0];
-    let number = arguments[1]
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or_else(|| "pull request must be a positive integer".to_owned())?;
+pub fn gate_report(repository: &str, number: u64) -> Result<Value, String> {
     let path = default_config_path().map_err(|violation| violation.to_string())?;
     let config = load_config(&path).map_err(|violations| {
         violations
@@ -187,11 +178,10 @@ pub fn print_gate(arguments: &[String]) -> Result<(), String> {
         .review_loop
         .repositories
         .iter()
-        .find(|policy| policy.repository == *repository)
+        .find(|policy| policy.repository == repository)
         .ok_or_else(|| format!("no review policy configured for {repository}"))?;
     let snapshot = fetch_pr(repository, number)?;
-    println!("{}", shadow_gate_report(policy, number, &snapshot));
-    Ok(())
+    Ok(shadow_gate_report(policy, number, &snapshot))
 }
 
 fn reject_yaml_tags(value: &serde_yaml::Value, path: &str, errors: &mut Vec<ConfigViolation>) {

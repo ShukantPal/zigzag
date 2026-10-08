@@ -29,9 +29,10 @@ management layer that decides what to run.
   durable audit directory beside `events.json`; it never invokes a control
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
 - **`approval_gate.py`** — the shadow-mode merge gate for Muse-owned PRs. It
-  delegates the complete decision to the Mac `zigzag review-gate` command, so
-  personal YAML policy, strict verdict admission, and CI evaluation use the
-  same Rust path as the daemon. Stale-head approvals don't count.
+  delegates the complete decision through the authenticated GUI-session relay
+  to the daemon's `/v1/review-gate` endpoint, so personal YAML policy, strict
+  verdict admission, and CI evaluation use the same Rust path as the daemon.
+  Stale-head approvals don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in
