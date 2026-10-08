@@ -150,11 +150,13 @@ class CommandDispatchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             task = pathlib.Path(tmp)
             fake = task / "fake_worker.py"
+            ready = task / "ready"
             fake.write_text(
-                "import signal, time\n"
+                "import pathlib, signal, time\n"
                 "def stop(*_):\n"
                 "    raise SystemExit(0)\n"
                 "signal.signal(signal.SIGTERM, stop)\n"
+                f"pathlib.Path({str(ready)!r}).touch()\n"
                 "time.sleep(30)\n")
             command = f"{department.shq(sys.executable)} {department.shq(str(fake))}"
             script = department.ssh_worker_script(tmp, command)
@@ -163,16 +165,21 @@ class CommandDispatchTest(unittest.TestCase):
             try:
                 deadline = time.monotonic() + 5
                 child_file = task / "child-pid.txt"
-                while time.monotonic() < deadline and child_pid is None:
+                while time.monotonic() < deadline and (
+                        child_pid is None or not ready.exists()):
                     if process.poll() is not None:
                         self.fail("SSH worker exited before recording its child")
                     value = child_file.read_text().strip() if child_file.exists() else ""
                     if value.isdigit():
                         child_pid = int(value)
-                        break
                     time.sleep(0.01)
                 self.assertIsNotNone(child_pid)
-                process.terminate()
+                self.assertTrue(ready.exists())
+                (task / "pid").write_text(str(process.pid))
+                killed = subprocess.run(
+                    ["sh", "-c", department.ssh_kill_script(tmp)],
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(killed.stdout.strip(), "killed")
                 self.assertEqual(process.wait(timeout=5), 143)
                 self.assertEqual((task / "exit-code.txt").read_text(), "143")
                 with self.assertRaises(ProcessLookupError):
@@ -261,7 +268,9 @@ class CommandDispatchTest(unittest.TestCase):
             department.cmd_kill(["t-one"])
         command = ssh.call_args.args[0]
         self.assertIn("child-pid.txt", command)
-        self.assertIn("child-pid.txt pid", command)
+        self.assertLess(command.index('"$rdir/pid"'),
+                        command.index('"$rdir/child-pid.txt"'))
+        self.assertIn("elif", command)
         output.assert_called_once_with("t-one: killed (via ssh)")
 
     def test_result_prints_relay_failure_and_task_stderr(self):

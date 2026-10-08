@@ -208,6 +208,18 @@ def ssh_worker_script(rdir, codex):
         f"printf %s \"$rc\" > {exit_file}; exit \"$rc\"")
 
 
+def ssh_kill_script(rdir):
+    """Terminate the SSH wrapper first so it owns the cancellation result."""
+    return (
+        f"rdir={shq(rdir)}; killed=0; "
+        "if [ -f \"$rdir/pid\" ] && kill $(cat \"$rdir/pid\") 2>/dev/null; "
+        "then killed=1; "
+        "elif [ -f \"$rdir/child-pid.txt\" ] && "
+        "kill $(cat \"$rdir/child-pid.txt\") 2>/dev/null; "
+        "then killed=1; fi; "
+        "[ \"$killed\" -eq 1 ] && echo killed || echo 'not running'")
+
+
 def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
@@ -392,13 +404,7 @@ def cmd_kill(args):
         print(f"{tid}: kill requested via relay (killed={killed})")
     else:
         rdir = f"{REMOTE_DEPT}/{tid}"
-        r = ssh(
-            f"rdir={shq(rdir)}; killed=0; "
-            "for f in child-pid.txt pid; do "
-            "if [ -f \"$rdir/$f\" ] && kill $(cat \"$rdir/$f\") 2>/dev/null; "
-            "then killed=1; fi; done; "
-            "[ \"$killed\" -eq 1 ] && echo killed || echo 'not running'",
-            timeout=60)
+        r = ssh(ssh_kill_script(rdir), timeout=60)
         print(f"{tid}: {r.stdout.decode().strip()} (via ssh)")
 
 

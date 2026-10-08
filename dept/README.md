@@ -52,9 +52,10 @@ management layer that decides what to run.
   actor listed in `approval_gate.human_review_actors` must submit a formal
   GitHub approval after inspecting the findings.
 - **`dispatch_review_round.py`** — seeds independent read-only correctness,
-  simplicity, and tests reviewers from the checked-out diff over non-GUI SSH
-  (no keychain). PR metadata is excluded from their prompts and trusted watcher
-  code publishes only validated verdict fields.
+  simplicity, and tests reviewers over non-GUI SSH (no keychain). Each round
+  uses an immutable archive and diff pinned to the reviewed commit, so owner
+  edits cannot change files under review. PR metadata is excluded from prompts,
+  and trusted watcher code publishes only validated verdict fields.
 - **`jules_pr_reviewer.py`** — dispatches a Codex review task for each new
   Jules-authored PR in `leveled-inc/leveled` (Jules owns revisions there;
   Codex reviews only).
