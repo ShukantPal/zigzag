@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod exec;
-mod update;
 mod review_loop;
+mod update;
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_FINISHED_PROCS: usize = 128;
@@ -146,13 +146,7 @@ fn run() -> Result<(), String> {
     if arguments.first().map(String::as_str) == Some("update-watchdog") {
         return update::run_watchdog(&arguments[1..]);
     }
-    if arguments.first().map(String::as_str) == Some("review-policy") {
-        return review_loop::print_policy(&arguments[1..]);
-    }
-    if arguments.first().map(String::as_str) == Some("review-gate") {
-        return review_loop::print_gate(&arguments[1..]);
-    }
-    let config = server_config(arguments)?;
+    let config = server_config(arguments.clone())?;
     let secret = read_secret_file(&config.secret_file)?;
     let control_secret = config
         .control_secret_file
@@ -187,6 +181,7 @@ fn run() -> Result<(), String> {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
+    let mut review_loop_authoritative = false;
     match review_loop::default_config_path() {
         Ok(path) => match review_loop::load_config(&path) {
             Ok(personal) if personal.review_loop.enabled => {
@@ -217,6 +212,12 @@ fn run() -> Result<(), String> {
             }
         },
         Err(violation) => eprintln!("review loop disabled: {violation}"),
+    }
+    if should_start_legacy_watch(review_loop_authoritative, &config.github_watch_repos) {
+        let state = Arc::clone(&state);
+        let repos = config.github_watch_repos.clone();
+        let interval = config.github_watch_interval;
+        thread::spawn(move || github_watch_loop(state, repos, interval));
     }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -500,7 +501,6 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     })
 }
 
-#[cfg(test)]
 fn valid_github_repo(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {
         return false;
@@ -512,6 +512,48 @@ fn valid_github_repo(repo: &str) -> bool {
             .bytes()
             .chain(name.bytes())
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn should_start_legacy_watch(review_loop_authoritative: bool, repositories: &[String]) -> bool {
+    !review_loop_authoritative && !repositories.is_empty()
+}
+
+fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration) {
+    loop {
+        for repo in &repos {
+            match github_open_pull_requests(repo) {
+                Ok(pull_requests) => {
+                    for number in pull_requests {
+                        let id = format!("github-pr-opened:{repo}:{number}");
+                        let payload = Json::Object(vec![
+                            ("id".to_owned(), Json::String(id.clone())),
+                            (
+                                "kind".to_owned(),
+                                Json::String("github_pr_opened".to_owned()),
+                            ),
+                            ("repository".to_owned(), Json::String(repo.clone())),
+                            ("pull_request".to_owned(), Json::number(number)),
+                            (
+                                "url".to_owned(),
+                                Json::String(format!("https://github.com/{repo}/pull/{number}")),
+                            ),
+                        ]);
+                        match state.store.add(payload) {
+                            Ok((_, false)) => {
+                                eprintln!("queued GitHub PR watchdog event for {repo}#{number}")
+                            }
+                            Ok((_, true)) => {}
+                            Err(_) => eprintln!(
+                                "could not persist GitHub PR watchdog event for {repo}#{number}"
+                            ),
+                        }
+                    }
+                }
+                Err(error) => eprintln!("GitHub PR watch for {repo} failed: {error}"),
+            }
+        }
+        thread::sleep(interval);
+    }
 }
 
 pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> {
@@ -1942,13 +1984,21 @@ fn query(target: &str) -> Result<HashMap<String, String>, String> {
     let Some((_, raw)) = target.split_once('?') else {
         return Ok(HashMap::new());
     };
-    raw.split('&')
+    let pairs: Vec<_> = raw
+        .split('&')
         .filter(|value| !value.is_empty())
         .map(|item| {
             let (key, value) = item.split_once('=').unwrap_or((item, ""));
-            Ok((percent_decode(key)?, percent_decode(value)?))
+            Ok::<_, String>((percent_decode(key)?, percent_decode(value)?))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let mut values = HashMap::new();
+    for (key, value) in pairs {
+        if values.insert(key, value).is_some() {
+            return Err("duplicate query parameter".to_owned());
+        }
+    }
+    Ok(values)
 }
 fn percent_decode(input: &str) -> Result<String, String> {
     let mut bytes = Vec::new();
@@ -2001,6 +2051,16 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         _ => "Internal Server Error",
     };
     stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn test_updater() -> Arc<update::Manager> {
+    Arc::new(update::Manager::new(update::Config {
+        directory: std::env::temp_dir().join("zigzag-test-updates"),
+        interval: Duration::ZERO,
+        policy: update::Policy::Enabled,
+        ready_file: None,
+    }))
 }
 
 #[cfg(test)]
