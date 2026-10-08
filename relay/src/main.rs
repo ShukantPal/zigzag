@@ -174,7 +174,11 @@ fn run() -> Result<(), String> {
         updater: Arc::clone(&updater),
         review_state_file: config.review_state_file.clone(),
     });
-    for agent in state.supervisor.registry.recover(process_group_running)? {
+    for agent in state
+        .supervisor
+        .registry
+        .recover(recovered_agent_identity_matches)?
+    {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
@@ -654,12 +658,25 @@ fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
 }
 
 fn handle_with_policy<F>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     state: Arc<Server>,
     load_policy: F,
 ) -> Result<(), String>
 where
     F: Fn() -> Result<exec::Policy, String>,
+{
+    handle_with_services(stream, state, load_policy, review_loop::gate_report)
+}
+
+fn handle_with_services<F, G>(
+    mut stream: TcpStream,
+    state: Arc<Server>,
+    load_policy: F,
+    gate_report: G,
+) -> Result<(), String>
+where
+    F: Fn() -> Result<exec::Policy, String>,
+    G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
 {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -710,7 +727,9 @@ where
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
-        ("GET", "/v1/review-gate") => review_gate_request(&mut stream, &state, &request.target),
+        ("GET", "/v1/review-gate") => {
+            review_gate_request(&mut stream, &state, &request.target, gate_report)
+        }
         ("GET", path) if agent_route(path).is_some() => agent_request(
             &mut stream,
             &state,
@@ -731,12 +750,20 @@ where
     }
 }
 
-fn review_gate_request(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
+fn review_gate_request<G>(
+    stream: &mut TcpStream,
+    state: &Server,
+    target: &str,
+    gate_report: G,
+) -> Result<(), String>
+where
+    G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
+{
     let (repository, number) = match review_gate_parameters(target) {
         Ok(parameters) => parameters,
         Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
     };
-    match review_loop::gate_report(&repository, number, &state.review_state_file) {
+    match gate_report(&repository, number, &state.review_state_file) {
         Ok(report) => {
             let encoded = serde_json::to_string(&report)
                 .map_err(|error| format!("could not encode review gate report: {error}"))?;
@@ -1086,6 +1113,10 @@ fn spawn_proc(
     let child_stdout = child.stdout.take().expect("stdout was piped");
     let child_stderr = child.stderr.take().expect("stderr was piped");
     let process_group = child.id() as i32;
+    let Some(process_identity) = process_identity(process_group) else {
+        let _ = force_kill_process_group(process_group);
+        return Err("could not record spawned process identity".to_owned());
+    };
     let mut table = supervisor
         .procs
         .lock()
@@ -1099,6 +1130,7 @@ fn spawn_proc(
         execution_id: execution_id.clone(),
         leader_pid: process_group,
         process_group,
+        process_identity: Some(process_identity),
         started_at: unix_timestamp(),
         deadline_at: None,
         command: format!(
@@ -1326,6 +1358,60 @@ fn force_kill_process_group(process_group: i32) -> bool {
 
 fn process_group_running(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, 0) == 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: i32) -> Option<String> {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size as i32,
+        )
+    };
+    (written as usize == size)
+        .then(|| format!("macos:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: i32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_command = stat.get(stat.rfind(')')? + 2..)?;
+    let start_ticks = after_command.split_whitespace().nth(19)?;
+    Some(format!("linux:{start_ticks}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_identity(_pid: i32) -> Option<String> {
+    None
+}
+
+fn recovered_agent_identity_matches(agent: &AgentRecord) -> bool {
+    process_group_running(agent.process_group)
+        && agent
+            .process_identity
+            .as_deref()
+            .zip(process_identity(agent.leader_pid).as_deref())
+            .is_some_and(|(expected, current)| expected == current)
+}
+
+fn managed_agent_running(agent: &AgentRecord) -> bool {
+    managed_agent_running_with(agent, recovered_agent_identity_matches)
+}
+
+fn managed_agent_running_with(
+    agent: &AgentRecord,
+    orphan_is_current: impl Fn(&AgentRecord) -> bool,
+) -> bool {
+    match agent.state.as_str() {
+        "running" => true,
+        "orphaned" => orphan_is_current(agent),
+        _ => false,
+    }
 }
 
 fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String> {
@@ -1918,6 +2004,90 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_review_gate_route_reads_the_configured_durable_state() {
+        let (state, state_path) = test_server();
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let key = format!("owner/repo#22@{head}");
+        let durable_state = serde_json::json!({
+            "schema_version": 1,
+            "rounds": {
+                (key): {
+                    "repository": "owner/repo",
+                    "pull_request": 22,
+                    "head": head,
+                    "base": base,
+                    "generation": 1,
+                    "verification": false,
+                    "phase": "reviewing",
+                    "reviewers": {},
+                    "verdicts": {},
+                    "excluded_comment_ids": [],
+                    "pending_comment_deletions": [],
+                    "owner": null,
+                    "owner_agent_id": null,
+                    "gate_reasons": [],
+                }
+            }
+        });
+        std::fs::write(
+            &state.review_state_file,
+            serde_json::to_vec(&durable_state).unwrap(),
+        )
+        .unwrap();
+        let expected_state_path = state.review_state_file.clone();
+
+        let response = request_once_with_gate(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
+            "",
+            |repository, pull_request, review_state_path| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(pull_request, 22);
+                assert_eq!(review_state_path, expected_state_path);
+                assert!(
+                    review_loop::persisted_active_comparison_matches(
+                        review_state_path,
+                        repository,
+                        pull_request,
+                        &"b".repeat(40),
+                        &"a".repeat(40),
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    !review_loop::persisted_active_comparison_matches(
+                        review_state_path,
+                        repository,
+                        pull_request,
+                        &"c".repeat(40),
+                        &"a".repeat(40),
+                    )
+                    .unwrap()
+                );
+                Ok(serde_json::json!({
+                    "pass": true,
+                    "head": "a".repeat(40),
+                }))
+            },
+        );
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let report = response_json(response);
+        assert_eq!(report.object("pass"), Some(&Json::Bool(true)));
+        assert_eq!(report.object("head"), Some(&Json::String("a".repeat(40))));
+
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(expected_state_path);
+    }
+
+    #[test]
     fn bearer_comparison_requires_the_full_token() {
         assert!(authorized(
             &format!("Bearer {}", "x".repeat(32)),
@@ -2214,6 +2384,7 @@ mod tests {
             execution_id: "execution".to_owned(),
             leader_pid: 1,
             process_group: 1,
+            process_identity: Some("test:1".to_owned()),
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "sh -c".to_owned(),
@@ -2469,6 +2640,12 @@ mod tests {
             "",
         ));
         assert_eq!(running.object("running"), Some(&Json::Bool(true)));
+        let recovered = state.supervisor.registry.get(&handle).unwrap();
+        assert!(recovered.process_identity.is_some());
+        assert!(recovered_agent_identity_matches(&recovered));
+        let mut reused_pid = recovered.clone();
+        reused_pid.process_identity = Some("different-process-birth".to_owned());
+        assert!(!recovered_agent_identity_matches(&reused_pid));
         let killed = response_json(request_once(
             Arc::clone(&state),
             &policy,
@@ -2556,6 +2733,27 @@ mod tests {
         target: &str,
         body: &str,
     ) -> String {
+        request_once_with_gate(
+            state,
+            policy,
+            method,
+            target,
+            body,
+            review_loop::gate_report,
+        )
+    }
+
+    fn request_once_with_gate<G>(
+        state: Arc<Server>,
+        policy: &exec::Policy,
+        method: &str,
+        target: &str,
+        body: &str,
+        gate_report: G,
+    ) -> String
+    where
+        G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request = format!(
@@ -2571,7 +2769,7 @@ mod tests {
             response
         });
         let (server, _) = listener.accept().unwrap();
-        handle_with_policy(server, state, || Ok(policy.clone())).unwrap();
+        handle_with_services(server, state, || Ok(policy.clone()), gate_report).unwrap();
         client.join().unwrap()
     }
 

@@ -821,11 +821,7 @@ fn dispatch_missing_reviewers(
             .as_ref()
             .and_then(|reviewer| reviewer.agent_id.as_deref())
             .and_then(|agent_id| server.supervisor.registry.get(agent_id))
-            .is_some_and(|agent| {
-                agent.state == "running"
-                    || (agent.state == "orphaned"
-                        && super::process_group_running(agent.process_group))
-            });
+            .is_some_and(|agent| super::managed_agent_running(&agent));
         if store.state.rounds[key].verdicts.contains_key(lens) || active {
             continue;
         }
@@ -1549,8 +1545,7 @@ fn collect_completed_reviewers(
             let Some(agent) = server.supervisor.registry.get(agent_id) else {
                 continue;
             };
-            let still_running = agent.state == "running"
-                || (agent.state == "orphaned" && super::process_group_running(agent.process_group));
+            let still_running = super::managed_agent_running(&agent);
             if still_running {
                 continue;
             }
@@ -1831,6 +1826,27 @@ fn active_gate_round<'a>(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn persisted_active_comparison_matches(
+    state_path: &Path,
+    repository: &str,
+    number: u64,
+    base: &str,
+    head: &str,
+) -> Result<bool, String> {
+    let store = StateStore::open(state_path.to_path_buf())?;
+    let snapshot = PullRequestSnapshot {
+        head_ref_oid: head.to_owned(),
+        base_ref_oid: base.to_owned(),
+        head_ref_name: "test".to_owned(),
+        state: "OPEN".to_owned(),
+        merged_at: None,
+        comments: Vec::new(),
+        status_check_rollup: Vec::new(),
+    };
+    Ok(active_gate_round(&store.state, repository, number, &snapshot).is_some())
+}
+
 fn shadow_gate_report(
     policy: &RepositoryPolicy,
     number: u64,
@@ -1916,10 +1932,7 @@ fn resume_owner(
         .registry
         .list(None, Some(&source_task_id))
         .iter()
-        .any(|agent| {
-            agent.state == "running"
-                || (agent.state == "orphaned" && super::process_group_running(agent.process_group))
-        })
+        .any(super::managed_agent_running)
     {
         return Ok(());
     }
@@ -2268,6 +2281,7 @@ fn latest_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Option<Stri
 fn kill_agents_with(
     registry: &AgentRegistry,
     agent_ids: &[String],
+    orphan_is_current: impl Fn(&relay_core::AgentRecord) -> bool,
     mut kill: impl FnMut(i32),
 ) -> Vec<String> {
     let mut unverified = Vec::new();
@@ -2275,9 +2289,12 @@ fn kill_agents_with(
         if let Some(agent) = registry.get(agent_id) {
             match agent.state.as_str() {
                 "running" => kill(agent.process_group),
-                // After a daemon restart there is no retained OS process
-                // handle or start-time identity. A numeric PGID may have been
-                // reused, so signalling it could kill an unrelated process.
+                "orphaned" if orphan_is_current(&agent) => {
+                    kill(agent.process_group);
+                    let _ = registry.transition(agent_id, "cleanup_forced", None);
+                }
+                // Records created before process birth identity was persisted,
+                // or whose PID has been reused, must never be signalled.
                 "orphaned" => unverified.push(agent_id.clone()),
                 _ => {}
             }
@@ -2288,10 +2305,15 @@ fn kill_agents_with(
 
 fn kill_agents(server: &Server, agent_ids: &[String]) {
     let mut process_groups = Vec::new();
-    let unverified = kill_agents_with(&server.supervisor.registry, agent_ids, |process_group| {
-        let _ = force_kill_process_group(process_group);
-        process_groups.push(process_group);
-    });
+    let unverified = kill_agents_with(
+        &server.supervisor.registry,
+        agent_ids,
+        super::recovered_agent_identity_matches,
+        |process_group| {
+            let _ = force_kill_process_group(process_group);
+            process_groups.push(process_group);
+        },
+    );
     for agent_id in unverified {
         if let Err(error) =
             server
@@ -2515,6 +2537,7 @@ review_loop:
             execution_id: format!("execution-{id}"),
             leader_pid: process_group,
             process_group,
+            process_identity: Some(format!("test:{process_group}")),
             started_at: format!("2026-01-01T00:00:{process_group:02}Z"),
             deadline_at: None,
             command: "codex exec".to_owned(),
@@ -2832,10 +2855,22 @@ review_loop:
             schema_version: state_schema_version(),
             rounds: BTreeMap::from([(round_key("owner/repo", 7, &head), round.clone())]),
         };
-        assert!(active_gate_round(&state, "owner/repo", 7, &accepted).is_some());
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-review-gate-state-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state = state;
+        store.save().unwrap();
+        let reopened = StateStore::open(state_path.clone()).unwrap();
+        assert!(active_gate_round(&reopened.state, "owner/repo", 7, &accepted).is_some());
         let mut retargeted = accepted;
         retargeted.base_ref_oid = "d".repeat(40);
-        assert!(active_gate_round(&state, "owner/repo", 7, &retargeted).is_none());
+        assert!(active_gate_round(&reopened.state, "owner/repo", 7, &retargeted).is_none());
         let report = shadow_gate_report(&policy, 7, &retargeted, None);
         assert_eq!(report["pass"], false);
         assert!(
@@ -2845,6 +2880,7 @@ review_loop:
                 .iter()
                 .any(|reason| reason == "no active review generation for current comparison")
         );
+        std::fs::remove_file(state_path).unwrap();
     }
 
     fn test_round(head: &str, phase: RoundPhase, agent_id: Option<&str>) -> ReviewRound {
@@ -3081,6 +3117,15 @@ review_loop:
             super::super::random_hex_128().unwrap()
         ));
         let registry = AgentRegistry::open(&path).unwrap();
+        let orphan = agent("liveness", "task", 40, "orphaned");
+        assert!(super::super::managed_agent_running_with(&orphan, |_| true));
+        assert!(!super::super::managed_agent_running_with(&orphan, |_| {
+            false
+        }));
+        let finished = agent("terminal", "task", 40, "finished");
+        assert!(!super::super::managed_agent_running_with(&finished, |_| {
+            true
+        }));
         registry
             .register(agent("running", "task", 41, "running"))
             .unwrap();
@@ -3090,6 +3135,9 @@ review_loop:
         registry
             .register(agent("finished", "task", 43, "finished"))
             .unwrap();
+        registry
+            .register(agent("verified", "task", 44, "orphaned"))
+            .unwrap();
         let mut killed = Vec::new();
         let unverified = kill_agents_with(
             &registry,
@@ -3097,11 +3145,14 @@ review_loop:
                 "running".to_owned(),
                 "orphaned".to_owned(),
                 "finished".to_owned(),
+                "verified".to_owned(),
             ],
+            |agent| agent.id == "verified",
             |process_group| killed.push(process_group),
         );
-        assert_eq!(killed, [41]);
+        assert_eq!(killed, [41, 44]);
         assert_eq!(unverified, ["orphaned"]);
+        assert_eq!(registry.get("verified").unwrap().state, "cleanup_forced");
         registry.transition("running", "finished", Some(0)).unwrap();
         let state_path = path.with_extension("events");
         let server = Server {
@@ -3227,7 +3278,7 @@ review_loop:
         ));
         let registry = AgentRegistry::open(&registry_path).unwrap();
         registry
-            .register(agent("owner", "owner-task", 51, "running"))
+            .register(agent("owner", "owner-task", 51, "orphaned"))
             .unwrap();
         registry
             .register(agent("reviewer", "review-task", 52, "running"))
@@ -3238,7 +3289,12 @@ review_loop:
         let superseded = supersede_stale_round(&mut store, &key, &changed, |agent_ids| {
             let persisted = StateStore::open(state_path.clone()).unwrap();
             assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Superseded);
-            kill_agents_with(&registry, agent_ids, |group| killed.push(group));
+            kill_agents_with(
+                &registry,
+                agent_ids,
+                |agent| agent.id == "owner",
+                |group| killed.push(group),
+            );
         });
         assert!(superseded.unwrap());
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Superseded);

@@ -19,6 +19,9 @@ pub struct AgentRecord {
     pub execution_id: String,
     pub leader_pid: i32,
     pub process_group: i32,
+    /// OS-reported process birth identity. Unlike a PID/PGID, this changes
+    /// when the operating system reuses a numeric process identifier.
+    pub process_identity: Option<String>,
     pub started_at: String,
     pub deadline_at: Option<String>,
     pub command: String,
@@ -230,10 +233,10 @@ impl AgentRegistry {
     }
 
     /// Mark formerly live agents honestly after a relay restart.  The caller
-    /// supplies a non-signalling group probe; no lost pipe is ever reattached.
-    pub fn recover<F>(&self, group_running: F) -> Result<Vec<AgentRecord>, String>
+    /// supplies a non-signalling identity probe; no lost pipe is ever reattached.
+    pub fn recover<F>(&self, process_is_current: F) -> Result<Vec<AgentRecord>, String>
     where
-        F: Fn(i32) -> bool,
+        F: Fn(&AgentRecord) -> bool,
     {
         let mut entries = self
             .inner
@@ -243,7 +246,7 @@ impl AgentRegistry {
         let mut changed = Vec::new();
         for entry in updated.values_mut() {
             if entry.state == "running" {
-                entry.state = if group_running(entry.process_group) {
+                entry.state = if process_is_current(entry) {
                     "orphaned".to_owned()
                 } else {
                     "lost_after_restart".to_owned()
@@ -456,6 +459,14 @@ fn agent_json(entry: &AgentRecord) -> Json {
             Json::Number(entry.process_group.to_string()),
         ),
         (
+            "process_identity".to_owned(),
+            entry
+                .process_identity
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
             "started_at".to_owned(),
             Json::String(entry.started_at.clone()),
         ),
@@ -555,6 +566,11 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 .unwrap_or_else(|| text("id").unwrap_or_default()),
             leader_pid: integer("leader_pid")? as i32,
             process_group: integer("process_group")? as i32,
+            process_identity: match get("process_identity") {
+                Some(Json::String(value)) => Some(value.clone()),
+                Some(Json::Null) | None => None,
+                _ => return Err("invalid agent registry".to_owned()),
+            },
             started_at: text("started_at")?,
             deadline_at: match get("deadline_at") {
                 Some(Json::String(v)) => Some(v.clone()),
@@ -1660,6 +1676,7 @@ mod tests {
             execution_id: "execution-1".to_owned(),
             leader_pid: 42,
             process_group: 42,
+            process_identity: Some("test:42".to_owned()),
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "codex exec".to_owned(),
@@ -1687,8 +1704,11 @@ mod tests {
         registry.register(agent("live")).unwrap();
         let mut gone = agent("gone");
         gone.process_group = 99;
+        gone.process_identity = Some("test:99".to_owned());
         registry.register(gone).unwrap();
-        let changed = registry.recover(|group| group == 42).unwrap();
+        let changed = registry
+            .recover(|record| record.process_identity.as_deref() == Some("test:42"))
+            .unwrap();
         assert_eq!(changed.len(), 2);
         assert_eq!(registry.get("live").unwrap().state, "orphaned");
         assert_eq!(registry.get("gone").unwrap().state, "lost_after_restart");
