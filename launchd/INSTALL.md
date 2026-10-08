@@ -145,7 +145,6 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 +        ["pr", "list"],
 +        ["pr", "view"],
 +        ["pr", "checks"],
-+        ["pr", "diff"],
 +        ["api"]
 +      ],
 +      "gh_read_repos": ["ShukantPal/zigzag"]
@@ -161,8 +160,8 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 
 `/opt/homebrew/bin/gh` must be replaced with the owner's actual absolute `gh`
 path. Zigzag additionally restricts the public `gh` entry to repositories in
-`gh_read_repos`, `pr list`, `pr view`, `pr checks`, `pr diff`, and GET-only
-`api` calls. It rejects
+`gh_read_repos`, `pr list`, `pr view`, `pr checks`, and GET-only `api` calls
+(including exact-SHA compare reads). It rejects
 `--method`, `-X`, body flags, all other `gh` subcommands, and `--web` (including
 `--web=true`), so this policy cannot be used to write GitHub state or read a
 different repository. The daemon's internal verdict publisher reuses only the

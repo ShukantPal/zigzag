@@ -331,6 +331,7 @@ impl StateStore {
 #[serde(rename_all = "camelCase")]
 struct PullRequestSnapshot {
     head_ref_oid: String,
+    base_ref_oid: String,
     head_ref_name: String,
     state: String,
     merged_at: Option<String>,
@@ -426,13 +427,7 @@ fn supersede_rounds_for_head(
     {
         if key == current_key || !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded)
         {
-            agents.extend(
-                round
-                    .reviewers
-                    .values()
-                    .filter_map(|reviewer| reviewer.agent_id.clone()),
-            );
-            agents.extend(round.owner_agent_id.clone());
+            agents.extend(round_agent_ids(round));
         }
         if key != current_key && !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded)
         {
@@ -443,10 +438,7 @@ fn supersede_rounds_for_head(
     agents
 }
 
-fn mark_round_merged(state: &mut DurableState, key: &str) -> Vec<String> {
-    let Some(round) = state.rounds.get_mut(key) else {
-        return Vec::new();
-    };
+fn round_agent_ids(round: &ReviewRound) -> Vec<String> {
     let mut agents: Vec<_> = round
         .reviewers
         .values()
@@ -454,6 +446,14 @@ fn mark_round_merged(state: &mut DurableState, key: &str) -> Vec<String> {
         .collect();
     agents.extend(round.owner_agent_id.clone());
     agents.sort();
+    agents
+}
+
+fn mark_round_merged(state: &mut DurableState, key: &str) -> Vec<String> {
+    let Some(round) = state.rounds.get_mut(key) else {
+        return Vec::new();
+    };
+    let agents = round_agent_ids(round);
     round.phase = RoundPhase::Merged;
     agents
 }
@@ -646,7 +646,7 @@ fn dispatch_missing_reviewers(
         let prompt = reviewer_prompt(&repository, number, &head, lens);
         let project_dir = review_workspace(&task_id)?;
         if review_patch.is_none() {
-            review_patch = Some(fetch_pr_diff(&repository, number)?);
+            review_patch = Some(fetch_pr_diff(&repository, number, &head)?);
             if fetch_pr(&repository, number)?.head_ref_oid != head {
                 return Err("PR head changed while preparing reviewer input".to_owned());
             }
@@ -715,11 +715,7 @@ fn poll_reviews(
         };
         let snapshot = fetch_pr(&repository, number)?;
         if snapshot.head_ref_oid != expected_head {
-            let agent_ids: Vec<_> = store.state.rounds[&key]
-                .reviewers
-                .values()
-                .filter_map(|reviewer| reviewer.agent_id.clone())
-                .collect();
+            let agent_ids = round_agent_ids(&store.state.rounds[&key]);
             store
                 .state
                 .rounds
@@ -882,24 +878,32 @@ fn fetch_pr(repository: &str, number: u64) -> Result<PullRequestSnapshot, String
         "--repo".to_owned(),
         repository.to_owned(),
         "--json".to_owned(),
-        "headRefOid,headRefName,state,mergedAt,comments,statusCheckRollup".to_owned(),
+        "headRefOid,baseRefOid,headRefName,state,mergedAt,comments,statusCheckRollup".to_owned(),
     ];
     let result = run_allowed("gh", args, format!("review-pr-{repository}-{number}"))?;
     serde_json::from_str(&result)
         .map_err(|error| format!("GitHub PR response was not expected JSON: {error}"))
 }
 
-fn fetch_pr_diff(repository: &str, number: u64) -> Result<String, String> {
+fn fetch_pr_diff(repository: &str, number: u64, expected_head: &str) -> Result<String, String> {
+    let snapshot = fetch_pr(repository, number)?;
+    if snapshot.head_ref_oid != expected_head {
+        return Err("pull request head changed before reviewer dispatch".to_owned());
+    }
+    let endpoint = format!(
+        "repos/{repository}/compare/{}...{expected_head}",
+        snapshot.base_ref_oid
+    );
     run_allowed(
         "gh",
         vec![
-            "pr".to_owned(),
-            "diff".to_owned(),
-            number.to_string(),
-            "--repo".to_owned(),
-            repository.to_owned(),
+            "api".to_owned(),
+            endpoint,
+            "--jq".to_owned(),
+            ".files | map({filename, previous_filename, status, additions, deletions, patch})"
+                .to_owned(),
         ],
-        format!("review-diff-{repository}-{number}"),
+        format!("review-diff-{repository}-{number}-{expected_head}"),
     )
 }
 
@@ -1703,6 +1707,7 @@ review_loop:
     fn snapshot(head: &str) -> PullRequestSnapshot {
         PullRequestSnapshot {
             head_ref_oid: head.to_owned(),
+            base_ref_oid: "c".repeat(40),
             head_ref_name: "codex/branch".to_owned(),
             state: "OPEN".to_owned(),
             merged_at: None,
@@ -2100,6 +2105,13 @@ review_loop:
         );
         assert_eq!(killed, [41, 42]);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_head_poll_cleanup_includes_the_owner_agent() {
+        let mut round = test_round(&"a".repeat(40), RoundPhase::Reviewing, Some("reviewer"));
+        round.owner_agent_id = Some("owner".to_owned());
+        assert_eq!(round_agent_ids(&round), ["owner", "reviewer"]);
     }
 
     #[test]

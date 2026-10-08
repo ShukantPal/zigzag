@@ -222,8 +222,7 @@ impl Policy {
 fn is_read_only_gh_command(args: &[String], repos: &BTreeSet<String>) -> bool {
     match args {
         [command, subcommand, rest @ ..]
-            if command == "pr"
-                && matches!(subcommand.as_str(), "list" | "view" | "checks" | "diff") =>
+            if command == "pr" && matches!(subcommand.as_str(), "list" | "view" | "checks") =>
         {
             gh_repo_argument(rest).is_some_and(|repo| repos.contains(repo))
                 && !rest
@@ -307,8 +306,21 @@ fn pr_watchdog_read_endpoint_repo(endpoint: &str) -> Option<String> {
         {
             Some(format!("{owner}/{repo}"))
         }
+        ["repos", owner, repo, "compare", comparison]
+            if valid_github_name(owner)
+                && valid_github_name(repo)
+                && comparison
+                    .split_once("...")
+                    .is_some_and(|(base, head)| valid_git_oid(base) && valid_git_oid(head)) =>
+        {
+            Some(format!("{owner}/{repo}"))
+        }
         _ => None,
     }
+}
+
+fn valid_git_oid(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_github_name(value: &str) -> bool {
@@ -603,7 +615,7 @@ mod tests {
     #[test]
     fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
         let policy = policy(
-            r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["pr","diff"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
+            r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
         );
         assert!(
             policy
@@ -613,13 +625,28 @@ mod tests {
                 )
                 .is_some()
         );
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
         assert!(
             policy
                 .allowed_path(
                     "gh",
-                    &args(&["pr", "diff", "42", "--repo", "leveled-inc/leveled"]),
+                    &args(&[
+                        "api",
+                        &format!("repos/leveled-inc/leveled/compare/{base}...{head}"),
+                        "--jq",
+                        ".files",
+                    ]),
                 )
                 .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["api", "repos/leveled-inc/leveled/compare/main...head"]),
+                )
+                .is_none()
         );
         assert_eq!(
             policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
