@@ -91,8 +91,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_prompt_uses_checked_out_diff_not_untrusted_pr_metadata(self):
         prompt = dispatcher.FULL_TEMPLATE.format(pr=12, repo="owner/repo", project_dir="/work",
                                                  lens="tests", head="a" * 40)
-        self.assertIn("verify `.review-head`", prompt)
-        self.assertIn("inspect `.review.diff`", prompt)
+        self.assertIn("verify `review-head`", prompt)
+        self.assertIn("inspect `review.diff`", prompt)
         self.assertIn("Do not read the PR body", prompt)
         self.assertIn("Do not invoke `gh`", prompt)
 
@@ -137,31 +137,55 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertIn(f"head={'a' * 40}", command)
         self.assertIn('git -C "$source" archive', command)
         self.assertIn('git -C "$source" diff --binary origin/main...', command)
-        self.assertIn(".review-head", command)
+        self.assertIn("review-head", command)
 
     def test_snapshot_materializes_exact_committed_source_and_diff(self):
-        repo = DEPT_DIR.parent
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
-            capture_output=True, text=True).stdout.strip()
-
         def local_mac(command):
             subprocess.run(["sh", "-c", command], check=True,
                            capture_output=True, text=True)
             return ""
 
-        with tempfile.TemporaryDirectory() as tmp, \
-             patch.object(dispatcher, "SNAPSHOT_ROOT", tmp), \
-             patch.object(dispatcher, "mac", side_effect=local_mac):
-            snapshot = pathlib.Path(self.real_create_review_snapshot(
-                str(repo), head, "owner/repo", 12, 3))
-            self.assertEqual((snapshot / ".review-head").read_text().strip(), head)
-            self.assertTrue((snapshot / ".review.diff").is_file())
-            self.assertEqual(
-                (snapshot / "dept" / "dispatch_review_round.py").read_bytes(),
-                subprocess.run(
-                    ["git", "show", f"{head}:dept/dispatch_review_round.py"],
-                    cwd=repo, check=True, capture_output=True).stdout)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            repo = root / "source repo"
+            repo.mkdir()
+            for command in (
+                    ["git", "init"],
+                    ["git", "config", "user.email", "test@example.com"],
+                    ["git", "config", "user.name", "Test"],):
+                subprocess.run(command, cwd=repo, check=True,
+                               capture_output=True)
+            source = repo / "source.txt"
+            source.write_text("base\n")
+            subprocess.run(["git", "add", "source.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo,
+                           check=True, capture_output=True)
+            subprocess.run(["git", "update-ref", "refs/remotes/origin/main",
+                            "HEAD"], cwd=repo, check=True)
+            victim = root / "victim.txt"
+            victim.write_text("untouched\n")
+            source.write_text("reviewed\n")
+            (repo / "review-head").symlink_to(victim)
+            (repo / "review.diff").symlink_to(victim)
+            subprocess.run(["git", "add", "source.txt", "review-head",
+                            "review.diff"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "reviewed"], cwd=repo,
+                           check=True, capture_output=True)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                capture_output=True, text=True).stdout.strip()
+            snapshot_root = root / "snapshots"
+            with patch.object(dispatcher, "SNAPSHOT_ROOT", str(snapshot_root)), \
+                 patch.object(dispatcher, "mac", side_effect=local_mac):
+                snapshot = pathlib.Path(self.real_create_review_snapshot(
+                    str(repo), head, "owner/repo", 12, 3))
+            self.assertEqual((snapshot / "review-head").read_text().strip(), head)
+            self.assertTrue((snapshot / "review.diff").is_file())
+            self.assertEqual((snapshot / "source" / "source.txt").read_text(),
+                             "reviewed\n")
+            self.assertIn("+reviewed", (snapshot / "review.diff").read_text())
+            self.assertTrue((snapshot / "source" / "review-head").is_symlink())
+            self.assertEqual(victim.read_text(), "untouched\n")
 
     def test_snapshot_rejects_non_commit_identifier(self):
         with patch.object(dispatcher, "mac") as mac, \
