@@ -594,13 +594,16 @@ fn require_gui_login_session() -> Result<(), String> {
     if is_local_gui_session(status, attributes) {
         Ok(())
     } else {
-        Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
+        Err(
+            "privileged daemon operations require Shukant's local macOS GUI login session"
+                .to_owned(),
+        )
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn require_gui_login_session() -> Result<(), String> {
-    Err("set-allowlist must run from Shukant's local macOS GUI login session".to_owned())
+    Err("privileged daemon operations require Shukant's local macOS GUI login session".to_owned())
 }
 
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {

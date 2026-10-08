@@ -256,6 +256,8 @@ struct OwnerContext {
     session_id: String,
     project_dir: PathBuf,
     department_task_id: String,
+    #[serde(default)]
+    branch: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -397,6 +399,7 @@ pub fn start(
     state_path: PathBuf,
     shadow: bool,
 ) -> Result<(), String> {
+    super::require_gui_login_session()?;
     let mut store = StateStore::open(state_path)?;
     thread::spawn(move || {
         let mut discovery_due = Instant::now();
@@ -1284,6 +1287,7 @@ fn bounded_compare_material(response: &str) -> Result<String, String> {
 }
 
 fn run_allowed(bin: &str, args: Vec<String>, id: String) -> Result<String, String> {
+    super::require_gui_login_session()?;
     let policy = exec::load_policy()?;
     let path = policy
         .allowed_path(bin, &args)
@@ -1775,6 +1779,16 @@ fn resume_owner(
     let task_id = owner_task_id(&repository, number, &head, generation);
     store.save()?;
     let prompt = owner_prompt(&repository, number, &base, &head, generation, findings);
+    if !owner_context_is_current(&owner, &repository, &head) {
+        let round = store.state.rounds.get_mut(key).expect("round exists");
+        round.phase = RoundPhase::Attention;
+        round.gate_reasons = vec![
+            "owning Codex session no longer matches the exact repository, branch, and head"
+                .to_owned(),
+        ];
+        store.save()?;
+        return Ok(());
+    }
     let agent_id = spawn_codex_task(
         server,
         &task_id,
@@ -1800,6 +1814,7 @@ fn spawn_codex_task(
     prompt: &str,
     review_material: Option<&[u8]>,
 ) -> Result<String, String> {
+    super::require_gui_login_session()?;
     if let Some(existing_id) = latest_agent_for_task(&server.supervisor.registry, task_id) {
         return Ok(existing_id);
     }
@@ -1951,6 +1966,7 @@ fn find_owner_context(repository: &str, branch: &str, head: &str) -> Option<Owne
                 session_id,
                 project_dir,
                 department_task_id,
+                branch: branch.to_owned(),
             },
         );
         if candidates
@@ -1998,6 +2014,35 @@ fn git_matches_owner_checkout(
     git_matches_repository(directory, repository)
         && git_output(directory, &["branch", "--show-current"]).as_deref() == Some(branch)
         && git_output(directory, &["rev-parse", "--verify", "HEAD"]).as_deref() == Some(head)
+}
+
+fn owner_context_is_current(owner: &OwnerContext, repository: &str, head: &str) -> bool {
+    if owner.branch.is_empty()
+        || !git_matches_owner_checkout(&owner.project_dir, repository, &owner.branch, head)
+    {
+        return false;
+    }
+    let Some(department) = home_dir().map(|home| home.join(".codex/dept")) else {
+        return false;
+    };
+    owner_context_matches_task(&department, owner)
+}
+
+fn owner_context_matches_task(department: &Path, owner: &OwnerContext) -> bool {
+    let task_dir = department.join(&owner.department_task_id);
+    let Some(project_dir) = fs::read_to_string(task_dir.join("dir.txt")).ok() else {
+        return false;
+    };
+    if fs::canonicalize(project_dir.trim()).ok().as_ref() != Some(&owner.project_dir) {
+        return false;
+    }
+    fs::read_to_string(task_dir.join("resume.txt"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| session_from_events(&task_dir.join("events.jsonl")))
+        .as_deref()
+        == Some(owner.session_id.as_str())
 }
 
 fn canonical_github_repository(remote: &str) -> Option<String> {
@@ -3021,6 +3066,37 @@ review_loop:
             "other-branch",
             &head
         ));
+
+        let department = std::env::temp_dir().join(format!(
+            "zigzag-owner-department-{}",
+            super::super::random_hex_128().unwrap()
+        ));
+        let task_dir = department.join("t-owner");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(
+            task_dir.join("dir.txt"),
+            directory.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            task_dir.join("events.jsonl"),
+            "{\"thread_id\":\"session-owner\"}\n",
+        )
+        .unwrap();
+        let owner = OwnerContext {
+            session_id: "session-owner".to_owned(),
+            project_dir: fs::canonicalize(&directory).unwrap(),
+            department_task_id: "t-owner".to_owned(),
+            branch: "codex/branch".to_owned(),
+        };
+        assert!(owner_context_matches_task(&department, &owner));
+        fs::write(
+            task_dir.join("events.jsonl"),
+            "{\"thread_id\":\"session-replaced\"}\n",
+        )
+        .unwrap();
+        assert!(!owner_context_matches_task(&department, &owner));
+
         git(&[
             "remote",
             "set-url",
@@ -3033,6 +3109,7 @@ review_loop:
             "codex/branch",
             &head
         ));
+        fs::remove_dir_all(department).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
