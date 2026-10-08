@@ -99,7 +99,8 @@ cap are rejected as potentially truncated and put the round in `Attention`.
 
 Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
 Shadow mode runs discovery, verdict admission, and gate decisions alongside
-the VM tooling but suppresses agent dispatch, owner resume, and process kills.
+the VM tooling, preserves the legacy `--watch-repo` `github_pr_opened` feed,
+and suppresses agent dispatch, owner resume, and process kills.
 Remove it only after decisions match and the VM review jobs have drained and
 stopped. See [launchd/INSTALL.md](launchd/INSTALL.md) for configuration and
 cutover.

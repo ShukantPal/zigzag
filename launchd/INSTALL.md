@@ -107,8 +107,12 @@ supersede old approvals, and merge polling terminates reviewer process groups.
 
 For the migration comparison period, set `ZIGZAG_REVIEW_LOOP_SHADOW=1` in the
 LaunchAgent environment. Shadow mode evaluates and emits decisions but never
-dispatches, resumes, or kills agents. At cutover, drain and stop the VM review
-jobs, remove the environment variable, and restart Zigzag.
+dispatches, resumes, or kills agents. Keep the existing `--watch-repo` and
+`--watch-interval` arguments during this period: Zigzag continues emitting the
+durable `github_pr_opened` feed that drives the VM review worker. At cutover,
+drain and stop the VM review jobs, remove the environment variable, and restart
+Zigzag; the active Mac review loop then suppresses the legacy watcher even if
+the compatibility arguments remain in the LaunchAgent.
 `review_loop.enabled: false` is different: it starts no review loop at all.
 
 Install the dedicated reviewer launcher beside the department launcher:

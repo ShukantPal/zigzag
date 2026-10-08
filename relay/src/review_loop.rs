@@ -924,6 +924,26 @@ fn retry_all_pending_comment_deletions(config: &ReviewLoopConfig, store: &mut St
     }
 }
 
+fn prepare_inactive_comment_cleanup(
+    policy: &RepositoryPolicy,
+    store: &mut StateStore,
+    key: &str,
+    comments: &[Comment],
+    shadow: bool,
+) -> Result<(), String> {
+    if stage_unadmitted_generated_comments(
+        policy,
+        store.state.rounds.get_mut(key).expect("round exists"),
+        comments,
+    ) {
+        store.save()?;
+    }
+    if !shadow && let Err(error) = retry_pending_comment_deletions(policy, store, key) {
+        eprintln!("review comment cleanup failed for {key}: {error}");
+    }
+    Ok(())
+}
+
 fn poll_reviews(
     server: &Arc<Server>,
     config: &ReviewLoopConfig,
@@ -968,16 +988,7 @@ fn poll_reviews(
         };
         let mut snapshot = fetch_pr(&repository, number)?;
         if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
-            if stage_unadmitted_generated_comments(
-                policy,
-                store.state.rounds.get_mut(&key).expect("round exists"),
-                &snapshot.comments,
-            ) {
-                store.save()?;
-            }
-            if !shadow && let Err(error) = retry_pending_comment_deletions(policy, store, &key) {
-                eprintln!("review comment cleanup failed for {key}: {error}");
-            }
+            prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
         }
         if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
@@ -1124,22 +1135,27 @@ fn poll_merges(
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
-        let (repository, number, generation) = {
+        let (repository, number, head, base, generation) = {
             let round = &store.state.rounds[&key];
             (
                 round.repository.clone(),
                 round.pull_request,
+                round.head.clone(),
+                round.base.clone(),
                 round.generation,
             )
         };
-        if !config
+        let Some(policy) = config
             .repositories
             .iter()
-            .any(|policy| policy.repository == repository)
-        {
+            .find(|policy| policy.repository == repository)
+        else {
             continue;
-        }
+        };
         let snapshot = fetch_pr(&repository, number)?;
+        if !open_comparison_matches(&snapshot, &base, &head) {
+            prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
+        }
         let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
@@ -2661,10 +2677,10 @@ review_loop:
     }
 
     #[test]
-    fn crash_recovery_stages_and_retries_unadmitted_comment_deletion() {
+    fn merge_cleanup_seam_stages_and_retries_unadmitted_comment_deletion() {
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
-        let mut round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
+        let round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
         let marker = verdict_id("owner/repo", 7, &head, 1, "tests", 1);
         let comment = Comment {
             author: Some(Author {
@@ -2674,14 +2690,6 @@ review_loop:
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             id: "IC_pending".to_owned(),
         };
-        assert!(stage_unadmitted_generated_comments(
-            &policy(),
-            &mut round,
-            &[comment]
-        ));
-        assert!(round.excluded_comment_ids.contains("IC_pending"));
-        assert!(round.pending_comment_deletions.contains("IC_pending"));
-
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-comment-cleanup-{}.json",
             super::super::random_hex_128().unwrap()
@@ -2689,6 +2697,22 @@ review_loop:
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
         store.save().unwrap();
+        prepare_inactive_comment_cleanup(&policy(), &mut store, &key, &[comment], true).unwrap();
+        assert!(
+            store.state.rounds[&key]
+                .excluded_comment_ids
+                .contains("IC_pending")
+        );
+        assert!(
+            store.state.rounds[&key]
+                .pending_comment_deletions
+                .contains("IC_pending")
+        );
+        assert!(
+            StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                .pending_comment_deletions
+                .contains("IC_pending")
+        );
         assert!(
             retry_pending_comment_deletions_with(&mut store, &key, |_| {
                 Err("temporary GitHub failure".to_owned())
