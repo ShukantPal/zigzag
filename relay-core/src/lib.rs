@@ -550,9 +550,15 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 .map(str::to_owned)
                 .ok_or_else(|| "invalid agent registry".to_owned())
         };
+        // Registries written by older daemons encode some numeric fields as
+        // strings.  Accept either form.
         let integer = |key| {
             get(key)
-                .and_then(Json::as_u64)
+                .and_then(|value| match value {
+                    Json::Number(_) => value.as_u64(),
+                    Json::String(text) => text.parse::<u64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| "invalid agent registry".to_owned())
         };
         let record = AgentRecord {
@@ -571,7 +577,11 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 Some(Json::Null) | None => None,
                 _ => return Err("invalid agent registry".to_owned()),
             },
-            started_at: text("started_at")?,
+            started_at: match get("started_at") {
+                Some(Json::String(value)) => value.clone(),
+                Some(Json::Number(value)) => value.clone(),
+                _ => return Err("invalid agent registry".to_owned()),
+            },
             deadline_at: match get("deadline_at") {
                 Some(Json::String(v)) => Some(v.clone()),
                 Some(Json::Null) => None,
@@ -603,6 +613,10 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
             },
             first_output_bytes: match get("first_output_bytes") {
                 Some(Json::Null) | None => None,
+                Some(Json::String(text)) => Some(
+                    text.parse::<u64>()
+                        .map_err(|_| "invalid agent registry".to_owned())?,
+                ),
                 Some(value) => Some(
                     value
                         .as_u64()
