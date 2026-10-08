@@ -318,7 +318,8 @@ impl StateStore {
     }
 
     fn save(&self) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
+        let parent = self.path.parent().map(Path::to_path_buf);
+        if let Some(parent) = &parent {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("could not create review state directory: {error}"))?;
         }
@@ -327,7 +328,13 @@ impl StateStore {
         let temporary = self.path.with_extension("tmp");
         write_private(temporary.clone(), &bytes)?;
         fs::rename(&temporary, &self.path)
-            .map_err(|error| format!("could not commit review-loop state: {error}"))
+            .map_err(|error| format!("could not commit review-loop state: {error}"))?;
+        if let Some(parent) = parent {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("could not sync review state directory: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -367,6 +374,12 @@ struct Check {
     conclusion: Option<String>,
     #[serde(default)]
     status: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreatedComment {
+    id: u64,
+    node_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -495,6 +508,16 @@ fn pull_request_is_open(snapshot: &PullRequestSnapshot) -> bool {
 
 fn pull_request_is_merged(snapshot: &PullRequestSnapshot) -> bool {
     snapshot.merged_at.is_some() || snapshot.state.eq_ignore_ascii_case("merged")
+}
+
+fn open_comparison_matches(
+    snapshot: &PullRequestSnapshot,
+    expected_base: &str,
+    expected_head: &str,
+) -> bool {
+    pull_request_is_open(snapshot)
+        && snapshot.base_ref_oid == expected_base
+        && snapshot.head_ref_oid == expected_head
 }
 
 fn mark_round_superseded(state: &mut DurableState, key: &str) -> Vec<String> {
@@ -762,10 +785,7 @@ fn dispatch_missing_reviewers(
                 if review_patch.is_none() {
                     review_patch = Some(fetch_pr_diff(&repository, number, &base, &head)?);
                     let current = fetch_pr(&repository, number)?;
-                    if !pull_request_is_open(&current)
-                        || current.head_ref_oid != head
-                        || current.base_ref_oid != base
-                    {
+                    if !open_comparison_matches(&current, &base, &head) {
                         return Err(
                             "PR comparison changed while preparing reviewer input".to_owned()
                         );
@@ -1041,10 +1061,7 @@ fn fetch_pr_diff(
     expected_head: &str,
 ) -> Result<String, String> {
     let snapshot = fetch_pr(repository, number)?;
-    if !pull_request_is_open(&snapshot)
-        || snapshot.head_ref_oid != expected_head
-        || snapshot.base_ref_oid != expected_base
-    {
+    if !open_comparison_matches(&snapshot, expected_base, expected_head) {
         return Err("pull request comparison changed before reviewer dispatch".to_owned());
     }
     let endpoint = format!("repos/{repository}/compare/{expected_base}...{expected_head}");
@@ -1312,13 +1329,32 @@ fn collect_completed_reviewers(
         // side effect; the caller then persists the terminal/superseded
         // transition from its post-collection snapshot.
         let current = fetch_pr(&repository, number)?;
-        if !pull_request_is_open(&current)
-            || current.head_ref_oid != head
-            || current.base_ref_oid != base
-        {
+        if !open_comparison_matches(&current, &base, &head) {
             return Ok(());
         }
-        post_verdict_comment(policy, number, &result, &marker, &task_id)?;
+        let comment = post_verdict_comment(policy, number, &result, &marker, &task_id)?;
+        let current = fetch_pr(&repository, number);
+        let publication_is_current = current
+            .as_ref()
+            .is_ok_and(|current| open_comparison_matches(current, &base, &head));
+        if !publication_is_current {
+            // Fail closed across GitHub's non-atomic read→comment boundary.
+            // Persist the GraphQL node id before the compensating delete so
+            // this comment can never be admitted even if deletion fails.
+            store
+                .state
+                .rounds
+                .get_mut(key)
+                .expect("round exists")
+                .excluded_comment_ids
+                .insert(comment.node_id.clone());
+            let persisted = store.save();
+            let deleted = delete_verdict_comment(policy, comment.id, &task_id);
+            persisted?;
+            deleted?;
+            current?;
+            return Ok(());
+        }
         store
             .state
             .rounds
@@ -1344,7 +1380,7 @@ fn post_verdict_comment(
     result: &ReviewerResult,
     marker: &str,
     task_id: &str,
-) -> Result<(), String> {
+) -> Result<CreatedComment, String> {
     let policy_store = exec::load_policy()?;
     let path = policy_store
         .trusted_gh_path_for_repo(&policy.repository)
@@ -1380,26 +1416,62 @@ fn post_verdict_comment(
         summary,
         marker
     );
-    let body_path = review_task_dir(task_id)?.join("verdict-comment.md");
-    write_private(body_path.clone(), body.as_bytes())?;
+    let body_path = review_task_dir(task_id)?.join("verdict-comment.json");
+    let payload = serde_json::to_vec(&serde_json::json!({"body": body}))
+        .map_err(|_| "could not encode validated review verdict".to_owned())?;
+    write_private(body_path.clone(), &payload)?;
     let response = exec::run(
         path,
         exec::ExecRequest {
             id: format!("publish-{task_id}"),
             bin: "gh".to_owned(),
             args: vec![
-                "pr".to_owned(),
-                "comment".to_owned(),
-                number.to_string(),
-                "--repo".to_owned(),
-                policy.repository.clone(),
-                "--body-file".to_owned(),
+                "api".to_owned(),
+                format!("repos/{}/issues/{number}/comments", policy.repository),
+                "--method".to_owned(),
+                "POST".to_owned(),
+                "--input".to_owned(),
                 body_path.to_string_lossy().into_owned(),
+                "--jq".to_owned(),
+                "{id,node_id}".to_owned(),
             ],
         },
     );
     if response.timed_out || response.truncated || response.exit_code != Some(0) {
         return Err("could not publish validated review verdict".to_owned());
+    }
+    let comment: CreatedComment = serde_json::from_str(&response.stdout)
+        .map_err(|_| "GitHub did not return the created review comment identity".to_owned())?;
+    if comment.id == 0 || comment.node_id.is_empty() {
+        return Err("GitHub returned an invalid review comment identity".to_owned());
+    }
+    Ok(comment)
+}
+
+fn delete_verdict_comment(
+    policy: &RepositoryPolicy,
+    comment_id: u64,
+    task_id: &str,
+) -> Result<(), String> {
+    let policy_store = exec::load_policy()?;
+    let path = policy_store
+        .trusted_gh_path_for_repo(&policy.repository)
+        .ok_or_else(|| "execution policy does not authorize review comment deletion".to_owned())?;
+    let response = exec::run(
+        path,
+        exec::ExecRequest {
+            id: format!("invalidate-{task_id}"),
+            bin: "gh".to_owned(),
+            args: vec![
+                "api".to_owned(),
+                format!("repos/{}/issues/comments/{comment_id}", policy.repository),
+                "--method".to_owned(),
+                "DELETE".to_owned(),
+            ],
+        },
+    );
+    if response.timed_out || response.truncated || response.exit_code != Some(0) {
+        return Err("could not invalidate stale review verdict comment".to_owned());
     }
     Ok(())
 }
@@ -1498,6 +1570,10 @@ fn resume_owner(
                 || (agent.state == "orphaned" && super::process_group_running(agent.process_group))
         })
     {
+        return Ok(());
+    }
+    let current = fetch_pr(&repository, number)?;
+    if !open_comparison_matches(&current, &base, &head) {
         return Ok(());
     }
     let task_id = owner_task_id(&repository, number, &head, generation);
@@ -2444,8 +2520,13 @@ review_loop:
         let round = test_round(&head, RoundPhase::Ready, None);
         let mut current = snapshot(&head);
         assert!(comparison_matches(&round, &current));
+        assert!(open_comparison_matches(&current, &round.base, &head));
         current.base_ref_oid = "d".repeat(40);
         assert!(!comparison_matches(&round, &current));
+        assert!(!open_comparison_matches(&current, &round.base, &head));
+        current.base_ref_oid = round.base.clone();
+        current.state = "CLOSED".to_owned();
+        assert!(!open_comparison_matches(&current, &round.base, &head));
     }
 
     #[test]
