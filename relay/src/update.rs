@@ -77,6 +77,7 @@ struct WatchdogConfig {
     current_link: PathBuf,
     status_directory: PathBuf,
     candidate_version: String,
+    candidate_pid: u32,
     secret_file: PathBuf,
     port: u16,
     relay_args: Vec<String>,
@@ -91,6 +92,7 @@ trait Runtime: Send + Sync {
     fn output(&self, command: &str, args: &[String]) -> Result<CommandOutput, String>;
     fn status(&self, command: &str, args: &[String]) -> Result<(), String>;
     fn spawn(&self, command: &Path, args: &[String]) -> Result<(), String>;
+    fn terminate(&self, process: u32) -> Result<(), String>;
     fn exec(
         &self,
         command: &Path,
@@ -136,6 +138,34 @@ impl Runtime for SystemRuntime {
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("could not start update watchdog: {e}"))
+    }
+
+    fn terminate(&self, process: u32) -> Result<(), String> {
+        let process = process as libc::pid_t;
+        // The watchdog is spawned by the process it supervises. Refuse to
+        // signal a recycled PID if that parent relationship has been lost.
+        if unsafe { libc::getppid() } != process {
+            return Err("update watchdog no longer supervises the candidate".to_owned());
+        }
+        if unsafe { libc::kill(process, libc::SIGTERM) } != 0 {
+            return Err("could not stop unhealthy candidate".to_owned());
+        }
+        for _ in 0..50 {
+            if unsafe { libc::getppid() } != process {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if unsafe { libc::kill(process, libc::SIGKILL) } != 0 {
+            return Err("unhealthy candidate did not stop".to_owned());
+        }
+        for _ in 0..50 {
+            if unsafe { libc::getppid() } != process {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err("unhealthy candidate did not exit".to_owned())
     }
 
     fn exec(
@@ -233,6 +263,10 @@ impl Manager {
     }
 
     /// Called only after listeners are bound in the replacement process.
+    ///
+    /// The watchdog promotes the candidate only after independently observing
+    /// authenticated health. A process that binds then crashes must not become
+    /// last-known-good merely because it wrote this readiness marker.
     pub fn acknowledge_ready(&self, version: Option<&str>) -> Result<(), String> {
         let Some(path) = &self.config.ready_file else {
             return Ok(());
@@ -240,16 +274,7 @@ impl Manager {
         let version = version
             .filter(|value| valid_version(value))
             .ok_or_else(|| "replacement version is unavailable".to_owned())?;
-        let current = self.config.directory.join("current");
-        let current =
-            fs::canonicalize(current).map_err(|_| "current release is unavailable".to_owned())?;
-        replace_symlink(&current, &self.config.directory.join("last-known-good"))?;
-        let mut status = self.status();
-        status.accepted_version = Some(version.to_owned());
-        status.last_result = Some("applied".to_owned());
-        save_status(&self.config.directory, &status)?;
-        // The watchdog may only declare success after every durable transition
-        // above has committed.
+        let _ = version;
         atomic_write(path, b"ready\n")?;
         Ok(())
     }
@@ -459,6 +484,8 @@ impl Manager {
             self.config.directory.to_string_lossy().into_owned(),
             "--candidate-version".to_owned(),
             manifest.version.clone(),
+            "--candidate-pid".to_owned(),
+            std::process::id().to_string(),
             "--secret-file".to_owned(),
             secret_file.to_string_lossy().into_owned(),
             "--port".to_owned(),
@@ -573,7 +600,7 @@ fn run_watchdog_with(
         .map_err(|_| "could not read watchdog token".to_owned())?;
     for _ in 0..attempts {
         if config.ready.exists() && health_check(config.port, token.trim()) {
-            return Ok(());
+            return promote_candidate(&config);
         }
         wait();
     }
@@ -582,7 +609,21 @@ fn run_watchdog_with(
     let mut status = read_status(&config.status_directory)?;
     status.last_result = Some(format!("health_check_failed:{}", config.candidate_version));
     save_status(&config.status_directory, &status)?;
+    // `current` now points at the rollback image, but the candidate is still
+    // the LaunchAgent process and owns the listeners. Stop it before replacing
+    // this watchdog child with the rollback image.
+    runtime.terminate(config.candidate_pid)?;
     runtime.exec(&config.rollback, &config.relay_args, None)
+}
+
+fn promote_candidate(config: &WatchdogConfig) -> Result<(), String> {
+    let candidate = fs::canonicalize(&config.current_link)
+        .map_err(|_| "current candidate is unavailable after health check".to_owned())?;
+    replace_symlink(&candidate, &config.status_directory.join("last-known-good"))?;
+    let mut status = read_status(&config.status_directory)?;
+    status.accepted_version = Some(config.candidate_version.clone());
+    status.last_result = Some("applied".to_owned());
+    save_status(&config.status_directory, &status)
 }
 
 fn release_asset_url(release: &Json, expected: &str) -> Result<String, String> {
@@ -773,6 +814,7 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
     let mut current_link = None;
     let mut status_directory = None;
     let mut candidate_version = None;
+    let mut candidate_pid = None;
     let mut credential_path = None;
     let mut port = None;
     while let Some(arg) = values.next() {
@@ -790,6 +832,13 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
             "--candidate-version" if valid_version(value) => {
                 candidate_version = Some(value.clone())
             }
+            "--candidate-pid" => {
+                candidate_pid = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "invalid watchdog candidate pid")?,
+                )
+            }
             "--secret-file" => credential_path = Some(PathBuf::from(value)),
             "--port" => port = Some(value.parse::<u16>().map_err(|_| "invalid watchdog port")?),
             _ => return Err("invalid update watchdog arguments".to_owned()),
@@ -801,6 +850,7 @@ fn parse_watchdog(arguments: &[String]) -> Result<WatchdogConfig, String> {
         current_link: current_link.ok_or("missing current release link")?,
         status_directory: status_directory.ok_or("missing watchdog status directory")?,
         candidate_version: candidate_version.ok_or("missing watchdog candidate version")?,
+        candidate_pid: candidate_pid.ok_or("missing watchdog candidate pid")?,
         secret_file: credential_path.ok_or("missing watchdog credential file")?,
         port: port.ok_or("missing watchdog port")?,
         relay_args: values.cloned().collect(),
@@ -1084,6 +1134,15 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn terminate(&self, process: u32) -> Result<(), String> {
+            self.calls.lock().unwrap().push(Call {
+                operation: "terminate",
+                command: process.to_string(),
+                args: vec![],
+            });
+            Ok(())
         }
 
         fn exec(
@@ -1382,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_commits_acceptance_and_unhealthy_candidate_rolls_back() {
+    fn watchdog_promotes_only_healthy_candidates_and_stops_unhealthy_ones() {
         let dir = temp_dir("watchdog");
         let previous = dir.join("previous");
         let candidate = dir.join("candidate");
@@ -1398,22 +1457,48 @@ mod tests {
         let runtime = MockRuntime::release("", b"", "");
         let updater = manager(&dir, runtime.clone(), Some(ready.clone()));
         updater.acknowledge_ready(Some("v2.0.0")).unwrap();
+        assert!(ready.exists());
+        assert_eq!(
+            read_status(&dir).unwrap().accepted_version.as_deref(),
+            Some("v1.0.0")
+        );
+        assert!(!dir.join("last-known-good").exists());
+
+        run_watchdog_with(
+            WatchdogConfig {
+                ready: ready.clone(),
+                rollback: previous.clone(),
+                current_link: current.clone(),
+                status_directory: dir.clone(),
+                candidate_version: "v2.0.0".to_owned(),
+                candidate_pid: 42,
+                secret_file: secret.clone(),
+                port: 1,
+                relay_args: vec![],
+            },
+            runtime.as_ref(),
+            1,
+            || {},
+            |_, _| true,
+        )
+        .unwrap();
         let applied = read_status(&dir).unwrap();
         assert_eq!(applied.accepted_version.as_deref(), Some("v2.0.0"));
         assert_eq!(applied.last_result.as_deref(), Some("applied"));
-        assert!(ready.exists());
         assert_eq!(
             fs::canonicalize(dir.join("last-known-good")).unwrap(),
             fs::canonicalize(&candidate).unwrap()
         );
 
-        // Recreate the pending state for an unhealthy replacement. Accepted
-        // remains the previous version and rollback never receives a ready flag.
+        // Recreate the pending state for an unhealthy replacement. The prior
+        // version remains accepted and the candidate is stopped before the
+        // watchdog execs the rollback image.
         let mut pending = empty_status();
         pending.last_result = Some("exec_pending_health_check".to_owned());
         save_status(&dir, &pending).unwrap();
         fs::remove_file(&ready).unwrap();
         replace_symlink(&candidate, &current).unwrap();
+        replace_symlink(&previous, &dir.join("last-known-good")).unwrap();
         let result = run_watchdog_with(
             WatchdogConfig {
                 ready,
@@ -1421,6 +1506,7 @@ mod tests {
                 current_link: current.clone(),
                 status_directory: dir.clone(),
                 candidate_version: "v2.0.0".to_owned(),
+                candidate_pid: 42,
                 secret_file: secret,
                 port: 1,
                 relay_args: vec!["--port".to_owned(), "8765".to_owned()],
@@ -1440,6 +1526,12 @@ mod tests {
         assert_eq!(
             rolled_back.last_result.as_deref(),
             Some("health_check_failed:v2.0.0")
+        );
+        assert!(
+            runtime
+                .calls()
+                .iter()
+                .any(|call| { call.operation == "terminate" && call.command == "42" })
         );
         let rollback_exec = runtime.exec_calls().pop().unwrap();
         assert!(
