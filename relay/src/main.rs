@@ -2487,7 +2487,8 @@ mod tests {
     }
 
     fn poll_until_complete(state: &Arc<Server>, policy: &exec::Policy, handle: &str) -> Json {
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
             let response = response_json(request_once(
                 Arc::clone(state),
                 policy,
