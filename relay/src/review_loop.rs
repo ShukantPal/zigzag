@@ -1,4 +1,6 @@
-use super::{Json, Server, exec, kill_process_group, new_execution_id, relay_event, spawn_proc};
+use super::{
+    Json, Server, exec, force_kill_process_group, new_execution_id, relay_event, spawn_proc,
+};
 use regex::Regex;
 use relay_core::AgentRegistry;
 use serde::{Deserialize, Serialize};
@@ -695,7 +697,11 @@ fn discover(
             )?;
             let superseded_agents =
                 supersede_rounds_for_head(&mut store.state, &policy.repository, number, &key);
-            let owner = find_owner_context(&policy.repository, &snapshot.head_ref_name);
+            let owner = find_owner_context(
+                &policy.repository,
+                &snapshot.head_ref_name,
+                &snapshot.head_ref_oid,
+            );
             store.state.rounds.insert(
                 key.clone(),
                 ReviewRound {
@@ -1908,22 +1914,19 @@ fn emit_decision(
         .map(|_| ())
 }
 
-fn find_owner_context(repository: &str, branch: &str) -> Option<OwnerContext> {
+fn find_owner_context(repository: &str, branch: &str, head: &str) -> Option<OwnerContext> {
     let department = home_dir()?.join(".codex/dept");
-    let mut candidates = Vec::new();
+    let mut candidates = BTreeMap::new();
     for entry in fs::read_dir(department).ok()?.flatten() {
         let task_dir = entry.path();
         let department_task_id = entry.file_name().to_string_lossy().into_owned();
         let Some(project_dir) = fs::read_to_string(task_dir.join("dir.txt")).ok() else {
             continue;
         };
-        let project_dir = PathBuf::from(project_dir.trim());
-        if !project_dir.is_dir()
-            || git_output(&project_dir, &["branch", "--show-current"]).as_deref() != Some(branch)
-        {
+        let Ok(project_dir) = fs::canonicalize(PathBuf::from(project_dir.trim())) else {
             continue;
-        }
-        if !git_matches_repository(&project_dir, repository) {
+        };
+        if !git_matches_owner_checkout(&project_dir, repository, branch, head) {
             continue;
         }
         let Some(session_id) = fs::read_to_string(task_dir.join("resume.txt"))
@@ -1941,17 +1944,28 @@ fn find_owner_context(repository: &str, branch: &str) -> Option<OwnerContext> {
         else {
             continue;
         };
-        candidates.push((
+        let key = (project_dir.clone(), session_id.clone());
+        let candidate = (
             modified,
             OwnerContext {
                 session_id,
                 project_dir,
                 department_task_id,
             },
-        ));
+        );
+        if candidates
+            .get(&key)
+            .is_none_or(|(prior_modified, _)| modified > *prior_modified)
+        {
+            candidates.insert(key, candidate);
+        }
     }
-    candidates.sort_by_key(|(modified, _)| *modified);
-    candidates.pop().map(|(_, owner)| owner)
+    // Multiple distinct local sessions at the exact comparison are
+    // ambiguous. Refuse to grant write-capable owner context by recency.
+    if candidates.len() != 1 {
+        return None;
+    }
+    candidates.into_values().next().map(|(_, owner)| owner)
 }
 
 fn git_output(directory: &Path, args: &[&str]) -> Option<String> {
@@ -1971,11 +1985,45 @@ fn git_matches_repository(directory: &Path, repository: &str) -> bool {
     let Some(remote) = git_output(directory, &["remote", "get-url", "origin"]) else {
         return false;
     };
-    let normalized = remote
-        .trim_end_matches(".git")
-        .trim_end_matches('/')
-        .replace(':', "/");
-    normalized.ends_with(&format!("/{repository}"))
+    canonical_github_repository(&remote)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(repository))
+}
+
+fn git_matches_owner_checkout(
+    directory: &Path,
+    repository: &str,
+    branch: &str,
+    head: &str,
+) -> bool {
+    git_matches_repository(directory, repository)
+        && git_output(directory, &["branch", "--show-current"]).as_deref() == Some(branch)
+        && git_output(directory, &["rev-parse", "--verify", "HEAD"]).as_deref() == Some(head)
+}
+
+fn canonical_github_repository(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let path = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("https://github.com/"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("git://github.com/"))?
+        .trim_end_matches(".git");
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let name = components.next()?;
+    if components.next().is_some()
+        || owner.is_empty()
+        || name.is_empty()
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
 }
 
 fn session_from_events(path: &Path) -> Option<String> {
@@ -2014,9 +2062,25 @@ fn kill_agents_with(registry: &AgentRegistry, agent_ids: &[String], mut kill: im
 }
 
 fn kill_agents(server: &Server, agent_ids: &[String]) {
+    let mut process_groups = Vec::new();
     kill_agents_with(&server.supervisor.registry, agent_ids, |process_group| {
-        let _ = kill_process_group(process_group);
+        let _ = force_kill_process_group(process_group);
+        process_groups.push(process_group);
     });
+    if process_groups.is_empty() {
+        return;
+    }
+    if let Ok(mut entries) = server.supervisor.procs.lock() {
+        let now = Instant::now();
+        for entry in entries.values_mut() {
+            if process_groups.contains(&entry.process_group) && entry.finished_at.is_none() {
+                entry.termination_requested_at.get_or_insert(now);
+                // SIGKILL has already been sent. This lets the reaper finish
+                // even while macOS still exposes zombie group members.
+                entry.termination_escalated = true;
+            }
+        }
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -2667,6 +2731,90 @@ review_loop:
     }
 
     #[test]
+    fn cleanup_force_kills_a_term_ignoring_group_and_marks_its_live_entry() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+        use std::sync::Mutex;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; sleep 60 & printf 'ready\\n'; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process_group = child.id() as i32;
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-review-force-kill-{}",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry_path = state_path.with_extension("agents");
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        registry
+            .register(agent("reviewer", "review-task", process_group, "running"))
+            .unwrap();
+        let complete_output = || {
+            Arc::new(Mutex::new(super::super::CappedOutput {
+                complete: true,
+                ..super::super::CappedOutput::default()
+            }))
+        };
+        let entry = super::super::ProcEntry {
+            child,
+            process_group,
+            id: "review-task".to_owned(),
+            bin: "sh".to_owned(),
+            subcommand: "-c".to_owned(),
+            spawned_at: Instant::now(),
+            finished_at: None,
+            termination_requested_at: None,
+            termination_escalated: false,
+            leader_reaped: false,
+            exit_code: None,
+            stdout: complete_output(),
+            stderr: complete_output(),
+        };
+        let server = Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry,
+                procs: Mutex::new(std::collections::HashMap::from([(
+                    "reviewer".to_owned(),
+                    entry,
+                )])),
+            },
+        };
+
+        kill_agents(&server, &["reviewer".to_owned()]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut entries = server.supervisor.procs.lock().unwrap();
+            let entry = entries.get_mut("reviewer").unwrap();
+            assert!(entry.termination_requested_at.is_some());
+            assert!(entry.termination_escalated);
+            if entry.child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "process group survived cleanup");
+            drop(entries);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
     fn stale_comparison_poll_kills_the_owner_and_reviewer_agents() {
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
@@ -2800,6 +2948,92 @@ review_loop:
         current.base_ref_oid = round.base.clone();
         current.state = "CLOSED".to_owned();
         assert!(!open_comparison_matches(&current, &round.base, &head));
+    }
+
+    #[test]
+    fn owner_checkout_requires_canonical_repository_branch_and_exact_head() {
+        for remote in [
+            "git@github.com:ShukantPal/zigzag.git",
+            "https://github.com/ShukantPal/zigzag.git",
+            "ssh://git@github.com/ShukantPal/zigzag.git",
+            "git://github.com/ShukantPal/zigzag.git",
+        ] {
+            assert_eq!(
+                canonical_github_repository(remote).as_deref(),
+                Some("ShukantPal/zigzag")
+            );
+        }
+        for remote in [
+            "git@github.com:attacker/ShukantPal/zigzag.git",
+            "https://github.com.evil/ShukantPal/zigzag.git",
+            "https://github.com@evil/ShukantPal/zigzag.git",
+            "/tmp/ShukantPal/zigzag.git",
+        ] {
+            assert_eq!(canonical_github_repository(remote), None);
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "zigzag-owner-checkout-{}",
+            super::super::random_hex_128().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&directory)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "Zigzag Test"]);
+        git(&["config", "user.email", "zigzag-test@example.invalid"]);
+        git(&["checkout", "--quiet", "-b", "codex/branch"]);
+        fs::write(directory.join("fixture"), "review owner\n").unwrap();
+        git(&["add", "fixture"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:ShukantPal/zigzag.git",
+        ]);
+        let head = git_output(&directory, &["rev-parse", "HEAD"]).unwrap();
+        assert!(git_matches_owner_checkout(
+            &directory,
+            "ShukantPal/zigzag",
+            "codex/branch",
+            &head
+        ));
+        assert!(!git_matches_owner_checkout(
+            &directory,
+            "ShukantPal/zigzag",
+            "codex/branch",
+            &"0".repeat(40)
+        ));
+        assert!(!git_matches_owner_checkout(
+            &directory,
+            "ShukantPal/zigzag",
+            "other-branch",
+            &head
+        ));
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:attacker/ShukantPal/zigzag.git",
+        ]);
+        assert!(!git_matches_owner_checkout(
+            &directory,
+            "ShukantPal/zigzag",
+            "codex/branch",
+            &head
+        ));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

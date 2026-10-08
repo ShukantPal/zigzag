@@ -1265,6 +1265,14 @@ fn kill_process_group(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, libc::SIGTERM) == 0 }
 }
 
+fn force_kill_process_group(process_group: i32) -> bool {
+    // Review-loop cleanup is terminal: obsolete reviewers and owners must not
+    // survive supersession or merge, including shells that ignore SIGTERM.
+    let terminated = kill_process_group(process_group);
+    let killed = unsafe { libc::kill(-process_group, libc::SIGKILL) == 0 };
+    terminated || killed
+}
+
 fn process_group_running(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, 0) == 0 }
 }
