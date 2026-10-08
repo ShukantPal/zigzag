@@ -50,7 +50,7 @@ jobs:
           printf '%s\n' "$RUNNER_TEMP/reviewer-work" > "$RUNNER_TEMP/reviewer-task/dir.txt"
           printf '%s\n' 'review prompt' > "$RUNNER_TEMP/reviewer-task/prompt.txt"
           printf '%s\n' '{}' > "$RUNNER_TEMP/reviewer-task/result-schema.json"
-          printf '%s\n' 'diff material' > "$RUNNER_TEMP/reviewer-work/review.patch"
+          printf '%s\n' '[]' > "$RUNNER_TEMP/reviewer-work/review-material.json"
           printf '%s\n' \
             '#!/bin/bash' \
             'set -eu' \

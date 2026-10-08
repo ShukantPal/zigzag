@@ -14,9 +14,9 @@ echo "codex-review-launch start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$" >&2
 CODEX=/run/current-system/sw/bin/codex
 {
   cat "$rdir/prompt.txt"
-  printf '\n\n<untrusted_patch>\n'
-  cat "$d/review.patch"
-  printf '\n</untrusted_patch>\n'
+  printf '\n\n<untrusted_patch_json>\n'
+  cat "$d/review-material.json"
+  printf '\n</untrusted_patch_json>\n'
 } | env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   "$CODEX" --sandbox read-only --ask-for-approval never exec --json \
     --ignore-user-config \
