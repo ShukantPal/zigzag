@@ -683,13 +683,6 @@ fn discover(
             // that case, watermark every comment visible when the new
             // generation begins so an approval from the old A generation can
             // never be inherited.
-            let excluded_comment_ids = prior_generation.map_or_else(BTreeSet::new, |_| {
-                snapshot
-                    .comments
-                    .iter()
-                    .map(|comment| comment.id.clone())
-                    .collect()
-            });
             prepare_superseded_comment_cleanup(
                 policy,
                 store,
@@ -698,6 +691,8 @@ fn discover(
                 &snapshot.comments,
                 shadow,
             )?;
+            let (excluded_comment_ids, pending_comment_deletions) =
+                replacement_comment_state(store.state.rounds.get(&key), &snapshot.comments);
             let superseded_agents =
                 supersede_rounds_for_head(&mut store.state, &policy.repository, number, &key);
             let owner = find_owner_context(
@@ -718,7 +713,7 @@ fn discover(
                     reviewers: BTreeMap::new(),
                     verdicts: BTreeMap::new(),
                     excluded_comment_ids,
-                    pending_comment_deletions: BTreeSet::new(),
+                    pending_comment_deletions,
                     owner,
                     owner_agent_id: None,
                     gate_reasons: Vec::new(),
@@ -743,6 +738,18 @@ fn discover(
         }
     }
     Ok(())
+}
+
+fn replacement_comment_state(
+    prior: Option<&ReviewRound>,
+    comments: &[Comment],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let Some(prior) = prior else {
+        return (BTreeSet::new(), BTreeSet::new());
+    };
+    let mut excluded = prior.excluded_comment_ids.clone();
+    excluded.extend(comments.iter().map(|comment| comment.id.clone()));
+    (excluded, prior.pending_comment_deletions.clone())
 }
 
 fn dispatch_missing_reviewers(
@@ -1594,6 +1601,7 @@ fn post_verdict_comment(
     let payload = serde_json::to_vec(&serde_json::json!({"body": body}))
         .map_err(|_| "could not encode validated review verdict".to_owned())?;
     write_private(body_path.clone(), &payload)?;
+    super::require_gui_login_session()?;
     let response = exec::run(
         path,
         exec::ExecRequest {
@@ -1627,6 +1635,7 @@ fn delete_verdict_comment(
     comment_node_id: &str,
     task_id: &str,
 ) -> Result<(), String> {
+    super::require_gui_login_session()?;
     let policy_store = exec::load_policy()?;
     let path = policy_store
         .trusted_gh_path_for_repo(&policy.repository)
@@ -1654,6 +1663,7 @@ fn delete_verdict_comment(
     if lookup.stdout.trim().is_empty() {
         return Ok(());
     }
+    super::require_gui_login_session()?;
     let deleted = exec::run(
         path,
         exec::ExecRequest {
@@ -2639,7 +2649,21 @@ review_loop:
             ]),
         };
         state.rounds.get_mut(&key_a).unwrap().owner_agent_id = Some("owner-a".to_owned());
+        state
+            .rounds
+            .get_mut(&key_a)
+            .unwrap()
+            .excluded_comment_ids
+            .insert(old_comment.id.clone());
+        state
+            .rounds
+            .get_mut(&key_a)
+            .unwrap()
+            .pending_comment_deletions
+            .insert(old_comment.id.clone());
         state.rounds.get_mut(&key_b).unwrap().owner_agent_id = Some("owner-b".to_owned());
+        let (excluded_comment_ids, pending_comment_deletions) =
+            replacement_comment_state(state.rounds.get(&key_a), std::slice::from_ref(&old_comment));
         let agents = supersede_rounds_for_head(&mut state, "owner/repo", 7, &key_a);
         assert_eq!(agents, ["agent-a", "agent-b", "owner-a", "owner-b"]);
         assert_eq!(state.rounds[&key_b].phase, RoundPhase::Superseded);
@@ -2648,12 +2672,18 @@ review_loop:
             key_a.clone(),
             ReviewRound {
                 generation,
-                excluded_comment_ids: BTreeSet::from([old_comment.id.clone()]),
+                excluded_comment_ids,
+                pending_comment_deletions,
                 ..test_round(&head_a, RoundPhase::Dispatching, None)
             },
         );
         assert_eq!(state.rounds[&key_a].generation, 2);
         assert!(state.rounds[&key_a].verdicts.is_empty());
+        assert!(
+            state.rounds[&key_a]
+                .pending_comment_deletions
+                .contains(&old_comment.id)
+        );
         assert!(
             latest_verdicts(
                 &policy(),
@@ -2993,6 +3023,62 @@ review_loop:
         current.base_ref_oid = round.base.clone();
         current.state = "CLOSED".to_owned();
         assert!(!open_comparison_matches(&current, &round.base, &head));
+    }
+
+    #[test]
+    fn base_retarget_replacement_preserves_pending_comment_cleanup() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let marker = verdict_id("owner/repo", 7, &head, 1, "tests", 1);
+        let comment = Comment {
+            author: Some(Author {
+                login: "ShukantPal".to_owned(),
+            }),
+            body: format!("generated verdict\n{marker}"),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            id: "IC_retarget".to_owned(),
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-base-retarget-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(
+            key.clone(),
+            test_round(&head, RoundPhase::Reviewing, Some("reviewer")),
+        );
+        store.save().unwrap();
+        prepare_superseded_comment_cleanup(
+            &policy(),
+            &mut store,
+            "owner/repo",
+            7,
+            std::slice::from_ref(&comment),
+            true,
+        )
+        .unwrap();
+        let (excluded_comment_ids, pending_comment_deletions) =
+            replacement_comment_state(store.state.rounds.get(&key), std::slice::from_ref(&comment));
+        let mut replacement = test_round(&head, RoundPhase::Dispatching, None);
+        replacement.base = "d".repeat(40);
+        replacement.generation = 2;
+        replacement.excluded_comment_ids = excluded_comment_ids;
+        replacement.pending_comment_deletions = pending_comment_deletions;
+        store.state.rounds.insert(key.clone(), replacement);
+        store.save().unwrap();
+
+        let reopened = StateStore::open(state_path.clone()).unwrap();
+        assert!(
+            reopened.state.rounds[&key]
+                .excluded_comment_ids
+                .contains(&comment.id)
+        );
+        assert!(
+            reopened.state.rounds[&key]
+                .pending_comment_deletions
+                .contains(&comment.id)
+        );
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]
