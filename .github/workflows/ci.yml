@@ -27,6 +27,15 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo fmt --all --check
+  rust-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+      - run: bash -n scripts/codex-review-launch.sh
+      - run: plutil -lint launchd/com.shukantpal.zigzag.plist
+      - run: cargo build --locked --workspace --all-targets
+      - run: cargo test --locked --workspace
 
   release:
     # GitHub exposes macos-14 as the supported ARM64 hosted image, not an

@@ -485,7 +485,7 @@ fn valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>, String> {
+pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
         id: format!("github-pr-scan-{repo}"),
@@ -507,7 +507,7 @@ pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<(u64, String)>
     parse_github_open_pull_requests(&result.stdout)
 }
 
-fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, String> {
+fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
     let value = parse_json(output)
         .map_err(|_| "GitHub PR discovery did not return the expected JSON".to_owned())?;
     let Json::Array(pull_requests) = value else {
@@ -528,13 +528,7 @@ fn parse_github_open_pull_requests(output: &str) -> Result<Vec<(u64, String)>, S
                 .and_then(Json::as_u64)
                 .filter(|number| *number > 0)
                 .ok_or_else(|| "GitHub PR discovery result is missing a PR number".to_owned())?;
-            let url = pull_request
-                .object("html_url")
-                .or_else(|| pull_request.object("url"))
-                .and_then(Json::as_str)
-                .filter(|url| !url.is_empty())
-                .ok_or_else(|| "GitHub PR discovery result is missing a PR URL".to_owned())?;
-            Ok((number, url.to_owned()))
+            Ok(number)
         })
         .collect()
 }
@@ -1993,19 +1987,15 @@ mod tests {
     }
 
     #[test]
-    fn github_pr_scan_requires_numbers_and_urls() {
+    fn github_pr_scan_requires_positive_numbers() {
         assert_eq!(
             parse_github_open_pull_requests(
                 r#"[[{"number":42,"html_url":"https://github.com/leveled-inc/leveled/pull/42"}]]"#,
             )
             .unwrap(),
-            vec![(
-                42,
-                "https://github.com/leveled-inc/leveled/pull/42".to_owned()
-            )]
+            vec![42]
         );
         assert!(parse_github_open_pull_requests(r#"{"number":42}"#).is_err());
-        assert!(parse_github_open_pull_requests(r#"[{"number":42,"url":""}]"#).is_err());
         assert!(
             parse_github_open_pull_requests(r#"[{"number":0,"url":"https://example.test"}]"#)
                 .is_err()

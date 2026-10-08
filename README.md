@@ -80,18 +80,19 @@ enabled when a distinct `--control-secret-file` (or
 
 At startup, the daemon reads `~/.zigzag/config.yaml`, validates it against the
 embedded draft 2020-12 JSON Schema (including the `regex` format), and rejects
-YAML duplicate keys, custom tags, unknown fields, invalid cross-field security
-policy, and duplicate repository entries. Configuration errors fail closed
+YAML duplicate keys, custom tags, unknown fields, and duplicate repository
+entries. Configuration errors fail closed
 for reviews only and are logged with paths; the relay keeps serving.
 
 When enabled, Zigzag owns a durable state machine for each
 `(repository, pull request, head)` in `events.reviews.json`. It dispatches
-independent configured lenses through the supervised `codex-launch`, admits
-only version 1 verdicts posted by the trusted identity for the exact current
-head, evaluates every matching required CI check, and emits `review_ready` or
-bounded `review_findings` events. Findings resume the owning Codex session. A
-new head supersedes the old state and approvals, and a merge kills outstanding
-reviewer process groups, including recovered orphan groups.
+independent configured lenses through a dedicated tool-free Codex launcher,
+admits only bounded version 1 JSON results for the exact current head, and
+publishes validated verdicts under the trusted GitHub identity. It evaluates
+every matching required CI check and emits `review_ready` or bounded
+`review_findings` events. Findings resume the owning Codex session. A new head
+supersedes the old state and approvals, and a merge kills outstanding reviewer
+process groups, including recovered orphan groups.
 
 Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
 Shadow mode runs discovery, verdict admission, and gate decisions alongside

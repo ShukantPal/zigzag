@@ -111,10 +111,24 @@ dispatches, resumes, or kills agents. At cutover, drain and stop the VM review
 jobs, remove the environment variable, and restart Zigzag.
 `review_loop.enabled: false` is different: it starts no review loop at all.
 
-Review dispatch uses the already-approved `codex-launch run` and
-`codex-launch resume` entries. GitHub discovery and gate reads remain
-read-only at the daemon boundary. Every repository in the YAML must also be
-present in the Keychain-held `gh_read_repos` policy.
+Install the dedicated reviewer launcher beside the department launcher:
+
+```sh
+cp scripts/codex-review-launch.sh ~/.codex/dept/
+chmod 700 ~/.codex/dept/codex-review-launch.sh
+```
+
+Reviewer agents use this launcher with Codex's shell tool and web search
+disabled, a read-only sandbox, approval policy `never`, no user config/rules,
+an empty process environment, and a JSON output schema. They receive only a
+bounded PR patch as untrusted prompt data and cannot access credentials, run
+commands, or post to GitHub. The daemon validates their result, then performs
+the narrow trusted comment publication step. Owner resume continues to use
+`codex-launch resume`.
+
+GitHub discovery and gate reads remain read-only at the public execution
+boundary. Every repository in the YAML must also be present in the
+Keychain-held `gh_read_repos` policy.
 
 ### Owner approval required: proposed `gh` policy addition
 
@@ -131,9 +145,14 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 +        ["pr", "list"],
 +        ["pr", "view"],
 +        ["pr", "checks"],
++        ["pr", "diff"],
 +        ["api"]
 +      ],
 +      "gh_read_repos": ["ShukantPal/zigzag"]
++    },
++    "codex-review-launch": {
++      "path": "/Users/REPLACE/.codex/dept/codex-review-launch.sh",
++      "commands": [["run"]]
 +    },
      "existing-binary": { "path": "/existing/path", "commands": [["existing-command"]] }
    }
@@ -141,12 +160,14 @@ macOS GUI session with `zigzag config set-allowlist --file PATH`.
 ```
 
 `/opt/homebrew/bin/gh` must be replaced with the owner's actual absolute `gh`
-path. Zigzag additionally restricts the `gh` entry to the repositories named
-in `gh_read_repos`, `pr list`, `pr view`, `pr checks`, and GET-only `api` calls
-for PR discovery, issue comments, review comments, and reviews. It rejects
+path. Zigzag additionally restricts the public `gh` entry to repositories in
+`gh_read_repos`, `pr list`, `pr view`, `pr checks`, `pr diff`, and GET-only
+`api` calls. It rejects
 `--method`, `-X`, body flags, all other `gh` subcommands, and `--web` (including
 `--web=true`), so this policy cannot be used to write GitHub state or read a
-different repository.
+different repository. The daemon's internal verdict publisher reuses only the
+configured `gh` path and repository scope after validating a reviewer result;
+`/v1/exec` still cannot invoke `gh pr comment`.
 The policy is deliberately not stored in this repository and this change does
 not touch the live Keychain item.
 

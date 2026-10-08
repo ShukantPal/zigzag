@@ -207,12 +207,23 @@ impl Policy {
             && (bin != "gh" || is_read_only_gh_command(args, &policy.gh_read_repos)))
         .then_some(policy.path.as_str())
     }
+
+    /// Internal review-loop publication uses the same repository-scoped `gh`
+    /// identity without exposing a general GitHub write prefix on `/v1/exec`.
+    pub fn trusted_gh_path_for_repo(&self, repo: &str) -> Option<&str> {
+        let policy = self.bins.get("gh")?;
+        policy
+            .gh_read_repos
+            .contains(repo)
+            .then_some(policy.path.as_str())
+    }
 }
 
 fn is_read_only_gh_command(args: &[String], repos: &BTreeSet<String>) -> bool {
     match args {
         [command, subcommand, rest @ ..]
-            if command == "pr" && matches!(subcommand.as_str(), "list" | "view" | "checks") =>
+            if command == "pr"
+                && matches!(subcommand.as_str(), "list" | "view" | "checks" | "diff") =>
         {
             gh_repo_argument(rest).is_some_and(|repo| repos.contains(repo))
                 && !rest
@@ -592,7 +603,7 @@ mod tests {
     #[test]
     fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
         let policy = policy(
-            r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
+            r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["pr","diff"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
         );
         assert!(
             policy
@@ -601,6 +612,26 @@ mod tests {
                     &args(&["pr", "checks", "42", "--repo", "leveled-inc/leveled"]),
                 )
                 .is_some()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["pr", "diff", "42", "--repo", "leveled-inc/leveled"]),
+                )
+                .is_some()
+        );
+        assert_eq!(
+            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
+            Some("/opt/homebrew/bin/gh")
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&["pr", "comment", "42", "--repo", "leveled-inc/leveled"]),
+                )
+                .is_none()
         );
         assert!(
             policy
