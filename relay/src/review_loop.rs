@@ -260,6 +260,14 @@ struct OwnerContext {
     branch: String,
 }
 
+struct OwnerSpawnFence<'a> {
+    repository: &'a str,
+    number: u64,
+    base: &'a str,
+    head: &'a str,
+    owner: &'a OwnerContext,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ReviewRound {
     repository: String,
@@ -829,6 +837,7 @@ fn dispatch_missing_reviewers(
                             .expect("review patch loaded")
                             .as_bytes(),
                     ),
+                    None,
                 )
             },
         ) {
@@ -1806,6 +1815,13 @@ fn resume_owner(
         Some(&owner.session_id),
         &prompt,
         None,
+        Some(&OwnerSpawnFence {
+            repository: &repository,
+            number,
+            base: &base,
+            head: &head,
+            owner: &owner,
+        }),
     )?;
     store
         .state
@@ -1823,6 +1839,7 @@ fn spawn_codex_task(
     session_id: Option<&str>,
     prompt: &str,
     review_material: Option<&[u8]>,
+    owner_fence: Option<&OwnerSpawnFence<'_>>,
 ) -> Result<String, String> {
     super::require_gui_login_session()?;
     if let Some(existing_id) = latest_agent_for_task(&server.supervisor.registry, task_id) {
@@ -1879,6 +1896,16 @@ fn spawn_codex_task(
         &execution_id,
         Json::Object(vec![]),
     ))?;
+    if let Some(fence) = owner_fence {
+        let current = fetch_pr(fence.repository, fence.number)?;
+        if !open_comparison_matches(&current, fence.base, fence.head) {
+            return Err("owner PR comparison changed at the spawn boundary".to_owned());
+        }
+        if !owner_context_is_current(fence.owner, fence.repository, fence.head) {
+            return Err("owner context changed at the spawn boundary".to_owned());
+        }
+    }
+    super::require_gui_login_session()?;
     let spawned = spawn_proc(
         &server.supervisor,
         Arc::clone(&server.store),

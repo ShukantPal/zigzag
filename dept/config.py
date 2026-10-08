@@ -3,7 +3,8 @@
 Edit this file, then materialize:
     python3 dept/config.py --materialize > dept/config.materialized.json
 The pre-commit hook does this automatically; CI verifies the committed JSON
-matches (``--check``). The Rust daemon reads ONLY the JSON.
+matches (``--check``). Review-loop policy deliberately lives only in the
+personal ``~/.zigzag/config.yaml`` contract and is absent here.
 """
 
 from __future__ import annotations
@@ -21,11 +22,6 @@ REPOS = {
     "leveled": "leveled-inc/leveled",
 }
 
-FULL_ROUNDS_MAX = 2
-VERIFICATION_ROUNDS_MAX = 2
-ZIGZAG_LENSES = ["correctness", "simplicity", "tests", "security"]
-DEFAULT_LENSES = ["correctness", "simplicity", "tests"]
-
 QUIET_HOURS = {"start": "22:00", "end": "07:00"}
 
 SA_EMAIL = "zigzag@shukant.iam.gserviceaccount.com"
@@ -33,14 +29,6 @@ DESIGN_DOCS_FOLDER_ID = "1W_iTcpdYGVXj_NTmkfcgOm_GGREk1Nj3"
 
 
 # --- Schema: the daemon's contract. Plain data, no behavior. ----------------
-@dataclass(frozen=True)
-class ReviewPolicy:
-    full_rounds_max: int
-    verification_rounds_max: int
-    lenses: list[str]
-    require_security_lens: bool
-
-
 @dataclass(frozen=True)
 class LoopOwnership:
     loop: str
@@ -61,22 +49,8 @@ class WatcherConfig:
 
 
 # --- The configuration itself: declarative, boring on purpose. --------------
-REVIEW_POLICY = {
-    "zigzag": ReviewPolicy(
-        FULL_ROUNDS_MAX, VERIFICATION_ROUNDS_MAX, ZIGZAG_LENSES,
-        require_security_lens=True,
-    ),
-    "leveled": ReviewPolicy(
-        FULL_ROUNDS_MAX, VERIFICATION_ROUNDS_MAX, DEFAULT_LENSES,
-        require_security_lens=False,
-    ),
-}
-
 LOOP_OWNERSHIP = [
     LoopOwnership("pr-comment-watcher", "mac"),
-    LoopOwnership("review-rounds", "mac"),
-    LoopOwnership("approval-gate", "mac"),
-    LoopOwnership("merge-killer", "mac"),
     LoopOwnership("dependabot", "mac"),
     LoopOwnership("doc-router", "mac"),
     LoopOwnership("chat-surface", "vm"),
@@ -91,8 +65,6 @@ DOC_ROUTES = [
 
 WATCHERS = [
     WatcherConfig("pr-comment-watcher", 300),
-    WatcherConfig("review-rounds", 600),
-    WatcherConfig("merge-killer", 300),
     WatcherConfig("dependabot", 1800),
     WatcherConfig("doc-router", 300),
 ]
@@ -102,19 +74,12 @@ DOC_ROUTER_WATCH_LIST = sorted(route.doc_id for route in DOC_ROUTES)
 
 
 # --- Validation: fail at build time, never in the daemon. -------------------
-VALID_LENSES = {"correctness", "simplicity", "tests", "security", "performance"}
 MATERIALIZED_PATH = pathlib.Path(__file__).with_name("config.materialized.json")
 
 
 def validate() -> list[str]:
     """Return all configuration errors so callers get one actionable report."""
     errors = []
-    for repo, policy in REVIEW_POLICY.items():
-        unknown = [lens for lens in policy.lenses if lens not in VALID_LENSES]
-        if unknown:
-            errors.append(f"{repo}: unknown lenses {unknown}")
-        if policy.require_security_lens and "security" not in policy.lenses:
-            errors.append(f"{repo}: security lens required but missing")
     loops = [ownership.loop for ownership in LOOP_OWNERSHIP]
     if len(loops) != len(set(loops)):
         errors.append("duplicate loop ownership entries")
@@ -132,7 +97,6 @@ def materialize() -> str:
     payload = {
         "generated_by": "dept/config.py --materialize (do not hand-edit)",
         "repos": REPOS,
-        "review_policy": {repo: asdict(policy) for repo, policy in REVIEW_POLICY.items()},
         "loop_ownership": [asdict(ownership) for ownership in LOOP_OWNERSHIP],
         "doc_routes": [asdict(route) for route in DOC_ROUTES],
         "doc_router_watch_list": DOC_ROUTER_WATCH_LIST,
