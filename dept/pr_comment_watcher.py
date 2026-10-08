@@ -104,7 +104,8 @@ def dept_status_text(tid):
 
 def task_finished(status):
     """Only a completion with a known exit code releases the dispatch guard."""
-    return status is not None and task_status(status) in ("succeeded", "failed", "pruned")
+    return status is not None and task_status(status) in (
+        "succeeded", "failed", "pruned", "missing")
 
 
 def pr_task_running(pr):
@@ -205,14 +206,8 @@ def load_watermark():
 
 def save_watermark(wm):
     os.makedirs(STATE_DIR, exist_ok=True)
-    # A round watcher may have seeded comments after this poll loaded its copy.
-    # Reload and union instead of overwriting that concurrent watermark update.
-    current = load_watermark()
-    states = current.get("pr_state", {})
-    states.update(wm.get("pr_state", {}))
     with open(WATERMARK, "w") as f:
-        json.dump({**wm, "pr_state": states,
-                   "seen": sorted(set(current.get("seen", [])) | set(wm.get("seen", [])), key=str)},
+        json.dump({**wm, "seen": sorted(set(wm.get("seen", [])), key=str)},
                   f, indent=2)
 
 

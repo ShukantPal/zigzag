@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
 
@@ -105,12 +106,16 @@ def round_seed_lock(repo, pr):
         yield
 
 
-def dispatch_reviewer(project_dir, prompt_file):
+def dispatch_reviewer(project_dir, prompt_file, planned_task_id):
     # SSH launches outside the GUI login session (no keychain) and the manager
     # applies Codex's read-only sandbox. Reviewers never need GitHub auth.
     result = run(sys.executable, DEPT, "start", project_dir, str(prompt_file),
-                 "--no-sop", "--read-only", "--ssh")
-    return task_id(result.stdout + result.stderr)
+                 "--no-sop", "--read-only", "--ssh", "--task-id",
+                 planned_task_id)
+    launched = task_id(result.stdout + result.stderr)
+    if launched != planned_task_id:
+        raise RuntimeError(f"dept.py launched {launched}, expected {planned_task_id}")
+    return launched
 
 
 def seed(pr, repo, project_dir, max_rounds=3, lenses=LENSES):
@@ -127,7 +132,7 @@ def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
     number = next_round_number(repo, pr)
     ROUNDS_DIR.mkdir(parents=True, exist_ok=True)
     PROMPT_DIR.mkdir(parents=True, exist_ok=True)
-    reviewers = {}
+    reviewers = {"t-" + uuid.uuid4().hex[:6]: lens for lens in lenses}
     round_path = ROUNDS_DIR / f"{repo_key(repo)}-pr{pr}-round{number}.json"
     round_data = {
         "pr": pr, "round": number, "repo": repo, "head": head,
@@ -138,13 +143,12 @@ def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
     # reviewer tasks or let a retry dispatch duplicates invisibly.
     round_path.write_text(json.dumps(round_data, indent=2))
     try:
-      for lens in lenses:
+      for planned_task_id, lens in reviewers.items():
         prompt = FULL_TEMPLATE.format(pr=pr, repo=repo, project_dir=project_dir,
                                       lens=lens, head=head)
         prompt_file = PROMPT_DIR / f"{repo_key(repo)}-pr{pr}-round{number}-{lens}.md"
         prompt_file.write_text(prompt)
-        reviewers[dispatch_reviewer(project_dir, prompt_file)] = lens
-        round_path.write_text(json.dumps(round_data, indent=2))
+        dispatch_reviewer(project_dir, prompt_file, planned_task_id)
     except Exception as e:
         round_data.update({"status": "attention", "attention_reason": f"reviewer dispatch failed: {e}"})
         round_path.write_text(json.dumps(round_data, indent=2))

@@ -68,6 +68,7 @@ task's changes.
      > 🤖 Codex (AI assistant) — [<lens>] review verdict
      VERDICT: APPROVE | CHANGES REQUESTED
      HEAD: <full 40-char head sha reviewed>
+     ROUND: <positive review-round number>
      ATTESTATION: MODEL_ADVISORY
    Comments land as ShukantPal via shared gh auth; the marker prevents feedback
    re-dispatch, but that shared identity is never accepted as human proof.

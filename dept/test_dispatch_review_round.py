@@ -1,6 +1,5 @@
 import importlib
 from concurrent.futures import ThreadPoolExecutor
-import itertools
 import json
 import pathlib
 import sys
@@ -45,15 +44,25 @@ class DispatchReviewRoundTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             info = {"headRefOid": "a" * 40}
+            launches = 0
+
+            def dispatch(_project, _prompt, planned):
+                nonlocal launches
+                launches += 1
+                if launches == 2:
+                    raise RuntimeError("nope")
+                return planned
+
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
-                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["t-a", RuntimeError("nope")]):
+                 patch.object(dispatcher, "dispatch_reviewer", side_effect=dispatch):
                 with self.assertRaisesRegex(RuntimeError, "nope"):
                     dispatcher.seed(12, "owner/repo", "/work")
             data = json.loads(next((root / "rounds").glob("*.json")).read_text())
         self.assertEqual(data["status"], "attention")
-        self.assertEqual(data["reviewers"], {"t-a": "correctness"})
+        self.assertEqual(set(data["reviewers"].values()),
+                         {"correctness", "simplicity", "tests"})
 
     def test_seed_records_all_reviewers_and_repo_scoped_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -62,12 +71,13 @@ class DispatchReviewRoundTest(unittest.TestCase):
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
-                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["t-c", "t-s", "t-t"]):
+                 patch.object(dispatcher, "dispatch_reviewer",
+                              side_effect=lambda _p, _f, planned: planned):
                 path, reviewers = dispatcher.seed(12, "owner/repo", "/work")
             data = json.loads(path.read_text())
             prompts = [prompt.read_text() for prompt in (root / "prompts").glob("*.md")]
         self.assertEqual(data["status"], "collecting")
-        self.assertEqual(reviewers, {"t-c": "correctness", "t-s": "simplicity", "t-t": "tests"})
+        self.assertEqual(set(reviewers.values()), {"correctness", "simplicity", "tests"})
         self.assertEqual(data["head"], "b" * 40)
         self.assertEqual(len(prompts), 3)
         self.assertTrue(all("Do not invoke `gh`" in prompt for prompt in prompts))
@@ -79,7 +89,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
-                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["a", "b", "c", "d", "e", "f"]):
+                 patch.object(dispatcher, "dispatch_reviewer",
+                              side_effect=lambda _p, _f, planned: planned):
                 one, _ = dispatcher.seed(12, "owner/one", "/work")
                 two, _ = dispatcher.seed(12, "owner/two", "/work")
         self.assertNotEqual(one.name, two.name)
@@ -90,7 +101,6 @@ class DispatchReviewRoundTest(unittest.TestCase):
             active = 0
             max_active = 0
             guard = threading.Lock()
-            task_numbers = itertools.count()
 
             def pr_info(_pr, _repo):
                 nonlocal active, max_active
@@ -102,8 +112,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
                     active -= 1
                 return {"headRefOid": "e" * 40}
 
-            def dispatch(_project, _prompt):
-                return f"t-{next(task_numbers)}"
+            def dispatch(_project, _prompt, planned):
+                return planned
 
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
@@ -116,10 +126,12 @@ class DispatchReviewRoundTest(unittest.TestCase):
         self.assertEqual(len({path.name for path, _ in results}), 2)
 
     def test_reviewer_dispatch_is_read_only_and_non_gui(self):
-        result = type("R", (), {"stdout": "started t-review", "stderr": ""})()
+        result = type("R", (), {"stdout": "started t-abc123", "stderr": ""})()
         with patch.object(dispatcher, "run", return_value=result) as run:
-            self.assertEqual(dispatcher.dispatch_reviewer("/work", pathlib.Path("/prompt")), "t-review")
-        self.assertEqual(run.call_args.args[-2:], ("--read-only", "--ssh"))
+            self.assertEqual(dispatcher.dispatch_reviewer(
+                "/work", pathlib.Path("/prompt"), "t-abc123"), "t-abc123")
+        self.assertEqual(run.call_args.args[-4:],
+                         ("--read-only", "--ssh", "--task-id", "t-abc123"))
 
     def test_seed_can_include_security_lens(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,7 +140,8 @@ class DispatchReviewRoundTest(unittest.TestCase):
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
-                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["a", "b", "c", "s"]):
+                 patch.object(dispatcher, "dispatch_reviewer",
+                              side_effect=lambda _p, _f, planned: planned):
                 _, reviewers = dispatcher.seed(12, "owner/repo", "/work",
                                                lenses=dispatcher.LENSES + ("security",))
         self.assertEqual(set(reviewers.values()), {"correctness", "simplicity", "tests", "security"})

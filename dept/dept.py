@@ -161,6 +161,7 @@ def dispatch_args(args, resume=False):
     ap.add_argument("--ssh", action="store_true",
                     help="launch over SSH+nohup instead of the relay (no keychain access)")
     ap.add_argument("--model", help="override the Codex model for this task")
+    ap.add_argument("--task-id", help="preallocated internal task id")
     ap.add_argument("--read-only", action="store_true",
                     help="run Codex in its read-only sandbox without approval bypass")
     return ap.parse_args(args)
@@ -184,6 +185,7 @@ def decorated_prompt(ns):
 
 
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
+TASK_ID_RE = re.compile(r"t-[0-9a-f]{6}\Z")
 
 
 def validate_model(model):
@@ -194,7 +196,7 @@ def validate_model(model):
 def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
-    r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
+    r = ssh(f"mkdir -p {REMOTE_DEPT} && mkdir {rdir} && cat > {rdir}/prompt.txt",
             stdin_data=prompt, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh setup failed: {r.stderr.decode()[-500:]}")
@@ -211,12 +213,15 @@ def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_o
     return rdir
 
 
-def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, read_only=False):
+def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
+                  read_only=False, task_id=None):
     """Launch start/resume through one preparation, transport, and ledger path."""
     validate_model(model)
-    tid = "t-" + uuid.uuid4().hex[:6]
+    tid = task_id or "t-" + uuid.uuid4().hex[:6]
+    if not TASK_ID_RE.fullmatch(tid):
+        sys.exit("invalid task id")
     relay_path = asset_path("relay-announce.md")
-    if os.path.exists(relay_path):
+    if not read_only and os.path.exists(relay_path):
         with open(relay_path, "rb") as f:
             relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
@@ -273,7 +278,7 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, rea
 def cmd_start(args):
     ns = dispatch_args(args)
     dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh, model=ns.model,
-                  read_only=ns.read_only)
+                  read_only=ns.read_only, task_id=ns.task_id)
 
 
 def shq(s):
@@ -484,7 +489,7 @@ def cmd_resume(args):
         sys.exit(f"project_dir does not exist on the Mac: {project_dir} "
                  f"(refusing to dispatch a dead task)")
     dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id, ns.model,
-                  ns.read_only)
+                  ns.read_only, task_id=ns.task_id)
 
 
 def cmd_check(args):

@@ -117,7 +117,7 @@ class ProjectBusyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text(json.dumps({
-                "pr": 7, "repo": "owner/repo", "head": "a" * 40, "project_dir": "/project",
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40, "project_dir": "/project",
                 "reviewers": {"t-a": "tests"},
                 "status": "collecting",
             }))
@@ -128,13 +128,14 @@ class ProjectBusyTest(unittest.TestCase):
             round_ = json.loads(path.read_text())
         self.assertIn("published validated review verdicts", message)
         self.assertEqual(round_["status"], "published")
-        post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40, "APPROVE", "t-a")
+        post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
+                                     "APPROVE", "t-a", 1)
 
     def test_changes_requested_is_published_as_blocking_verdict(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text(json.dumps({
-                "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
                 "project_dir": "/project", "reviewers": {"t-a": "tests"},
                 "status": "collecting",
             }))
@@ -144,13 +145,13 @@ class ProjectBusyTest(unittest.TestCase):
                  patch.object(watcher, "post_verdict") as post:
                 watcher.process_round(str(path))
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
-                                     "CHANGES REQUESTED", "t-a")
+                                     "CHANGES REQUESTED", "t-a", 1)
 
     def test_partial_publication_retry_does_not_duplicate_posted_lenses(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text(json.dumps({
-                "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
                 "project_dir": "/project",
                 "reviewers": {"t-c": "correctness", "t-t": "tests"},
                 "status": "collecting",
@@ -174,21 +175,21 @@ class ProjectBusyTest(unittest.TestCase):
                 watcher.process_round(str(path))
             final = json.loads(path.read_text())
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
-                                     "APPROVE", "t-t")
+                                     "APPROVE", "t-t", 1)
         self.assertEqual(final["status"], "published")
 
     def test_retry_after_post_before_state_save_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text(json.dumps({
-                "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
                 "project_dir": "/project", "reviewers": {"t-a": "tests"},
                 "status": "collecting",
             }))
             states = {"t-a": "done"}
             findings = {"t-a": "VERDICT: APPROVE\nHEAD: " + "a" * 40}
             posted = []
-            body = watcher.verdict_body("tests", "a" * 40, "APPROVE", "t-a")
+            body = watcher.verdict_body("tests", "a" * 40, "APPROVE", "t-a", 1)
 
             def mac(command):
                 if "--json comments" in command:
@@ -220,7 +221,7 @@ class ProjectBusyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
             path.write_text(json.dumps({
-                "pr": 7, "repo": "owner/repo", "head": "a" * 40, "project_dir": "/project",
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40, "project_dir": "/project",
                 "reviewers": {"t-a": "tests"}, "status": "collecting",
             }))
             with patch.object(watcher, "reviewer_states", return_value={"t-a": "done"}), \
@@ -240,7 +241,7 @@ class ProjectBusyTest(unittest.TestCase):
             with self.subTest(output=output), tempfile.TemporaryDirectory() as tmp:
                 path = pathlib.Path(tmp) / "round.json"
                 path.write_text(json.dumps({
-                    "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                    "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
                     "project_dir": "/project", "reviewers": {"t-a": "tests"},
                     "status": "collecting",
                 }))
@@ -259,7 +260,39 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertEqual(watcher.task_status("t-a: DONE (exit 7)"), "failed")
         self.assertEqual(watcher.task_status("t-a: DONE (exit unknown)"), "unknown")
         self.assertEqual(watcher.task_status("t-a: DONE (pruned)"), "pruned")
+        self.assertEqual(watcher.task_status("t-a: MISSING"), "missing")
         self.assertEqual(watcher.task_status("t-a: DONE"), "unknown")
+
+    def test_dispatching_round_reconciles_persisted_launch_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "round.json"
+            path.write_text(json.dumps({
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
+                "project_dir": "/project", "reviewers": {"t-a": "tests"},
+                "status": "dispatching",
+            }))
+            with patch.object(watcher, "reviewer_states",
+                              return_value={"t-a": "running"}):
+                result = watcher.process_round(str(path))
+            state = json.loads(path.read_text())
+        self.assertEqual(state["status"], "collecting")
+        self.assertIn("t-a=running", result)
+
+    def test_abandoned_persisted_launch_intent_reaches_attention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "round.json"
+            path.write_text(json.dumps({
+                "pr": 7, "round": 1, "repo": "owner/repo", "head": "a" * 40,
+                "project_dir": "/project", "reviewers": {"t-a": "tests"},
+                "status": "dispatching",
+                "dispatch_misses": {"t-a": watcher.MISS_LIMIT - 1},
+            }))
+            with patch.object(watcher, "reviewer_states",
+                              return_value={"t-a": "missing"}):
+                result = watcher.process_round(str(path))
+            state = json.loads(path.read_text())
+        self.assertEqual(state["status"], "attention")
+        self.assertIn("launch incomplete", result)
 
     def test_conflicting_verdict_output_is_rejected(self):
         output = ("VERDICT: APPROVE\nVERDICT: CHANGES REQUESTED\nHEAD: " + "a" * 40)

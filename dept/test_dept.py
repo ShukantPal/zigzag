@@ -99,6 +99,20 @@ class CommandDispatchTest(unittest.TestCase):
         args = department.dispatch_args(["/project", "/prompt", "--model", "gpt-6-luna"])
         self.assertEqual(args.model, "gpt-6-luna")
 
+    def test_preallocated_task_id_is_validated_and_preserved(self):
+        result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
+        with patch.object(department, "setup_task_dir", return_value="/remote/t") as setup, \
+             patch.object(department, "ssh", return_value=result), \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", b"prompt", True,
+                                     task_id="t-fedcba")
+        self.assertEqual(setup.call_args.args[0], "t-fedcba")
+        with patch.object(department, "setup_task_dir") as setup, \
+             self.assertRaises(SystemExit):
+            department.dispatch_task("/project", b"prompt", True,
+                                     task_id="../../bad")
+        setup.assert_not_called()
+
     def test_command_handler_key_error_is_not_reported_as_unknown_command(self):
         with patch.object(department, "cmd_start", side_effect=KeyError("connection")):
             with self.assertRaisesRegex(KeyError, "connection"):
@@ -128,6 +142,17 @@ class CommandDispatchTest(unittest.TestCase):
         launch = str(ssh.call_args_list[-1].args[0])
         self.assertIn("--sandbox read-only", launch)
         self.assertNotIn("--approve-for-me", launch)
+
+    def test_read_only_prompt_omits_relay_announcement(self):
+        result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
+        with patch.object(department.uuid, "uuid4",
+                          return_value=SimpleNamespace(hex="abc123")), \
+             patch.object(department, "setup_task_dir", return_value="/remote/t") as setup, \
+             patch.object(department, "ssh", return_value=result), \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", b"review prompt", True,
+                                     read_only=True)
+        self.assertEqual(setup.call_args.args[2], b"review prompt")
 
     def test_invalid_model_is_rejected_before_remote_setup(self):
         with patch.object(department, "ssh") as ssh, self.assertRaises(SystemExit):

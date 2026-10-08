@@ -16,6 +16,7 @@ Verdict comments are top-level PR comments posted by review-team workers
   > \U0001F916 Codex (AI assistant) \u2014 [correctness] review verdict
   VERDICT: APPROVE
   HEAD: <full 40-hex sha reviewed>
+  ROUND: <positive review-round number>
   <short summary; findings when CHANGES REQUESTED>
 
 Lenses: correctness, simplicity, tests (+ security when the round seeds it).
@@ -54,6 +55,7 @@ VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 LENS_RE = re.compile(r"\[([a-z]+)\]\s+review verdict", re.IGNORECASE)
+ROUND_RE = re.compile(r"^ROUND:\s*([1-9][0-9]*)\s*$", re.MULTILINE)
 
 
 def human_review_actors():
@@ -98,14 +100,17 @@ def latest_verdicts(comments):
         lenses = LENS_RE.findall(body)
         verdicts_found = VERDICT_RE.findall(body)
         heads = HEAD_RE.findall(body)
-        if len(lenses) != 1 or len(verdicts_found) != 1 or len(heads) != 1:
+        rounds = ROUND_RE.findall(body)
+        if (len(lenses) != 1 or len(verdicts_found) != 1 or len(heads) != 1 or
+                len(rounds) != 1):
             continue
         lens = lenses[0].lower()
-        key = (c.get("createdAt") or "", c.get("id") or 0)
-        if lens not in verdicts or key > verdicts[lens][3]:
+        round_number = int(rounds[0])
+        key = (round_number, c.get("createdAt") or "", c.get("id") or 0)
+        if lens not in verdicts or key > verdicts[lens][4]:
             verdicts[lens] = (verdicts_found[0].upper(), heads[0].lower(),
-                              c.get("author"), key)
-    return {l: v[:3] for l, v in verdicts.items()}
+                              c.get("author"), round_number, key)
+    return {l: v[:4] for l, v in verdicts.items()}
 
 
 def current_human_approval(reviews, head, actors):
@@ -114,7 +119,8 @@ def current_human_approval(reviews, head, actors):
     for review in reviews:
         author = review.get("author")
         state = (review.get("state") or "").upper()
-        if author not in actors or state not in ("APPROVED", "CHANGES_REQUESTED"):
+        if author not in actors or state not in ("APPROVED", "CHANGES_REQUESTED",
+                                                 "DISMISSED"):
             continue
         key = (review.get("submittedAt") or "", review.get("id") or "")
         if author not in latest or key > latest[author][0]:
@@ -172,9 +178,10 @@ def check(repo, pr, lenses):
             reasons.append(f"no verdict from [{lens}] reviewer")
             approvals[lens] = {"verdict": None}
             continue
-        verdict, vhead, author = v
+        verdict, vhead, author, round_number = v
         approvals[lens] = {"verdict": verdict, "head": vhead,
-                           "on_current_head": vhead == head}
+                           "on_current_head": vhead == head,
+                           "round": round_number}
         if verdict != "APPROVE":
             reasons.append(f"[{lens}] latest verdict is {verdict} (not APPROVE)")
         elif vhead != head:

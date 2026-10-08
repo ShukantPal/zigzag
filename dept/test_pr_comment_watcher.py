@@ -14,7 +14,7 @@ watcher = importlib.import_module("pr_comment_watcher")
 
 
 class WatermarkTest(unittest.TestCase):
-    def test_save_unions_stale_seen_and_pr_state(self):
+    def test_save_writes_supplied_watermark_under_serialized_poll(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "watermark.json"
             path.write_text(json.dumps({"seen": ["ic:old"], "pr_state": {"1": "OPEN"}}))
@@ -22,8 +22,8 @@ class WatermarkTest(unittest.TestCase):
                  patch.object(watcher, "STATE_DIR", tmp):
                 watcher.save_watermark({"seen": ["rc:new"], "pr_state": {"2": "CLOSED"}})
             data = json.loads(path.read_text())
-        self.assertEqual(set(data["seen"]), {"ic:old", "rc:new"})
-        self.assertEqual(data["pr_state"], {"1": "OPEN", "2": "CLOSED"})
+        self.assertEqual(data["seen"], ["rc:new"])
+        self.assertEqual(data["pr_state"], {"2": "CLOSED"})
 
     def test_pr_task_running_fails_closed_when_active_task_status_errors(self):
         with tempfile.TemporaryDirectory() as tmp:

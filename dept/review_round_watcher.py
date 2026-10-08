@@ -8,6 +8,7 @@ raw output is never sent to a write-capable owner task.
 Seeding a round: write <state-dir>/review_rounds/<repo>-pr<pr>-round<n>.json:
 {
   "pr": 922,
+  "round": 2,
   "repo": "leveled-inc/leveled",
   "head": "0123456789abcdef0123456789abcdef01234567",
   "project_dir": "/Users/shukant/.codex/worktrees/stale-engine-race",
@@ -15,7 +16,7 @@ Seeding a round: write <state-dir>/review_rounds/<repo>-pr<pr>-round<n>.json:
   "created_at": "2026-09-20T22:30:00-07:00",
   "status": "collecting"
 }
-status: collecting -> published (terminal) | attention (needs a human).
+status: dispatching -> collecting -> published (terminal) | attention (needs a human).
 
 Rules honored:
 - Only an explicit zero exit permits reviewer output to be published.
@@ -115,6 +116,8 @@ STATUS_RE = re.compile(r":\s*(RUNNING|DONE)(?:\s+\(exit\s+([^\)]+)\))?\s*$")
 
 def task_status(text):
     """Parse status without treating an ambiguous completion as safe."""
+    if text.strip().endswith(": MISSING"):
+        return "missing"
     if text.strip().endswith(": DONE (pruned)"):
         return "pruned"
     match = STATUS_RE.search(text.strip())
@@ -175,6 +178,8 @@ def reviewer_states(task_ids):
             completed.append(tid)
         elif status in ("failed", "pruned"):
             states[tid] = "failed"
+        elif status == "missing":
+            states[tid] = "missing"
         else:
             raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")
     if not completed:
@@ -227,9 +232,9 @@ def validated_verdict(text, head):
     return verdicts[0].upper()
 
 
-def verdict_body(lens, head, verdict, task_id):
+def verdict_body(lens, head, verdict, task_id, round_number):
     return (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
-            f"VERDICT: {verdict}\nHEAD: {head}\n\n"
+            f"VERDICT: {verdict}\nHEAD: {head}\nROUND: {round_number}\n\n"
             "ATTESTATION: MODEL_ADVISORY\n\n"
             f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
             "requires a formal review from an allowlisted human before it can "
@@ -243,8 +248,8 @@ def verdict_already_posted(repo, pr, body):
                c.get("body") == body for c in comments)
 
 
-def post_verdict(repo, pr, lens, head, verdict, task_id):
-    body = verdict_body(lens, head, verdict, task_id)
+def post_verdict(repo, pr, lens, head, verdict, task_id, round_number):
+    body = verdict_body(lens, head, verdict, task_id, round_number)
     if verdict_already_posted(repo, pr, body):
         return False
     mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
@@ -274,10 +279,29 @@ def _process_round_locked(path):
     # Reload only after acquiring the shared lock: another watcher may have
     # completed this round while this process was waiting to run.
     rnd = load_round(path)
-    if rnd.get("status") != "collecting":
+    if rnd.get("status") not in ("dispatching", "collecting"):
         return f"#{rnd['pr']}: status={rnd.get('status')}, skipping"
     tids = list(rnd["reviewers"].keys())
     states = reviewer_states(tids)
+    if rnd.get("status") == "dispatching":
+        dispatch_misses = rnd.setdefault("dispatch_misses", {})
+        missing = [t for t in tids if states.get(t) == "missing"]
+        for tid in tids:
+            dispatch_misses[tid] = (dispatch_misses.get(tid, 0) + 1
+                                    if tid in missing else 0)
+        abandoned = [t for t in missing if dispatch_misses[t] >= MISS_LIMIT]
+        if abandoned:
+            rnd["status"] = "attention"
+            rnd["attention_reason"] = (
+                "reviewer launch incomplete after persisted intent: " +
+                ", ".join(abandoned))
+            save_round(path, rnd)
+            return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+        if missing:
+            save_round(path, rnd)
+            return f"#{rnd['pr']}: waiting for persisted reviewer launch intent"
+        rnd["status"] = "collecting"
+        rnd.pop("dispatch_misses", None)
     misses = rnd.setdefault("misses", {})
 
     dead = [t for t in tids if states.get(t) == "dead-empty"]
@@ -321,7 +345,8 @@ def _process_round_locked(path):
     posted = set(rnd.get("posted_lenses", []))
     for lens, (verdict, tid) in verdicts.items():
         if lens not in posted:
-            post_verdict(rnd["repo"], rnd["pr"], lens, rnd["head"], verdict, tid)
+            post_verdict(rnd["repo"], rnd["pr"], lens, rnd["head"], verdict,
+                         tid, rnd["round"])
             posted.add(lens)
             rnd["posted_lenses"] = sorted(posted)
             save_round(path, rnd)
