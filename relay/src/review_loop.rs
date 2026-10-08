@@ -51,6 +51,8 @@ pub struct RepositoryPolicy {
     pub full_rounds_max: u64,
     pub verification_rounds_max: u64,
     pub lenses: Vec<String>,
+    /// Audited policy assertion from the design schema. `true` requires the
+    /// security lens; `false` still permits opting into that lens explicitly.
     pub require_security_lens: bool,
     pub required_ci_checks: Vec<RequiredCheck>,
     pub trusted_verdict_identity: String,
@@ -322,6 +324,8 @@ struct ReviewRound {
     excluded_comment_ids: BTreeSet<String>,
     #[serde(default)]
     pending_comment_deletions: BTreeSet<String>,
+    #[serde(default)]
+    pending_agent_cleanup: BTreeSet<String>,
     owner: Option<OwnerContext>,
     owner_agent_id: Option<String>,
     gate_reasons: Vec<String>,
@@ -456,6 +460,9 @@ pub fn start(
     super::require_gui_login_session()?;
     let mut store = StateStore::open(state_path)?;
     validate_review_transport(&config, super::github_open_pull_requests)?;
+    if authoritative_mode(shadow) {
+        retry_pending_agent_cleanup(&state, &mut store)?;
+    }
     thread::spawn(move || {
         let mut discovery_due = Instant::now();
         let mut review_due = Instant::now();
@@ -515,6 +522,7 @@ fn supersede_rounds_for_head(
     repository: &str,
     number: u64,
     current_key: &str,
+    cleanup_required: bool,
 ) -> Vec<String> {
     let mut agents = Vec::new();
     for (key, round) in state
@@ -528,7 +536,7 @@ fn supersede_rounds_for_head(
                 RoundPhase::Merged | RoundPhase::Closed | RoundPhase::Superseded
             )
         {
-            agents.extend(round_agent_ids(round));
+            agents.extend(stage_agent_cleanup(round, cleanup_required));
         }
         if key != current_key
             && !matches!(
@@ -540,6 +548,7 @@ fn supersede_rounds_for_head(
         }
     }
     agents.sort();
+    agents.dedup();
     agents
 }
 
@@ -600,11 +609,36 @@ fn open_comparison_matches(
         && snapshot.head_ref_oid == expected_head
 }
 
-fn mark_round_superseded(state: &mut DurableState, key: &str) -> Vec<String> {
+fn stage_agent_cleanup(round: &mut ReviewRound, cleanup_required: bool) -> Vec<String> {
+    let agents = round_agent_ids(round);
+    if cleanup_required {
+        round.pending_agent_cleanup.extend(agents.iter().cloned());
+    }
+    agents
+}
+
+fn complete_agent_cleanup(store: &mut StateStore, agents: &[String]) -> Result<(), String> {
+    let mut changed = false;
+    for round in store.state.rounds.values_mut() {
+        for agent in agents {
+            changed |= round.pending_agent_cleanup.remove(agent);
+        }
+    }
+    if changed {
+        store.save()?;
+    }
+    Ok(())
+}
+
+fn mark_round_superseded(
+    state: &mut DurableState,
+    key: &str,
+    cleanup_required: bool,
+) -> Vec<String> {
     let Some(round) = state.rounds.get_mut(key) else {
         return Vec::new();
     };
-    let agents = round_agent_ids(round);
+    let agents = stage_agent_cleanup(round, cleanup_required);
     round.phase = RoundPhase::Superseded;
     agents
 }
@@ -613,6 +647,7 @@ fn supersede_stale_round(
     store: &mut StateStore,
     key: &str,
     snapshot: &PullRequestSnapshot,
+    cleanup_required: bool,
     mut kill: impl FnMut(&[String]),
 ) -> Result<bool, String> {
     if store
@@ -623,9 +658,12 @@ fn supersede_stale_round(
     {
         return Ok(false);
     }
-    let agents = mark_round_superseded(&mut store.state, key);
+    let agents = mark_round_superseded(&mut store.state, key, cleanup_required);
     store.save()?;
-    kill(&agents);
+    if cleanup_required {
+        kill(&agents);
+        complete_agent_cleanup(store, &agents)?;
+    }
     Ok(true)
 }
 
@@ -633,6 +671,7 @@ fn terminalize_closed_round(
     store: &mut StateStore,
     key: &str,
     snapshot: &PullRequestSnapshot,
+    cleanup_required: bool,
     mut kill: impl FnMut(&[String]),
 ) -> Result<Option<&'static str>, String> {
     if pull_request_is_open(snapshot) {
@@ -641,7 +680,7 @@ fn terminalize_closed_round(
     let Some(round) = store.state.rounds.get_mut(key) else {
         return Ok(None);
     };
-    let agents = round_agent_ids(round);
+    let agents = stage_agent_cleanup(round, cleanup_required);
     let event = if pull_request_is_merged(snapshot) {
         round.phase = RoundPhase::Merged;
         "review_merged"
@@ -650,7 +689,10 @@ fn terminalize_closed_round(
         "review_closed"
     };
     store.save()?;
-    kill(&agents);
+    if cleanup_required {
+        kill(&agents);
+        complete_agent_cleanup(store, &agents)?;
+    }
     Ok(Some(event))
 }
 
@@ -785,8 +827,13 @@ fn discover_with(
             )?;
             let (excluded_comment_ids, pending_comment_deletions) =
                 replacement_comment_state(store.state.rounds.get(&key), &snapshot.comments);
-            let superseded_agents =
-                supersede_rounds_for_head(&mut store.state, &policy.repository, number, &key);
+            let superseded_agents = supersede_rounds_for_head(
+                &mut store.state,
+                &policy.repository,
+                number,
+                &key,
+                authoritative_mode(shadow),
+            );
             let owner = find_owner_context(
                 &policy.repository,
                 &snapshot.head_ref_name,
@@ -806,6 +853,11 @@ fn discover_with(
                     verdicts: BTreeMap::new(),
                     excluded_comment_ids,
                     pending_comment_deletions,
+                    pending_agent_cleanup: if authoritative_mode(shadow) {
+                        superseded_agents.iter().cloned().collect()
+                    } else {
+                        BTreeSet::new()
+                    },
                     owner,
                     owner_agent_id: None,
                     gate_reasons: Vec::new(),
@@ -814,6 +866,7 @@ fn discover_with(
             store.save()?;
             if authoritative_mode(shadow) {
                 kill_agents(server, &superseded_agents);
+                complete_agent_cleanup(store, &superseded_agents)?;
             }
             if !authoritative_mode(shadow) {
                 emit_decision(
@@ -1151,19 +1204,23 @@ fn poll_reviews_with(
         if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
             prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
         }
-        if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
-            if authoritative_mode(shadow) {
-                cleanup_agents(agent_ids);
-            }
-        })? {
+        if let Some(event) = terminalize_closed_round(
+            store,
+            &key,
+            &snapshot,
+            authoritative_mode(shadow),
+            |agent_ids| cleanup_agents(agent_ids),
+        )? {
             emit_decision(server, &key, generation, event, shadow, Vec::new())?;
             continue;
         }
-        if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
-            if authoritative_mode(shadow) {
-                cleanup_agents(agent_ids);
-            }
-        })? {
+        if supersede_stale_round(
+            store,
+            &key,
+            &snapshot,
+            authoritative_mode(shadow),
+            |agent_ids| cleanup_agents(agent_ids),
+        )? {
             continue;
         }
         let verdicts = latest_verdicts(
@@ -1184,19 +1241,23 @@ fn poll_reviews_with(
         // force-push or base retarget. Fence every downstream decision and
         // owner resume with a fresh comparison read.
         snapshot = fetch_snapshot(&repository, number)?;
-        if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
-            if authoritative_mode(shadow) {
-                cleanup_agents(agent_ids);
-            }
-        })? {
+        if let Some(event) = terminalize_closed_round(
+            store,
+            &key,
+            &snapshot,
+            authoritative_mode(shadow),
+            |agent_ids| cleanup_agents(agent_ids),
+        )? {
             emit_decision(server, &key, generation, event, shadow, Vec::new())?;
             continue;
         }
-        if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
-            if authoritative_mode(shadow) {
-                cleanup_agents(agent_ids);
-            }
-        })? {
+        if supersede_stale_round(
+            store,
+            &key,
+            &snapshot,
+            authoritative_mode(shadow),
+            |agent_ids| cleanup_agents(agent_ids),
+        )? {
             continue;
         }
         let changes: Vec<_> = store.state.rounds[&key]
@@ -1330,11 +1391,13 @@ fn poll_merges_with(
         if !open_comparison_matches(&snapshot, &base, &head) {
             prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
         }
-        let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
-            if authoritative_mode(shadow) {
-                cleanup_agents(agent_ids);
-            }
-        })?
+        let Some(event) = terminalize_closed_round(
+            store,
+            &key,
+            &snapshot,
+            authoritative_mode(shadow),
+            |agent_ids| cleanup_agents(agent_ids),
+        )?
         else {
             continue;
         };
@@ -2022,6 +2085,42 @@ fn resume_owner(
     key: &str,
     findings: &[(String, Vec<String>)],
 ) -> Result<(), String> {
+    resume_owner_with(
+        server,
+        store,
+        key,
+        findings,
+        fetch_pr,
+        owner_context_is_current,
+        |task_id, owner, prompt, repository, number, base, head| {
+            spawn_codex_task(
+                server,
+                task_id,
+                &owner.project_dir,
+                Some(&owner.session_id),
+                prompt,
+                None,
+                Some(&OwnerSpawnFence {
+                    repository,
+                    number,
+                    base,
+                    head,
+                    owner,
+                }),
+            )
+        },
+    )
+}
+
+fn resume_owner_with(
+    server: &Arc<Server>,
+    store: &mut StateStore,
+    key: &str,
+    findings: &[(String, Vec<String>)],
+    fetch_snapshot: impl FnOnce(&str, u64) -> Result<PullRequestSnapshot, String>,
+    owner_is_current: impl FnOnce(&OwnerContext, &str, &str) -> bool,
+    spawn_owner: impl FnOnce(&str, &OwnerContext, &str, &str, u64, &str, &str) -> Result<String, String>,
+) -> Result<(), String> {
     let (repository, number, head, base, generation, owner, owner_agent_id) = {
         let round = &store.state.rounds[key];
         (
@@ -2065,14 +2164,14 @@ fn resume_owner(
     {
         return Ok(());
     }
-    let current = fetch_pr(&repository, number)?;
+    let current = fetch_snapshot(&repository, number)?;
     if !open_comparison_matches(&current, &base, &head) {
         return Ok(());
     }
     let task_id = owner_task_id(&repository, number, &head, generation);
     store.save()?;
     let prompt = owner_prompt(&repository, number, &base, &head, generation, findings);
-    if !owner_context_is_current(&owner, &repository, &head) {
+    if !owner_is_current(&owner, &repository, &head) {
         let round = store.state.rounds.get_mut(key).expect("round exists");
         round.phase = RoundPhase::Attention;
         round.gate_reasons = vec![
@@ -2082,21 +2181,7 @@ fn resume_owner(
         store.save()?;
         return Ok(());
     }
-    let agent_id = spawn_codex_task(
-        server,
-        &task_id,
-        &owner.project_dir,
-        Some(&owner.session_id),
-        &prompt,
-        None,
-        Some(&OwnerSpawnFence {
-            repository: &repository,
-            number,
-            base: &base,
-            head: &head,
-            owner: &owner,
-        }),
-    )?;
+    let agent_id = spawn_owner(&task_id, &owner, &prompt, &repository, number, &base, &head)?;
     store
         .state
         .rounds
@@ -2426,21 +2511,23 @@ fn latest_managed_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Opt
 fn kill_agents_with(
     registry: &AgentRegistry,
     agent_ids: &[String],
-    orphan_is_current: impl Fn(&relay_core::AgentRecord) -> bool,
+    process_is_current: impl Fn(&relay_core::AgentRecord) -> bool,
     mut kill: impl FnMut(i32),
 ) -> Vec<String> {
     let mut unverified = Vec::new();
     for agent_id in agent_ids {
         if let Some(agent) = registry.get(agent_id) {
             match agent.state.as_str() {
-                "running" => kill(agent.process_group),
-                "orphaned" if orphan_is_current(&agent) => {
+                "running" | "orphaned" if process_is_current(&agent) => {
                     kill(agent.process_group);
-                    let _ = registry.transition(agent_id, "cleanup_forced", None);
+                    if agent.state == "orphaned" {
+                        let _ = registry.transition(agent_id, "cleanup_forced", None);
+                    }
                 }
-                // Records created before process birth identity was persisted,
-                // or whose PID has been reused, must never be signalled.
-                "orphaned" => unverified.push(agent_id.clone()),
+                // Even a record still labelled running can lag process exit
+                // and PID reuse until the reaper runs. Every cleanup signal
+                // therefore requires the persisted process-birth identity.
+                "running" | "orphaned" => unverified.push(agent_id.clone()),
                 _ => {}
             }
         }
@@ -2483,6 +2570,21 @@ fn kill_agents(server: &Server, agent_ids: &[String]) {
             }
         }
     }
+}
+
+fn retry_pending_agent_cleanup(server: &Server, store: &mut StateStore) -> Result<(), String> {
+    let agents: BTreeSet<_> = store
+        .state
+        .rounds
+        .values()
+        .flat_map(|round| round.pending_agent_cleanup.iter().cloned())
+        .collect();
+    if agents.is_empty() {
+        return Ok(());
+    }
+    let agents: Vec<_> = agents.into_iter().collect();
+    kill_agents(server, &agents);
+    complete_agent_cleanup(store, &agents)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -3245,6 +3347,7 @@ review_loop:
             verdicts: BTreeMap::new(),
             excluded_comment_ids: BTreeSet::new(),
             pending_comment_deletions: BTreeSet::new(),
+            pending_agent_cleanup: BTreeSet::new(),
             owner: None,
             owner_agent_id: None,
             gate_reasons: Vec::new(),
@@ -3340,6 +3443,113 @@ review_loop:
     }
 
     #[test]
+    fn failed_owner_is_cleared_durably_and_resumed_once_with_current_fence() {
+        let head = "a".repeat(40);
+        let base = "c".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-owner-retry-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry_path = state_path.with_extension("agents");
+        let event_path = state_path.with_extension("events");
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        registry
+            .register(agent("failed-owner", "owner-resume", 41, "failed"))
+            .unwrap();
+        registry
+            .register(agent("completed-owner", "other", 42, "succeeded"))
+            .unwrap();
+        registry
+            .register(agent("lost-owner", "other", 43, "lost_after_restart"))
+            .unwrap();
+        assert!(!registered_agent_running(&registry, "completed-owner"));
+        assert!(!registered_agent_running(&registry, "lost-owner"));
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::clone(&registry),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut round = test_round(&head, RoundPhase::Findings, Some("reviewer"));
+        round.owner = Some(OwnerContext {
+            session_id: "session-1".to_owned(),
+            project_dir: PathBuf::from("/private/tmp/owner"),
+            department_task_id: "department-1".to_owned(),
+            branch: "codex/branch".to_owned(),
+        });
+        round.owner_agent_id = Some("failed-owner".to_owned());
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+        let mut spawns = 0;
+        resume_owner_with(
+            &server,
+            &mut store,
+            &key,
+            &[("tests".to_owned(), vec!["fix the race".to_owned()])],
+            |repository, number| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(number, 7);
+                Ok(snapshot(&head))
+            },
+            |owner, repository, expected_head| {
+                assert_eq!(owner.session_id, "session-1");
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(expected_head, head);
+                true
+            },
+            |task_id, owner, prompt, repository, number, expected_base, expected_head| {
+                spawns += 1;
+                assert_eq!(task_id, owner_task_id("owner/repo", 7, &head, 1));
+                assert_eq!(owner.session_id, "session-1");
+                assert!(prompt.contains("fix the race"));
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(number, 7);
+                assert_eq!(expected_base, base);
+                assert_eq!(expected_head, head);
+                assert_eq!(
+                    StateStore::open(state_path.clone()).unwrap().state.rounds[&key].owner_agent_id,
+                    None,
+                    "the stale owner handle must be cleared before the spawn side effect"
+                );
+                Ok("current-owner".to_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(spawns, 1);
+        assert_eq!(
+            StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                .owner_agent_id
+                .as_deref(),
+            Some("current-owner")
+        );
+        registry
+            .register(agent("current-owner", "owner-resume", 44, "running"))
+            .unwrap();
+        resume_owner_with(
+            &server,
+            &mut store,
+            &key,
+            &[],
+            |_, _| panic!("a live owner must suppress refetch and duplicate resume"),
+            |_, _, _| panic!("a live owner must suppress owner revalidation"),
+            |_, _, _, _, _, _, _| panic!("a live owner must not be duplicated"),
+        )
+        .unwrap();
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
     fn returning_to_a_superseded_head_starts_a_new_generation_without_old_approvals() {
         let head_a = "a".repeat(40);
         let head_b = "b".repeat(40);
@@ -3384,7 +3594,7 @@ review_loop:
         state.rounds.get_mut(&key_b).unwrap().owner_agent_id = Some("owner-b".to_owned());
         let (excluded_comment_ids, pending_comment_deletions) =
             replacement_comment_state(state.rounds.get(&key_a), std::slice::from_ref(&old_comment));
-        let agents = supersede_rounds_for_head(&mut state, "owner/repo", 7, &key_a);
+        let agents = supersede_rounds_for_head(&mut state, "owner/repo", 7, &key_a, true);
         assert_eq!(agents, ["agent-a", "agent-b", "owner-a", "owner-b"]);
         assert_eq!(state.rounds[&key_b].phase, RoundPhase::Superseded);
         let generation = state.rounds[&key_a].generation + 1;
@@ -3488,12 +3698,14 @@ review_loop:
             |agent_ids| {
                 let persisted = StateStore::open(state_path.clone()).unwrap();
                 assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Merged);
+                assert_eq!(persisted.state.rounds[&key].pending_agent_cleanup.len(), 3);
                 killed.extend_from_slice(agent_ids);
             },
         )
         .unwrap();
         assert_eq!(killed, ["agent-a", "agent-b", "owner-agent"]);
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Merged);
+        assert!(store.state.rounds[&key].pending_agent_cleanup.is_empty());
         assert_ne!(
             owner_task_id("owner/repo", 7, &head, 1),
             owner_task_id("owner/repo", 7, &head, 2)
@@ -3519,15 +3731,20 @@ review_loop:
         let mut closed = snapshot(&head);
         closed.state = "CLOSED".to_owned();
         let mut killed = Vec::new();
-        let event = terminalize_closed_round(&mut store, &key, &closed, |agent_ids| {
+        let event = terminalize_closed_round(&mut store, &key, &closed, true, |agent_ids| {
             let persisted = StateStore::open(state_path.clone()).unwrap();
             assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Closed);
+            assert_eq!(
+                persisted.state.rounds[&key].pending_agent_cleanup,
+                BTreeSet::from(["owner".to_owned(), "reviewer".to_owned()])
+            );
             killed.extend_from_slice(agent_ids);
         })
         .unwrap();
         assert_eq!(event, Some("review_closed"));
         assert_eq!(killed, ["owner", "reviewer"]);
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Closed);
+        assert!(store.state.rounds[&key].pending_agent_cleanup.is_empty());
         let _ = fs::remove_file(state_path);
     }
 
@@ -3559,6 +3776,9 @@ review_loop:
         registry
             .register(agent("verified", "task", 44, "orphaned"))
             .unwrap();
+        registry
+            .register(agent("reused-running", "task", 45, "running"))
+            .unwrap();
         let mut killed = Vec::new();
         let unverified = kill_agents_with(
             &registry,
@@ -3567,12 +3787,13 @@ review_loop:
                 "orphaned".to_owned(),
                 "finished".to_owned(),
                 "verified".to_owned(),
+                "reused-running".to_owned(),
             ],
-            |agent| agent.id == "verified",
+            |agent| matches!(agent.id.as_str(), "running" | "verified"),
             |process_group| killed.push(process_group),
         );
         assert_eq!(killed, [41, 44]);
-        assert_eq!(unverified, ["orphaned"]);
+        assert_eq!(unverified, ["orphaned", "reused-running"]);
         assert_eq!(registry.get("verified").unwrap().state, "cleanup_forced");
         registry.transition("running", "finished", Some(0)).unwrap();
         let state_path = path.with_extension("events");
@@ -3666,7 +3887,7 @@ review_loop:
         store.save().unwrap();
         let mut changed = snapshot(&head);
         changed.base_ref_oid = "d".repeat(40);
-        supersede_stale_round(&mut store, &key, &changed, |agent_ids| {
+        supersede_stale_round(&mut store, &key, &changed, true, |agent_ids| {
             kill_agents(&server, agent_ids)
         })
         .unwrap();
@@ -3675,6 +3896,74 @@ review_loop:
         assert_eq!(
             registry.get("legacy").unwrap().state,
             "cleanup_skipped_unverified"
+        );
+        child.wait().unwrap();
+
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(review_state_path);
+    }
+
+    #[test]
+    fn restart_replays_terminal_cleanup_debt_before_polling() {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process_group = child.id() as i32;
+        let registry_path = std::env::temp_dir().join(format!(
+            "zigzag-cleanup-debt-agents-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        let mut recovered = agent("recovered-owner", "owner-task", process_group, "orphaned");
+        recovered.process_identity = super::super::process_identity(process_group);
+        registry.register(recovered).unwrap();
+        let state_path = registry_path.with_extension("events");
+        let review_state_path = registry_path.with_extension("review-state");
+        let server = Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::clone(&registry),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: review_state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        };
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let mut round = test_round(&head, RoundPhase::Merged, None);
+        round.owner_agent_id = Some("recovered-owner".to_owned());
+        round
+            .pending_agent_cleanup
+            .insert("recovered-owner".to_owned());
+        let mut store = StateStore::open(review_state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+
+        retry_pending_agent_cleanup(&server, &mut store).unwrap();
+        assert!(store.state.rounds[&key].pending_agent_cleanup.is_empty());
+        assert!(
+            StateStore::open(review_state_path.clone())
+                .unwrap()
+                .state
+                .rounds[&key]
+                .pending_agent_cleanup
+                .is_empty()
+        );
+        assert_eq!(
+            registry.get("recovered-owner").unwrap().state,
+            "cleanup_forced"
         );
         child.wait().unwrap();
 
@@ -3711,9 +4000,9 @@ review_loop:
         ));
         let registry_path = state_path.with_extension("agents");
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
-        registry
-            .register(agent("reviewer", "review-task", process_group, "running"))
-            .unwrap();
+        let mut reviewer = agent("reviewer", "review-task", process_group, "running");
+        reviewer.process_identity = super::super::process_identity(process_group);
+        registry.register(reviewer).unwrap();
         let complete_output = || {
             Arc::new(Mutex::new(super::super::CappedOutput {
                 complete: true,
