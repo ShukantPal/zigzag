@@ -813,8 +813,9 @@ impl Sha256 {
             0xc67178f2,
         ];
         let mut w = [0u32; 64];
-        for (i, chunk) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(chunk.try_into().expect("word"));
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            let offset = i * 4;
+            *word = u32::from_be_bytes(block[offset..offset + 4].try_into().expect("word"));
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
