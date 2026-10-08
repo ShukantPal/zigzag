@@ -10,6 +10,9 @@
     "zigzag_token_file": "~/.codex/zigzag.token",
     "relay_launcher": "codex-launch"
   },
+  "approval_gate": {
+    "human_review_actors": ["separate-human-github-login"]
+  },
   "pr_comment_watcher": {
     "repo": "owner/repo",
     "project_dir": "/absolute/path/to/checkout",

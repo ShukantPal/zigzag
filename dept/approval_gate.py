@@ -5,9 +5,10 @@ A PR passes the gate only when BOTH hold on the CURRENT head:
   1. Required CI is green: semgrep + BuildBuddy successful. The
      `scribes-stg-preview-deploy` manual trigger (ACTION_REQUIRED/NEUTRAL) and
      gcbrun noise are not blockers (Shukant's leveled CI rule).
-  2. Every required review lens has a latest verdict comment of APPROVE whose
-     HEAD equals the PR's current head SHA. Stale approvals (older head) and
-     CHANGES REQUESTED verdicts fail the gate.
+  2. Every required review lens has a latest model-advisory verdict comment of
+     APPROVE whose HEAD equals the PR's current head SHA, and a separately
+     authenticated, allowlisted human has formally approved that exact head.
+     Stale approvals and CHANGES REQUESTED verdicts fail the gate.
 
 Verdict comments are top-level PR comments posted by review-team workers
 (land as ShukantPal via shared gh auth, so they carry the marker line):
@@ -15,13 +16,14 @@ Verdict comments are top-level PR comments posted by review-team workers
   > \U0001F916 Codex (AI assistant) \u2014 [correctness] review verdict
   VERDICT: APPROVE
   HEAD: <full 40-hex sha reviewed>
-  ATTESTATION: HUMAN
   <short summary; findings when CHANGES REQUESTED>
 
 Lenses: correctness, simplicity, tests (+ security when the round seeds it).
 The PR comment watcher skips marker-bearing comments, so verdicts never
-re-dispatch. Verdicts are NOT `gh pr review --approve` reviews on purpose:
-formal approvals would count toward branch protection as ShukantPal.
+re-dispatch. Model verdicts are never treated as human proof. Human approval
+must be a formal GitHub review from an actor named in the deployment-only
+`approval_gate.human_review_actors` config; shared automation actors are
+explicitly excluded from that allowlist.
 
 Usage: approval_gate.py <owner/repo> <pr> [--lenses correctness,simplicity,tests]
 Exit 0 with {"pass": true, ...}; exit 1 with {"pass": false, "reasons": [...]}.
@@ -52,8 +54,14 @@ VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 LENS_RE = re.compile(r"\[([a-z]+)\]\s+review verdict", re.IGNORECASE)
-ATTESTATION_RE = re.compile(r"^ATTESTATION:\s*(HUMAN|MODEL_ADVISORY)\s*$",
-                            re.IGNORECASE | re.MULTILINE)
+
+
+def human_review_actors():
+    configured = CONFIG.get("approval_gate", {}).get("human_review_actors", [])
+    if not isinstance(configured, list):
+        return frozenset()
+    actors = frozenset(a for a in configured if isinstance(a, str) and a)
+    return actors - TRUSTED_REVIEW_ACTORS
 
 
 def mac(cmd):
@@ -67,16 +75,18 @@ def mac(cmd):
 def fetch_pr(repo, pr):
     out = mac(
         f"gh pr view {pr} --repo {repo} "
-        "--json headRefOid,comments,statusCheckRollup "
+        "--json headRefOid,comments,reviews,statusCheckRollup "
         "-q '{head: .headRefOid, comments: [.comments[] | "
         "{author: .author.login, body, createdAt, id}], "
+        "reviews: [.reviews[] | {author: .author.login, state, submittedAt, id, "
+        "commit: .commit.oid}], "
         "checks: [.statusCheckRollup[] | {name, conclusion, status}]}'"
     )
     return json.loads(out)
 
 
 def latest_verdicts(comments):
-    """Latest unambiguous verdict per lens, including its attestation class."""
+    """Latest unambiguous model verdict per lens."""
     verdicts = {}
     for c in comments:
         body = c.get("body") or ""
@@ -88,16 +98,33 @@ def latest_verdicts(comments):
         lenses = LENS_RE.findall(body)
         verdicts_found = VERDICT_RE.findall(body)
         heads = HEAD_RE.findall(body)
-        attestations = ATTESTATION_RE.findall(body)
         if len(lenses) != 1 or len(verdicts_found) != 1 or len(heads) != 1:
             continue
         lens = lenses[0].lower()
-        attestation = attestations[0].upper() if len(attestations) == 1 else "UNATTESTED"
         key = (c.get("createdAt") or "", c.get("id") or 0)
         if lens not in verdicts or key > verdicts[lens][3]:
             verdicts[lens] = (verdicts_found[0].upper(), heads[0].lower(),
-                              c.get("author"), key, attestation)
-    return {l: (v[0], v[1], v[2], v[4]) for l, v in verdicts.items()}
+                              c.get("author"), key)
+    return {l: v[:3] for l, v in verdicts.items()}
+
+
+def current_human_approval(reviews, head, actors):
+    """Return a latest current-head approval from a distinct trusted actor."""
+    latest = {}
+    for review in reviews:
+        author = review.get("author")
+        state = (review.get("state") or "").upper()
+        if author not in actors or state not in ("APPROVED", "CHANGES_REQUESTED"):
+            continue
+        key = (review.get("submittedAt") or "", review.get("id") or "")
+        if author not in latest or key > latest[author][0]:
+            latest[author] = (key, review)
+    for author, (_, review) in latest.items():
+        if ((review.get("state") or "").upper() == "APPROVED" and
+                (review.get("commit") or "").lower() == head):
+            return {"author": author, "commit": head,
+                    "submittedAt": review.get("submittedAt")}
+    return None
 
 
 def check(repo, pr, lenses):
@@ -145,20 +172,25 @@ def check(repo, pr, lenses):
             reasons.append(f"no verdict from [{lens}] reviewer")
             approvals[lens] = {"verdict": None}
             continue
-        verdict, vhead, author, attestation = v
+        verdict, vhead, author = v
         approvals[lens] = {"verdict": verdict, "head": vhead,
-                           "on_current_head": vhead == head,
-                           "attestation": attestation}
+                           "on_current_head": vhead == head}
         if verdict != "APPROVE":
             reasons.append(f"[{lens}] latest verdict is {verdict} (not APPROVE)")
         elif vhead != head:
             reasons.append(f"[{lens}] APPROVE is stale: reviewed {vhead[:8]}, "
                            f"PR head is {head[:8]}")
-        elif attestation != "HUMAN":
-            reasons.append(f"[{lens}] APPROVE is advisory; human attestation required")
+
+    actors = human_review_actors()
+    human_approval = current_human_approval(data.get("reviews") or [], head, actors)
+    if not actors:
+        reasons.append("no separate human review actors configured")
+    elif not human_approval:
+        reasons.append("no current-head APPROVED review from an allowlisted human")
 
     result = {"pass": not reasons, "reasons": reasons, "warnings": warnings,
-              "repo": repo, "pr": pr, "head": head, "approvals": approvals}
+              "repo": repo, "pr": pr, "head": head, "approvals": approvals,
+              "human_approval": human_approval}
     return result
 
 

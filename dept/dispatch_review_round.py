@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Seed a read-only review team and its follow-up revision round."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -58,7 +60,7 @@ def pr_info(pr, repo):
     """Read PR metadata with explicit repo scope, never checkout-relative gh."""
     output = mac(
         f"gh pr view {int(pr)} --repo {shlex.quote(repo)} "
-        "--json headRefOid,headRefName,body")
+        "--json headRefOid,headRefName")
     return json.loads(output)
 
 
@@ -93,6 +95,16 @@ def task_id(output):
     raise RuntimeError(f"dept.py did not report a task id: {output[-500:]}")
 
 
+@contextmanager
+def round_seed_lock(repo, pr):
+    """Serialize round allocation and dispatch for one repository/PR."""
+    ROUNDS_DIR.mkdir(parents=True, exist_ok=True)
+    path = ROUNDS_DIR / f"{repo_key(repo)}-pr{pr}.seed.lock"
+    with path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def dispatch_reviewer(project_dir, prompt_file):
     # SSH launches outside the GUI login session (no keychain) and the manager
     # applies Codex's read-only sandbox. Reviewers never need GitHub auth.
@@ -102,6 +114,11 @@ def dispatch_reviewer(project_dir, prompt_file):
 
 
 def seed(pr, repo, project_dir, max_rounds=3, lenses=LENSES):
+    with round_seed_lock(repo, pr):
+        return _seed_locked(pr, repo, project_dir, max_rounds, lenses)
+
+
+def _seed_locked(pr, repo, project_dir, max_rounds, lenses):
     existing = round_files(repo, pr)
     if len(existing) >= max_rounds:
         raise RuntimeError(f"PR #{pr} already has {len(existing)} active review rounds (cap {max_rounds})")

@@ -127,6 +127,37 @@ class ProjectBusyTest(unittest.TestCase):
         post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
                                      "CHANGES REQUESTED", "t-a")
 
+    def test_partial_publication_retry_does_not_duplicate_posted_lenses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "round.json"
+            path.write_text(json.dumps({
+                "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                "project_dir": "/project",
+                "reviewers": {"t-c": "correctness", "t-t": "tests"},
+                "status": "collecting",
+            }))
+            states = {"t-c": "done", "t-t": "done"}
+            findings = {
+                "t-c": "VERDICT: APPROVE\nHEAD: " + "a" * 40,
+                "t-t": "VERDICT: APPROVE\nHEAD: " + "a" * 40,
+            }
+            with patch.object(watcher, "reviewer_states", return_value=states), \
+                 patch.object(watcher, "fetch_findings", return_value=findings), \
+                 patch.object(watcher, "post_verdict",
+                              side_effect=[None, RuntimeError("post failed")]):
+                with self.assertRaisesRegex(RuntimeError, "post failed"):
+                    watcher.process_round(str(path))
+            self.assertEqual(json.loads(path.read_text())["posted_lenses"],
+                             ["correctness"])
+            with patch.object(watcher, "reviewer_states", return_value=states), \
+                 patch.object(watcher, "fetch_findings", return_value=findings), \
+                 patch.object(watcher, "post_verdict") as post:
+                watcher.process_round(str(path))
+            final = json.loads(path.read_text())
+        post.assert_called_once_with("owner/repo", 7, "tests", "a" * 40,
+                                     "APPROVE", "t-t")
+        self.assertEqual(final["status"], "published")
+
     def test_invalid_reviewer_output_never_reaches_owner_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "round.json"
@@ -155,6 +186,18 @@ class ProjectBusyTest(unittest.TestCase):
 
     def test_session_key_scopes_same_pr_number_by_repo(self):
         self.assertNotEqual(watcher.session_key("owner/one", 7), watcher.session_key("owner/two", 7))
+
+    def test_set_active_task_migrates_legacy_session_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = pathlib.Path(tmp) / "sessions.json"
+            sessions.write_text(json.dumps({"7": {"session_id": "legacy-session"}}))
+            with patch.object(watcher, "SESSIONS_FILE", str(sessions)):
+                watcher.set_active_task("owner/repo", 7, "t-new")
+            state = json.loads(sessions.read_text())
+        self.assertNotIn("7", state)
+        self.assertEqual(state[watcher.session_key("owner/repo", 7)], {
+            "session_id": "legacy-session", "active_task": "t-new",
+        })
 
     def test_duplicate_poll_is_refused_while_round_lock_is_held(self):
         with tempfile.TemporaryDirectory() as tmp:

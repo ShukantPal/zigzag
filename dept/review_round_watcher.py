@@ -82,13 +82,22 @@ def session_key(repo, pr):
     return f"{repo}#{pr}"
 
 
+def session_state(sessions, repo, pr):
+    """Read scoped state while preserving legacy numeric-key sessions."""
+    return {**sessions.get(str(pr), {}), **sessions.get(session_key(repo, pr), {})}
+
+
 def set_active_task(repo, pr, task_id):
     try:
         with open(SESSIONS_FILE) as f:
             sessions = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         sessions = {}
-    sessions.setdefault(session_key(repo, pr), {})["active_task"] = task_id
+    key = session_key(repo, pr)
+    scoped = sessions.setdefault(key, {})
+    for name, value in sessions.pop(str(pr), {}).items():
+        scoped.setdefault(name, value)
+    scoped["active_task"] = task_id
     os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
     with open(SESSIONS_FILE, "w") as f:
         json.dump(sessions, f, indent=2)
@@ -227,7 +236,8 @@ def post_verdict(repo, pr, lens, head, verdict, task_id):
             f"VERDICT: {verdict}\nHEAD: {head}\n\n"
             "ATTESTATION: MODEL_ADVISORY\n\n"
             f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
-            "requires separate human attestation before it can satisfy the gate.")
+            "requires a formal review from an allowlisted human before it can "
+            "satisfy the gate.")
     mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
 
 

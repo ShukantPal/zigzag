@@ -30,8 +30,9 @@ management layer that decides what to run.
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
 - **`approval_gate.py`** — the merge gate for Muse-owned PRs: required CI
   green on the latest head **and** a 3-lens review team (correctness,
-  simplicity, tests) each showing a human-attested APPROVE on that head.
-  Stale-head and model-advisory approvals don't count.
+  simplicity, tests) each showing APPROVE on that head, plus a formal
+  current-head approval from a separately authenticated human reviewer.
+  Stale-head verdicts and shared-automation approvals don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
   and resumes the PR's owning worker session to address them. Watermark in
@@ -44,8 +45,9 @@ management layer that decides what to run.
 - **`review_round_watcher.py`** — validates and publishes constrained verdicts
   from a seeded 3-lens review round. It never forwards raw reviewer output into
   a write-capable owner session; model verdicts are marked advisory so an
-  injected reviewer cannot manufacture a gate-satisfying approval. The owner
-  inspects findings on the PR and posts `ATTESTATION: HUMAN` to approve.
+  injected reviewer cannot manufacture a gate-satisfying approval. A distinct
+  actor listed in `approval_gate.human_review_actors` must submit a formal
+  GitHub approval after inspecting the findings.
 - **`dispatch_review_round.py`** — seeds independent read-only correctness,
   simplicity, and tests reviewers from the checked-out diff over non-GUI SSH
   (no keychain). PR metadata is excluded from their prompts and trusted watcher

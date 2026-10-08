@@ -1,8 +1,12 @@
 import importlib
+from concurrent.futures import ThreadPoolExecutor
+import itertools
 import json
 import pathlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -14,11 +18,11 @@ dispatcher = importlib.import_module("dispatch_review_round")
 
 class DispatchReviewRoundTest(unittest.TestCase):
     def test_pr_info_scopes_gh_to_repo(self):
-        result = '{"headRefOid": "a", "headRefName": "branch", "body": "why"}'
+        result = '{"headRefOid": "a", "headRefName": "branch"}'
         with patch.object(dispatcher, "mac", return_value=result) as mac:
             dispatcher.pr_info(12, "owner/repo")
         self.assertEqual(mac.call_args.args[0],
-                         "gh pr view 12 --repo owner/repo --json headRefOid,headRefName,body")
+                         "gh pr view 12 --repo owner/repo --json headRefOid,headRefName")
 
     def test_superseded_rounds_do_not_count_or_consume_numbers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,7 +44,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_seed_persists_each_reviewer_and_marks_failure_attention(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "a" * 40, "headRefName": "branch", "body": "why"}
+            info = {"headRefOid": "a" * 40, "headRefName": "branch"}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
@@ -54,7 +58,7 @@ class DispatchReviewRoundTest(unittest.TestCase):
     def test_seed_records_all_reviewers_and_repo_scoped_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            info = {"headRefOid": "b" * 40, "headRefName": "fetched-branch", "body": "intent"}
+            info = {"headRefOid": "b" * 40, "headRefName": "fetched-branch"}
             with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
                  patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
                  patch.object(dispatcher, "pr_info", return_value=info), \
@@ -80,6 +84,37 @@ class DispatchReviewRoundTest(unittest.TestCase):
                 one, _ = dispatcher.seed(12, "owner/one", "/work")
                 two, _ = dispatcher.seed(12, "owner/two", "/work")
         self.assertNotEqual(one.name, two.name)
+
+    def test_concurrent_seeds_allocate_distinct_rounds_without_overlapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            active = 0
+            max_active = 0
+            guard = threading.Lock()
+            task_numbers = itertools.count()
+
+            def pr_info(_pr, _repo):
+                nonlocal active, max_active
+                with guard:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                with guard:
+                    active -= 1
+                return {"headRefOid": "e" * 40, "headRefName": "branch"}
+
+            def dispatch(_project, _prompt):
+                return f"t-{next(task_numbers)}"
+
+            with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
+                 patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
+                 patch.object(dispatcher, "pr_info", side_effect=pr_info), \
+                 patch.object(dispatcher, "dispatch_reviewer", side_effect=dispatch), \
+                 ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    lambda _: dispatcher.seed(12, "owner/repo", "/work"), range(2)))
+        self.assertEqual(max_active, 1)
+        self.assertEqual(len({path.name for path, _ in results}), 2)
 
     def test_reviewer_dispatch_is_read_only_and_non_gui(self):
         result = type("R", (), {"stdout": "started t-review", "stderr": ""})()

@@ -1,4 +1,5 @@
 import importlib
+from contextlib import nullcontext
 import json
 import pathlib
 import sys
@@ -56,6 +57,16 @@ class WatermarkTest(unittest.TestCase):
                 tid, _ = watcher._dispatch_locked(3, None, "prompt", [])
         self.assertEqual(tid, "t-new")
         set_active.assert_called_once_with("owner/repo", 3, "t-new")
+
+    def test_dispatch_resumes_legacy_numeric_session(self):
+        with patch.object(watcher, "REPO", "owner/repo"), \
+             patch.object(watcher, "worker_dispatch_lock",
+                          return_value=nullcontext(True)), \
+             patch.object(watcher, "load_sessions",
+                          return_value={"3": {"session_id": "legacy-session"}}), \
+             patch.object(watcher, "_dispatch_locked", return_value=("t-new", "ok")) as dispatch:
+            watcher.dispatch(3, "branch", [], {})
+        self.assertEqual(dispatch.call_args.args[1], "legacy-session")
 
 
 if __name__ == "__main__":

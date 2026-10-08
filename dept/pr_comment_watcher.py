@@ -22,7 +22,7 @@ import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
 from review_round_watcher import (project_dir_busy, set_active_task, session_key,
-                                  task_status, worker_dispatch_lock)
+                                  session_state, task_status, worker_dispatch_lock)
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -114,7 +114,7 @@ def pr_task_running(pr):
     ledger prompt_head scan is a fallback. The ledger's status field is
     write-once, so verify via `dept.py status` (relay truth)."""
     try:
-        sess = load_sessions().get(session_key(REPO, pr), {})
+        sess = session_state(load_sessions(), REPO, pr)
         tid = sess.get("active_task")
         if tid:
             status = dept_status_text(tid)
@@ -307,7 +307,7 @@ file exactly as he saw it.
    Some items are full review BODIES, not inline comments — they have NO REST reaction
    endpoint. For those, get the node id then use GraphQL:
    `gh api repos/leveled-inc/leveled/pulls/<pr>/reviews/<id> --jq .node_id`
-   `gh api graphql -F subjectId=<node_id> -F content=EYES -f 'query=mutation($subjectId:ID!,$content:ReactionContent!){addReaction(input:{subjectId:$subjectId,content:$content}){reaction{content}}}'`
+   `gh api graphql -F subjectId=<node_id> -F content=EYES -f 'query=mutation($subjectId:ID!,$content:ReactionContent!){{addReaction(input:{{subjectId:$subjectId,content:$content}}){{reaction{{content}}}}}}'`
    (The watcher already attempts this when it dispatches, so eyes may already be on.)
    If a comment already carries a 🚀 (rocket) reaction from this bot account, it was queued
    behind earlier work — delete the rocket first (list reactions, find the rocket, DELETE
@@ -413,7 +413,7 @@ def dispatch(pr, branch, new_comments, parent_bodies):
         lines.append(entry)
     prompt = PROMPT_TMPL.format(pr=pr, branch=branch, comments="\n".join(lines))
     sessions = load_sessions()
-    sess = sessions.get(str(pr), {})
+    sess = session_state(sessions, REPO, pr)
     session_id = sess.get("session_id")
     if session_id:
         prompt = ("NOTE: you are CONTINUING your existing session on this PR "
