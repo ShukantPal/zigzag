@@ -2387,9 +2387,8 @@ fn emit_decision(
 }
 
 fn find_owner_context(repository: &str, branch: &str, head: &str) -> Option<OwnerContext> {
-    let department = home_dir()?.join(".codex/dept");
     let mut candidates = BTreeMap::new();
-    for entry in fs::read_dir(department).ok()?.flatten() {
+    for entry in fs::read_dir(department_dir()?).ok()?.flatten() {
         let task_dir = entry.path();
         let department_task_id = entry.file_name().to_string_lossy().into_owned();
         let Some(project_dir) = fs::read_to_string(task_dir.join("dir.txt")).ok() else {
@@ -2479,10 +2478,14 @@ fn owner_context_is_current(owner: &OwnerContext, repository: &str, head: &str) 
     {
         return false;
     }
-    let Some(department) = home_dir().map(|home| home.join(".codex/dept")) else {
+    let Some(department) = department_dir() else {
         return false;
     };
     owner_context_matches_task(&department, owner)
+}
+
+fn department_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".codex/dept"))
 }
 
 fn owner_context_matches_task(department: &Path, owner: &OwnerContext) -> bool {
@@ -3075,6 +3078,19 @@ review_loop:
             "the per-finding schema limit must be tested independently of the aggregate byte cap"
         );
         assert!(parse_reviewer_result(&oversized_finding, "correctness", &head, &limits).is_none());
+        let too_many_findings = serde_json::json!({
+            "version": 1,
+            "lens": "correctness",
+            "verdict": "changes_requested",
+            "head": head.clone(),
+            "findings": ["one", "two", "three", "four", "five"],
+        })
+        .to_string();
+        assert!(
+            limits.max_findings_per_lens > 4,
+            "the schema item cap must be tested independently of repository policy"
+        );
+        assert!(parse_reviewer_result(&too_many_findings, "correctness", &head, &limits).is_none());
     }
 
     #[test]
