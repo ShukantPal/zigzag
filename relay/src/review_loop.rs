@@ -271,6 +271,8 @@ struct ReviewRound {
     verdicts: BTreeMap<String, AdmittedVerdict>,
     #[serde(default)]
     excluded_comment_ids: BTreeSet<String>,
+    #[serde(default)]
+    pending_comment_deletions: BTreeSet<String>,
     owner: Option<OwnerContext>,
     owner_agent_id: Option<String>,
     gate_reasons: Vec<String>,
@@ -378,7 +380,6 @@ struct Check {
 
 #[derive(Clone, Debug, Deserialize)]
 struct CreatedComment {
-    id: u64,
     node_id: String,
 }
 
@@ -700,6 +701,7 @@ fn discover(
                     reviewers: BTreeMap::new(),
                     verdicts: BTreeMap::new(),
                     excluded_comment_ids,
+                    pending_comment_deletions: BTreeSet::new(),
                     owner,
                     owner_agent_id: None,
                     gate_reasons: Vec::new(),
@@ -825,12 +827,112 @@ fn dispatch_missing_reviewers(
     Ok(())
 }
 
+fn stage_unadmitted_generated_comments(
+    policy: &RepositoryPolicy,
+    round: &mut ReviewRound,
+    comments: &[Comment],
+) -> bool {
+    let mut changed = false;
+    for (lens, reviewer) in &round.reviewers {
+        if round.verdicts.contains_key(lens) {
+            continue;
+        }
+        let marker = verdict_id(
+            &round.repository,
+            round.pull_request,
+            &round.head,
+            round.generation,
+            lens,
+            reviewer.attempt,
+        );
+        for comment in comments.iter().filter(|comment| {
+            comment.author.as_ref().map(|author| author.login.as_str())
+                == Some(policy.trusted_verdict_identity.as_str())
+                && comment.body.contains(&marker)
+        }) {
+            changed |= round.excluded_comment_ids.insert(comment.id.clone());
+            changed |= round.pending_comment_deletions.insert(comment.id.clone());
+        }
+    }
+    changed
+}
+
+fn retry_pending_comment_deletions(
+    policy: &RepositoryPolicy,
+    store: &mut StateStore,
+    key: &str,
+) -> Result<(), String> {
+    let task_id = format!("comment-cleanup-{}", stable_identifier(key, 80));
+    retry_pending_comment_deletions_with(store, key, |comment_node_id| {
+        delete_verdict_comment(policy, comment_node_id, &task_id)
+    })
+}
+
+fn retry_pending_comment_deletions_with(
+    store: &mut StateStore,
+    key: &str,
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let pending: Vec<_> = store.state.rounds[key]
+        .pending_comment_deletions
+        .iter()
+        .cloned()
+        .collect();
+    for comment_node_id in pending {
+        delete(&comment_node_id)?;
+        store
+            .state
+            .rounds
+            .get_mut(key)
+            .expect("round exists")
+            .pending_comment_deletions
+            .remove(&comment_node_id);
+        if let Err(error) = store.save() {
+            store
+                .state
+                .rounds
+                .get_mut(key)
+                .expect("round exists")
+                .pending_comment_deletions
+                .insert(comment_node_id);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn retry_all_pending_comment_deletions(config: &ReviewLoopConfig, store: &mut StateStore) {
+    let keys: Vec<_> = store
+        .state
+        .rounds
+        .iter()
+        .filter(|(_, round)| !round.pending_comment_deletions.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        let repository = store.state.rounds[&key].repository.clone();
+        let Some(policy) = config
+            .repositories
+            .iter()
+            .find(|policy| policy.repository == repository)
+        else {
+            continue;
+        };
+        if let Err(error) = retry_pending_comment_deletions(policy, store, &key) {
+            eprintln!("review comment cleanup failed for {key}: {error}");
+        }
+    }
+}
+
 fn poll_reviews(
     server: &Arc<Server>,
     config: &ReviewLoopConfig,
     store: &mut StateStore,
     shadow: bool,
 ) -> Result<(), String> {
+    if !shadow {
+        retry_all_pending_comment_deletions(config, store);
+    }
     let keys: Vec<_> = store
         .state
         .rounds
@@ -865,6 +967,18 @@ fn poll_reviews(
             continue;
         };
         let mut snapshot = fetch_pr(&repository, number)?;
+        if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
+            if stage_unadmitted_generated_comments(
+                policy,
+                store.state.rounds.get_mut(&key).expect("round exists"),
+                &snapshot.comments,
+            ) {
+                store.save()?;
+            }
+            if !shadow && let Err(error) = retry_pending_comment_deletions(policy, store, &key) {
+                eprintln!("review comment cleanup failed for {key}: {error}");
+            }
+        }
         if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
@@ -1348,10 +1462,15 @@ fn collect_completed_reviewers(
                 .expect("round exists")
                 .excluded_comment_ids
                 .insert(comment.node_id.clone());
-            let persisted = store.save();
-            let deleted = delete_verdict_comment(policy, comment.id, &task_id);
-            persisted?;
-            deleted?;
+            store
+                .state
+                .rounds
+                .get_mut(key)
+                .expect("round exists")
+                .pending_comment_deletions
+                .insert(comment.node_id.clone());
+            store.save()?;
+            retry_pending_comment_deletions(policy, store, key)?;
             current?;
             return Ok(());
         }
@@ -1433,7 +1552,7 @@ fn post_verdict_comment(
                 "--input".to_owned(),
                 body_path.to_string_lossy().into_owned(),
                 "--jq".to_owned(),
-                "{id,node_id}".to_owned(),
+                "{node_id}".to_owned(),
             ],
         },
     );
@@ -1442,7 +1561,7 @@ fn post_verdict_comment(
     }
     let comment: CreatedComment = serde_json::from_str(&response.stdout)
         .map_err(|_| "GitHub did not return the created review comment identity".to_owned())?;
-    if comment.id == 0 || comment.node_id.is_empty() {
+    if comment.node_id.is_empty() {
         return Err("GitHub returned an invalid review comment identity".to_owned());
     }
     Ok(comment)
@@ -1450,27 +1569,53 @@ fn post_verdict_comment(
 
 fn delete_verdict_comment(
     policy: &RepositoryPolicy,
-    comment_id: u64,
+    comment_node_id: &str,
     task_id: &str,
 ) -> Result<(), String> {
     let policy_store = exec::load_policy()?;
     let path = policy_store
         .trusted_gh_path_for_repo(&policy.repository)
         .ok_or_else(|| "execution policy does not authorize review comment deletion".to_owned())?;
-    let response = exec::run(
+    let lookup = exec::run(
+        path,
+        exec::ExecRequest {
+            id: format!("locate-invalidation-{task_id}"),
+            bin: "gh".to_owned(),
+            args: vec![
+                "api".to_owned(),
+                "graphql".to_owned(),
+                "-f".to_owned(),
+                "query=query($id:ID!){node(id:$id){id}}".to_owned(),
+                "-f".to_owned(),
+                format!("id={comment_node_id}"),
+                "--jq".to_owned(),
+                ".data.node.id // \"\"".to_owned(),
+            ],
+        },
+    );
+    if lookup.timed_out || lookup.truncated || lookup.exit_code != Some(0) {
+        return Err("could not locate stale review verdict comment".to_owned());
+    }
+    if lookup.stdout.trim().is_empty() {
+        return Ok(());
+    }
+    let deleted = exec::run(
         path,
         exec::ExecRequest {
             id: format!("invalidate-{task_id}"),
             bin: "gh".to_owned(),
             args: vec![
                 "api".to_owned(),
-                format!("repos/{}/issues/comments/{comment_id}", policy.repository),
-                "--method".to_owned(),
-                "DELETE".to_owned(),
+                "graphql".to_owned(),
+                "-f".to_owned(),
+                "query=mutation($id:ID!){deleteIssueComment(input:{id:$id}){clientMutationId}}"
+                    .to_owned(),
+                "-f".to_owned(),
+                format!("id={comment_node_id}"),
             ],
         },
     );
-    if response.timed_out || response.truncated || response.exit_code != Some(0) {
+    if deleted.timed_out || deleted.truncated || deleted.exit_code != Some(0) {
         return Err("could not invalidate stale review verdict comment".to_owned());
     }
     Ok(())
@@ -2256,6 +2401,7 @@ review_loop:
             )]),
             verdicts: BTreeMap::new(),
             excluded_comment_ids: BTreeSet::new(),
+            pending_comment_deletions: BTreeSet::new(),
             owner: None,
             owner_agent_id: None,
             gate_reasons: Vec::new(),
@@ -2512,6 +2658,72 @@ review_loop:
         assert_eq!(killed, [51, 52]);
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(registry_path);
+    }
+
+    #[test]
+    fn crash_recovery_stages_and_retries_unadmitted_comment_deletion() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let mut round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
+        let marker = verdict_id("owner/repo", 7, &head, 1, "tests", 1);
+        let comment = Comment {
+            author: Some(Author {
+                login: "ShukantPal".to_owned(),
+            }),
+            body: format!("generated verdict\n{marker}"),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            id: "IC_pending".to_owned(),
+        };
+        assert!(stage_unadmitted_generated_comments(
+            &policy(),
+            &mut round,
+            &[comment]
+        ));
+        assert!(round.excluded_comment_ids.contains("IC_pending"));
+        assert!(round.pending_comment_deletions.contains("IC_pending"));
+
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-comment-cleanup-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+        assert!(
+            retry_pending_comment_deletions_with(&mut store, &key, |_| {
+                Err("temporary GitHub failure".to_owned())
+            })
+            .is_err()
+        );
+        assert!(
+            store.state.rounds[&key]
+                .pending_comment_deletions
+                .contains("IC_pending")
+        );
+        assert!(
+            StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                .pending_comment_deletions
+                .contains("IC_pending")
+        );
+
+        let mut deleted = Vec::new();
+        retry_pending_comment_deletions_with(&mut store, &key, |node_id| {
+            deleted.push(node_id.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deleted, ["IC_pending"]);
+        assert!(
+            store.state.rounds[&key]
+                .pending_comment_deletions
+                .is_empty()
+        );
+        assert!(
+            StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                .pending_comment_deletions
+                .is_empty()
+        );
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]
