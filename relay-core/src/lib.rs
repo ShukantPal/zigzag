@@ -604,12 +604,12 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 _ => return Err("invalid agent registry".to_owned()),
             },
             first_output_bytes: match get("first_output_bytes") {
+                Some(Json::Null) | None => None,
                 Some(value) => Some(
                     value
                         .as_u64()
                         .ok_or_else(|| "invalid agent registry".to_owned())?,
                 ),
-                None => None,
             },
         };
         entries.insert(record.id.clone(), record);
@@ -1720,6 +1720,37 @@ mod tests {
             .to_json();
         assert!(logs.contains("[REDACTED]"));
         assert!(!logs.contains("secret-value"));
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
+    }
+
+    #[test]
+    fn agent_registry_round_trips_cwd_and_accepts_legacy_records_without_it() {
+        let file = path("agent-cwd");
+        let registry = AgentRegistry::open(&file).unwrap();
+        let mut record = agent("cwd");
+        record.cwd = Some("/Users/shukant/Workspace/zigzag".to_owned());
+        registry.register(record).unwrap();
+        drop(registry);
+
+        let reloaded = AgentRegistry::open(&file).unwrap();
+        assert_eq!(
+            reloaded.get("cwd").unwrap().cwd.as_deref(),
+            Some("/Users/shukant/Workspace/zigzag")
+        );
+        drop(reloaded);
+
+        let mut legacy = agent_json(&agent("cwd"));
+        if let Json::Object(fields) = &mut legacy {
+            fields.retain(|(name, _)| name != "cwd");
+        }
+        fs::write(
+            &file,
+            Json::Object(vec![("agents".to_owned(), Json::Array(vec![legacy]))]).to_json(),
+        )
+        .unwrap();
+        let legacy_reloaded = AgentRegistry::open(&file).unwrap();
+        assert_eq!(legacy_reloaded.get("cwd").unwrap().cwd, None);
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
     }

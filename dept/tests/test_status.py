@@ -13,6 +13,7 @@ from dept.status import (
     StatusScreen,
     build_executions,
     compact_cwd,
+    display_cwd,
     detail_lines,
     duration_between,
     flags,
@@ -22,6 +23,7 @@ from dept.status import (
     relay_output,
     relay_snapshot,
     main as status_main,
+    print_once,
     transcript_command,
     transcript_lines,
     transcript_path,
@@ -162,7 +164,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertIn("relay events lost", flags(merged_execution))
         self.assertEqual(merged_execution.agent_id, "agent")
 
-    def test_cwd_comes_from_registry_or_process_spawned_event(self):
+    def test_cwd_uses_registry_or_process_spawned_event_fallback(self):
         spawned = event(
             "process_spawned", "2026-01-01T00:00:00.000Z",
             payload={"cwd": "/Users/shukant/Workspace/older"},
@@ -172,11 +174,23 @@ class SnapshotIngestionTests(unittest.TestCase):
             [{"id": "agent", "execution_id": "execution", "cwd": "/Users/shukant/Workspace/current"}],
         )[0]
         self.assertEqual(execution.cwd, "/Users/shukant/Workspace/current")
+        self.assertEqual(build_executions([spawned], [])[0].cwd, "/Users/shukant/Workspace/older")
+
+    def test_cwd_ignores_missing_or_malformed_spawn_payloads(self):
+        for payload in (None, {}, {"cwd": None}, {"cwd": 42}, {"cwd": ""}):
+            with self.subTest(payload=payload):
+                spawned = event("process_spawned", "2026-01-01T00:00:00.000Z", payload=payload)
+                self.assertIsNone(build_executions([spawned], [])[0].cwd)
 
     def test_compact_cwd_shortens_home_and_truncates_from_the_left(self):
         home_child = str(Path.home() / "Workspace" / "ShukantPal" / "zigzag")
         self.assertEqual(compact_cwd(home_child, 99), "~/Workspace/ShukantPal/zigzag")
         self.assertEqual(compact_cwd("/private/tmp/a/very/deep/leveled", 12), "…eep/leveled")
+
+    def test_cwd_terminal_control_characters_are_escaped_before_rendering(self):
+        cwd = "/safe\x1b[2J\nnext"
+        self.assertEqual(display_cwd(cwd), "/safe\\x1b[2J\\x0anext")
+        self.assertNotIn("\x1b", compact_cwd(cwd, 99))
 
     def test_status_refresh_keeps_audit_events_when_relay_requests_fail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -234,6 +248,10 @@ class TranscriptTests(unittest.TestCase):
         self.assertIn("CWD: /full/project/path", lines)
         self.assertEqual(lines[-3:], ["Relay output (last 40 lines):", "first", "second"])
 
+    def test_transcript_escapes_cwd_terminal_control_characters(self):
+        lines = transcript_lines(Execution("execution", "task", cwd="/safe\x1b[2J\nnext"), [], None)
+        self.assertIn("CWD: /safe\\x1b[2J\\x0anext", lines)
+
 
 class CommandTests(unittest.TestCase):
     def test_dept_entry_point_forwards_status_and_rejects_unknown_commands(self):
@@ -243,20 +261,57 @@ class CommandTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(dept.main(["unknown"]), 2)
 
+    def test_status_once_prints_compact_and_missing_cwd_rows(self):
+        cwd = "/private/tmp/a/very/deep/leveled"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            print_once([Execution("execution-one", "one", cwd=cwd), Execution("execution-two", "two")], [])
+        lines = stdout.getvalue().splitlines()
+        self.assertIn(f"one\t{compact_cwd(cwd)}\t", lines[1])
+        self.assertIn("two\tnot observed\t", lines[2])
+
     def test_status_once_prints_a_snapshot_and_interval_validation_rejects_zero(self):
         def refresh(screen):
-            screen.executions = [Execution("execution", "task", [event("process_spawned", "2026-01-01T00:00:00.000Z")])]
+            screen.executions = [Execution("execution", "task", [event("process_spawned", "2026-01-01T00:00:00.000Z")], cwd="/private/tmp/a/very/deep/leveled")]
             screen.warnings = ["relay unavailable"]
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch("dept.status.StatusScreen.refresh", refresh), redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(status_main(["--once"]), 0)
         self.assertIn("TASK\tCWD\tPHASE", stdout.getvalue())
+        self.assertIn(compact_cwd("/private/tmp/a/very/deep/leveled"), stdout.getvalue())
         self.assertIn("process_spawned", stdout.getvalue())
         self.assertIn("WARNING: relay unavailable", stderr.getvalue())
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
             status_main(["--once", "--interval", "0"])
         self.assertEqual(error.exception.code, 2)
+
+    def test_interactive_draw_uses_compact_cwd_column(self):
+        class Screen:
+            def __init__(self):
+                self.lines = []
+
+            def erase(self):
+                pass
+
+            def getmaxyx(self):
+                return 20, 120
+
+            def addnstr(self, _row, _column, text, _width, *_attributes):
+                self.lines.append(text)
+
+            def hline(self, *_args):
+                pass
+
+            def refresh(self):
+                pass
+
+        cwd = "/private/tmp/a/very/deep/leveled"
+        status = StatusScreen("http://relay", Path("events.json"), Path("token"), 1)
+        status.executions = [Execution("execution", "task", cwd=cwd)]
+        screen = Screen()
+        status.draw(screen)
+        self.assertTrue(any(compact_cwd(cwd) in line for line in screen.lines))
 
 
 if __name__ == "__main__":

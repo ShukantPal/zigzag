@@ -1040,7 +1040,13 @@ fn working_directory_argument(args: &[String]) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == "-C")
         .map(|pair| pair[1].clone())
-        .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
+        .filter(|value| valid_cwd(value))
+}
+
+fn valid_cwd(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && value.chars().all(|character| !character.is_control())
 }
 
 fn drain_to_capture(
@@ -1489,7 +1495,7 @@ fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
         None => None,
         Some(value) => value
             .as_str()
-            .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
+            .filter(|value| valid_cwd(value))
             .map(str::to_owned)
             .ok_or_else(|| denial_json(&denied_id))
             .map(Some)?,
@@ -2086,7 +2092,14 @@ mod tests {
             );
             assert!(parse_spawn_request(body.as_bytes()).is_err(), "{value:?}");
         }
-        for value in ["", &"x".repeat(4097)] {
+        for value in [
+            "",
+            &"x".repeat(4097),
+            r#"bad\npath"#,
+            r#"bad\tpath"#,
+            r#"bad\rpath"#,
+            r#"bad\u001b[2J"#,
+        ] {
             let body =
                 format!(r#"{{"id":"task","cwd":"{value}","bin":"sh","args":["-c","true"]}}"#);
             assert!(parse_spawn_request(body.as_bytes()).is_err(), "{value:?}");
@@ -2094,6 +2107,14 @@ mod tests {
         assert_eq!(
             working_directory_argument(&["exec".to_owned(), "-C".to_owned(), "/work".to_owned()]),
             Some("/work".to_owned())
+        );
+        assert_eq!(
+            working_directory_argument(&[
+                "exec".to_owned(),
+                "-C".to_owned(),
+                "bad\npath".to_owned()
+            ]),
+            None
         );
         // The synchronous command parser deliberately retains its exact old
         // request shape; spawn-only metadata never reaches argv execution.
@@ -2213,6 +2234,34 @@ mod tests {
             "",
         ));
         assert!(logs.to_json().contains("hello"));
+        let cwd = "/private/tmp/zigzag-status-cwd";
+        let cwd_spawn = response_json(request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/spawn",
+            &format!(r#"{{"id":"cwd-task","bin":"sh","args":["-c","true"],"cwd":"{cwd}"}}"#),
+        ));
+        let cwd_handle = cwd_spawn.object("proc").and_then(Json::as_str).unwrap();
+        assert_eq!(
+            state
+                .supervisor
+                .registry
+                .get(cwd_handle)
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(cwd)
+        );
+        let spawned = state.store.timeline("cwd-task").unwrap();
+        assert!(spawned.iter().any(|event| {
+            event.object("kind").and_then(Json::as_str) == Some("process_spawned")
+                && event
+                    .object("payload")
+                    .and_then(|payload| payload.object("cwd"))
+                    .and_then(Json::as_str)
+                    == Some(cwd)
+        }));
         let audit = state.store.timeline("echo").unwrap();
         let kinds: Vec<_> = audit
             .iter()

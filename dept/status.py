@@ -319,8 +319,8 @@ def flags(execution: Execution) -> str:
     return ", ".join(entries) or "healthy"
 
 
-def compact_cwd(cwd: str | None, width: int = 24) -> str:
-    """Shorten home paths and preserve the informative tail for the table."""
+def display_cwd(cwd: str | None) -> str:
+    """Return CWD diagnostic text that is safe to render in a terminal."""
     if not cwd:
         return "not observed"
     home = str(Path.home())
@@ -330,6 +330,12 @@ def compact_cwd(cwd: str | None, width: int = 24) -> str:
         display = "~" + cwd[len(home):]
     else:
         display = cwd
+    return "".join(character if character.isprintable() else f"\\x{ord(character):02x}" for character in display)
+
+
+def compact_cwd(cwd: str | None, width: int = 24) -> str:
+    """Shorten safe CWD text and preserve the informative tail for the table."""
+    display = display_cwd(cwd)
     if width <= 0:
         return ""
     if len(display) <= width:
@@ -357,7 +363,7 @@ def transcript_lines(execution: Execution, output: list[str], error: str | None)
     path = transcript_path(execution.task_id)
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
-        f"CWD: {execution.cwd or 'not observed'}",
+        f"CWD: {display_cwd(execution.cwd)}",
         f"Source: {path}",
         f"Command: {transcript_command(execution.task_id)}",
     ]
@@ -466,7 +472,7 @@ def print_once(executions: list[Execution], warnings: list[str]) -> None:
     for execution in executions:
         total, boundary = execution.total_elapsed()
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.cwd or "not observed", execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
+        print("\t".join((execution.task_id, compact_cwd(execution.cwd), execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
