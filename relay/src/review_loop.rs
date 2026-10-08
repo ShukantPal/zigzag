@@ -2201,7 +2201,12 @@ fn spawn_codex_task(
     owner_fence: Option<&OwnerSpawnFence<'_>>,
 ) -> Result<String, String> {
     super::require_gui_login_session()?;
-    if let Some(existing_id) = latest_managed_agent_for_task(&server.supervisor.registry, task_id) {
+    if let Some(existing_id) = reusable_managed_agent_with_fence(
+        &server.supervisor.registry,
+        task_id,
+        owner_fence,
+        validate_owner_spawn_fence,
+    )? {
         return Ok(existing_id);
     }
     let root = review_task_dir(task_id)?;
@@ -2256,13 +2261,7 @@ fn spawn_codex_task(
         Json::Object(vec![]),
     ))?;
     if let Some(fence) = owner_fence {
-        let current = fetch_pr(fence.repository, fence.number)?;
-        if !open_comparison_matches(&current, fence.base, fence.head) {
-            return Err("owner PR comparison changed at the spawn boundary".to_owned());
-        }
-        if !owner_context_is_current(fence.owner, fence.repository, fence.head) {
-            return Err("owner context changed at the spawn boundary".to_owned());
-        }
+        validate_owner_spawn_fence(fence)?;
     }
     super::require_gui_login_session()?;
     let spawned = spawn_proc(
@@ -2277,6 +2276,35 @@ fn spawn_codex_task(
         execution_id,
     )?;
     Ok(spawned.handle)
+}
+
+fn reusable_managed_agent_with_fence<F>(
+    registry: &AgentRegistry,
+    task_id: &str,
+    owner_fence: Option<&OwnerSpawnFence<'_>>,
+    mut validate_owner_fence: F,
+) -> Result<Option<String>, String>
+where
+    F: FnMut(&OwnerSpawnFence<'_>) -> Result<(), String>,
+{
+    let existing_id = latest_managed_agent_for_task(registry, task_id);
+    if existing_id.is_some()
+        && let Some(fence) = owner_fence
+    {
+        validate_owner_fence(fence)?;
+    }
+    Ok(existing_id)
+}
+
+fn validate_owner_spawn_fence(fence: &OwnerSpawnFence<'_>) -> Result<(), String> {
+    let current = fetch_pr(fence.repository, fence.number)?;
+    if !open_comparison_matches(&current, fence.base, fence.head) {
+        return Err("owner PR comparison changed at the spawn boundary".to_owned());
+    }
+    if !owner_context_is_current(fence.owner, fence.repository, fence.head) {
+        return Err("owner context changed at the spawn boundary".to_owned());
+    }
+    Ok(())
 }
 
 fn write_private(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
@@ -2647,7 +2675,7 @@ fn reviewer_task_id(
     format!(
         "review-{}-{number}-{}-g{generation}-{lens}-{attempt}",
         stable_identifier(repository, 40),
-        stable_fragment(head, 12)
+        stable_fragment(head, 40)
     )
 }
 
@@ -2672,7 +2700,7 @@ fn owner_task_id(repository: &str, number: u64, head: &str, generation: u64) -> 
     format!(
         "review-owner-{}-{number}-{}-g{generation}",
         stable_identifier(repository, 40),
-        stable_fragment(head, 12)
+        stable_fragment(head, 40)
     )
 }
 
@@ -3352,6 +3380,70 @@ review_loop:
             owner_agent_id: None,
             gate_reasons: Vec::new(),
         }
+    }
+
+    #[test]
+    fn task_ids_distinguish_heads_with_the_same_short_prefix() {
+        let head_a = format!("{}{}", "a".repeat(12), "b".repeat(28));
+        let head_b = format!("{}{}", "a".repeat(12), "c".repeat(28));
+        assert_ne!(
+            reviewer_task_id("owner/repo", 7, &head_a, 1, "tests", 1),
+            reviewer_task_id("owner/repo", 7, &head_b, 1, "tests", 1)
+        );
+        assert_ne!(
+            owner_task_id("owner/repo", 7, &head_a, 1),
+            owner_task_id("owner/repo", 7, &head_b, 1)
+        );
+    }
+
+    #[test]
+    fn owner_task_reattachment_revalidates_the_spawn_fence() {
+        let registry_path = std::env::temp_dir().join(format!(
+            "zigzag-owner-reattach-registry-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry = AgentRegistry::open(&registry_path).unwrap();
+        let head = "a".repeat(40);
+        let base = "c".repeat(40);
+        let task_id = owner_task_id("owner/repo", 7, &head, 1);
+        registry
+            .register(agent("existing-owner", &task_id, 41, "running"))
+            .unwrap();
+        let owner = OwnerContext {
+            session_id: "session-1".to_owned(),
+            project_dir: PathBuf::from("/private/tmp/owner"),
+            department_task_id: "department-1".to_owned(),
+            branch: "codex/branch".to_owned(),
+        };
+        let fence = OwnerSpawnFence {
+            repository: "owner/repo",
+            number: 7,
+            base: &base,
+            head: &head,
+            owner: &owner,
+        };
+        let mut validations = 0;
+        let error = reusable_managed_agent_with_fence(&registry, &task_id, Some(&fence), |_| {
+            validations += 1;
+            Err("comparison changed".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(error, "comparison changed");
+        assert_eq!(validations, 1);
+        assert_eq!(
+            reusable_managed_agent_with_fence(&registry, &task_id, Some(&fence), |_| Ok(()))
+                .unwrap()
+                .as_deref(),
+            Some("existing-owner")
+        );
+        assert_eq!(
+            reusable_managed_agent_with_fence(&registry, "missing", Some(&fence), |_| {
+                panic!("a missing task has nothing to reattach")
+            })
+            .unwrap(),
+            None
+        );
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]
