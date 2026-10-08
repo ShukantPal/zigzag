@@ -4,6 +4,19 @@
 set -u
 mode="${1:?usage: codex-launch.sh run|resume <taskdir>}"
 rdir="${2:?usage: codex-launch.sh run|resume <taskdir>}"
+case "$mode" in
+  run|resume) ;;
+  *) echo "invalid launch mode" >&2; exit 2 ;;
+esac
+allowed_root="${CODEX_DEPT_ROOT:-/Users/shukant/.codex/dept}"
+[ -d "$allowed_root" ] && [ -d "$rdir" ] || exit 2
+allowed_root="$(cd "$allowed_root" && pwd -P)" || exit 2
+rdir="$(cd "$rdir" && pwd -P)" || exit 2
+task_name="${rdir#"$allowed_root"/}"
+case "$task_name" in
+  t-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) echo "task directory is outside the department root" >&2; exit 2 ;;
+esac
 # Start capturing before any payload validation.  If a bad or incomplete task
 # payload reaches the relay, its wrapper error must still be inspectable via
 # `dept.py result`, rather than disappearing into the relay's transient buffer.
@@ -30,9 +43,15 @@ fi
 if [ "$mode" = "resume" ]; then
   [ -f "$rdir/resume.txt" ] || exit 2
   sid="$(cat "$rdir/resume.txt")"
+  mkdir "$rdir/.launch-claimed" 2>/dev/null || {
+    echo "task already launched" >&2; exit 4;
+  }
   exec "$CODEX" "$@" resume "$sid" "$(cat "$rdir/prompt.txt")" \
     -o "$rdir/last-message.txt" < /dev/null > "$rdir/events.jsonl"
 else
+  mkdir "$rdir/.launch-claimed" 2>/dev/null || {
+    echo "task already launched" >&2; exit 4;
+  }
   exec "$CODEX" "$@" -C "$d" -o "$rdir/last-message.txt" "$(cat "$rdir/prompt.txt")" \
     < /dev/null > "$rdir/events.jsonl"
 fi

@@ -45,6 +45,16 @@ class ProjectBusyTest(unittest.TestCase):
              patch.object(watcher.subprocess, "run", return_value=result):
             self.assertTrue(watcher.project_dir_busy("/work/project"))
 
+    def test_pruned_relay_history_does_not_block_project(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as ledger:
+            ledger.write(json.dumps({"id": "t-old", "project": "/work/project"}) + "\n")
+            ledger_path = ledger.name
+        self.addCleanup(lambda: pathlib.Path(ledger_path).unlink(missing_ok=True))
+        result = SimpleNamespace(stdout="t-old: DONE (pruned)\n", stderr="", returncode=0)
+        with patch.object(watcher, "LEDGER", ledger_path), \
+             patch.object(watcher.subprocess, "run", return_value=result):
+            self.assertFalse(watcher.project_dir_busy("/work/project"))
+
     def test_project_busy_scans_entries_older_than_previous_tail_limit(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as ledger:
             ledger.write(json.dumps({"id": "t-old", "project": "/work/project"}) + "\n")
@@ -69,6 +79,15 @@ class ProjectBusyTest(unittest.TestCase):
         with patch.object(watcher.subprocess, "run", return_value=result), \
              patch.object(watcher, "mac", return_value="t-relay done\n"):
             self.assertEqual(watcher.reviewer_states(["t-relay"]), {"t-relay": "done"})
+
+    def test_pruned_reviewer_is_not_treated_as_successful(self):
+        result = SimpleNamespace(stdout="t-relay: DONE (pruned)\n", stderr="",
+                                 returncode=0)
+        with patch.object(watcher.subprocess, "run", return_value=result), \
+             patch.object(watcher, "mac") as mac:
+            self.assertEqual(watcher.reviewer_states(["t-relay"]),
+                             {"t-relay": "failed"})
+        mac.assert_not_called()
 
     def test_fetch_findings_parses_multiple_outputs_without_trailing_newline(self):
         output = "\n@@@t-correct@@@\nfirst finding\n@@@t-tests@@@\nsecond finding"
@@ -212,11 +231,34 @@ class ProjectBusyTest(unittest.TestCase):
         self.assertEqual(round_["status"], "attention")
         post.assert_not_called()
 
+    def test_mismatched_or_duplicate_head_never_publishes(self):
+        outputs = [
+            "VERDICT: APPROVE\nHEAD: " + "b" * 40,
+            "VERDICT: APPROVE\nHEAD: " + "a" * 40 + "\nHEAD: " + "b" * 40,
+        ]
+        for output in outputs:
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "round.json"
+                path.write_text(json.dumps({
+                    "pr": 7, "repo": "owner/repo", "head": "a" * 40,
+                    "project_dir": "/project", "reviewers": {"t-a": "tests"},
+                    "status": "collecting",
+                }))
+                with patch.object(watcher, "reviewer_states",
+                                  return_value={"t-a": "done"}), \
+                     patch.object(watcher, "fetch_findings",
+                                  return_value={"t-a": output}), \
+                     patch.object(watcher, "post_verdict") as post:
+                    watcher.process_round(str(path))
+                self.assertEqual(json.loads(path.read_text())["status"], "attention")
+                post.assert_not_called()
+
     def test_status_parser_requires_known_exit(self):
         self.assertEqual(watcher.task_status("t-a: RUNNING"), "running")
         self.assertEqual(watcher.task_status("t-a: DONE (exit 0)"), "succeeded")
         self.assertEqual(watcher.task_status("t-a: DONE (exit 7)"), "failed")
         self.assertEqual(watcher.task_status("t-a: DONE (exit unknown)"), "unknown")
+        self.assertEqual(watcher.task_status("t-a: DONE (pruned)"), "pruned")
         self.assertEqual(watcher.task_status("t-a: DONE"), "unknown")
 
     def test_conflicting_verdict_output_is_rejected(self):

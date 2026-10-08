@@ -351,7 +351,7 @@ def remote_status_detail(entry):
     if entry.get("via") == "relay" and entry.get("proc"):
         payload = zigzag_poll(entry["proc"])
         if payload is None:
-            return "DONE", None  # pruned from the relay table: finished long ago
+            return "DONE", {"pruned": True}
         return ("RUNNING" if payload.get("running") else "DONE"), payload
     r = ssh(f"rdir={REMOTE_DEPT}/{tid}; "
             f"if [ ! -f $rdir/pid ]; then echo MISSING; exit 0; fi; "
@@ -397,8 +397,11 @@ def cmd_status(args):
     status, payload = remote_status_detail(entry)
     suffix = ""
     if status == "DONE":
-        exit_code = None if payload is None else payload.get("exit_code")
-        suffix = f" (exit {exit_code if exit_code is not None else 'unknown'})"
+        if payload and payload.get("pruned"):
+            suffix = " (pruned)"
+        else:
+            exit_code = None if payload is None else payload.get("exit_code")
+            suffix = f" (exit {exit_code if exit_code is not None else 'unknown'})"
     print(f"{tid}: {status}{suffix}")
 
 

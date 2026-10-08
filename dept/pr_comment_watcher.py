@@ -104,7 +104,7 @@ def dept_status_text(tid):
 
 def task_finished(status):
     """Only a completion with a known exit code releases the dispatch guard."""
-    return status is not None and task_status(status) in ("succeeded", "failed")
+    return status is not None and task_status(status) in ("succeeded", "failed", "pruned")
 
 
 def pr_task_running(pr):

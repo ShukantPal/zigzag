@@ -115,6 +115,8 @@ STATUS_RE = re.compile(r":\s*(RUNNING|DONE)(?:\s+\(exit\s+([^\)]+)\))?\s*$")
 
 def task_status(text):
     """Parse status without treating an ambiguous completion as safe."""
+    if text.strip().endswith(": DONE (pruned)"):
+        return "pruned"
     match = STATUS_RE.search(text.strip())
     if not match:
         return "unknown"
@@ -171,7 +173,7 @@ def reviewer_states(task_ids):
             states[tid] = "running"
         elif status == "succeeded":
             completed.append(tid)
-        elif status == "failed":
+        elif status in ("failed", "pruned"):
             states[tid] = "failed"
         else:
             raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")

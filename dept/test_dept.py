@@ -155,6 +155,14 @@ class CommandDispatchTest(unittest.TestCase):
         poll.assert_called_once_with("proc")
         output.assert_called_once_with("t-one: DONE (exit 7)")
 
+    def test_status_distinguishes_pruned_relay_from_unknown_exit(self):
+        entry = {"id": "t-one", "via": "relay", "proc": "proc"}
+        with patch.object(department, "ledger_read", return_value=[entry]), \
+             patch.object(department, "zigzag_poll", return_value=None), \
+             patch("builtins.print") as output:
+            department.cmd_status(["t-one"])
+        output.assert_called_once_with("t-one: DONE (pruned)")
+
     def test_status_reports_ssh_exit_code(self):
         entry = {"id": "t-one", "via": "ssh"}
         result = SimpleNamespace(returncode=0, stdout=b"DONE 7\n", stderr=b"")

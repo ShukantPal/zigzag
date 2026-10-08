@@ -44,6 +44,18 @@ class WatermarkTest(unittest.TestCase):
                               return_value="t-live: DONE (exit unknown)\n"):
                 self.assertEqual(watcher.pr_task_running(3), "t-live")
 
+    def test_pr_task_running_releases_pruned_relay_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = pathlib.Path(tmp) / "sessions.json"
+            sessions.write_text(json.dumps({watcher.session_key("owner/repo", 3):
+                                            {"active_task": "t-old"}}))
+            with patch.object(watcher, "REPO", "owner/repo"), \
+                 patch.object(watcher, "SESSIONS_FILE", str(sessions)), \
+                 patch.object(watcher, "LEDGER", str(pathlib.Path(tmp) / "missing-ledger")), \
+                 patch.object(watcher, "dept_status_text",
+                              return_value="t-old: DONE (pruned)\n"):
+                self.assertIsNone(watcher.pr_task_running(3))
+
     def test_dispatch_records_repo_scoped_active_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             prompt_dir = pathlib.Path(tmp) / "prompts"
