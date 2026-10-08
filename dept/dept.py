@@ -95,9 +95,12 @@ def _zigzag_call(method, path, body=None, timeout=30):
         sys.exit(f"zigzag request failed: {e}")
 
 
-def zigzag_spawn(bin_name, args, ident):
+def zigzag_spawn(bin_name, args, ident, *, cwd=None):
+    payload = {"id": ident, "bin": bin_name, "args": args}
+    if cwd:
+        payload["cwd"] = cwd
     status, payload = _zigzag_call("POST", "/v1/spawn",
-                                   {"id": ident, "bin": bin_name, "args": args})
+                                   payload)
     if status != 200 or "proc" not in payload:
         sys.exit(f"zigzag spawn failed (http {status}): {payload}")
     return payload["proc"]
@@ -219,8 +222,12 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
         transport = {"via": "ssh", "pid": pid}
         detail = f"pid={pid}"
     else:
-        proc = zigzag_spawn(RELAY_LAUNCHER,
-                            ["resume" if session_id else "run", rdir], f"codex-{tid}")
+        proc = zigzag_spawn(
+            RELAY_LAUNCHER,
+            ["resume" if session_id else "run", rdir],
+            f"codex-{tid}",
+            cwd=project_dir,
+        )
         transport = {"via": "relay", "proc": proc}
         detail = f"proc={proc[:12]}..."
     prefix = f"[resume {session_id[:8]}] " if session_id else ""

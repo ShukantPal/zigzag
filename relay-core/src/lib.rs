@@ -9,7 +9,9 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Durable, deliberately small record for a supervised agent.  Command
-/// arguments and prompt text are intentionally not retained here.
+/// arguments and prompt text are intentionally not retained here. The working
+/// directory is retained because it identifies the local checkout in status
+/// diagnostics without exposing either of those sensitive inputs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRecord {
     pub id: String,
@@ -22,6 +24,7 @@ pub struct AgentRecord {
     pub started_at: String,
     pub deadline_at: Option<String>,
     pub command: String,
+    pub cwd: Option<String>,
     pub state: String,
     pub exit_code: Option<i32>,
     pub log_degraded: bool,
@@ -60,6 +63,10 @@ impl AgentRecord {
                     .unwrap_or(Json::Null),
             ),
             ("command".to_owned(), Json::String(self.command.clone())),
+            (
+                "cwd".to_owned(),
+                self.cwd.clone().map(Json::String).unwrap_or(Json::Null),
+            ),
             (
                 "exit_code".to_owned(),
                 self.exit_code
@@ -468,6 +475,10 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .unwrap_or(Json::Null),
         ),
         ("command".to_owned(), Json::String(entry.command.clone())),
+        (
+            "cwd".to_owned(),
+            entry.cwd.clone().map(Json::String).unwrap_or(Json::Null),
+        ),
         ("state".to_owned(), Json::String(entry.state.clone())),
         (
             "exit_code".to_owned(),
@@ -562,6 +573,13 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 _ => return Err("invalid agent registry".to_owned()),
             },
             command: text("command")?,
+            // Old registry files intentionally did not retain the working
+            // directory, so absent cwd remains a valid read-only diagnostic.
+            cwd: match get("cwd") {
+                Some(Json::String(value)) => Some(value.clone()),
+                Some(Json::Null) | None => None,
+                _ => return Err("invalid agent registry".to_owned()),
+            },
             state: text("state")?,
             exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
             log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
@@ -1663,6 +1681,7 @@ mod tests {
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "codex exec".to_owned(),
+            cwd: None,
             state: "running".to_owned(),
             exit_code: None,
             log_degraded: false,

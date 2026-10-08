@@ -12,6 +12,7 @@ from dept.status import (
     Execution,
     StatusScreen,
     build_executions,
+    compact_cwd,
     detail_lines,
     duration_between,
     flags,
@@ -161,6 +162,22 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertIn("relay events lost", flags(merged_execution))
         self.assertEqual(merged_execution.agent_id, "agent")
 
+    def test_cwd_comes_from_registry_or_process_spawned_event(self):
+        spawned = event(
+            "process_spawned", "2026-01-01T00:00:00.000Z",
+            payload={"cwd": "/Users/shukant/Workspace/older"},
+        )
+        execution = build_executions(
+            [spawned],
+            [{"id": "agent", "execution_id": "execution", "cwd": "/Users/shukant/Workspace/current"}],
+        )[0]
+        self.assertEqual(execution.cwd, "/Users/shukant/Workspace/current")
+
+    def test_compact_cwd_shortens_home_and_truncates_from_the_left(self):
+        home_child = str(Path.home() / "Workspace" / "ShukantPal" / "zigzag")
+        self.assertEqual(compact_cwd(home_child, 99), "~/Workspace/ShukantPal/zigzag")
+        self.assertEqual(compact_cwd("/private/tmp/a/very/deep/leveled", 12), "…eep/leveled")
+
     def test_status_refresh_keeps_audit_events_when_relay_requests_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "events.json"
@@ -210,10 +227,11 @@ class TranscriptTests(unittest.TestCase):
         )
 
     def test_transcript_detail_shows_path_command_and_spool(self):
-        execution = Execution("execution", "t-example", agent_id="agent")
+        execution = Execution("execution", "t-example", agent_id="agent", cwd="/full/project/path")
         lines = transcript_lines(execution, ["first", "second"], None)
         self.assertIn(f"Source: {transcript_path('t-example')}", lines)
         self.assertIn(f"Command: {transcript_command('t-example')}", lines)
+        self.assertIn("CWD: /full/project/path", lines)
         self.assertEqual(lines[-3:], ["Relay output (last 40 lines):", "first", "second"])
 
 
@@ -233,7 +251,7 @@ class CommandTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch("dept.status.StatusScreen.refresh", refresh), redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(status_main(["--once"]), 0)
-        self.assertIn("TASK\tPHASE", stdout.getvalue())
+        self.assertIn("TASK\tCWD\tPHASE", stdout.getvalue())
         self.assertIn("process_spawned", stdout.getvalue())
         self.assertIn("WARNING: relay unavailable", stderr.getvalue())
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:

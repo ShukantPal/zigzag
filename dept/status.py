@@ -102,6 +102,7 @@ class Execution:
     events: list[dict[str, Any]] = field(default_factory=list)
     agent_state: str = "not observed"
     agent_id: str | None = None
+    cwd: str | None = None
     degraded: list[str] = field(default_factory=list)
     relay_lost: bool = False
 
@@ -135,6 +136,11 @@ def build_executions(
         execution = grouped.setdefault(execution_id, Execution(execution_id))
         execution.task_id = str(event.get("task_id") or execution.task_id)
         execution.events.append(event)
+        payload = event.get("payload")
+        if event.get("kind") == "process_spawned" and isinstance(payload, dict):
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                execution.cwd = cwd
     for agent in agents:
         execution_id = agent.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:
@@ -144,6 +150,9 @@ def build_executions(
         agent_id = agent.get("id")
         if isinstance(agent_id, str) and agent_id:
             execution.agent_id = agent_id
+        cwd = agent.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            execution.cwd = cwd
         if agent.get("audit_degraded"):
             execution.degraded.append("audit degraded")
         if agent.get("log_degraded"):
@@ -310,6 +319,24 @@ def flags(execution: Execution) -> str:
     return ", ".join(entries) or "healthy"
 
 
+def compact_cwd(cwd: str | None, width: int = 24) -> str:
+    """Shorten home paths and preserve the informative tail for the table."""
+    if not cwd:
+        return "not observed"
+    home = str(Path.home())
+    if cwd == home:
+        display = "~"
+    elif cwd.startswith(home + os.sep):
+        display = "~" + cwd[len(home):]
+    else:
+        display = cwd
+    if width <= 0:
+        return ""
+    if len(display) <= width:
+        return display
+    return "…" if width == 1 else "…" + display[-(width - 1):]
+
+
 def detail_lines(execution: Execution, limit: int = 12) -> list[str]:
     lines = [f"{execution.task_id} / {execution.execution_id} — {flags(execution)}"]
     shown = execution.events[-limit:]
@@ -330,6 +357,7 @@ def transcript_lines(execution: Execution, output: list[str], error: str | None)
     path = transcript_path(execution.task_id)
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
+        f"CWD: {execution.cwd or 'not observed'}",
         f"Source: {path}",
         f"Command: {transcript_command(execution.task_id)}",
     ]
@@ -409,13 +437,13 @@ class StatusScreen:
         if self.show_transcript:
             header = "dept status — transcript (read-only)  q/Esc back"
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
-        columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
+        columns = "TASK           CWD                      PHASE              ELAPSED      TOTAL        AGENT      LAST EVENT"
         screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
         rows = 1 if self.show_transcript else max(1, height // 2 - 2)
         for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest_event[:24]}"
+            line = f"{execution.task_id[:14]:14} {compact_cwd(execution.cwd):24} {execution.phase[:18]:18} {format_duration(execution.current_elapsed()):12} {total_text:12} {execution.agent_state[:10]:10} {execution.latest_event[:19]}"
             screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
@@ -434,11 +462,11 @@ class StatusScreen:
 
 
 def print_once(executions: list[Execution], warnings: list[str]) -> None:
-    print("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tAGENT\tLAST EVENT\tFLAGS")
+    print("TASK\tCWD\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tAGENT\tLAST EVENT\tFLAGS")
     for execution in executions:
         total, boundary = execution.total_elapsed()
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
+        print("\t".join((execution.task_id, execution.cwd or "not observed", execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 

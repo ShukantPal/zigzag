@@ -105,6 +105,7 @@ struct Request {
 struct SpawnRequest {
     command: exec::ExecRequest,
     execution_id: Option<String>,
+    cwd: Option<String>,
 }
 
 enum ReadRequestError {
@@ -878,6 +879,7 @@ fn spawn_request(
         path,
         request.command,
         execution_id.clone(),
+        request.cwd,
     ) {
         Ok(handle) => reply(
             stream,
@@ -920,7 +922,11 @@ fn spawn_proc(
     path: &str,
     request: exec::ExecRequest,
     execution_id: String,
+    cwd: Option<String>,
 ) -> Result<SpawnedProc, String> {
+    // Direct Codex launches already carry this in `-C <dir>`. Department
+    // launcher calls also provide it as display-only spawn metadata.
+    let cwd = cwd.or_else(|| working_directory_argument(&request.args));
     let stdout = Arc::new(Mutex::new(CappedOutput::default()));
     let stderr = Arc::new(Mutex::new(CappedOutput::default()));
     let mut child = Command::new(path)
@@ -956,6 +962,7 @@ fn spawn_proc(
             request.bin,
             request.args.first().map(String::as_str).unwrap_or("")
         ),
+        cwd: cwd.clone(),
         state: "running".to_owned(),
         exit_code: None,
         log_degraded: false,
@@ -980,7 +987,12 @@ fn spawn_proc(
         "process_spawned",
         &id,
         &execution_id,
-        Json::Object(vec![("agent_id".to_owned(), Json::String(handle.clone()))]),
+        Json::Object(
+            [("agent_id".to_owned(), Json::String(handle.clone()))]
+                .into_iter()
+                .chain(cwd.map(|cwd| ("cwd".to_owned(), Json::String(cwd))))
+                .collect(),
+        ),
     )) {
         let _ = supervisor
             .registry
@@ -1022,6 +1034,13 @@ fn spawn_proc(
     );
     prune_procs(&mut table, Instant::now());
     Ok(SpawnedProc { id, handle })
+}
+
+fn working_directory_argument(args: &[String]) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == "-C")
+        .map(|pair| pair[1].clone())
+        .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
 }
 
 fn drain_to_capture(
@@ -1431,13 +1450,15 @@ fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
     };
     let denied_id = Json::Object(fields.clone());
     let denied_id = exec::request_id(&denied_id);
-    if fields
+    if fields.iter().any(|(name, _)| {
+        !matches!(
+            name.as_str(),
+            "id" | "bin" | "args" | "execution_id" | "cwd"
+        )
+    }) || fields
         .iter()
-        .any(|(name, _)| !matches!(name.as_str(), "id" | "bin" | "args" | "execution_id"))
-        || fields
-            .iter()
-            .enumerate()
-            .any(|(index, (name, _))| fields[..index].iter().any(|(previous, _)| previous == name))
+        .enumerate()
+        .any(|(index, (name, _))| fields[..index].iter().any(|(previous, _)| previous == name))
     {
         return Err(denial_json(&denied_id));
     }
@@ -1460,16 +1481,30 @@ fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
             .ok_or_else(|| denial_json(&denied_id))
             .map(Some)?,
     };
+    let cwd = match fields
+        .iter()
+        .find(|(name, _)| name == "cwd")
+        .map(|(_, value)| value)
+    {
+        None => None,
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
+            .map(str::to_owned)
+            .ok_or_else(|| denial_json(&denied_id))
+            .map(Some)?,
+    };
     let command = exec::parse_request(&Json::Object(
         fields
             .into_iter()
-            .filter(|(name, _)| name != "execution_id")
+            .filter(|(name, _)| name != "execution_id" && name != "cwd")
             .collect(),
     ))
     .map_err(|_| denial_json(&denied_id))?;
     Ok(SpawnRequest {
         command,
         execution_id,
+        cwd,
     })
 }
 
@@ -2007,6 +2042,7 @@ mod tests {
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "sh -c".to_owned(),
+            cwd: None,
             state: "orphaned".to_owned(),
             exit_code: None,
             log_degraded: false,
@@ -2036,16 +2072,29 @@ mod tests {
     #[test]
     fn spawn_request_accepts_only_safe_execution_correlation_ids() {
         let request = parse_spawn_request(
-            br#"{"id":"task","execution_id":"attempt-01_A","bin":"sh","args":["-c","true"]}"#,
+            br#"{"id":"task","execution_id":"attempt-01_A","cwd":"/Users/shukant/Workspace/zigzag","bin":"sh","args":["-c","true"]}"#,
         )
         .unwrap();
         assert_eq!(request.execution_id.as_deref(), Some("attempt-01_A"));
+        assert_eq!(
+            request.cwd.as_deref(),
+            Some("/Users/shukant/Workspace/zigzag")
+        );
         for value in ["", "contains space", "slash/value", &"x".repeat(129)] {
             let body = format!(
                 r#"{{"id":"task","execution_id":"{value}","bin":"sh","args":["-c","true"]}}"#
             );
             assert!(parse_spawn_request(body.as_bytes()).is_err(), "{value:?}");
         }
+        for value in ["", &"x".repeat(4097)] {
+            let body =
+                format!(r#"{{"id":"task","cwd":"{value}","bin":"sh","args":["-c","true"]}}"#);
+            assert!(parse_spawn_request(body.as_bytes()).is_err(), "{value:?}");
+        }
+        assert_eq!(
+            working_directory_argument(&["exec".to_owned(), "-C".to_owned(), "/work".to_owned()]),
+            Some("/work".to_owned())
+        );
         // The synchronous command parser deliberately retains its exact old
         // request shape; spawn-only metadata never reaches argv execution.
         assert!(
@@ -2078,6 +2127,7 @@ mod tests {
             "/bin/sh",
             request,
             "execution-old".to_owned(),
+            None,
         )
         .unwrap()
         .handle;
