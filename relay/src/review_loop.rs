@@ -165,7 +165,7 @@ pub fn load_config(path: &Path) -> Result<PersonalConfig, Vec<ConfigViolation>> 
     })
 }
 
-pub fn gate_report(repository: &str, number: u64) -> Result<Value, String> {
+pub fn gate_report(repository: &str, number: u64, state_path: &Path) -> Result<Value, String> {
     let path = default_config_path().map_err(|violation| violation.to_string())?;
     let config = load_config(&path).map_err(|violations| {
         violations
@@ -181,7 +181,9 @@ pub fn gate_report(repository: &str, number: u64) -> Result<Value, String> {
         .find(|policy| policy.repository == repository)
         .ok_or_else(|| format!("no review policy configured for {repository}"))?;
     let snapshot = fetch_pr(repository, number)?;
-    Ok(shadow_gate_report(policy, number, &snapshot))
+    let store = StateStore::open(state_path.to_path_buf())?;
+    let round = active_gate_round(&store.state, repository, number, &snapshot);
+    Ok(shadow_gate_report(policy, number, &snapshot, round))
 }
 
 fn reject_yaml_tags(value: &serde_yaml::Value, path: &str, errors: &mut Vec<ConfigViolation>) {
@@ -1813,29 +1815,38 @@ fn evaluate_gate(
     }
 }
 
+fn active_gate_round<'a>(
+    state: &'a DurableState,
+    repository: &str,
+    number: u64,
+    snapshot: &PullRequestSnapshot,
+) -> Option<&'a ReviewRound> {
+    let key = round_key(repository, number, &snapshot.head_ref_oid);
+    state.rounds.get(&key).filter(|round| {
+        comparison_matches(round, snapshot)
+            && !matches!(
+                round.phase,
+                RoundPhase::Superseded | RoundPhase::Closed | RoundPhase::Merged
+            )
+    })
+}
+
 fn shadow_gate_report(
     policy: &RepositoryPolicy,
     number: u64,
     snapshot: &PullRequestSnapshot,
+    round: Option<&ReviewRound>,
 ) -> Value {
-    let round = ReviewRound {
-        repository: policy.repository.clone(),
-        pull_request: number,
-        head: snapshot.head_ref_oid.clone(),
-        base: snapshot.base_ref_oid.clone(),
-        generation: 1,
-        verification: false,
-        phase: RoundPhase::Reviewing,
-        reviewers: BTreeMap::new(),
-        verdicts: BTreeMap::new(),
-        excluded_comment_ids: BTreeSet::new(),
-        pending_comment_deletions: BTreeSet::new(),
-        owner: None,
-        owner_agent_id: None,
-        gate_reasons: Vec::new(),
-    };
-    let verdicts = latest_verdicts(policy, &round, &snapshot.comments, false);
+    let verdicts = round.map_or_else(BTreeMap::new, |round| {
+        latest_verdicts(policy, round, &snapshot.comments, false)
+    });
     let mut decision = evaluate_gate(policy, &snapshot.head_ref_oid, snapshot, &verdicts);
+    if round.is_none() {
+        decision.ready = false;
+        decision
+            .reasons
+            .push("no active review generation for current comparison".to_owned());
+    }
     if !pull_request_is_open(snapshot) {
         decision.ready = false;
         decision.reasons.push("pull request is not open".to_owned());
@@ -2254,22 +2265,43 @@ fn latest_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Option<Stri
         .map(|agent| agent.id)
 }
 
-fn kill_agents_with(registry: &AgentRegistry, agent_ids: &[String], mut kill: impl FnMut(i32)) {
+fn kill_agents_with(
+    registry: &AgentRegistry,
+    agent_ids: &[String],
+    mut kill: impl FnMut(i32),
+) -> Vec<String> {
+    let mut unverified = Vec::new();
     for agent_id in agent_ids {
-        if let Some(agent) = registry.get(agent_id)
-            && matches!(agent.state.as_str(), "running" | "orphaned")
-        {
-            kill(agent.process_group);
+        if let Some(agent) = registry.get(agent_id) {
+            match agent.state.as_str() {
+                "running" => kill(agent.process_group),
+                // After a daemon restart there is no retained OS process
+                // handle or start-time identity. A numeric PGID may have been
+                // reused, so signalling it could kill an unrelated process.
+                "orphaned" => unverified.push(agent_id.clone()),
+                _ => {}
+            }
         }
     }
+    unverified
 }
 
 fn kill_agents(server: &Server, agent_ids: &[String]) {
     let mut process_groups = Vec::new();
-    kill_agents_with(&server.supervisor.registry, agent_ids, |process_group| {
+    let unverified = kill_agents_with(&server.supervisor.registry, agent_ids, |process_group| {
         let _ = force_kill_process_group(process_group);
         process_groups.push(process_group);
     });
+    for agent_id in unverified {
+        if let Err(error) =
+            server
+                .supervisor
+                .registry
+                .transition(&agent_id, "cleanup_skipped_unverified", None)
+        {
+            eprintln!("could not persist safe orphan cleanup for {agent_id}: {error}");
+        }
+    }
     if process_groups.is_empty() {
         return;
     }
@@ -2776,13 +2808,17 @@ review_loop:
         };
         let mut accepted = snapshot(&head);
         accepted.comments = policy.lenses.iter().map(|lens| exact(lens)).collect();
-        assert_eq!(shadow_gate_report(&policy, 7, &accepted)["pass"], true);
+        let round = test_round(&head, RoundPhase::Reviewing, None);
+        assert_eq!(
+            shadow_gate_report(&policy, 7, &accepted, Some(&round))["pass"],
+            true
+        );
 
-        let mut flexible_legacy = accepted;
+        let mut flexible_legacy = accepted.clone();
         flexible_legacy.comments[0].body = format!(
             "preface containing 🤖\n> 🤖 Codex (AI assistant) — [correctness] review verdict\nverdict: approve\nHEAD: {head}\nNo blocking findings."
         );
-        let report = shadow_gate_report(&policy, 7, &flexible_legacy);
+        let report = shadow_gate_report(&policy, 7, &flexible_legacy, Some(&round));
         assert_eq!(report["pass"], false);
         assert!(
             report["reasons"]
@@ -2790,6 +2826,24 @@ review_loop:
                 .unwrap()
                 .iter()
                 .any(|reason| reason == "no admitted [correctness] verdict")
+        );
+
+        let state = DurableState {
+            schema_version: state_schema_version(),
+            rounds: BTreeMap::from([(round_key("owner/repo", 7, &head), round.clone())]),
+        };
+        assert!(active_gate_round(&state, "owner/repo", 7, &accepted).is_some());
+        let mut retargeted = accepted;
+        retargeted.base_ref_oid = "d".repeat(40);
+        assert!(active_gate_round(&state, "owner/repo", 7, &retargeted).is_none());
+        let report = shadow_gate_report(&policy, 7, &retargeted, None);
+        assert_eq!(report["pass"], false);
+        assert!(
+            report["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "no active review generation for current comparison")
         );
     }
 
@@ -3021,7 +3075,7 @@ review_loop:
     }
 
     #[test]
-    fn cleanup_invokes_the_process_killer_for_running_and_orphaned_agents() {
+    fn cleanup_never_signals_unverified_orphaned_process_groups() {
         let path = std::env::temp_dir().join(format!(
             "zigzag-review-agents-{}.json",
             super::super::random_hex_128().unwrap()
@@ -3037,7 +3091,7 @@ review_loop:
             .register(agent("finished", "task", 43, "finished"))
             .unwrap();
         let mut killed = Vec::new();
-        kill_agents_with(
+        let unverified = kill_agents_with(
             &registry,
             &[
                 "running".to_owned(),
@@ -3046,8 +3100,27 @@ review_loop:
             ],
             |process_group| killed.push(process_group),
         );
-        assert_eq!(killed, [41, 42]);
+        assert_eq!(killed, [41]);
+        assert_eq!(unverified, ["orphaned"]);
+        registry.transition("running", "finished", Some(0)).unwrap();
+        let state_path = path.with_extension("events");
+        let server = Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::new(registry),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: path.with_extension("review-state"),
+        };
+        kill_agents(&server, &["orphaned".to_owned()]);
+        assert_eq!(
+            server.supervisor.registry.get("orphaned").unwrap().state,
+            "cleanup_skipped_unverified"
+        );
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]
@@ -3113,6 +3186,7 @@ review_loop:
                     entry,
                 )])),
             },
+            review_state_file: state_path.with_extension("review-state"),
         };
 
         kill_agents(&server, &["reviewer".to_owned()]);

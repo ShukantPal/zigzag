@@ -48,6 +48,7 @@ struct Server {
     store: Arc<Store>,
     supervisor: Supervisor,
     updater: Arc<update::Manager>,
+    review_state_file: PathBuf,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -171,6 +172,7 @@ fn run() -> Result<(), String> {
             procs: Mutex::new(HashMap::new()),
         },
         updater: Arc::clone(&updater),
+        review_state_file: config.review_state_file.clone(),
     });
     for agent in state.supervisor.registry.recover(process_group_running)? {
         replay_recovered_lifecycle(&state.store, &agent)?;
@@ -708,6 +710,7 @@ where
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("GET", "/v1/review-gate") => review_gate_request(&mut stream, &state, &request.target),
         ("GET", path) if agent_route(path).is_some() => agent_request(
             &mut stream,
             &state,
@@ -726,6 +729,45 @@ where
         },
         _ => reply(&mut stream, 404, error("not_found")),
     }
+}
+
+fn review_gate_request(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
+    let (repository, number) = match review_gate_parameters(target) {
+        Ok(parameters) => parameters,
+        Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
+    };
+    match review_loop::gate_report(&repository, number, &state.review_state_file) {
+        Ok(report) => {
+            let encoded = serde_json::to_string(&report)
+                .map_err(|error| format!("could not encode review gate report: {error}"))?;
+            let response = parse_json(&encoded)
+                .map_err(|_| "could not convert review gate report".to_owned())?;
+            reply(stream, 200, response)
+        }
+        Err(error_message) => {
+            eprintln!("review gate failed for {repository}#{number}: {error_message}");
+            reply(stream, 500, error("review_gate_failed"))
+        }
+    }
+}
+
+fn review_gate_parameters(target: &str) -> Result<(String, u64), ()> {
+    let values = query(target).map_err(|_| ())?;
+    let allowed = ["repository", "pull_request"];
+    if values.len() != allowed.len() || values.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(());
+    }
+    let repository = values
+        .get("repository")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or(())?;
+    let number = values
+        .get("pull_request")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|number| *number > 0)
+        .ok_or(())?;
+    Ok((repository, number))
 }
 
 fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
@@ -1855,6 +1897,27 @@ mod tests {
     }
 
     #[test]
+    fn review_gate_query_requires_one_repository_and_positive_pr() {
+        assert_eq!(
+            review_gate_parameters(
+                "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=22"
+            ),
+            Ok(("ShukantPal/zigzag".to_owned(), 22))
+        );
+        for target in [
+            "/v1/review-gate",
+            "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=0",
+            "/v1/review-gate?repository=&pull_request=22",
+            "/v1/review-gate?repository=ShukantPal%2Fzigzag&pull_request=22&extra=1",
+            "/v1/review-gate?repository=one%2Frepo&repository=two%2Frepo&pull_request=22",
+            "/v1/review-gate?repository=one%2Frepo&pull_request=22&pull_request=23",
+            "/v1/review-gate?repository=%ZZ&pull_request=22",
+        ] {
+            assert_eq!(review_gate_parameters(target), Err(()));
+        }
+    }
+
+    #[test]
     fn bearer_comparison_requires_the_full_token() {
         assert!(authorized(
             &format!("Bearer {}", "x".repeat(32)),
@@ -2450,6 +2513,7 @@ mod tests {
                     policy: update::Policy::Enabled,
                     ready_file: None,
                 })),
+                review_state_file: path.with_extension("review-state"),
             }),
             path,
         )
