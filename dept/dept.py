@@ -2,8 +2,8 @@
 """Codex department manager: dispatch and track background Codex agents on Shukant's Mac.
 
 Usage:
-  dept.py start <project-dir> <prompt-file>
-  dept.py resume [project-dir] <session-id> <prompt-file>
+  dept.py start <project-dir> <prompt-file> [--model <name>] [--read-only]
+  dept.py resume [project-dir] <session-id> <prompt-file> [--model <name>] [--read-only]
       (project-dir optional: resolved from the session file's recorded cwd)
   dept.py status <task-id>
   dept.py list
@@ -12,7 +12,7 @@ Usage:
 
 All long-running work happens detached on the Mac (nohup), so it survives this VM.
 """
-import json, os, subprocess, sys, time, uuid, datetime
+import json, os, re, subprocess, sys, time, uuid, datetime
 
 try:  # `python3 dept/dept.py` and `python3 -m dept.dept` are both supported.
     from .dept_config import ROOT, load_config, state_dir
@@ -42,8 +42,11 @@ def asset_path(name):
 
 
 def tunnel_proxy():
-    hp = os.environ["HTTPS_PROXY"]
-    return hp.rsplit(":", 1)[0] + ":3130"
+    hp = os.environ.get("HTTPS_PROXY", "")
+    # Interactive invocations and local test runners do not necessarily inherit
+    # the VM cron's proxy environment.  Leave the helper's proxy unset in that
+    # case instead of crashing before SSH can report a useful transport error.
+    return hp.rsplit(":", 1)[0] + ":3130" if ":" in hp else ""
 
 
 def ssh(*remote_cmd, stdin_data=None, timeout=60):
@@ -157,6 +160,10 @@ def dispatch_args(args, resume=False):
                     help="prepend the writing standard (strategic/hierarchical/simple) instead of the code SOP")
     ap.add_argument("--ssh", action="store_true",
                     help="launch over SSH+nohup instead of the relay (no keychain access)")
+    ap.add_argument("--model", help="override the Codex model for this task")
+    ap.add_argument("--task-id", help="preallocated internal task id")
+    ap.add_argument("--read-only", action="store_true",
+                    help="run Codex in its read-only sandbox without approval bypass")
     return ap.parse_args(args)
 
 
@@ -177,39 +184,91 @@ def decorated_prompt(ns):
     return prompt
 
 
-def setup_task_dir(tid, project_dir, prompt, session_id=None):
+MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*\Z")
+TASK_ID_RE = re.compile(r"t-[0-9a-f]{6}\Z")
+
+
+def validate_model(model):
+    if model and not MODEL_RE.fullmatch(model):
+        sys.exit("invalid model identifier: use letters, digits, '.', '_', ':', '/', or '-'")
+
+
+def ssh_worker_script(rdir, codex):
+    """Wrap one SSH-launched command with durable exit and child state."""
+    exit_file = shq(f"{rdir}/exit-code.txt")
+    child_file = shq(f"{rdir}/child-pid.txt")
+    return (
+        "child=; cleanup() { "
+        "if [ -n \"$child\" ]; then kill \"$child\" 2>/dev/null; "
+        "wait \"$child\" 2>/dev/null; fi; "
+        f"printf %s 143 > {exit_file}; exit 143; }}; "
+        "trap cleanup TERM INT; "
+        f"{codex} & child=$!; printf %s \"$child\" > {child_file}; "
+        "wait \"$child\"; rc=$?; trap - TERM INT; "
+        f"printf %s \"$rc\" > {exit_file}; exit \"$rc\"")
+
+
+def ssh_kill_script(rdir):
+    """Terminate the SSH wrapper first so it owns the cancellation result."""
+    return (
+        f"rdir={shq(rdir)}; killed=0; "
+        "if [ -f \"$rdir/pid\" ] && kill $(cat \"$rdir/pid\") 2>/dev/null; "
+        "then killed=1; "
+        "elif [ -f \"$rdir/child-pid.txt\" ] && "
+        "kill $(cat \"$rdir/child-pid.txt\") 2>/dev/null; "
+        "then killed=1; fi; "
+        "[ \"$killed\" -eq 1 ] && echo killed || echo 'not running'")
+
+
+def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
-    r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
+    r = ssh(f"mkdir -p {REMOTE_DEPT} && mkdir {rdir} && cat > {rdir}/prompt.txt",
             stdin_data=prompt, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh setup failed: {r.stderr.decode()[-500:]}")
     files = f"printf %s {shq(project_dir)} > {rdir}/dir.txt"
     if session_id:
         files += f" && printf %s {shq(session_id)} > {rdir}/resume.txt"
+    if model:
+        files += f" && printf %s {shq(model)} > {rdir}/model.txt"
+    if read_only:
+        files += f" && : > {rdir}/read-only.txt"
     r = ssh(files, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh dir write failed: {r.stderr.decode()[-500:]}")
     return rdir
 
 
-def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
+def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
+                  read_only=False, task_id=None):
     """Launch start/resume through one preparation, transport, and ledger path."""
-    tid = "t-" + uuid.uuid4().hex[:6]
+    validate_model(model)
+    tid = task_id or "t-" + uuid.uuid4().hex[:6]
+    if not TASK_ID_RE.fullmatch(tid):
+        sys.exit("invalid task id")
     relay_path = asset_path("relay-announce.md")
-    if os.path.exists(relay_path):
-        relay = open(relay_path, "rb").read().replace(b"{{TASK_ID}}", tid.encode())
+    if not read_only and os.path.exists(relay_path):
+        with open(relay_path, "rb") as f:
+            relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
-    rdir = setup_task_dir(tid, project_dir, prompt, session_id)
+    rdir = setup_task_dir(tid, project_dir, prompt, session_id, model, read_only)
     action = "resumed" if session_id else "started"
     if use_ssh:
-        command = (f'resume "$(cat {rdir}/resume.txt)" "$(cat {rdir}/prompt.txt)" '
-                   f'-o {rdir}/last-message.txt'
+        command = (f'resume "$(cat {shq(f"{rdir}/resume.txt")})" '
+                   f'"$(cat {shq(f"{rdir}/prompt.txt")})" '
+                   f'-o {shq(f"{rdir}/last-message.txt")}'
                    if session_id else
-                   f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)"')
+                   f'-C "$PWD" -o {shq(f"{rdir}/last-message.txt")} '
+                   f'"$(cat {shq(f"{rdir}/prompt.txt")})"')
+        model_flag = f"-m {shq(model)} " if model else ""
+        safety_flags = ("--sandbox read-only --ignore-user-config --ignore-rules "
+                        if read_only else "--approve-for-me ")
+        codex = (f"codex exec --json {safety_flags}--skip-git-repo-check "
+                 f"{model_flag}{command}")
+        wrapped = ssh_worker_script(rdir, codex)
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
-                  f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
-                  f'{command} '
+                  f'nohup sh -c {shq(wrapped)} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
                   f'echo $! > {rdir}/pid && cat {rdir}/pid')
         r = ssh(launch, timeout=60)
@@ -225,15 +284,19 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None):
         detail = f"proc={proc[:12]}..."
     prefix = f"[resume {session_id[:8]}] " if session_id else ""
     ledger_append({"id": tid, "project": project_dir, **transport, "status": "running",
-                   "prompt_head": prefix + prompt.decode(errors="replace")[:200],
+                   "read_only": read_only, "prompt_head": prefix + prompt.decode(errors="replace")[:200],
                    "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
     session = f" session={session_id[:8]}" if session_id else ""
-    print(f"{action} {tid} {detail}{session} project={project_dir} (via {transport['via']})")
+    # Keep this field present for both explicit overrides and the configured
+    # default so cron callers have a stable, observable confirmation format.
+    model_text = f" model={model or 'default'}"
+    print(f"{action} {tid} {detail}{session}{model_text} project={project_dir} (via {transport['via']})")
 
 
 def cmd_start(args):
     ns = dispatch_args(args)
-    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh)
+    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh, model=ns.model,
+                  read_only=ns.read_only, task_id=ns.task_id)
 
 
 def shq(s):
@@ -305,19 +368,29 @@ def remote_isdir(path):
     return r.returncode == 0
 
 
-def remote_status(entry):
-    """RUNNING / DONE / MISSING for a ledger entry, via SSH pid or relay proc."""
+def remote_status_detail(entry):
+    """Return (status, relay payload) from one liveness lookup."""
     tid = entry["id"]
     if entry.get("via") == "relay" and entry.get("proc"):
         payload = zigzag_poll(entry["proc"])
         if payload is None:
-            return "DONE"  # pruned from the relay table: finished long ago
-        return "RUNNING" if payload.get("running") else "DONE"
+            return "DONE", {"pruned": True}
+        return ("RUNNING" if payload.get("running") else "DONE"), payload
     r = ssh(f"rdir={REMOTE_DEPT}/{tid}; "
             f"if [ ! -f $rdir/pid ]; then echo MISSING; exit 0; fi; "
-            f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; else echo DONE; fi",
+            f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; "
+            f"elif [ -f $rdir/exit-code.txt ]; then printf 'DONE '; cat $rdir/exit-code.txt; echo; "
+            f"else echo DONE; fi",
             timeout=60)
-    return r.stdout.decode().strip()
+    output = r.stdout.decode().strip()
+    if output.startswith("DONE "):
+        value = output.partition(" ")[2]
+        return "DONE", {"exit_code": int(value)} if value.isdigit() else None
+    return output, None
+
+
+def remote_status(entry):
+    return remote_status_detail(entry)[0]
 
 
 def cmd_kill(args):
@@ -330,15 +403,23 @@ def cmd_kill(args):
         killed = zigzag_kill(entry["proc"])
         print(f"{tid}: kill requested via relay (killed={killed})")
     else:
-        r = ssh(f"kill $(cat {REMOTE_DEPT}/{tid}/pid) 2>/dev/null && echo killed || echo 'not running'",
-                timeout=60)
+        rdir = f"{REMOTE_DEPT}/{tid}"
+        r = ssh(ssh_kill_script(rdir), timeout=60)
         print(f"{tid}: {r.stdout.decode().strip()} (via ssh)")
 
 
 def cmd_status(args):
     tid = args[0]
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
-    print(f"{tid}: {remote_status(entry)}")
+    status, payload = remote_status_detail(entry)
+    suffix = ""
+    if status == "DONE":
+        if payload and payload.get("pruned"):
+            suffix = " (pruned)"
+        else:
+            exit_code = None if payload is None else payload.get("exit_code")
+            suffix = f" (exit {exit_code if exit_code is not None else 'unknown'})"
+    print(f"{tid}: {status}{suffix}")
 
 
 def cmd_list(args):
@@ -352,9 +433,26 @@ def cmd_result(args):
     tid = args[0]
     entry = next((e for e in ledger_read() if e["id"] == tid), {"id": tid})
     rdir = f"{REMOTE_DEPT}/{tid}"
-    print(f"--- status: {remote_status(entry)} ---")
+    status, payload = remote_status_detail(entry)
+    print(f"--- status: {status} ---")
     r = ssh(f"cat {rdir}/last-message.txt 2>/dev/null || echo '(no final message yet)'", timeout=60)
     print(r.stdout.decode(errors="replace"))
+    if entry.get("via") == "relay" and entry.get("proc"):
+        if payload is not None:
+            print("--- diagnostics ---")
+            print(f"relay exit_code: {payload.get('exit_code', 'unknown')}")
+            stderr = payload.get("stderr") or ""
+            if stderr:
+                print("relay stderr (tail):")
+                print(stderr[-1500:])
+        diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
+        print("stderr.log (tail):")
+        print(diag.stdout.decode(errors="replace"))
+    elif entry.get("via", "ssh") == "ssh":
+        diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
+        print("--- diagnostics ---")
+        print("stderr.log (tail):")
+        print(diag.stdout.decode(errors="replace"))
     print("--- token usage ---")
     print(token_summary(tid))
 
@@ -402,7 +500,8 @@ def cmd_resume(args):
     if not remote_isdir(project_dir):
         sys.exit(f"project_dir does not exist on the Mac: {project_dir} "
                  f"(refusing to dispatch a dead task)")
-    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id)
+    dispatch_task(project_dir, decorated_prompt(ns), ns.ssh, ns.session_id, ns.model,
+                  ns.read_only, task_id=ns.task_id)
 
 
 def cmd_check(args):

@@ -1,54 +1,52 @@
 #!/usr/bin/env python3
-"""Watch review rounds: when every reviewer task for a PR has finished, resume
-the owning worker session with the queued review comments + reviewer findings.
+"""Watch review rounds and publish validated verdicts from isolated reviewers.
 
 Runs from a platform cron (every 10 min) — stateless polling via SSH, no
-long-lived process to die. This automates what was previously a manual step:
-dispatch read-only review teams, wait for them, collect their last-message.txt
-files, and resume the owning session once with everything batched.
+long-lived process to die. Reviewers run without GUI-keychain access and their
+raw output is never sent to a write-capable owner task.
 
-Seeding a round: write <state-dir>/review_rounds/<pr>.json:
+Seeding a round: write <state-dir>/review_rounds/<repo>-pr<pr>-round<n>.json:
 {
   "pr": 922,
+  "round": 2,
   "repo": "leveled-inc/leveled",
-  "owning_session": "01a0c0ec-5e74-7ef0-8108-c64384c7e5ab",
+  "head": "0123456789abcdef0123456789abcdef01234567",
   "project_dir": "/Users/shukant/.codex/worktrees/stale-engine-race",
-  "branch": "codex/audiorecorder-stale-engine-race",
   "reviewers": {"t-c6fb36": "concurrency", "t-3868f8": "simplicity", "t-4c19a0": "tests"},
-  "queued_comments": ["AudioRecorder.swift:506 -- \"Explain when this would happen\"", "..."],
-  "force_push_authorized": true,
   "created_at": "2026-09-20T22:30:00-07:00",
   "status": "collecting"
 }
-status: collecting -> dispatched (terminal) | attention (needs a human).
+status: dispatching -> collecting -> published (terminal) | attention (needs a human).
 
 Rules honored:
-- Never two workers on the same project_dir at once (ledger scan, fail closed).
-- force-push on Codex-owned PR branches is standing pre-authorized
-  (2026-09-20, Shukant's rule): the worker decides, using --force-with-lease.
-  Set "force_push_authorized": false in the round file only for a PR Shukant
-  opened himself or that belongs to someone else — then the worker commits
-  locally and reports that a force-push is needed.
+- Only an explicit zero exit permits reviewer output to be published.
+- Model output is constrained to one verdict and one exact reviewed head.
 - A reviewer task dead with no output after ~2h of polls -> status "attention".
 """
 import json
 import fcntl
+from contextlib import contextmanager
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
+from round_state import write_round
 
 CONFIG = load_config()
 CONNECTION = CONFIG.get("connection", {})
 STATE_DIR = state_dir(CONFIG)
 ROUNDS_DIR = os.path.join(STATE_DIR, "review_rounds")
-PROMPT_DIR = os.path.join(STATE_DIR, "task-prompts")
 DEPT = os.path.join(ROOT, "dept.py")
 LEDGER = os.path.join(STATE_DIR, "ledger.jsonl")
 REMOTE_DEPT = CONNECTION.get("remote_dept", "~/.codex/dept")
 LOCK_FILE = os.path.join(ROUNDS_DIR, "watcher.lock")
+# Shared with dispatchers: serializes the gap between checking a project and
+# launching the next owning-session worker.
+WATCHER_LOCK = os.path.join(state_dir(CONFIG), "worker-dispatch.lock")
+SESSIONS_FILE = os.path.join(state_dir(CONFIG), "pr_sessions.json")
 
 DRY_RUN = "--dry-run" in sys.argv
 # ~2h of missed polls at 10-min cadence before flagging a dead reviewer task.
@@ -71,8 +69,68 @@ def load_round(path):
 
 
 def save_round(path, rnd):
-    with open(path, "w") as f:
-        json.dump(rnd, f, indent=2)
+    write_round(path, rnd)
+
+
+def session_key(repo, pr):
+    """Avoid cross-repository collisions for same-number PRs."""
+    return f"{repo}#{pr}"
+
+
+def session_state(sessions, repo, pr):
+    """Read scoped state while preserving legacy numeric-key sessions."""
+    return {**sessions.get(str(pr), {}), **sessions.get(session_key(repo, pr), {})}
+
+
+def set_active_task(repo, pr, task_id):
+    try:
+        with open(SESSIONS_FILE) as f:
+            sessions = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        sessions = {}
+    key = session_key(repo, pr)
+    scoped = sessions.setdefault(key, {})
+    for name, value in sessions.pop(str(pr), {}).items():
+        scoped.setdefault(name, value)
+    scoped["active_task"] = task_id
+    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(sessions, f, indent=2)
+
+
+@contextmanager
+def worker_dispatch_lock():
+    """Serialize project-idle checks and owning-worker launches across watchers."""
+    os.makedirs(os.path.dirname(WATCHER_LOCK), exist_ok=True)
+    with open(WATCHER_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+
+
+STATUS_RE = re.compile(r":\s*(RUNNING|DONE)(?:\s+\(exit\s+([^\)]+)\))?\s*$")
+
+
+def task_status(text):
+    """Parse liveness separately from whether completion was successful."""
+    if text.strip().endswith(": MISSING"):
+        return "missing"
+    if text.strip().endswith(": DONE (pruned)"):
+        return "pruned"
+    match = STATUS_RE.search(text.strip())
+    if not match:
+        return "unknown"
+    if match.group(1) == "RUNNING":
+        return "running"
+    exit_code = match.group(2)
+    if exit_code == "0":
+        return "succeeded"
+    if exit_code and exit_code.isdigit():
+        return "failed"
+    return "terminated_unknown"
 
 
 def project_dir_busy(project_dir):
@@ -94,7 +152,9 @@ def project_dir_busy(project_dir):
         try:
             p = subprocess.run([sys.executable, DEPT, "status", tid],
                                capture_output=True, text=True, timeout=90)
-            if "RUNNING" in (p.stdout + p.stderr):
+            text = p.stdout + p.stderr
+            status = task_status(text) if p.returncode == 0 else "unknown"
+            if status in ("running", "unknown"):
                 return True
         except Exception:
             return True  # fail closed: can't verify, don't dispatch
@@ -111,10 +171,18 @@ def reviewer_states(task_ids):
         text = p.stdout + p.stderr
         if p.returncode != 0:
             raise RuntimeError(f"could not determine reviewer {tid} state: {text[:200]}")
-        if "RUNNING" in text:
+        status = task_status(text)
+        if status == "running":
             states[tid] = "running"
-        elif "DONE" in text:
+        elif status == "succeeded":
             completed.append(tid)
+        elif status in ("failed", "pruned"):
+            states[tid] = "failed"
+        elif status == "missing":
+            states[tid] = "missing"
+        elif status == "terminated_unknown":
+            raise RuntimeError(
+                f"reviewer {tid} terminated without a recorded exit: {text[:200]}")
         else:
             raise RuntimeError(f"unrecognized reviewer {tid} state: {text[:200]}")
     if not completed:
@@ -133,82 +201,90 @@ def reviewer_states(task_ids):
 
 
 def fetch_findings(task_ids):
-    """Cat every reviewer's last-message.txt in one SSH call, delimited.
-
-    Delimiter is matched with a regex anchored on newlines: a findings file
-    may not end with a trailing newline, which would glue the next delimiter
-    onto its last line and break line-based parsing.
-    """
-    script = "; ".join(
-        f'printf "\\n@@@{tid}@@@\\n"; cat {REMOTE_DEPT}/{tid}/last-message.txt'
-        for tid in task_ids
-    )
-    out = mac(script)
-    parts = re.split(r"\n@@@([A-Za-z0-9_-]+)@@@\n", out)
-    # parts: [pre, tid1, body1, tid2, body2, ...]
+    """Fetch each reviewer output independently so content cannot reframe it."""
     findings = {}
-    for i in range(1, len(parts) - 1, 2):
-        findings[parts[i]] = parts[i + 1].strip()
+    for tid in task_ids:
+        if not re.fullmatch(r"t-[0-9a-f]{6}", tid):
+            raise RuntimeError(f"invalid reviewer task id: {tid}")
+        findings[tid] = mac(
+            f"cat {REMOTE_DEPT}/{tid}/last-message.txt").strip()
     return findings
 
 
-PROMPT_TEMPLATE = """# PR #{pr} revision round — address queued review comments + review-team findings
-
-Context: PR #{pr} ({repo}), branch `{branch}`, worktree `{project_dir}`.
-You own this PR's revisions.
-
-## Queued review comments (posted by Shukant on the PR — ADDRESS each, don't just report)
-{comments}
-
-For each: make the code/doc/test change that resolves it AND post a threaded reply
-to that comment on the PR. Every threaded reply MUST start with the marker line
-`> \U0001F916 Codex (AI assistant)` on its own line (replies post as ShukantPal via
-shared gh auth; without the marker they read as his own words).
-
-Staleness guard: before working, check the PR — if any queued comment above is
-already addressed (replied to, or resolved in the code), skip it and say so.
-
-## Review-team findings (address all of these too — verify each against the actual code before changing anything)
-{findings}
-
-## Push authorization
-{push_rule}
-
-## Done criteria
-All of the above addressed, tests updated and passing, required CI green on the
-latest head, PR updated, threaded replies posted to each queued comment with the
-marker line. Then report the PR URL and a per-comment summary of what changed.
-"""
+VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$", re.MULTILINE)
+HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 
 
-def build_prompt(rnd, findings):
-    comments = "\n".join(f"{i+1}. {c}" for i, c in enumerate(rnd.get("queued_comments", [])))
-    ftext = "\n\n".join(
-        f"### {label} ({tid})\n{findings.get(tid, '(no output captured)')}"
-        for tid, label in rnd["reviewers"].items()
-    )
-    if rnd.get("force_push_authorized", True):
-        push_rule = ("Force-push with `--force-with-lease` on this PR branch is standing "
-                     "pre-authorized (Shukant's rule, 2026-09-20): decide yourself whether "
-                     "the revision needs it. Re-verify the PR shows only this task's work "
-                     "afterward.")
-    else:
-        push_rule = ("Do NOT force-push. If the revision requires rewriting pushed history, "
-                     "commit locally and report that a force-push is needed so Shukant can "
-                     "authorize it explicitly.")
-    return PROMPT_TEMPLATE.format(pr=rnd["pr"], repo=rnd.get("repo", ""),
-                                  branch=rnd.get("branch", ""),
-                                  project_dir=rnd["project_dir"],
-                                  comments=comments or "(none queued)", findings=ftext,
-                                  push_rule=push_rule)
+def validated_verdict(text, head):
+    """Accept one unambiguous pair of constrained fields from advisory output."""
+    verdicts = VERDICT_RE.findall(text)
+    reviewed_heads = HEAD_RE.findall(text)
+    if len(verdicts) != 1 or len(reviewed_heads) != 1:
+        return None
+    if reviewed_heads[0].lower() != head.lower():
+        return None
+    return verdicts[0].upper()
+
+
+def verdict_body(lens, head, verdict, task_id, round_number, round_lenses):
+    manifest = ",".join(sorted(round_lenses))
+    return (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
+            f"VERDICT: {verdict}\nHEAD: {head}\nROUND: {round_number}\n"
+            f"LENSES: {manifest}\n\n"
+            "ATTESTATION: MODEL_ADVISORY\n\n"
+            f"Validated read-only reviewer task: {task_id}. An APPROVE verdict "
+            "requires a formal review from an allowlisted human before it can "
+            "satisfy the gate.")
+
+
+def verdict_already_posted(repo, pr, body):
+    output = mac(f"gh pr view {int(pr)} --repo {shlex.quote(repo)} --json comments")
+    comments = json.loads(output).get("comments", [])
+    return any((c.get("author") or {}).get("login") == "ShukantPal" and
+               c.get("body") == body for c in comments)
+
+
+def post_verdict(repo, pr, lens, head, verdict, task_id, round_number,
+                 round_lenses):
+    body = verdict_body(lens, head, verdict, task_id, round_number,
+                        round_lenses)
+    if verdict_already_posted(repo, pr, body):
+        return False
+    mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
+    return True
 
 
 def process_round(path):
+    return _process_round_locked(path)
+
+
+def _process_round_locked(path):
+    # Reload only after acquiring the shared lock: another watcher may have
+    # completed this round while this process was waiting to run.
     rnd = load_round(path)
-    if rnd.get("status") != "collecting":
+    if rnd.get("status") not in ("dispatching", "collecting"):
         return f"#{rnd['pr']}: status={rnd.get('status')}, skipping"
     tids = list(rnd["reviewers"].keys())
     states = reviewer_states(tids)
+    if rnd.get("status") == "dispatching":
+        dispatch_misses = rnd.setdefault("dispatch_misses", {})
+        missing = [t for t in tids if states.get(t) == "missing"]
+        for tid in tids:
+            dispatch_misses[tid] = (dispatch_misses.get(tid, 0) + 1
+                                    if tid in missing else 0)
+        abandoned = [t for t in missing if dispatch_misses[t] >= MISS_LIMIT]
+        if abandoned:
+            rnd["status"] = "attention"
+            rnd["attention_reason"] = (
+                "reviewer launch incomplete after persisted intent: " +
+                ", ".join(abandoned))
+            save_round(path, rnd)
+            return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+        if missing:
+            save_round(path, rnd)
+            return f"#{rnd['pr']}: waiting for persisted reviewer launch intent"
+        rnd["status"] = "collecting"
+        rnd.pop("dispatch_misses", None)
     misses = rnd.setdefault("misses", {})
 
     dead = [t for t in tids if states.get(t) == "dead-empty"]
@@ -223,56 +299,45 @@ def process_round(path):
         rnd["attention_reason"] = f"reviewer tasks dead with no output: {', '.join(worst)}"
         save_round(path, rnd)
         return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+    failed = [t for t in tids if states.get(t) == "failed"]
+    if failed:
+        rnd["status"] = "attention"
+        rnd["attention_reason"] = f"reviewer tasks exited unsuccessfully: {', '.join(failed)}"
+        save_round(path, rnd)
+        return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
     if any(states.get(t) != "done" for t in tids):
         save_round(path, rnd)
         pend = [f"{t}={states.get(t, '?')}" for t in tids]
         return f"#{rnd['pr']}: waiting ({', '.join(pend)})"
 
-    # All reviewers done — collect findings and dispatch.
-    if project_dir_busy(rnd["project_dir"]):
-        return f"#{rnd['pr']}: all reviewers done but {rnd['project_dir']} busy, will retry"
+    # All reviewers done — publish only validated verdict fields. Never pass
+    # raw model output to the privileged owner session: reviewer output may be
+    # adversarial even when the review sandbox itself is read-only.
     findings = fetch_findings(tids)
-    prompt = build_prompt(rnd, findings)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    ppath = os.path.join(PROMPT_DIR, f"{rnd['pr']}-review-round-{ts}.md")
-    os.makedirs(PROMPT_DIR, exist_ok=True)
-    with open(ppath, "w") as f:
-        f.write(prompt)
-
-    if DRY_RUN:
-        return (f"#{rnd['pr']}: DRY RUN — would resume session {rnd['owning_session'][:8]} "
-                f"with prompt {ppath} ({len(prompt)} chars, {len(findings)} findings)")
-
-    p = subprocess.run([sys.executable, DEPT, "resume", rnd["project_dir"],
-                        rnd["owning_session"], ppath],
-                       capture_output=True, text=True, timeout=300)
-    out = (p.stdout + p.stderr).strip()
-    task_id = None
-    for line in out.splitlines():
-        if line.startswith("resumed "):
-            task_id = line.split()[1]
-    if p.returncode != 0 or not task_id:
-        # Fall back to a fresh task so the findings don't rot.
-        p2 = subprocess.run([sys.executable, DEPT, "start", rnd["project_dir"], ppath],
-                            capture_output=True, text=True, timeout=300)
-        out2 = (p2.stdout + p2.stderr).strip()
-        for line in out2.splitlines():
-            if line.startswith("started "):
-                task_id = line.split()[1]
-        if p2.returncode != 0 or not task_id:
+    verdicts = {}
+    for tid, lens in rnd["reviewers"].items():
+        verdict = validated_verdict(findings.get(tid, ""), rnd["head"])
+        if not verdict:
             rnd["status"] = "attention"
-            rnd["attention_reason"] = f"resume+start both failed: {(out + out2)[:300]}"
+            rnd["attention_reason"] = f"reviewer {tid} did not return a valid verdict for {rnd['head']}"
             save_round(path, rnd)
-            return f"#{rnd['pr']}: ATTENTION — dispatch failed"
-        log_extra = " (fresh task; resume failed)"
-    else:
-        log_extra = ""
-    rnd["status"] = "dispatched"
-    rnd["dispatched_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    rnd["dispatched_task"] = task_id
-    rnd["prompt_file"] = ppath
+            return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+        verdicts[lens] = (verdict, tid)
+    if DRY_RUN:
+        return f"#{rnd['pr']}: DRY RUN — would publish {len(verdicts)} validated verdicts"
+    posted = set(rnd.get("posted_lenses", []))
+    round_lenses = tuple(rnd["reviewers"].values())
+    for lens, (verdict, tid) in verdicts.items():
+        if lens not in posted:
+            post_verdict(rnd["repo"], rnd["pr"], lens, rnd["head"], verdict,
+                         tid, rnd["round"], round_lenses)
+            posted.add(lens)
+            rnd["posted_lenses"] = sorted(posted)
+            save_round(path, rnd)
+    rnd["status"] = "published"
+    rnd["published_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     save_round(path, rnd)
-    return f"#{rnd['pr']}: resumed owning session as {task_id}{log_extra}"
+    return f"#{rnd['pr']}: published validated review verdicts; owner must inspect PR findings manually"
 
 
 def main():

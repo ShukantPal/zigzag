@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
+from review_round_watcher import (project_dir_busy, set_active_task, session_key,
+                                  session_state, task_status, worker_dispatch_lock)
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -95,15 +97,15 @@ def dept_status_text(tid):
     try:
         p = subprocess.run([sys.executable, DEPT, "status", tid],
                            capture_output=True, text=True, timeout=60)
-        return p.stdout + p.stderr
+        return (p.stdout + p.stderr) if p.returncode == 0 else None
     except Exception:
-        return ""
+        return None
 
 
-def save_sessions(sessions):
-    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(sessions, f, indent=2)
+def task_finished(status):
+    """Release dispatch for confirmed termination, regardless of known exit."""
+    return status is not None and task_status(status) in (
+        "succeeded", "failed", "terminated_unknown", "pruned", "missing")
 
 
 def pr_task_running(pr):
@@ -113,10 +115,11 @@ def pr_task_running(pr):
     ledger prompt_head scan is a fallback. The ledger's status field is
     write-once, so verify via `dept.py status` (relay truth)."""
     try:
-        sess = load_sessions().get(str(pr), {})
+        sess = session_state(load_sessions(), REPO, pr)
         tid = sess.get("active_task")
         if tid:
-            if "RUNNING" in dept_status_text(tid):
+            status = dept_status_text(tid)
+            if not task_finished(status):
                 return tid
     except Exception:
         pass
@@ -136,7 +139,8 @@ def pr_task_running(pr):
     for e in entries:
         tid = e.get("id")
         try:
-            if "RUNNING" in dept_status_text(tid):
+            status = dept_status_text(tid)
+            if not task_finished(status):
                 return tid
         except Exception:
             return tid  # fail closed: don't dispatch if we can't verify
@@ -203,7 +207,8 @@ def load_watermark():
 def save_watermark(wm):
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(WATERMARK, "w") as f:
-        json.dump({**wm, "seen": sorted(set(wm.get("seen", [])), key=str)}, f, indent=2)
+        json.dump({**wm, "seen": sorted(set(wm.get("seen", [])), key=str)},
+                  f, indent=2)
 
 
 def pr_head_branch(n):
@@ -297,7 +302,7 @@ file exactly as he saw it.
    Some items are full review BODIES, not inline comments — they have NO REST reaction
    endpoint. For those, get the node id then use GraphQL:
    `gh api repos/leveled-inc/leveled/pulls/<pr>/reviews/<id> --jq .node_id`
-   `gh api graphql -F subjectId=<node_id> -F content=EYES -f 'query=mutation($subjectId:ID!,$content:ReactionContent!){addReaction(input:{subjectId:$subjectId,content:$content}){reaction{content}}}'`
+   `gh api graphql -F subjectId=<node_id> -F content=EYES -f 'query=mutation($subjectId:ID!,$content:ReactionContent!){{addReaction(input:{{subjectId:$subjectId,content:$content}}){{reaction{{content}}}}}}'`
    (The watcher already attempts this when it dispatches, so eyes may already be on.)
    If a comment already carries a 🚀 (rocket) reaction from this bot account, it was queued
    behind earlier work — delete the rocket first (list reactions, find the rocket, DELETE
@@ -403,7 +408,7 @@ def dispatch(pr, branch, new_comments, parent_bodies):
         lines.append(entry)
     prompt = PROMPT_TMPL.format(pr=pr, branch=branch, comments="\n".join(lines))
     sessions = load_sessions()
-    sess = sessions.get(str(pr), {})
+    sess = session_state(sessions, REPO, pr)
     session_id = sess.get("session_id")
     if session_id:
         prompt = ("NOTE: you are CONTINUING your existing session on this PR "
@@ -414,7 +419,16 @@ def dispatch(pr, branch, new_comments, parent_bodies):
     # Queued comments get a 🚀 (rocket) reaction so Shukant can see they're
     # lined up; the worker swaps it for 👀 when it starts on them.
     # (GitHub's reaction API has no hourglass — rocket is the closest "queued".)
+    with worker_dispatch_lock() as acquired:
+        if not acquired:
+            return None, "skipped: another project worker is dispatching"
+        return _dispatch_locked(pr, session_id, prompt, new_comments)
+
+
+def _dispatch_locked(pr, session_id, prompt, new_comments):
     running = pr_task_running(pr)
+    if not running and project_dir_busy(PROJECT_DIR):
+        running = "another project worker"
     if running:
         for c in new_comments:
             try:
@@ -451,10 +465,7 @@ def dispatch(pr, branch, new_comments, parent_bodies):
     if task_id:
         # Record the live worker so pr_task_running() can serialize on it
         # deterministically (ledger prompt_head matching is only a fallback).
-        sessions = load_sessions()
-        sess = sessions.setdefault(str(pr), {})
-        sess["active_task"] = task_id
-        save_sessions(sessions)
+        set_active_task(REPO, pr, task_id)
     return task_id, out
 
 

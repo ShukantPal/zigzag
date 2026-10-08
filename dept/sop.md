@@ -47,32 +47,43 @@ task's changes.
    you have not checked this way — checking the local branch is NOT enough.
 6. **Review team — mandatory oversight** (Shukant's standing rule, 2026-09-20:
    no single Codex ships alone — one worker's blind spots are the team's catch).
-   After your final code push with required CI green, dispatch a review team of
-   3 INDEPENDENT Codex tasks via fresh `dept.py start` calls — never your own
-   subagents, never yourself re-checking. Each reviewer gets: the PR number +
-   repo, the branch, the exact head SHA to review, and ONE lens:
+   After your final code push with required CI green, use
+   `dispatch_review_round.py` to dispatch 3 INDEPENDENT read-only Codex tasks
+   via fresh `dept.py start` calls — never your own subagents, never yourself
+   re-checking. Each reviewer gets the PR number, repo, exact head SHA, and ONE
+   lens:
    - correctness: logic bugs, concurrency/races, error handling, API misuse
    - simplicity: over-engineering, dead code, consistency with repo patterns
    - tests: coverage gaps, edge cases, flaky/async patterns
    (+ a 4th, security, if the PR touches auth, credentials, network, crypto,
    or PII — then the team is 4.)
-   Reviewers work read-only: they check out the PR head in their own worktree
-   (or review the diff) and MUST NOT push. Each reviewer finishes by posting a
-   top-level PR comment in exactly this format:
+   Reviewers work read-only without GitHub credentials: they review the exact
+   checked-out diff, MUST NOT push or invoke network tools, and finish with
+   these two machine-readable lines exactly once, plus concise findings when
+   changes are requested:
+     VERDICT: APPROVE | CHANGES REQUESTED
+     HEAD: <full 40-char head sha reviewed>
+   The trusted `review_round_watcher.py` controller validates successful task
+   exit plus those fields, then publishes a top-level advisory comment:
      > 🤖 Codex (AI assistant) — [<lens>] review verdict
      VERDICT: APPROVE | CHANGES REQUESTED
      HEAD: <full 40-char head sha reviewed>
-     <2–5 line summary; findings when CHANGES REQUESTED>
-   (Comments land as ShukantPal via shared gh auth — the marker line marks them
-   as the review team's, and the comment watcher skips marker comments, so
-   verdicts never re-dispatch. Do NOT use `gh pr review --approve`: formal
-   approvals would count toward branch protection as ShukantPal.)
+     ROUND: <positive review-round number>
+     LENSES: <comma-separated lenses seeded for this round>
+     ATTESTATION: MODEL_ADVISORY
+   Comments land as ShukantPal via shared gh auth; the marker prevents feedback
+   re-dispatch, but that shared identity is never accepted as human proof.
+   Inspect a CHANGES REQUESTED task's local result before revising; raw reviewer
+   prose is never injected automatically into a write-capable owner session.
    Address every CHANGES REQUESTED finding, push, then re-dispatch the reviewers
    on the new head for a fresh verdict.
    **Approval gate**: the PR is review-ready ONLY when required CI is green on
-   the latest head AND every required lens shows a latest verdict of APPROVE
-   whose HEAD equals the PR's current head. Stale approvals (older head) do not
-   count. The orchestrator verifies with
+   the latest head AND the newest persisted review round is complete and every
+   lens it seeded shows a verdict of APPROVE
+   whose HEAD equals the PR's current head, AND an actor configured in
+   `approval_gate.human_review_actors` has submitted a formal APPROVED review on
+   that exact head. Shared automation actors and stale approvals do not count.
+   The orchestrator verifies with
    `python3 dept/approval_gate.py <owner/repo> <pr>`
    before the PR is reported — do not claim review-ready until the gate passes.
 7. **CI green**: watch the PR's checks (`gh pr checks --watch`) and fix

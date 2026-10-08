@@ -18,14 +18,23 @@ management layer that decides what to run.
   Codex Desktop app) with a new prompt; `status` / `list` / `result` /
   `tokens` / `check` / `kill` inspect and manage tasks. Task state is kept
   in the configured state directory (local runtime state, gitignored).
+  `start` and `resume` accept `--model <name>` for a per-task override and
+  `--read-only` for a sandboxed task without approval bypass.
+- **`codex-launch.sh`** — the Mac GUI-session relay wrapper. It reads each
+  task's optional `model.txt` override and writes wrapper diagnostics to the
+  task directory before invoking `codex exec`.
 - **`dept.py status`** — with no task id (or with status-view options), this
   is the read-only live view of Zigzag execution state. It reads the relay's
   `GET /v1/agents?state=running` and cursor event endpoint plus the Mac-local
   durable audit directory beside `events.json`; it never invokes a control
   endpoint or reads agent output. Use `--once` for a non-interactive snapshot.
 - **`approval_gate.py`** — the merge gate for Muse-owned PRs: required CI
-  green on the latest head **and** a 3-lens review team (correctness,
-  simplicity, tests) each showing APPROVE on that head. Stale-head approvals
+  green on the latest head **and** every lens declared by the latest review
+  round (correctness, simplicity, tests, plus security when seeded) showing
+  APPROVE on that head, plus a formal
+  current-head approval from a separately authenticated human reviewer.
+  The newest persisted seeded round is authoritative even before its comments
+  publish; stale-head, lower-round verdicts and shared-automation approvals
   don't count.
 - **`pr_comment_watcher.py`** — stateless poller (runs on a 5-minute cron):
   watches listed PRs for new review comments / review bodies from Shukant
@@ -36,8 +45,17 @@ management layer that decides what to run.
   new feedback with a marked reply (the Drive API has no emoji reactions), and
   resumes the document's owning session from a Drive-scoped service-account
   token minted with the GUI-login keychain key.
-- **`review_round_watcher.py`** — when a seeded 3-lens review round finishes,
-  resumes the owning worker session with the reviewers' findings batched.
+- **`review_round_watcher.py`** — validates and publishes constrained verdicts
+  from a seeded 3-lens review round. It never forwards raw reviewer output into
+  a write-capable owner session; model verdicts are marked advisory so an
+  injected reviewer cannot manufacture a gate-satisfying approval. A distinct
+  actor listed in `approval_gate.human_review_actors` must submit a formal
+  GitHub approval after inspecting the findings.
+- **`dispatch_review_round.py`** — seeds independent read-only correctness,
+  simplicity, and tests reviewers over non-GUI SSH (no keychain). Each round
+  uses an immutable archive and diff pinned to the reviewed commit, so owner
+  edits cannot change files under review. PR metadata is excluded from prompts,
+  and trusted watcher code publishes only validated verdict fields.
 - **`jules_pr_reviewer.py`** — dispatches a Codex review task for each new
   Jules-authored PR in `leveled-inc/leveled` (Jules owns revisions there;
   Codex reviews only).
