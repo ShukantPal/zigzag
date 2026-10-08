@@ -1,5 +1,6 @@
 use super::{Json, Server, exec, kill_process_group, new_execution_id, relay_event, spawn_proc};
 use regex::Regex;
+use relay_core::AgentRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -264,6 +265,8 @@ struct ReviewRound {
     phase: RoundPhase,
     reviewers: BTreeMap<String, ReviewerState>,
     verdicts: BTreeMap<String, AdmittedVerdict>,
+    #[serde(default)]
+    excluded_comment_ids: BTreeSet<String>,
     owner: Option<OwnerContext>,
     owner_agent_id: Option<String>,
     gate_reasons: Vec<String>,
@@ -429,6 +432,7 @@ fn supersede_rounds_for_head(
                     .values()
                     .filter_map(|reviewer| reviewer.agent_id.clone()),
             );
+            agents.extend(round.owner_agent_id.clone());
         }
         if key != current_key && !matches!(round.phase, RoundPhase::Merged | RoundPhase::Superseded)
         {
@@ -448,6 +452,7 @@ fn mark_round_merged(state: &mut DurableState, key: &str) -> Vec<String> {
         .values()
         .filter_map(|reviewer| reviewer.agent_id.clone())
         .collect();
+    agents.extend(round.owner_agent_id.clone());
     agents.sort();
     round.phase = RoundPhase::Merged;
     agents
@@ -499,14 +504,22 @@ fn discover(
                 store.state.rounds.values().any(|round| {
                     round.repository == policy.repository && round.pull_request == number
                 });
+            let prior_generation = store.state.rounds.get(&key).map(|round| round.generation);
+            let generation = prior_generation.map_or(1, |generation| generation + 1);
+            // Exact-head keys can recur after a force-push A→B→A. In
+            // that case, watermark every comment visible when the new
+            // generation begins so an approval from the old A generation can
+            // never be inherited.
+            let excluded_comment_ids = prior_generation.map_or_else(BTreeSet::new, |_| {
+                snapshot
+                    .comments
+                    .iter()
+                    .map(|comment| comment.id.clone())
+                    .collect()
+            });
             let superseded_agents =
                 supersede_rounds_for_head(&mut store.state, &policy.repository, number, &key);
             let owner = find_owner_context(&policy.repository, &snapshot.head_ref_name);
-            let generation = store
-                .state
-                .rounds
-                .get(&key)
-                .map_or(1, |round| round.generation + 1);
             store.state.rounds.insert(
                 key.clone(),
                 ReviewRound {
@@ -518,6 +531,7 @@ fn discover(
                     phase: RoundPhase::Dispatching,
                     reviewers: BTreeMap::new(),
                     verdicts: BTreeMap::new(),
+                    excluded_comment_ids,
                     owner,
                     owner_agent_id: None,
                     gate_reasons: Vec::new(),
@@ -601,12 +615,7 @@ fn dispatch_missing_reviewers(
         if existing
             .as_ref()
             .is_some_and(|reviewer| reviewer.agent_id.is_none())
-            && let Some(agent) = server
-                .supervisor
-                .registry
-                .list(None, Some(&task_id))
-                .into_iter()
-                .max_by(|left, right| left.started_at.cmp(&right.started_at))
+            && let Some(agent_id) = latest_agent_for_task(&server.supervisor.registry, &task_id)
         {
             store
                 .state
@@ -616,7 +625,7 @@ fn dispatch_missing_reviewers(
                 .reviewers
                 .get_mut(lens)
                 .expect("planned reviewer exists")
-                .agent_id = Some(agent.id);
+                .agent_id = Some(agent_id);
             store.save()?;
             continue;
         }
@@ -723,7 +732,12 @@ fn poll_reviews(
             }
             continue;
         }
-        let verdicts = latest_verdicts(policy, &expected_head, &snapshot.comments);
+        let verdicts = latest_verdicts(
+            policy,
+            &expected_head,
+            &snapshot.comments,
+            &store.state.rounds[&key].excluded_comment_ids,
+        );
         {
             let round = store.state.rounds.get_mut(&key).expect("round exists");
             round.verdicts = verdicts;
@@ -912,12 +926,16 @@ fn latest_verdicts(
     policy: &RepositoryPolicy,
     head: &str,
     comments: &[Comment],
+    excluded_comment_ids: &BTreeSet<String>,
 ) -> BTreeMap<String, AdmittedVerdict> {
     let marker = Regex::new(r"^> 🤖 Codex \(AI assistant\) — \[([a-z]+)\] review verdict$")
         .expect("verdict marker regex is valid");
     let mut candidates: BTreeMap<String, (String, String, Option<AdmittedVerdict>)> =
         BTreeMap::new();
     for comment in comments {
+        if excluded_comment_ids.contains(&comment.id) {
+            continue;
+        }
         if comment.author.as_ref().map(|author| author.login.as_str())
             != Some(policy.trusted_verdict_identity.as_str())
         {
@@ -1237,12 +1255,13 @@ fn resume_owner(
     key: &str,
     findings: &[(String, Vec<String>)],
 ) -> Result<(), String> {
-    let (repository, number, head, owner, already_dispatched) = {
+    let (repository, number, head, generation, owner, already_dispatched) = {
         let round = &store.state.rounds[key];
         (
             round.repository.clone(),
             round.pull_request,
             round.head.clone(),
+            round.generation,
             round.owner.clone(),
             round.owner_agent_id.is_some(),
         )
@@ -1270,7 +1289,7 @@ fn resume_owner(
     {
         return Ok(());
     }
-    let task_id = owner_task_id(&repository, number, &head);
+    let task_id = owner_task_id(&repository, number, &head, generation);
     store.save()?;
     let prompt = owner_prompt(&repository, number, &head, findings);
     let agent_id = spawn_codex_task(
@@ -1298,14 +1317,8 @@ fn spawn_codex_task(
     prompt: &str,
     review_material: Option<&[u8]>,
 ) -> Result<String, String> {
-    if let Some(existing) = server
-        .supervisor
-        .registry
-        .list(None, Some(task_id))
-        .into_iter()
-        .max_by(|left, right| left.started_at.cmp(&right.started_at))
-    {
-        return Ok(existing.id);
+    if let Some(existing_id) = latest_agent_for_task(&server.supervisor.registry, task_id) {
+        return Ok(existing_id);
     }
     let root = review_task_dir(task_id)?;
     fs::create_dir_all(&root).map_err(|error| format!("could not create review task: {error}"))?;
@@ -1499,14 +1512,28 @@ fn session_from_events(path: &Path) -> Option<String> {
     None
 }
 
-fn kill_agents(server: &Server, agent_ids: &[String]) {
+fn latest_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Option<String> {
+    registry
+        .list(None, Some(task_id))
+        .into_iter()
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
+        .map(|agent| agent.id)
+}
+
+fn kill_agents_with(registry: &AgentRegistry, agent_ids: &[String], mut kill: impl FnMut(i32)) {
     for agent_id in agent_ids {
-        if let Some(agent) = server.supervisor.registry.get(agent_id)
+        if let Some(agent) = registry.get(agent_id)
             && matches!(agent.state.as_str(), "running" | "orphaned")
         {
-            let _ = kill_process_group(agent.process_group);
+            kill(agent.process_group);
         }
     }
+}
+
+fn kill_agents(server: &Server, agent_ids: &[String]) {
+    kill_agents_with(&server.supervisor.registry, agent_ids, |process_group| {
+        let _ = kill_process_group(process_group);
+    });
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1587,9 +1614,9 @@ fn verdict_id(
     )
 }
 
-fn owner_task_id(repository: &str, number: u64, head: &str) -> String {
+fn owner_task_id(repository: &str, number: u64, head: &str, generation: u64) -> String {
     format!(
-        "review-owner-{}-{number}-{}",
+        "review-owner-{}-{number}-{}-g{generation}",
         stable_identifier(repository, 40),
         stable_fragment(head, 12)
     )
@@ -1692,6 +1719,33 @@ review_loop:
                     status: Some("COMPLETED".to_owned()),
                 },
             ],
+        }
+    }
+
+    fn agent(id: &str, task_id: &str, process_group: i32, state: &str) -> relay_core::AgentRecord {
+        relay_core::AgentRecord {
+            id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            execution_id: format!("execution-{id}"),
+            leader_pid: process_group,
+            process_group,
+            started_at: format!("2026-01-01T00:00:{process_group:02}Z"),
+            deadline_at: None,
+            command: "codex exec".to_owned(),
+            state: state.to_owned(),
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: false,
+            redacted: false,
+            stdout_next: 0,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
         }
     }
 
@@ -1833,7 +1887,7 @@ review_loop:
                 id: "2".to_owned(),
             },
         ];
-        let verdicts = latest_verdicts(&policy(), &head, &comments);
+        let verdicts = latest_verdicts(&policy(), &head, &comments, &BTreeSet::new());
         assert_eq!(verdicts.len(), 1);
         assert!(verdicts.contains_key("tests"));
 
@@ -1851,7 +1905,12 @@ review_loop:
             created_at: "2026-01-03".to_owned(),
             id: "3".to_owned(),
         });
-        assert!(latest_verdicts(&limited, &head, &with_oversized_latest).is_empty());
+        assert!(
+            latest_verdicts(&limited, &head, &with_oversized_latest, &BTreeSet::new(),).is_empty()
+        );
+
+        let excluded = BTreeSet::from(["2".to_owned(), "3".to_owned()]);
+        assert!(latest_verdicts(&policy(), &head, &with_oversized_latest, &excluded).is_empty());
     }
 
     #[test]
@@ -1898,6 +1957,7 @@ review_loop:
                 },
             )]),
             verdicts: BTreeMap::new(),
+            excluded_comment_ids: BTreeSet::new(),
             owner: None,
             owner_agent_id: None,
             gate_reasons: Vec::new(),
@@ -1913,6 +1973,11 @@ review_loop:
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
         let expected_task_id = reviewer_task_id("owner/repo", 7, &head, 1, "tests", 1);
+        let registry_path = path.with_extension("agents");
+        let registry = AgentRegistry::open(&registry_path).unwrap();
+        registry
+            .register(agent("existing-agent", &expected_task_id, 41, "running"))
+            .unwrap();
         let mut store = StateStore::open(path.clone()).unwrap();
         store.state.rounds.insert(
             key.clone(),
@@ -1933,9 +1998,16 @@ review_loop:
             round.reviewers["tests"].attempt,
         );
         assert_eq!(recovered_task_id, expected_task_id);
-        round.reviewers.get_mut("tests").unwrap().agent_id = Some("agent-a".to_owned());
+        let recovered_agent = latest_agent_for_task(&registry, &recovered_task_id).unwrap();
+        round.reviewers.get_mut("tests").unwrap().agent_id = Some(recovered_agent);
         assert_eq!(round.reviewers["tests"].attempt, 1);
+        assert_eq!(
+            round.reviewers["tests"].agent_id.as_deref(),
+            Some("existing-agent")
+        );
+        assert_eq!(registry.list(None, Some(&expected_task_id)).len(), 1);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]
@@ -1957,8 +2029,10 @@ review_loop:
                 ),
             ]),
         };
+        state.rounds.get_mut(&key_a).unwrap().owner_agent_id = Some("owner-a".to_owned());
+        state.rounds.get_mut(&key_b).unwrap().owner_agent_id = Some("owner-b".to_owned());
         let agents = supersede_rounds_for_head(&mut state, "owner/repo", 7, &key_a);
-        assert_eq!(agents, ["agent-a", "agent-b"]);
+        assert_eq!(agents, ["agent-a", "agent-b", "owner-a", "owner-b"]);
         assert_eq!(state.rounds[&key_b].phase, RoundPhase::Superseded);
         let generation = state.rounds[&key_a].generation + 1;
         state.rounds.insert(
@@ -1977,6 +2051,7 @@ review_loop:
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
         let mut round = test_round(&head, RoundPhase::Reviewing, Some("agent-a"));
+        round.owner_agent_id = Some("owner-agent".to_owned());
         round.reviewers.insert(
             "security".to_owned(),
             ReviewerState {
@@ -1989,8 +2064,42 @@ review_loop:
             rounds: BTreeMap::from([(key.clone(), round)]),
         };
         let agents = mark_round_merged(&mut state, &key);
-        assert_eq!(agents, ["agent-a", "agent-b"]);
+        assert_eq!(agents, ["agent-a", "agent-b", "owner-agent"]);
         assert_eq!(state.rounds[&key].phase, RoundPhase::Merged);
+        assert_ne!(
+            owner_task_id("owner/repo", 7, &head, 1),
+            owner_task_id("owner/repo", 7, &head, 2)
+        );
+    }
+
+    #[test]
+    fn cleanup_invokes_the_process_killer_for_running_and_orphaned_agents() {
+        let path = std::env::temp_dir().join(format!(
+            "zigzag-review-agents-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry = AgentRegistry::open(&path).unwrap();
+        registry
+            .register(agent("running", "task", 41, "running"))
+            .unwrap();
+        registry
+            .register(agent("orphaned", "task", 42, "orphaned"))
+            .unwrap();
+        registry
+            .register(agent("finished", "task", 43, "finished"))
+            .unwrap();
+        let mut killed = Vec::new();
+        kill_agents_with(
+            &registry,
+            &[
+                "running".to_owned(),
+                "orphaned".to_owned(),
+                "finished".to_owned(),
+            ],
+            |process_group| killed.push(process_group),
+        );
+        assert_eq!(killed, [41, 42]);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
