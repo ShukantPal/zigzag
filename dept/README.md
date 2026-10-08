@@ -40,11 +40,13 @@ management layer that decides what to run.
   new feedback with a marked reply (the Drive API has no emoji reactions), and
   resumes the document's owning session from a Drive-scoped service-account
   token minted with the GUI-login keychain key.
-- **`review_round_watcher.py`** — when a seeded 3-lens review round finishes,
-  resumes the owning worker session with the reviewers' findings batched.
-- **`dispatch_review_round.py`** — seeds the independent correctness,
-  simplicity, and tests reviewers for a PR; their prompts include the PR body
-  as design rationale and use explicit repository scoping.
+- **`review_round_watcher.py`** — validates and publishes constrained verdicts
+  from a seeded 3-lens review round. It never forwards raw reviewer output into
+  a write-capable owner session; the owner inspects findings on the PR.
+- **`dispatch_review_round.py`** — seeds independent read-only correctness,
+  simplicity, and tests reviewers from the checked-out diff over non-GUI SSH
+  (no keychain). PR metadata is excluded from their prompts and trusted watcher
+  code publishes only validated verdict fields.
 - **`jules_pr_reviewer.py`** — dispatches a Codex review task for each new
   Jules-authored PR in `leveled-inc/leveled` (Jules owns revisions there;
   Codex reviews only).

@@ -2,7 +2,7 @@
 """Codex department manager: dispatch and track background Codex agents on Shukant's Mac.
 
 Usage:
-  dept.py start <project-dir> <prompt-file> [--model <name>]
+  dept.py start <project-dir> <prompt-file> [--model <name>] [--read-only]
   dept.py resume [project-dir] <session-id> <prompt-file> [--model <name>]
       (project-dir optional: resolved from the session file's recorded cwd)
   dept.py status <task-id>
@@ -161,6 +161,8 @@ def dispatch_args(args, resume=False):
     ap.add_argument("--ssh", action="store_true",
                     help="launch over SSH+nohup instead of the relay (no keychain access)")
     ap.add_argument("--model", help="override the Codex model for this task")
+    ap.add_argument("--read-only", action="store_true",
+                    help="run Codex in its read-only sandbox without approval bypass")
     return ap.parse_args(args)
 
 
@@ -181,7 +183,7 @@ def decorated_prompt(ns):
     return prompt
 
 
-def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None):
+def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_only=False):
     """Store a fully-decorated task payload before either launch transport."""
     rdir = f"{REMOTE_DEPT}/{tid}"
     r = ssh(f"mkdir -p {rdir} && cat > {rdir}/prompt.txt",
@@ -193,13 +195,15 @@ def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None):
         files += f" && printf %s {shq(session_id)} > {rdir}/resume.txt"
     if model:
         files += f" && printf %s {shq(model)} > {rdir}/model.txt"
+    if read_only:
+        files += f" && : > {rdir}/read-only.txt"
     r = ssh(files, timeout=60)
     if r.returncode != 0:
         sys.exit(f"ssh dir write failed: {r.stderr.decode()[-500:]}")
     return rdir
 
 
-def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
+def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None, read_only=False):
     """Launch start/resume through one preparation, transport, and ledger path."""
     tid = "t-" + uuid.uuid4().hex[:6]
     relay_path = asset_path("relay-announce.md")
@@ -207,7 +211,7 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
         with open(relay_path, "rb") as f:
             relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
-    rdir = setup_task_dir(tid, project_dir, prompt, session_id, model)
+    rdir = setup_task_dir(tid, project_dir, prompt, session_id, model, read_only)
     action = "resumed" if session_id else "started"
     if use_ssh:
         command = (f'resume "$(cat {rdir}/resume.txt)" "$(cat {rdir}/prompt.txt)" '
@@ -215,8 +219,9 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
                    if session_id else
                    f'-C "$d" -o {rdir}/last-message.txt "$(cat {rdir}/prompt.txt)"')
         model_flag = f"-m {shq(model)} " if model else ""
+        safety_flags = "--sandbox read-only " if read_only else "--approve-for-me "
         launch = (f'd=$(cat {rdir}/dir.txt); [ -d "$d" ] || exit 3; cd "$d" && '
-                  f'nohup codex exec --json --approve-for-me --skip-git-repo-check '
+                  f'nohup codex exec --json {safety_flags}--skip-git-repo-check '
                   f'{model_flag}{command} '
                   f'< /dev/null > {rdir}/events.jsonl 2> {rdir}/stderr.log & '
                   f'echo $! > {rdir}/pid && cat {rdir}/pid')
@@ -233,7 +238,7 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
         detail = f"proc={proc[:12]}..."
     prefix = f"[resume {session_id[:8]}] " if session_id else ""
     ledger_append({"id": tid, "project": project_dir, **transport, "status": "running",
-                   "prompt_head": prefix + prompt.decode(errors="replace")[:200],
+                   "read_only": read_only, "prompt_head": prefix + prompt.decode(errors="replace")[:200],
                    "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
     session = f" session={session_id[:8]}" if session_id else ""
     # Keep this field present for both explicit overrides and the configured
@@ -244,7 +249,8 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None):
 
 def cmd_start(args):
     ns = dispatch_args(args)
-    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh, model=ns.model)
+    dispatch_task(ns.project_dir, decorated_prompt(ns), ns.ssh, model=ns.model,
+                  read_only=ns.read_only)
 
 
 def shq(s):
@@ -357,8 +363,7 @@ def cmd_status(args):
     suffix = ""
     if status == "DONE" and entry.get("via") == "relay" and entry.get("proc"):
         exit_code = None if payload is None else payload.get("exit_code")
-        if exit_code not in (None, 0):
-            suffix = f" (exit {exit_code})"
+        suffix = f" (exit {exit_code if exit_code is not None else 'unknown'})"
     print(f"{tid}: {status}{suffix}")
 
 

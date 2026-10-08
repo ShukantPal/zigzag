@@ -9,7 +9,7 @@ LAUNCHER = pathlib.Path(__file__).with_name("codex-launch.sh")
 
 
 class LauncherTest(unittest.TestCase):
-    def test_run_and_resume_forward_model_and_capture_files(self):
+    def test_run_and_resume_forward_exact_model_arguments_and_capture_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             task = root / "task"; task.mkdir()
@@ -19,17 +19,25 @@ class LauncherTest(unittest.TestCase):
             fake = root / "codex"
             fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\nexit 0\n")
             fake.chmod(0o755)
-            for mode in ("run", "resume"):
-                if mode == "run":
-                    (task / "model.txt").unlink()
-                else:
-                    (task / "model.txt").write_text("model")
+            for mode, expected in (
+                ("run", ["exec", "--json", "--approve-for-me", "--skip-git-repo-check", "-m", "model", "-C", str(project), "-o", str(task / "last-message.txt"), "hello"]),
+                ("resume", ["exec", "--json", "--approve-for-me", "--skip-git-repo-check", "-m", "model", "resume", "sid", "hello", "-o", str(task / "last-message.txt")]),
+            ):
                 capture = root / mode
                 env = dict(os.environ, CODEX=str(fake), CAPTURE=str(capture))
                 self.assertEqual(subprocess.run([str(LAUNCHER), mode, str(task)], env=env).returncode, 0)
-                self.assertEqual("-m" in capture.read_text().splitlines(), mode == "resume")
+                self.assertEqual(capture.read_text().splitlines(), expected)
                 self.assertTrue((task / "events.jsonl").exists())
                 self.assertTrue((task / "stderr.log").exists())
+
+    def test_run_without_model_omits_model_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp); task = root / "task"; task.mkdir(); project = root / "project"; project.mkdir()
+            (task / "dir.txt").write_text(str(project)); (task / "prompt.txt").write_text("hello")
+            fake = root / "codex"; fake.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n"); fake.chmod(0o755)
+            capture = root / "capture"
+            self.assertEqual(subprocess.run([str(LAUNCHER), "run", str(task)], env=dict(os.environ, CODEX=str(fake), CAPTURE=str(capture))).returncode, 0)
+            self.assertNotIn("-m", capture.read_text().splitlines())
 
     def test_missing_payload_and_codex_failure_propagate(self):
         with tempfile.TemporaryDirectory() as tmp:

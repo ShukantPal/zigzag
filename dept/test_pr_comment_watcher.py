@@ -24,6 +24,29 @@ class WatermarkTest(unittest.TestCase):
         self.assertEqual(set(data["seen"]), {"ic:old", "rc:new"})
         self.assertEqual(data["pr_state"], {"1": "OPEN", "2": "CLOSED"})
 
+    def test_pr_task_running_fails_closed_when_active_task_status_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = pathlib.Path(tmp) / "sessions.json"
+            sessions.write_text(json.dumps({watcher.session_key("owner/repo", 3): {"active_task": "t-live"}}))
+            with patch.object(watcher, "REPO", "owner/repo"), \
+                 patch.object(watcher, "SESSIONS_FILE", str(sessions)), \
+                 patch.object(watcher, "dept_status_text", return_value=None):
+                self.assertEqual(watcher.pr_task_running(3), "t-live")
+
+    def test_dispatch_records_repo_scoped_active_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt_dir = pathlib.Path(tmp) / "prompts"
+            result = type("R", (), {"returncode": 0, "stdout": "started t-new proc=x", "stderr": ""})()
+            with patch.object(watcher, "REPO", "owner/repo"), \
+                 patch.object(watcher, "PROMPT_DIR", str(prompt_dir)), \
+                 patch.object(watcher, "pr_task_running", return_value=None), \
+                 patch.object(watcher, "project_dir_busy", return_value=False), \
+                 patch.object(watcher.subprocess, "run", return_value=result), \
+                 patch.object(watcher, "set_active_task") as set_active:
+                tid, _ = watcher._dispatch_locked(3, None, "prompt", [])
+        self.assertEqual(tid, "t-new")
+        set_active.assert_called_once_with("owner/repo", 3, "t-new")
+
 
 if __name__ == "__main__":
     unittest.main()

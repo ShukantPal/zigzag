@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Watch review rounds: when every reviewer task for a PR has finished, resume
-the owning worker session with the queued review comments + reviewer findings.
+"""Watch review rounds and publish validated verdicts from isolated reviewers.
 
 Runs from a platform cron (every 10 min) — stateless polling via SSH, no
-long-lived process to die. This automates what was previously a manual step:
-dispatch read-only review teams, wait for them, collect their last-message.txt
-files, and resume the owning session once with everything batched.
+long-lived process to die. Reviewers run without GUI-keychain access and their
+raw output is never sent to a write-capable owner task.
 
 Seeding a round: write <state-dir>/review_rounds/<pr>.json:
 {
@@ -36,6 +34,7 @@ import fcntl
 from contextlib import contextmanager
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -80,13 +79,18 @@ def save_round(path, rnd):
         json.dump(rnd, f, indent=2)
 
 
-def set_active_task(pr, task_id):
+def session_key(repo, pr):
+    """Avoid cross-repository collisions for same-number PRs."""
+    return f"{repo}#{pr}"
+
+
+def set_active_task(repo, pr, task_id):
     try:
         with open(SESSIONS_FILE) as f:
             sessions = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         sessions = {}
-    sessions.setdefault(str(pr), {})["active_task"] = task_id
+    sessions.setdefault(session_key(repo, pr), {})["active_task"] = task_id
     os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
     with open(SESSIONS_FILE, "w") as f:
         json.dump(sessions, f, indent=2)
@@ -111,11 +115,9 @@ def task_survived(task_id, delay=30):
     p = subprocess.run([sys.executable, DEPT, "status", task_id],
                        capture_output=True, text=True, timeout=90)
     text = p.stdout + p.stderr
-    # A short successful task may already be DONE by the first poll.  The
-    # manager includes ``exit N`` for a non-zero relay exit, so only that form
-    # is an early-launch failure.
-    return p.returncode == 0 and ("RUNNING" in text or
-                                 ("DONE" in text and "exit " not in text))
+    # A completed relay task is healthy only with an explicit successful exit.
+    # `DONE` alone includes signal exits and pruned/unknown relay payloads.
+    return p.returncode == 0 and ("RUNNING" in text or "DONE (exit 0)" in text)
 
 
 def project_dir_busy(project_dir):
@@ -137,7 +139,10 @@ def project_dir_busy(project_dir):
         try:
             p = subprocess.run([sys.executable, DEPT, "status", tid],
                                capture_output=True, text=True, timeout=90)
-            if "RUNNING" in (p.stdout + p.stderr):
+            text = p.stdout + p.stderr
+            if p.returncode != 0 or "RUNNING" in text:
+                return True
+            if "DONE" not in text:
                 return True
         except Exception:
             return True  # fail closed: can't verify, don't dispatch
@@ -195,55 +200,24 @@ def fetch_findings(task_ids):
     return findings
 
 
-PROMPT_TEMPLATE = """# PR #{pr} revision round — address queued review comments + review-team findings
-
-Context: PR #{pr} ({repo}), branch `{branch}`, worktree `{project_dir}`.
-You own this PR's revisions.
-
-## Queued review comments (posted by Shukant on the PR — ADDRESS each, don't just report)
-{comments}
-
-For each: make the code/doc/test change that resolves it AND post a threaded reply
-to that comment on the PR. Every threaded reply MUST start with the marker line
-`> \U0001F916 Codex (AI assistant)` on its own line (replies post as ShukantPal via
-shared gh auth; without the marker they read as his own words).
-
-Staleness guard: before working, check the PR — if any queued comment above is
-already addressed (replied to, or resolved in the code), skip it and say so.
-
-## Review-team findings (address all of these too — verify each against the actual code before changing anything)
-{findings}
-
-## Push authorization
-{push_rule}
-
-## Done criteria
-All of the above addressed, tests updated and passing, required CI green on the
-latest head, PR updated, threaded replies posted to each queued comment with the
-marker line. Then report the PR URL and a per-comment summary of what changed.
-"""
+VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$", re.MULTILINE)
+HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
 
 
-def build_prompt(rnd, findings):
-    comments = "\n".join(f"{i+1}. {c}" for i, c in enumerate(rnd.get("queued_comments", [])))
-    ftext = "\n\n".join(
-        f"### {label} ({tid})\n{findings.get(tid, '(no output captured)')}"
-        for tid, label in rnd["reviewers"].items()
-    )
-    if rnd.get("force_push_authorized", True):
-        push_rule = ("Force-push with `--force-with-lease` on this PR branch is standing "
-                     "pre-authorized (Shukant's rule, 2026-09-20): decide yourself whether "
-                     "the revision needs it. Re-verify the PR shows only this task's work "
-                     "afterward.")
-    else:
-        push_rule = ("Do NOT force-push. If the revision requires rewriting pushed history, "
-                     "commit locally and report that a force-push is needed so Shukant can "
-                     "authorize it explicitly.")
-    return PROMPT_TEMPLATE.format(pr=rnd["pr"], repo=rnd.get("repo", ""),
-                                  branch=rnd.get("branch", ""),
-                                  project_dir=rnd["project_dir"],
-                                  comments=comments or "(none queued)", findings=ftext,
-                                  push_rule=push_rule)
+def validated_verdict(text, head):
+    """Accept only the two constrained fields; raw model output stays untrusted."""
+    verdict = VERDICT_RE.search(text)
+    reviewed = HEAD_RE.search(text)
+    if not (verdict and reviewed) or reviewed.group(1).lower() != head.lower():
+        return None
+    return verdict.group(1).upper()
+
+
+def post_verdict(repo, pr, lens, head, verdict, task_id):
+    body = (f"> 🤖 Codex (AI assistant) — [{lens}] review verdict\n\n"
+            f"VERDICT: {verdict}\nHEAD: {head}\n\n"
+            f"Validated read-only reviewer task: {task_id}.")
+    mac(f"gh pr comment {int(pr)} --repo {shlex.quote(repo)} --body {shlex.quote(body)}")
 
 
 def process_round(path):
@@ -280,61 +254,32 @@ def _process_round_locked(path):
         pend = [f"{t}={states.get(t, '?')}" for t in tids]
         return f"#{rnd['pr']}: waiting ({', '.join(pend)})"
 
-    # All reviewers done — collect findings and dispatch.
-    if project_dir_busy(rnd["project_dir"]):
-        return f"#{rnd['pr']}: all reviewers done but {rnd['project_dir']} busy, will retry"
+    # All reviewers done — publish only validated verdict fields. Never pass
+    # raw model output to the privileged owner session: reviewer output may be
+    # adversarial even when the review sandbox itself is read-only.
     findings = fetch_findings(tids)
-    prompt = build_prompt(rnd, findings)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    ppath = os.path.join(PROMPT_DIR, f"{rnd['pr']}-review-round-{ts}.md")
-    os.makedirs(PROMPT_DIR, exist_ok=True)
-    with open(ppath, "w") as f:
-        f.write(prompt)
-
-    if DRY_RUN:
-        return (f"#{rnd['pr']}: DRY RUN — would resume session {rnd['owning_session'][:8]} "
-                f"with prompt {ppath} ({len(prompt)} chars, {len(findings)} findings)")
-
-    p = subprocess.run([sys.executable, DEPT, "resume", rnd["project_dir"],
-                        rnd["owning_session"], ppath],
-                       capture_output=True, text=True, timeout=300)
-    out = (p.stdout + p.stderr).strip()
-    task_id = None
-    for line in out.splitlines():
-        if line.startswith("resumed "):
-            task_id = line.split()[1]
-    if p.returncode != 0 or not task_id:
-        # Fall back to a fresh task so the findings don't rot.
-        p2 = subprocess.run([sys.executable, DEPT, "start", rnd["project_dir"], ppath],
-                            capture_output=True, text=True, timeout=300)
-        out2 = (p2.stdout + p2.stderr).strip()
-        for line in out2.splitlines():
-            if line.startswith("started "):
-                task_id = line.split()[1]
-        if p2.returncode != 0 or not task_id:
+    verdicts = {}
+    for tid, lens in rnd["reviewers"].items():
+        verdict = validated_verdict(findings.get(tid, ""), rnd["head"])
+        if not verdict:
             rnd["status"] = "attention"
-            rnd["attention_reason"] = f"resume+start both failed: {(out + out2)[:300]}"
+            rnd["attention_reason"] = f"reviewer {tid} did not return a valid verdict for {rnd['head']}"
             save_round(path, rnd)
-            return f"#{rnd['pr']}: ATTENTION — dispatch failed"
-        log_extra = " (fresh task; resume failed)"
-    else:
-        log_extra = ""
-    rnd["status"] = "dispatched"
-    rnd["dispatched_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    rnd["dispatched_task"] = task_id
-    rnd["prompt_file"] = ppath
-    set_active_task(rnd["pr"], task_id)
-    if not task_survived(task_id):
-        misses = rnd.setdefault("dispatch_misses", 0) + 1
-        rnd["dispatch_misses"] = misses
-        rnd.pop("dispatched_task", None)
-        rnd["status"] = "attention" if misses >= 3 else "collecting"
-        if misses >= 3:
-            rnd["attention_reason"] = "dispatch task died before reaching Codex three times"
-        save_round(path, rnd)
-        return f"#{rnd['pr']}: dispatch died immediately ({misses}/3)"
+            return f"#{rnd['pr']}: ATTENTION — {rnd['attention_reason']}"
+        verdicts[lens] = (verdict, tid)
+    if DRY_RUN:
+        return f"#{rnd['pr']}: DRY RUN — would publish {len(verdicts)} validated verdicts"
+    posted = set(rnd.get("posted_lenses", []))
+    for lens, (verdict, tid) in verdicts.items():
+        if lens not in posted:
+            post_verdict(rnd["repo"], rnd["pr"], lens, rnd["head"], verdict, tid)
+            posted.add(lens)
+            rnd["posted_lenses"] = sorted(posted)
+            save_round(path, rnd)
+    rnd["status"] = "published"
+    rnd["published_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     save_round(path, rnd)
-    return f"#{rnd['pr']}: resumed owning session as {task_id}{log_extra}"
+    return f"#{rnd['pr']}: published validated review verdicts; owner must inspect PR findings manually"
 
 
 def main():

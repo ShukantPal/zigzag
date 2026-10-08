@@ -44,6 +44,9 @@ REQUIRED_CHECKS = {
 IGNORED_CHECKS = re.compile(r"scribes-stg-preview-deploy", re.IGNORECASE)
 
 MARKER = "\U0001F916"  # 🤖 — what the comment watcher keys its skip on
+# Verdicts land through the shared GitHub account; marker text is copyable, but
+# this actor identity is retrieved from GitHub's API and is not user-supplied.
+TRUSTED_REVIEW_ACTORS = frozenset({"ShukantPal"})
 VERDICT_RE = re.compile(r"^VERDICT:\s*(APPROVE|CHANGES REQUESTED)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 HEAD_RE = re.compile(r"^HEAD:\s*([0-9a-f]{40})\s*$", re.IGNORECASE | re.MULTILINE)
@@ -77,7 +80,7 @@ def latest_verdicts(comments):
         # GitHub comments normally retain newlines, but a reviewer once posted
         # literal `\\n` separators. Parse that harmless formatting mistake too.
         body = re.sub(r"\\+n", "\n", body)
-        if MARKER not in body:
+        if MARKER not in body or c.get("author") not in TRUSTED_REVIEW_ACTORS:
             continue
         lens_m = LENS_RE.search(body)
         verdict_m = VERDICT_RE.search(body)

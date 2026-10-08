@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from dept_config import ROOT, load_config, ssh_base, ssh_env, state_dir
-from review_round_watcher import project_dir_busy, set_active_task, worker_dispatch_lock
+from review_round_watcher import project_dir_busy, set_active_task, session_key, worker_dispatch_lock
 
 # Marker the worker must prefix on every threaded reply it posts. Without it the
 # reply looks like Shukant's own words (shared gh auth). The watcher skips comments
@@ -96,15 +96,9 @@ def dept_status_text(tid):
     try:
         p = subprocess.run([sys.executable, DEPT, "status", tid],
                            capture_output=True, text=True, timeout=60)
-        return p.stdout + p.stderr
+        return (p.stdout + p.stderr) if p.returncode == 0 else None
     except Exception:
-        return ""
-
-
-def save_sessions(sessions):
-    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(sessions, f, indent=2)
+        return None
 
 
 def pr_task_running(pr):
@@ -114,10 +108,11 @@ def pr_task_running(pr):
     ledger prompt_head scan is a fallback. The ledger's status field is
     write-once, so verify via `dept.py status` (relay truth)."""
     try:
-        sess = load_sessions().get(str(pr), {})
+        sess = load_sessions().get(session_key(REPO, pr), {})
         tid = sess.get("active_task")
         if tid:
-            if "RUNNING" in dept_status_text(tid):
+            status = dept_status_text(tid)
+            if status is None or "RUNNING" in status or "DONE" not in status:
                 return tid
     except Exception:
         pass
@@ -137,7 +132,8 @@ def pr_task_running(pr):
     for e in entries:
         tid = e.get("id")
         try:
-            if "RUNNING" in dept_status_text(tid):
+            status = dept_status_text(tid)
+            if status is None or "RUNNING" in status or "DONE" not in status:
                 return tid
         except Exception:
             return tid  # fail closed: don't dispatch if we can't verify
@@ -468,7 +464,7 @@ def _dispatch_locked(pr, session_id, prompt, new_comments):
     if task_id:
         # Record the live worker so pr_task_running() can serialize on it
         # deterministically (ledger prompt_head matching is only a fallback).
-        set_active_task(pr, task_id)
+        set_active_task(REPO, pr, task_id)
     return task_id, out
 
 

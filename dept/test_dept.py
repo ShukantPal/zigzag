@@ -122,6 +122,39 @@ class CommandDispatchTest(unittest.TestCase):
         poll.assert_called_once_with("proc")
         output.assert_called_once_with("t-one: DONE (exit 7)")
 
+    def test_result_prints_relay_failure_and_task_stderr(self):
+        entry = {"id": "t-one", "via": "relay", "proc": "proc"}
+        result = SimpleNamespace(stdout=b"final message\n", stderr=b"")
+        stderr = SimpleNamespace(stdout=b"launcher failure\n", stderr=b"")
+        tokens = SimpleNamespace(stdout=b'"total_tokens":3\n', stderr=b"")
+        with patch.object(department, "ledger_read", return_value=[entry]), \
+             patch.object(department, "remote_status_detail", return_value=("DONE", {"exit_code": 7, "stderr": "relay failure"})), \
+             patch.object(department, "ssh", side_effect=[result, stderr, tokens]), \
+             patch("builtins.print") as output:
+            department.cmd_result(["t-one"])
+        rendered = "\n".join(str(c.args[0]) for c in output.call_args_list)
+        self.assertIn("relay exit_code: 7", rendered)
+        self.assertIn("relay failure", rendered)
+        self.assertIn("launcher failure", rendered)
+
+    def test_result_reports_pruned_relay_and_ssh_stderr(self):
+        relay = {"id": "t-relay", "via": "relay", "proc": "proc"}
+        ssh_entry = {"id": "t-ssh", "via": "ssh"}
+        response = SimpleNamespace(stdout=b"", stderr=b"")
+        with patch.object(department, "ledger_read", return_value=[relay]), \
+             patch.object(department, "remote_status_detail", return_value=("DONE", None)), \
+             patch.object(department, "ssh", side_effect=[response, response, response]), \
+             patch("builtins.print") as output:
+            department.cmd_result(["t-relay"])
+        rendered = "\n".join(str(c.args[0]) for c in output.call_args_list)
+        self.assertIn("stderr.log (tail):", rendered)
+        with patch.object(department, "ledger_read", return_value=[ssh_entry]), \
+             patch.object(department, "remote_status_detail", return_value=("DONE", None)), \
+             patch.object(department, "ssh", side_effect=[response, response, response]), \
+             patch("builtins.print") as output:
+            department.cmd_result(["t-ssh"])
+        self.assertIn("--- diagnostics ---", "\n".join(str(c.args[0]) for c in output.call_args_list))
+
 
 if __name__ == "__main__":
     unittest.main()

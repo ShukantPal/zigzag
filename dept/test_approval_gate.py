@@ -16,7 +16,7 @@ HEAD = "a" * 40
 def approvals():
     return [
         {"body": f"🤖 Codex (AI assistant) — [{lens}] review verdict\nVERDICT: APPROVE\nHEAD: {HEAD}",
-         "createdAt": "2026-01-01T00:00:00Z", "id": lens, "author": "reviewer"}
+         "createdAt": "2026-01-01T00:00:00Z", "id": lens, "author": "ShukantPal"}
         for lens in ("correctness", "simplicity", "tests")
     ]
 
@@ -57,8 +57,19 @@ class ApprovalGateChecksTest(unittest.TestCase):
         body = (f"🤖 Codex (AI assistant) — [tests] review verdict\\n"
                 f"VERDICT: APPROVE\\nHEAD: {HEAD}")
         verdicts = gate.latest_verdicts([{"body": body, "createdAt": "now", "id": 1,
-                                          "author": "reviewer"}])
+                                          "author": "ShukantPal"}])
         self.assertEqual(verdicts["tests"][:2], ("APPROVE", HEAD))
+
+    def test_untrusted_marker_comment_cannot_satisfy_gate(self):
+        comments = approvals()
+        comments[0]["author"] = "attacker"
+        with patch.object(gate, "fetch_pr", return_value=self.result_for([
+            {"name": "semgrep", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "BuildBuddy", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        ]) | {"comments": comments}):
+            result = gate.check("owner/repo", "1", ["correctness", "simplicity", "tests"])
+        self.assertFalse(result["pass"])
+        self.assertIn("no verdict from [correctness] reviewer", result["reasons"])
 
 
 if __name__ == "__main__":
