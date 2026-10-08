@@ -65,6 +65,8 @@ struct ProcEntry {
     subcommand: String,
     spawned_at: Instant,
     finished_at: Option<Instant>,
+    termination_requested_at: Option<Instant>,
+    termination_escalated: bool,
     leader_reaped: bool,
     exit_code: Option<i32>,
     stdout: Arc<Mutex<CappedOutput>>,
@@ -1111,6 +1113,8 @@ fn spawn_proc(
             subcommand: request.args.first().cloned().unwrap_or_default(),
             spawned_at: Instant::now(),
             finished_at: None,
+            termination_requested_at: None,
+            termination_escalated: false,
             leader_reaped: false,
             exit_code: None,
             stdout,
@@ -1200,6 +1204,9 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             false
         };
         if killed {
+            entry
+                .termination_requested_at
+                .get_or_insert_with(Instant::now);
             // Reap promptly when the signal is delivered before a subsequent
             // poll, but do not block an HTTP request waiting for cleanup.
             update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
@@ -1443,6 +1450,19 @@ fn update_proc_status_with_handle(
     if entry.finished_at.is_some() {
         return;
     }
+    if entry
+        .termination_requested_at
+        .is_some_and(|requested| requested.elapsed() >= Duration::from_millis(500))
+        && !entry.termination_escalated
+    {
+        // Shells waiting on descendants do not consistently exit after a
+        // group-wide SIGTERM on macOS. Escalate the whole group after a short
+        // grace period so explicit kill requests always converge.
+        unsafe {
+            libc::kill(-entry.process_group, libc::SIGKILL);
+        }
+        entry.termination_escalated = true;
+    }
     if !entry.leader_reaped {
         match entry.child.try_wait() {
             Ok(Some(status)) => {
@@ -1453,7 +1473,12 @@ fn update_proc_status_with_handle(
             Err(_) => return,
         }
     }
-    if !process_group_running(entry.process_group) && output_is_complete(entry) {
+    // A fully killed group can remain visible to kill(2) while an orphaned
+    // descendant is still a zombie. Once SIGKILL was sent, a reaped leader
+    // and closed output pipes prove there are no live managed writers left.
+    if (!process_group_running(entry.process_group) || entry.termination_escalated)
+        && output_is_complete(entry)
+    {
         let state = match entry.exit_code {
             Some(0) => "succeeded",
             Some(_) => "failed",
@@ -2428,6 +2453,8 @@ mod tests {
             subcommand: "-c".to_owned(),
             spawned_at: Instant::now(),
             finished_at: Some(Instant::now()),
+            termination_requested_at: None,
+            termination_escalated: false,
             leader_reaped: true,
             exit_code: Some(0),
             stdout: Arc::new(Mutex::new(CappedOutput {
