@@ -170,24 +170,11 @@ pub fn gate_report(
     number: u64,
     state_path: &Path,
     shadow: bool,
+    config: &ReviewLoopConfig,
 ) -> Result<Value, String> {
-    gate_report_with(
-        repository,
-        number,
-        state_path,
-        shadow,
-        || {
-            let path = default_config_path().map_err(|violation| violation.to_string())?;
-            load_config(&path).map_err(|violations| {
-                violations
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            })
-        },
-        || fetch_pr(repository, number),
-    )
+    gate_report_with(repository, number, state_path, shadow, config, || {
+        fetch_pr(repository, number)
+    })
 }
 
 fn gate_report_with(
@@ -195,15 +182,13 @@ fn gate_report_with(
     number: u64,
     state_path: &Path,
     shadow: bool,
-    load_personal_config: impl FnOnce() -> Result<PersonalConfig, String>,
+    config: &ReviewLoopConfig,
     fetch_snapshot: impl FnOnce() -> Result<PullRequestSnapshot, String>,
 ) -> Result<Value, String> {
-    let config = load_personal_config()?;
-    if !config.review_loop.enabled {
+    if !config.enabled {
         return Err("review loop is disabled".to_owned());
     }
     let policy = config
-        .review_loop
         .repositories
         .iter()
         .find(|policy| policy.repository == repository)
@@ -743,9 +728,27 @@ fn discover(
     store: &mut StateStore,
     shadow: bool,
 ) -> Result<(), String> {
+    discover_with(
+        server,
+        config,
+        store,
+        shadow,
+        super::github_open_pull_requests,
+        fetch_pr,
+    )
+}
+
+fn discover_with(
+    server: &Arc<Server>,
+    config: &ReviewLoopConfig,
+    store: &mut StateStore,
+    shadow: bool,
+    mut open_pull_requests: impl FnMut(&str) -> Result<Vec<u64>, String>,
+    mut fetch_snapshot: impl FnMut(&str, u64) -> Result<PullRequestSnapshot, String>,
+) -> Result<(), String> {
     for policy in &config.repositories {
-        for number in super::github_open_pull_requests(&policy.repository)? {
-            let snapshot = fetch_pr(&policy.repository, number)?;
+        for number in open_pull_requests(&policy.repository)? {
+            let snapshot = fetch_snapshot(&policy.repository, number)?;
             if !pull_request_is_open(&snapshot) {
                 continue;
             }
@@ -1095,6 +1098,19 @@ fn poll_reviews(
     store: &mut StateStore,
     shadow: bool,
 ) -> Result<(), String> {
+    poll_reviews_with(server, config, store, shadow, fetch_pr, |agent_ids| {
+        kill_agents(server, agent_ids)
+    })
+}
+
+fn poll_reviews_with(
+    server: &Arc<Server>,
+    config: &ReviewLoopConfig,
+    store: &mut StateStore,
+    shadow: bool,
+    mut fetch_snapshot: impl FnMut(&str, u64) -> Result<PullRequestSnapshot, String>,
+    mut cleanup_agents: impl FnMut(&[String]),
+) -> Result<(), String> {
     if authoritative_mode(shadow) {
         retry_all_pending_comment_deletions(config, store);
     }
@@ -1131,13 +1147,13 @@ fn poll_reviews(
         else {
             continue;
         };
-        let mut snapshot = fetch_pr(&repository, number)?;
+        let mut snapshot = fetch_snapshot(&repository, number)?;
         if !open_comparison_matches(&snapshot, &store.state.rounds[&key].base, &expected_head) {
             prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
         }
         if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if authoritative_mode(shadow) {
-                kill_agents(server, agent_ids);
+                cleanup_agents(agent_ids);
             }
         })? {
             emit_decision(server, &key, generation, event, shadow, Vec::new())?;
@@ -1145,7 +1161,7 @@ fn poll_reviews(
         }
         if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if authoritative_mode(shadow) {
-                kill_agents(server, agent_ids);
+                cleanup_agents(agent_ids);
             }
         })? {
             continue;
@@ -1167,10 +1183,10 @@ fn poll_reviews(
         // Reviewer collection can post a comment and take long enough for a
         // force-push or base retarget. Fence every downstream decision and
         // owner resume with a fresh comparison read.
-        snapshot = fetch_pr(&repository, number)?;
+        snapshot = fetch_snapshot(&repository, number)?;
         if let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if authoritative_mode(shadow) {
-                kill_agents(server, agent_ids);
+                cleanup_agents(agent_ids);
             }
         })? {
             emit_decision(server, &key, generation, event, shadow, Vec::new())?;
@@ -1178,7 +1194,7 @@ fn poll_reviews(
         }
         if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if authoritative_mode(shadow) {
-                kill_agents(server, agent_ids);
+                cleanup_agents(agent_ids);
             }
         })? {
             continue;
@@ -1267,6 +1283,19 @@ fn poll_merges(
     store: &mut StateStore,
     shadow: bool,
 ) -> Result<(), String> {
+    poll_merges_with(server, config, store, shadow, fetch_pr, |agent_ids| {
+        kill_agents(server, agent_ids)
+    })
+}
+
+fn poll_merges_with(
+    server: &Arc<Server>,
+    config: &ReviewLoopConfig,
+    store: &mut StateStore,
+    shadow: bool,
+    mut fetch_snapshot: impl FnMut(&str, u64) -> Result<PullRequestSnapshot, String>,
+    mut cleanup_agents: impl FnMut(&[String]),
+) -> Result<(), String> {
     let keys: Vec<_> = store
         .state
         .rounds
@@ -1297,13 +1326,13 @@ fn poll_merges(
         else {
             continue;
         };
-        let snapshot = fetch_pr(&repository, number)?;
+        let snapshot = fetch_snapshot(&repository, number)?;
         if !open_comparison_matches(&snapshot, &base, &head) {
             prepare_inactive_comment_cleanup(policy, store, &key, &snapshot.comments, shadow)?;
         }
         let Some(event) = terminalize_closed_round(store, &key, &snapshot, |agent_ids| {
             if authoritative_mode(shadow) {
-                kill_agents(server, agent_ids);
+                cleanup_agents(agent_ids);
             }
         })?
         else {
@@ -1604,13 +1633,12 @@ fn collect_completed_reviewers(
     key: &str,
     comments: &[Comment],
 ) -> Result<(), String> {
-    let (repository, number, head, base, generation) = {
+    let (repository, number, head, generation) = {
         let round = &store.state.rounds[key];
         (
             round.repository.clone(),
             round.pull_request,
             round.head.clone(),
-            round.base.clone(),
             round.generation,
         )
     };
@@ -1662,59 +1690,71 @@ fn collect_completed_reviewers(
             // Do not re-admit an older generated result after a correction.
             continue;
         }
-        // The reviewer may finish after the PR closes, merges, force-pushes,
-        // or retargets. Re-fence immediately before the external comment
-        // side effect; the caller then persists the terminal/superseded
-        // transition from its post-collection snapshot.
-        let current = fetch_pr(&repository, number)?;
-        if !open_comparison_matches(&current, &base, &head) {
-            return Ok(());
-        }
-        let comment = post_verdict_comment(policy, number, &result, &marker, &task_id)?;
-        let current = fetch_pr(&repository, number);
-        let publication_is_current = current
-            .as_ref()
-            .is_ok_and(|current| open_comparison_matches(current, &base, &head));
-        if !publication_is_current {
-            // Fail closed across GitHub's non-atomic read→comment boundary.
-            // Persist the GraphQL node id before the compensating delete so
-            // this comment can never be admitted even if deletion fails.
-            store
-                .state
-                .rounds
-                .get_mut(key)
-                .expect("round exists")
-                .excluded_comment_ids
-                .insert(comment.node_id.clone());
-            store
-                .state
-                .rounds
-                .get_mut(key)
-                .expect("round exists")
-                .pending_comment_deletions
-                .insert(comment.node_id.clone());
-            store.save()?;
-            retry_pending_comment_deletions(policy, store, key)?;
-            current?;
-            return Ok(());
-        }
-        store
-            .state
-            .rounds
-            .get_mut(key)
-            .expect("round exists")
-            .verdicts
-            .insert(
-                lens.clone(),
-                AdmittedVerdict {
-                    verdict: result.verdict,
-                    head: result.head.clone(),
-                    findings: result.findings.clone(),
-                },
-            );
-        store.save()?;
+        publish_reviewer_result_with(
+            store,
+            key,
+            lens,
+            &result,
+            |comment_node_id| delete_verdict_comment(policy, comment_node_id, &task_id),
+            || fetch_pr(&repository, number),
+            || post_verdict_comment(policy, number, &result, &marker, &task_id),
+        )?;
     }
     Ok(())
+}
+
+fn publish_reviewer_result_with(
+    store: &mut StateStore,
+    key: &str,
+    lens: &str,
+    result: &ReviewerResult,
+    mut delete_comment: impl FnMut(&str) -> Result<(), String>,
+    mut fetch_snapshot: impl FnMut() -> Result<PullRequestSnapshot, String>,
+    post_comment: impl FnOnce() -> Result<CreatedComment, String>,
+) -> Result<(), String> {
+    let (base, head) = {
+        let round = &store.state.rounds[key];
+        (round.base.clone(), round.head.clone())
+    };
+    // The reviewer may finish after the PR closes, merges, force-pushes,
+    // or retargets. Re-fence immediately before the external comment.
+    if !open_comparison_matches(&fetch_snapshot()?, &base, &head) {
+        return Ok(());
+    }
+    let comment = post_comment()?;
+    let current = fetch_snapshot();
+    let publication_is_current = current
+        .as_ref()
+        .is_ok_and(|snapshot| open_comparison_matches(snapshot, &base, &head));
+    if !publication_is_current {
+        // Fail closed across GitHub's non-atomic read→comment boundary.
+        // Persist the GraphQL node id before the compensating delete so this
+        // comment can never be admitted even if deletion or the refetch fails.
+        let round = store.state.rounds.get_mut(key).expect("round exists");
+        round.excluded_comment_ids.insert(comment.node_id.clone());
+        round
+            .pending_comment_deletions
+            .insert(comment.node_id.clone());
+        store.save()?;
+        retry_pending_comment_deletions_with(store, key, &mut delete_comment)?;
+        current?;
+        return Ok(());
+    }
+    store
+        .state
+        .rounds
+        .get_mut(key)
+        .expect("round exists")
+        .verdicts
+        .insert(
+            lens.to_owned(),
+            AdmittedVerdict {
+                verdict: result.verdict,
+                head: result.head.clone(),
+                findings: result.findings.clone(),
+            },
+        );
+    store.save()
 }
 
 fn post_verdict_comment(
@@ -1982,7 +2022,7 @@ fn resume_owner(
     key: &str,
     findings: &[(String, Vec<String>)],
 ) -> Result<(), String> {
-    let (repository, number, head, base, generation, owner, already_dispatched) = {
+    let (repository, number, head, base, generation, owner, owner_agent_id) = {
         let round = &store.state.rounds[key];
         (
             round.repository.clone(),
@@ -1991,11 +2031,22 @@ fn resume_owner(
             round.base.clone(),
             round.generation,
             round.owner.clone(),
-            round.owner_agent_id.is_some(),
+            round.owner_agent_id.clone(),
         )
     };
-    if already_dispatched {
-        return Ok(());
+    if let Some(agent_id) = owner_agent_id {
+        if registered_agent_running(&server.supervisor.registry, &agent_id) {
+            return Ok(());
+        }
+        // A completed, failed, lost, or no-longer-current recovered owner is
+        // not an active resume. Persist the cleared handle before retrying.
+        store
+            .state
+            .rounds
+            .get_mut(key)
+            .expect("round exists")
+            .owner_agent_id = None;
+        store.save()?;
     }
     let Some(owner) = owner else {
         let round = store.state.rounds.get_mut(key).expect("round exists");
@@ -2065,7 +2116,7 @@ fn spawn_codex_task(
     owner_fence: Option<&OwnerSpawnFence<'_>>,
 ) -> Result<String, String> {
     super::require_gui_login_session()?;
-    if let Some(existing_id) = latest_agent_for_task(&server.supervisor.registry, task_id) {
+    if let Some(existing_id) = latest_managed_agent_for_task(&server.supervisor.registry, task_id) {
         return Ok(existing_id);
     }
     let root = review_task_dir(task_id)?;
@@ -2352,6 +2403,22 @@ fn latest_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Option<Stri
     registry
         .list(None, Some(task_id))
         .into_iter()
+        .max_by(|left, right| left.started_at.cmp(&right.started_at))
+        .map(|agent| agent.id)
+}
+
+fn registered_agent_running(registry: &AgentRegistry, agent_id: &str) -> bool {
+    registry
+        .get(agent_id)
+        .as_ref()
+        .is_some_and(super::managed_agent_running)
+}
+
+fn latest_managed_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Option<String> {
+    registry
+        .list(None, Some(task_id))
+        .into_iter()
+        .filter(super::managed_agent_running)
         .max_by(|left, right| left.started_at.cmp(&right.started_at))
         .map(|agent| agent.id)
 }
@@ -2677,6 +2744,91 @@ review_loop:
     }
 
     #[test]
+    fn shadow_discovery_supersedes_durably_without_dispatch_or_cleanup() {
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-shadow-discovery-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry_path = state_path.with_extension("agents");
+        let event_path = state_path.with_extension("events");
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        registry
+            .register(agent("old-reviewer", "review-task", 41, "running"))
+            .unwrap();
+        registry
+            .register(agent("old-owner", "owner-task", 42, "running"))
+            .unwrap();
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::clone(&registry),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: true,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let old_head = "b".repeat(40);
+        let old_key = round_key("owner/repo", 7, &old_head);
+        let mut old_round = test_round(&old_head, RoundPhase::Reviewing, Some("old-reviewer"));
+        old_round.owner_agent_id = Some("old-owner".to_owned());
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(old_key.clone(), old_round);
+        store.save().unwrap();
+        let new_head = "a".repeat(40);
+        let mut repository_policy = policy();
+        repository_policy.repository = "owner/repo".to_owned();
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: vec![repository_policy],
+        };
+        discover_with(
+            &server,
+            &config,
+            &mut store,
+            true,
+            |repository| {
+                assert_eq!(repository, "owner/repo");
+                Ok(vec![7])
+            },
+            |repository, number| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(number, 7);
+                Ok(snapshot(&new_head))
+            },
+        )
+        .unwrap();
+
+        let new_key = round_key("owner/repo", 7, &new_head);
+        assert_eq!(store.state.rounds[&old_key].phase, RoundPhase::Superseded);
+        assert_eq!(store.state.rounds[&new_key].phase, RoundPhase::Dispatching);
+        assert!(store.state.rounds[&new_key].reviewers.is_empty());
+        assert_eq!(registry.get("old-reviewer").unwrap().state, "running");
+        assert_eq!(registry.get("old-owner").unwrap().state, "running");
+        assert!(
+            server
+                .store
+                .timeline(&new_key)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.object("kind").and_then(Json::as_str) == Some("shadow_round_observed")
+                })
+        );
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
+    }
+
+    #[test]
     fn config_reports_paths_and_semantic_repository_uniqueness() {
         let invalid = valid_yaml(true).replace("    merge_seconds: 300", "    merge_seconds: 10");
         let violations = load_text(&invalid).unwrap_err();
@@ -2988,17 +3140,14 @@ review_loop:
     fn production_gate_seam_loads_config_snapshot_and_active_durable_round() {
         let mut policy = policy();
         policy.repository = "owner/repo".to_owned();
-        let config = || PersonalConfig {
-            schema_version: 1,
-            review_loop: ReviewLoopConfig {
-                enabled: true,
-                intervals: Intervals {
-                    discovery_seconds: 1,
-                    review_seconds: 1,
-                    merge_seconds: 1,
-                },
-                repositories: vec![policy.clone()],
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
             },
+            repositories: vec![policy.clone()],
         };
         let head = "a".repeat(40);
         let mut round = test_round(&head, RoundPhase::Reviewing, None);
@@ -3040,53 +3189,36 @@ review_loop:
         store.state.rounds.insert(key.clone(), round);
         store.save().unwrap();
 
-        let report = gate_report_with(
-            "owner/repo",
-            7,
-            &state_path,
-            false,
-            || Ok(config()),
-            || Ok(accepted.clone()),
-        )
+        let report = gate_report_with("owner/repo", 7, &state_path, false, &config, || {
+            Ok(accepted.clone())
+        })
         .unwrap();
         assert_eq!(report["pass"], true);
 
         let mut retargeted = accepted.clone();
         retargeted.base_ref_oid = "d".repeat(40);
-        let report = gate_report_with(
-            "owner/repo",
-            7,
-            &state_path,
-            false,
-            || Ok(config()),
-            || Ok(retargeted),
-        )
+        let report = gate_report_with("owner/repo", 7, &state_path, false, &config, || {
+            Ok(retargeted)
+        })
         .unwrap();
         assert_eq!(report["pass"], false);
 
         store.state.rounds.get_mut(&key).unwrap().phase = RoundPhase::Merged;
         store.save().unwrap();
-        let report = gate_report_with(
-            "owner/repo",
-            7,
-            &state_path,
-            false,
-            || Ok(config()),
-            || Ok(accepted.clone()),
-        )
+        let report = gate_report_with("owner/repo", 7, &state_path, false, &config, || {
+            Ok(accepted.clone())
+        })
         .unwrap();
         assert_eq!(report["pass"], false);
 
+        let mut disabled_config = config.clone();
+        disabled_config.enabled = false;
         let disabled = gate_report_with(
             "owner/repo",
             7,
             &state_path,
             false,
-            || {
-                let mut disabled = config();
-                disabled.review_loop.enabled = false;
-                Ok(disabled)
-            },
+            &disabled_config,
             || Ok(accepted),
         )
         .unwrap_err();
@@ -3139,21 +3271,52 @@ review_loop:
             test_round(&head, RoundPhase::Dispatching, None),
         );
         store.save().unwrap();
-        let mut reopened = StateStore::open(path.clone()).unwrap();
-        let mut spawn_count = 0;
-        let dispatched = dispatch_reviewer_attempt(
-            &mut reopened,
-            &key,
-            "tests",
-            2,
-            |task_id| latest_agent_for_task(&registry, task_id),
-            |_| {
-                spawn_count += 1;
-                Ok("new-agent".to_owned())
+        drop(registry);
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        let event_path = path.with_extension("events");
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::clone(&registry),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
+            review_state_file: path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut policy = policy();
+        policy.repository = "owner/repo".to_owned();
+        policy.lenses = vec!["tests".to_owned()];
+        policy.require_security_lens = false;
+        policy.required_ci_checks.clear();
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: vec![policy],
+        };
+        let mut reopened = StateStore::open(path.clone()).unwrap();
+        let mut fetches = 0;
+        poll_reviews_with(
+            &server,
+            &config,
+            &mut reopened,
+            false,
+            |repository, number| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(number, 7);
+                fetches += 1;
+                Ok(snapshot(&head))
+            },
+            |_| panic!("unchanged comparison must not request cleanup"),
         )
         .unwrap();
-        assert!(dispatched);
+        assert_eq!(fetches, 2);
         let round = &reopened.state.rounds[&key];
         assert_eq!(round.reviewers["tests"].attempt, 1);
         assert_eq!(
@@ -3161,9 +3324,19 @@ review_loop:
             Some("existing-agent")
         );
         assert_eq!(registry.list(None, Some(&expected_task_id)).len(), 1);
-        assert_eq!(spawn_count, 0, "restart must reattach instead of spawning");
+        assert!(registered_agent_running(&registry, "existing-agent"));
+        registry
+            .transition("existing-agent", "failed", Some(1))
+            .unwrap();
+        assert!(!registered_agent_running(&registry, "existing-agent"));
+        assert_eq!(
+            latest_managed_agent_for_task(&registry, &expected_task_id),
+            None,
+            "a failed owner-style task must be eligible for a fresh resume"
+        );
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
     }
 
     #[test]
@@ -3276,14 +3449,49 @@ review_loop:
         let mut merged = snapshot(&head);
         merged.state = "MERGED".to_owned();
         merged.merged_at = Some("2026-01-01T00:00:00Z".to_owned());
+        let registry_path = state_path.with_extension("agents");
+        let event_path = state_path.with_extension("events");
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut repository_policy = policy();
+        repository_policy.repository = "owner/repo".to_owned();
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: vec![repository_policy],
+        };
         let mut killed = Vec::new();
-        let event = terminalize_closed_round(&mut store, &key, &merged, |agent_ids| {
-            let persisted = StateStore::open(state_path.clone()).unwrap();
-            assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Merged);
-            killed.extend_from_slice(agent_ids);
-        })
+        poll_merges_with(
+            &server,
+            &config,
+            &mut store,
+            false,
+            |repository, number| {
+                assert_eq!(repository, "owner/repo");
+                assert_eq!(number, 7);
+                Ok(merged.clone())
+            },
+            |agent_ids| {
+                let persisted = StateStore::open(state_path.clone()).unwrap();
+                assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Merged);
+                killed.extend_from_slice(agent_ids);
+            },
+        )
         .unwrap();
-        assert_eq!(event, Some("review_merged"));
         assert_eq!(killed, ["agent-a", "agent-b", "owner-agent"]);
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Merged);
         assert_ne!(
@@ -3291,6 +3499,8 @@ review_loop:
             owner_task_id("owner/repo", 7, &head, 2)
         );
         let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
     }
 
     #[test]
@@ -3376,6 +3586,7 @@ review_loop:
             },
             review_state_file: path.with_extension("review-state"),
             review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
         };
         kill_agents(&server, &["orphaned".to_owned()]);
         assert_eq!(
@@ -3444,6 +3655,7 @@ review_loop:
             },
             review_state_file: review_state_path.clone(),
             review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
         };
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
@@ -3536,6 +3748,7 @@ review_loop:
             },
             review_state_file: state_path.with_extension("review-state"),
             review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
         };
 
         kill_agents(&server, &["reviewer".to_owned()]);
@@ -3574,31 +3787,67 @@ review_loop:
             "zigzag-stale-agents-{}.json",
             super::super::random_hex_128().unwrap()
         ));
-        let registry = AgentRegistry::open(&registry_path).unwrap();
-        registry
-            .register(agent("owner", "owner-task", 51, "orphaned"))
-            .unwrap();
-        registry
-            .register(agent("reviewer", "review-task", 52, "running"))
-            .unwrap();
+        let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+        let event_path = state_path.with_extension("events");
+        let server = Arc::new(Server {
+            secret: "x".repeat(32),
+            control_secret: Some("x".repeat(32)),
+            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            supervisor: super::super::Supervisor {
+                registry,
+                procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            },
+            review_state_file: state_path.clone(),
+            review_loop_shadow: false,
+            review_config: std::sync::Mutex::new(None),
+        });
+        let mut repository_policy = policy();
+        repository_policy.repository = "owner/repo".to_owned();
+        let config = ReviewLoopConfig {
+            enabled: true,
+            intervals: Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: vec![repository_policy],
+        };
         let mut killed = Vec::new();
         let mut changed = snapshot(&head);
         changed.base_ref_oid = "d".repeat(40);
-        let superseded = supersede_stale_round(&mut store, &key, &changed, |agent_ids| {
-            let persisted = StateStore::open(state_path.clone()).unwrap();
-            assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Superseded);
-            kill_agents_with(
-                &registry,
-                agent_ids,
-                |agent| agent.id == "owner",
-                |group| killed.push(group),
-            );
-        });
-        assert!(superseded.unwrap());
+        poll_reviews_with(
+            &server,
+            &config,
+            &mut store,
+            false,
+            |_, _| Ok(changed.clone()),
+            |agent_ids| {
+                let persisted = StateStore::open(state_path.clone()).unwrap();
+                assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Superseded);
+                killed.extend_from_slice(agent_ids);
+            },
+        )
+        .unwrap();
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Superseded);
-        assert_eq!(killed, [51, 52]);
+        assert_eq!(killed, ["owner", "reviewer"]);
+
+        let mut shadow_round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
+        shadow_round.owner_agent_id = Some("owner".to_owned());
+        store.state.rounds.insert(key.clone(), shadow_round);
+        store.save().unwrap();
+        poll_reviews_with(
+            &server,
+            &config,
+            &mut store,
+            true,
+            |_, _| Ok(changed.clone()),
+            |_| panic!("shadow polling must not clean up process groups"),
+        )
+        .unwrap();
+        assert_eq!(store.state.rounds[&key].phase, RoundPhase::Superseded);
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(registry_path);
+        let _ = fs::remove_file(event_path);
     }
 
     #[test]
@@ -3698,6 +3947,67 @@ review_loop:
         current.base_ref_oid = round.base.clone();
         current.state = "CLOSED".to_owned();
         assert!(!open_comparison_matches(&current, &round.base, &head));
+    }
+
+    #[test]
+    fn publication_refetch_race_persists_exclusion_before_retrying_deletion() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-publication-race-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(
+            key.clone(),
+            test_round(&head, RoundPhase::Reviewing, Some("reviewer")),
+        );
+        store.save().unwrap();
+        let current = snapshot(&head);
+        let mut retargeted = current.clone();
+        retargeted.base_ref_oid = "d".repeat(40);
+        let mut snapshots = vec![current, retargeted].into_iter();
+        let result = ReviewerResult {
+            version: RESULT_VERSION,
+            lens: "tests".to_owned(),
+            verdict: Verdict::Approve,
+            head: head.clone(),
+            findings: Vec::new(),
+        };
+        let error = publish_reviewer_result_with(
+            &mut store,
+            &key,
+            "tests",
+            &result,
+            |_| Err("delete unavailable".to_owned()),
+            || Ok(snapshots.next().unwrap()),
+            || {
+                Ok(CreatedComment {
+                    node_id: "IC_raced".to_owned(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "delete unavailable");
+
+        let mut reopened = StateStore::open(state_path.clone()).unwrap();
+        let round = &reopened.state.rounds[&key];
+        assert!(round.excluded_comment_ids.contains("IC_raced"));
+        assert!(round.pending_comment_deletions.contains("IC_raced"));
+        assert!(!round.verdicts.contains_key("tests"));
+        let mut deleted = Vec::new();
+        retry_pending_comment_deletions_with(&mut reopened, &key, |id| {
+            deleted.push(id.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(deleted, ["IC_raced"]);
+        assert!(
+            StateStore::open(state_path.clone()).unwrap().state.rounds[&key]
+                .pending_comment_deletions
+                .is_empty()
+        );
+        let _ = fs::remove_file(state_path);
     }
 
     #[test]

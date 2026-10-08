@@ -33,15 +33,19 @@ def relay_call(path):
         headers={"Authorization": f"Bearer {token}"},
         method="GET",
     )
-    proxy = os.environ.get("HTTPS_PROXY", "")
-    proxy = proxy.rsplit(":", 1)[0] + ":3130" if ":" in proxy else ""
+    proxy = relay_proxy_url(os.environ.get("HTTPS_PROXY", ""))
     opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy} if proxy else {}))
     try:
         with opener.open(request, timeout=180) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"review gate failed with HTTP {error.code}") from error
+
+
+def relay_proxy_url(https_proxy):
+    return https_proxy.rsplit(":", 1)[0] + ":3130" if ":" in https_proxy else ""
 
 
 def fetch_gate(repo, pr):

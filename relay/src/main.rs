@@ -50,6 +50,7 @@ struct Server {
     updater: Arc<update::Manager>,
     review_state_file: PathBuf,
     review_loop_shadow: bool,
+    review_config: Mutex<Option<Arc<review_loop::ReviewLoopConfig>>>,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -176,6 +177,7 @@ fn run() -> Result<(), String> {
         updater: Arc::clone(&updater),
         review_state_file: config.review_state_file.clone(),
         review_loop_shadow,
+        review_config: Mutex::new(None),
     });
     for agent in state
         .supervisor
@@ -188,13 +190,21 @@ fn run() -> Result<(), String> {
     match review_loop::default_config_path() {
         Ok(path) => match review_loop::load_config(&path) {
             Ok(personal) if personal.review_loop.enabled => {
+                let review_config = Arc::new(personal.review_loop);
                 match review_loop::start(
                     Arc::clone(&state),
-                    personal.review_loop,
+                    (*review_config).clone(),
                     config.review_state_file.clone(),
                     review_loop_shadow,
                 ) {
-                    Ok(()) => review_loop_authoritative = !review_loop_shadow,
+                    Ok(()) => {
+                        *state
+                            .review_config
+                            .lock()
+                            .map_err(|_| "review config lock poisoned".to_owned())? =
+                            Some(review_config);
+                        review_loop_authoritative = !review_loop_shadow;
+                    }
                     Err(error) => eprintln!("review loop disabled: {error}"),
                 }
             }
@@ -678,7 +688,13 @@ fn handle_with_services<F, G>(
 ) -> Result<(), String>
 where
     F: Fn() -> Result<exec::Policy, String>,
-    G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
+    G: Fn(
+        &str,
+        u64,
+        &std::path::Path,
+        bool,
+        &review_loop::ReviewLoopConfig,
+    ) -> Result<serde_json::Value, String>,
 {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -759,17 +775,31 @@ fn review_gate_request<G>(
     gate_report: G,
 ) -> Result<(), String>
 where
-    G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
+    G: Fn(
+        &str,
+        u64,
+        &std::path::Path,
+        bool,
+        &review_loop::ReviewLoopConfig,
+    ) -> Result<serde_json::Value, String>,
 {
     let (repository, number) = match review_gate_parameters(target) {
         Ok(parameters) => parameters,
         Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
+    };
+    let config = match state.review_config.lock() {
+        Ok(config) => config.clone(),
+        Err(_) => return reply(stream, 500, error("review_gate_failed")),
+    };
+    let Some(config) = config else {
+        return reply(stream, 500, error("review_gate_failed"));
     };
     match gate_report(
         &repository,
         number,
         &state.review_state_file,
         state.review_loop_shadow,
+        &config,
     ) {
         Ok(report) => {
             let encoded = serde_json::to_string(&report)
@@ -2053,7 +2083,7 @@ mod tests {
             "GET",
             "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
             "",
-            |repository, pull_request, review_state_path, shadow| {
+            |repository, pull_request, review_state_path, shadow, _config| {
                 assert_eq!(repository, "owner/repo");
                 assert_eq!(pull_request, 22);
                 assert_eq!(review_state_path, expected_state_path);
@@ -2080,7 +2110,7 @@ mod tests {
             "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
             "",
             "wrong-token",
-            |_, _, _, _| panic!("unauthorized gate request reached the backend"),
+            |_, _, _, _, _| panic!("unauthorized gate request reached the backend"),
         );
         assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
 
@@ -2713,9 +2743,22 @@ mod tests {
                 })),
                 review_state_file: path.with_extension("review-state"),
                 review_loop_shadow: false,
+                review_config: Mutex::new(Some(Arc::new(test_review_config()))),
             }),
             path,
         )
+    }
+
+    fn test_review_config() -> review_loop::ReviewLoopConfig {
+        review_loop::ReviewLoopConfig {
+            enabled: true,
+            intervals: review_loop::Intervals {
+                discovery_seconds: 1,
+                review_seconds: 1,
+                merge_seconds: 1,
+            },
+            repositories: Vec::new(),
+        }
     }
 
     fn completed_entry() -> ProcEntry {
@@ -2774,7 +2817,13 @@ mod tests {
         gate_report: G,
     ) -> String
     where
-        G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
+        G: Fn(
+            &str,
+            u64,
+            &std::path::Path,
+            bool,
+            &review_loop::ReviewLoopConfig,
+        ) -> Result<serde_json::Value, String>,
     {
         request_once_with_gate_token(
             state,
@@ -2797,7 +2846,13 @@ mod tests {
         gate_report: G,
     ) -> String
     where
-        G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
+        G: Fn(
+            &str,
+            u64,
+            &std::path::Path,
+            bool,
+            &review_loop::ReviewLoopConfig,
+        ) -> Result<serde_json::Value, String>,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
