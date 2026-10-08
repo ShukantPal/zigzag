@@ -602,12 +602,12 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 _ => return Err("invalid agent registry".to_owned()),
             },
             first_output_bytes: match get("first_output_bytes") {
+                Some(Json::Null) | None => None,
                 Some(value) => Some(
                     value
                         .as_u64()
                         .ok_or_else(|| "invalid agent registry".to_owned())?,
                 ),
-                None => None,
             },
         };
         entries.insert(record.id.clone(), record);

@@ -49,6 +49,7 @@ struct Server {
     supervisor: Supervisor,
     updater: Arc<update::Manager>,
     review_state_file: PathBuf,
+    review_loop_shadow: bool,
 }
 
 /// Live handles deliberately disappear on restart; the durable half lives in
@@ -163,6 +164,7 @@ fn run() -> Result<(), String> {
         policy: config.update_policy.clone(),
         ready_file: config.update_ready_file.clone(),
     }));
+    let review_loop_shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
     let state = Arc::new(Server {
         secret,
         control_secret,
@@ -173,6 +175,7 @@ fn run() -> Result<(), String> {
         },
         updater: Arc::clone(&updater),
         review_state_file: config.review_state_file.clone(),
+        review_loop_shadow,
     });
     for agent in state
         .supervisor
@@ -185,14 +188,13 @@ fn run() -> Result<(), String> {
     match review_loop::default_config_path() {
         Ok(path) => match review_loop::load_config(&path) {
             Ok(personal) if personal.review_loop.enabled => {
-                let shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
                 match review_loop::start(
                     Arc::clone(&state),
                     personal.review_loop,
                     config.review_state_file.clone(),
-                    shadow,
+                    review_loop_shadow,
                 ) {
-                    Ok(()) => review_loop_authoritative = !shadow,
+                    Ok(()) => review_loop_authoritative = !review_loop_shadow,
                     Err(error) => eprintln!("review loop disabled: {error}"),
                 }
             }
@@ -676,7 +678,7 @@ fn handle_with_services<F, G>(
 ) -> Result<(), String>
 where
     F: Fn() -> Result<exec::Policy, String>,
-    G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
+    G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
 {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -757,13 +759,18 @@ fn review_gate_request<G>(
     gate_report: G,
 ) -> Result<(), String>
 where
-    G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
+    G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
 {
     let (repository, number) = match review_gate_parameters(target) {
         Ok(parameters) => parameters,
         Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
     };
-    match gate_report(&repository, number, &state.review_state_file) {
+    match gate_report(
+        &repository,
+        number,
+        &state.review_state_file,
+        state.review_loop_shadow,
+    ) {
         Ok(report) => {
             let encoded = serde_json::to_string(&report)
                 .map_err(|error| format!("could not encode review gate report: {error}"))?;
@@ -2004,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_review_gate_route_reads_the_configured_durable_state() {
+    fn authenticated_review_gate_route_forwards_mode_and_state_path() {
         let (state, state_path) = test_server();
         let policy =
             exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
@@ -2046,30 +2053,14 @@ mod tests {
             "GET",
             "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
             "",
-            |repository, pull_request, review_state_path| {
+            |repository, pull_request, review_state_path, shadow| {
                 assert_eq!(repository, "owner/repo");
                 assert_eq!(pull_request, 22);
                 assert_eq!(review_state_path, expected_state_path);
-                assert!(
-                    review_loop::persisted_active_comparison_matches(
-                        review_state_path,
-                        repository,
-                        pull_request,
-                        &"b".repeat(40),
-                        &"a".repeat(40),
-                    )
-                    .unwrap()
-                );
-                assert!(
-                    !review_loop::persisted_active_comparison_matches(
-                        review_state_path,
-                        repository,
-                        pull_request,
-                        &"c".repeat(40),
-                        &"a".repeat(40),
-                    )
-                    .unwrap()
-                );
+                assert!(!shadow);
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(review_state_path).unwrap()).unwrap();
+                assert!(persisted["rounds"].is_object());
                 Ok(serde_json::json!({
                     "pass": true,
                     "head": "a".repeat(40),
@@ -2081,6 +2072,17 @@ mod tests {
         let report = response_json(response);
         assert_eq!(report.object("pass"), Some(&Json::Bool(true)));
         assert_eq!(report.object("head"), Some(&Json::String("a".repeat(40))));
+
+        let unauthorized = request_once_with_gate_token(
+            Arc::clone(&state),
+            &policy,
+            "GET",
+            "/v1/review-gate?repository=owner%2Frepo&pull_request=22",
+            "",
+            "wrong-token",
+            |_, _, _, _| panic!("unauthorized gate request reached the backend"),
+        );
+        assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
 
         drop(state);
         let _ = std::fs::remove_file(state_path);
@@ -2244,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn review_state_is_derived_from_event_state_and_old_watch_flags_are_rejected() {
+    fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
         let base_arguments = || {
             vec![
                 "--secret-file".to_owned(),
@@ -2260,8 +2262,27 @@ mod tests {
         );
 
         let mut arguments = base_arguments();
-        arguments.extend(["--watch-repo".to_owned(), "leveled-inc/leveled".to_owned()]);
-        assert!(server_config(arguments).is_err());
+        arguments.extend([
+            "--watch-repo".to_owned(),
+            "leveled-inc/leveled".to_owned(),
+            "--watch-interval".to_owned(),
+            "60".to_owned(),
+        ]);
+        let config = server_config(arguments).unwrap();
+        assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
+        assert_eq!(config.github_watch_interval, Duration::from_secs(60));
+        let shadow_authoritative = review_loop::authoritative_mode(true);
+        assert!(!shadow_authoritative);
+        assert!(should_start_legacy_watch(
+            shadow_authoritative,
+            &config.github_watch_repos
+        ));
+        let cutover_authoritative = review_loop::authoritative_mode(false);
+        assert!(cutover_authoritative);
+        assert!(!should_start_legacy_watch(
+            cutover_authoritative,
+            &config.github_watch_repos
+        ));
     }
 
     #[test]
@@ -2691,6 +2712,7 @@ mod tests {
                     ready_file: None,
                 })),
                 review_state_file: path.with_extension("review-state"),
+                review_loop_shadow: false,
             }),
             path,
         )
@@ -2752,13 +2774,36 @@ mod tests {
         gate_report: G,
     ) -> String
     where
-        G: Fn(&str, u64, &std::path::Path) -> Result<serde_json::Value, String>,
+        G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
+    {
+        request_once_with_gate_token(
+            state,
+            policy,
+            method,
+            target,
+            body,
+            &"x".repeat(32),
+            gate_report,
+        )
+    }
+
+    fn request_once_with_gate_token<G>(
+        state: Arc<Server>,
+        policy: &exec::Policy,
+        method: &str,
+        target: &str,
+        body: &str,
+        token: &str,
+        gate_report: G,
+    ) -> String
+    where
+        G: Fn(&str, u64, &std::path::Path, bool) -> Result<serde_json::Value, String>,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let request = format!(
             "{method} {target} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
-            "x".repeat(32),
+            token,
             body.len()
         );
         let client = thread::spawn(move || {
