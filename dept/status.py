@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+try:  # `python3 dept/status.py` and `python3 -m dept.status` are both supported.
+    from .dept_config import load_config
+except ImportError:  # pragma: no cover - direct script execution path
+    from dept_config import load_config
+
 DEFAULT_STATE_FILE = Path("~/.codex/zigzag/events.json").expanduser()
 DEFAULT_TOKEN_FILE = Path("~/.codex/zigzag/zigzag.token").expanduser()
 
@@ -254,13 +259,22 @@ def relay_snapshot(url: str, token_file: Path) -> tuple[list[dict[str, Any]], li
     return recent, agents, lost, warnings
 
 
-def transcript_path(task_id: str) -> Path:
+def mac_dept_root() -> Path:
+    """Return the configured Mac task root, not the host running this UI."""
+    configured = os.environ.get("CODEX_DEPT_REMOTE_DIR")
+    if not configured:
+        connection = load_config().get("connection", {})
+        configured = connection.get("remote_dept") if isinstance(connection, dict) else None
+    return Path(configured) if isinstance(configured, str) and configured else Path("~/.codex/dept").expanduser()
+
+
+def transcript_path(task_id: str, root: Path | None = None) -> Path:
     """Return the Mac-local final-message path created for every dept task."""
-    return Path("~/.codex/dept").expanduser() / task_id / "last-message.txt"
+    return (root or mac_dept_root()) / task_id / "last-message.txt"
 
 
-def transcript_command(task_id: str) -> str:
-    return f"tail -f {shlex.quote(str(transcript_path(task_id)))}"
+def transcript_command(task_id: str, root: Path | None = None) -> str:
+    return f"tail -f {shlex.quote(str(transcript_path(task_id, root)))}"
 
 
 def relay_output(url: str, token_file: Path, agent_id: str, *, tail: int = 12_000) -> tuple[list[str], str | None]:
@@ -326,12 +340,14 @@ def detail_lines(execution: Execution, limit: int = 12) -> list[str]:
     return lines
 
 
-def transcript_lines(execution: Execution, output: list[str], error: str | None) -> list[str]:
-    path = transcript_path(execution.task_id)
+def transcript_lines(
+    execution: Execution, output: list[str], error: str | None, root: Path | None = None,
+) -> list[str]:
+    path = transcript_path(execution.task_id, root)
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
         f"Source: {path}",
-        f"Command: {transcript_command(execution.task_id)}",
+        f"Command: {transcript_command(execution.task_id, root)}",
     ]
     if execution.agent_id is None:
         lines.append("Relay output unavailable: no retained supervised agent matches this execution.")
@@ -345,8 +361,11 @@ def transcript_lines(execution: Execution, output: list[str], error: str | None)
 
 
 class StatusScreen:
-    def __init__(self, url: str, state_file: Path, token_file: Path, interval: float) -> None:
+    def __init__(
+        self, url: str, state_file: Path, token_file: Path, interval: float, task_root: Path | None = None,
+    ) -> None:
         self.url, self.state_file, self.token_file, self.interval = url, state_file, token_file, interval
+        self.task_root = task_root or mac_dept_root()
         self.executions: list[Execution] = []
         self.warnings: list[str] = []
         self.selected = 0
@@ -381,6 +400,14 @@ class StatusScreen:
         if self.selected != previous:
             self.transcript_output, self.transcript_error = [], None
 
+    def visible_rows(self, height: int) -> int:
+        return 1 if self.show_transcript else max(1, height // 2 - 2)
+
+    def toggle_transcript(self) -> None:
+        self.show_transcript = not self.show_transcript
+        self.offset = self.selected
+        self.transcript_output, self.transcript_error = [], None
+
     def run(self, screen: curses.window) -> None:
         curses.curs_set(0)
         screen.timeout(max(100, int(self.interval * 1000)))
@@ -390,17 +417,15 @@ class StatusScreen:
             key = screen.getch()
             if key in (ord("q"), 27):
                 if self.show_transcript:
-                    self.show_transcript = False
-                    self.transcript_output, self.transcript_error = [], None
+                    self.toggle_transcript()
                 else:
                     return
-            if key in (curses.KEY_ENTER, 10, 13, ord("t")):
-                self.show_transcript = not self.show_transcript
-                self.transcript_output, self.transcript_error = [], None
-            if key in (curses.KEY_UP, ord("k")):
-                self.move_selection(-1, max(1, screen.getmaxyx()[0] // 2 - 2))
-            if key in (curses.KEY_DOWN, ord("j")):
-                self.move_selection(1, max(1, screen.getmaxyx()[0] // 2 - 2))
+            elif key in (curses.KEY_ENTER, 10, 13, ord("t")):
+                self.toggle_transcript()
+            elif key in (curses.KEY_UP, ord("k")):
+                self.move_selection(-1, self.visible_rows(screen.getmaxyx()[0]))
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.move_selection(1, self.visible_rows(screen.getmaxyx()[0]))
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
@@ -411,7 +436,7 @@ class StatusScreen:
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
         columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
         screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
-        rows = 1 if self.show_transcript else max(1, height // 2 - 2)
+        rows = self.visible_rows(height)
         for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
@@ -421,7 +446,7 @@ class StatusScreen:
         screen.hline(divider, 0, "-", width - 1)
         if self.executions and self.show_transcript:
             lines = transcript_lines(
-                self.executions[self.selected], self.transcript_output, self.transcript_error,
+                self.executions[self.selected], self.transcript_output, self.transcript_error, self.task_root,
             )
         elif self.executions:
             lines = detail_lines(self.executions[self.selected], max(1, height - divider - 3))
