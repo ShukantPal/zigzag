@@ -29,6 +29,12 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.shukantpal.zigzag.
 
 This repository deliberately does not run either command for you.
 
+For verified self-updates, make the `ProgramArguments` binary path the stable
+`~/.codex/zigzag/relay/current` symlink and pass `--update-dir
+~/.codex/zigzag/relay`. Seed `current` from the reviewed initial release before
+bootstrapping. Do not restart the LaunchAgent to apply an update: the relay
+drains and re-execs itself so it remains in this GUI login session.
+
 ## Zigzag
 
 ```sh

@@ -85,6 +85,57 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Verified relay updates
+
+On every successful `main` build, CI produces a signed ARM64 relay binary, a
+SHA-256 manifest, and a GitHub SLSA provenance attestation. The newest
+non-prerelease GitHub Release is the floating discovery location; it is never
+trusted merely because it is named `latest`.
+
+The relay checks hourly by default. Before accepting an update it requires the
+release target/version to be newer, the manifest digest to match, the expected
+Apple code-signing identifier and team, and a GitHub attestation verified with
+the bundled Sigstore trust root. Verification constrains the repository,
+`release.yml` workflow, and `main` source ref/commit. A root rotation is a
+reviewed source change: downloaded release metadata cannot replace it.
+
+Install the initial relay under the managed directory and configure the
+LaunchAgent to execute its stable `current` symlink, for example
+`~/.codex/zigzag/relay/current`. This ensures LaunchAgent recovery starts the
+last known-good release after an acknowledged update. The running relay keeps
+the previous image, stops accepting `/v1/spawn` requests, waits for the durable
+agent registry to have no `running` records, atomically switches `current`, and
+`exec`s the candidate. A small child watchdog stays in the same GUI session;
+if the replacement cannot bind, open state, and answer authenticated
+`/v1/health` within one minute, it `exec`s the saved binary. This deliberately
+does not invoke `launchctl bootout` or `bootstrap`, preserving Keychain access.
+
+The durable local controls are:
+
+```sh
+zigzag updates --dir ~/.codex/zigzag/relay status
+zigzag updates --dir ~/.codex/zigzag/relay pause
+zigzag updates --dir ~/.codex/zigzag/relay pin v0.1.42
+zigzag updates --dir ~/.codex/zigzag/relay unpin
+```
+
+`--update-interval SECONDS` changes the cadence (`0` disables scheduled
+checks); `--update-policy enabled|paused|pin:VERSION` supplies the initial
+policy. The `update-status.json` control file records the accepted version,
+policy, last check, and candidate result. Update attempts and the applied or
+failed result are schema-v1 `mac-relay` audit events under `task_id=relay-update`.
+
+### Update threat model
+
+Auto-update is deliberate remote code execution. A network attacker, a forged
+manifest, an altered release asset, or an unrelated GitHub workflow cannot
+pass the digest and identity-constrained attestation verification. Shipping a
+malicious relay requires a valid provenance record from the pinned Zigzag
+release workflow (or compromise of the local trusted binary/state). A
+repository maintainer, protected workflow, GitHub Actions credential, or GitHub
+organization compromise can still produce a trusted malicious release; those
+are the remaining trust assumptions, not claims this mechanism eliminates.
+
 ## Release signing and deploy (Mac)
 
 Every `cargo build` re-generates the binary's ad-hoc signature (new
