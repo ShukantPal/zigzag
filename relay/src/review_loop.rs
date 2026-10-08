@@ -259,6 +259,8 @@ struct ReviewRound {
     repository: String,
     pull_request: u64,
     head: String,
+    #[serde(default)]
+    base: String,
     #[serde(default = "initial_generation")]
     generation: u64,
     verification: bool,
@@ -482,6 +484,19 @@ fn apply_gate_decision(round: &mut ReviewRound, decision: &GateDecision) {
     };
 }
 
+fn comparison_matches(round: &ReviewRound, snapshot: &PullRequestSnapshot) -> bool {
+    round.head == snapshot.head_ref_oid && round.base == snapshot.base_ref_oid
+}
+
+fn mark_round_superseded(state: &mut DurableState, key: &str) -> Vec<String> {
+    let Some(round) = state.rounds.get_mut(key) else {
+        return Vec::new();
+    };
+    let agents = round_agent_ids(round);
+    round.phase = RoundPhase::Superseded;
+    agents
+}
+
 fn discover(
     server: &Arc<Server>,
     config: &ReviewLoopConfig,
@@ -493,7 +508,8 @@ fn discover(
             let snapshot = fetch_pr(&policy.repository, number)?;
             let key = round_key(&policy.repository, number, &snapshot.head_ref_oid);
             if store.state.rounds.get(&key).is_some_and(|round| {
-                !matches!(round.phase, RoundPhase::Superseded | RoundPhase::Merged)
+                comparison_matches(round, &snapshot)
+                    && !matches!(round.phase, RoundPhase::Superseded | RoundPhase::Merged)
             }) {
                 continue;
             }
@@ -526,6 +542,7 @@ fn discover(
                     repository: policy.repository.clone(),
                     pull_request: number,
                     head: snapshot.head_ref_oid.clone(),
+                    base: snapshot.base_ref_oid.clone(),
                     generation,
                     verification,
                     phase: RoundPhase::Dispatching,
@@ -564,7 +581,7 @@ fn dispatch_missing_reviewers(
     store: &mut StateStore,
     key: &str,
 ) -> Result<(), String> {
-    let (repository, number, head, generation, verification) = {
+    let (repository, number, head, base, generation, verification) = {
         let round = store
             .state
             .rounds
@@ -574,6 +591,7 @@ fn dispatch_missing_reviewers(
             round.repository.clone(),
             round.pull_request,
             round.head.clone(),
+            round.base.clone(),
             round.generation,
             round.verification,
         )
@@ -646,9 +664,10 @@ fn dispatch_missing_reviewers(
         let prompt = reviewer_prompt(&repository, number, &head, lens);
         let project_dir = review_workspace(&task_id)?;
         if review_patch.is_none() {
-            review_patch = Some(fetch_pr_diff(&repository, number, &head)?);
-            if fetch_pr(&repository, number)?.head_ref_oid != head {
-                return Err("PR head changed while preparing reviewer input".to_owned());
+            review_patch = Some(fetch_pr_diff(&repository, number, &base, &head)?);
+            let current = fetch_pr(&repository, number)?;
+            if current.head_ref_oid != head || current.base_ref_oid != base {
+                return Err("PR comparison changed while preparing reviewer input".to_owned());
             }
         }
         let agent_id = spawn_codex_task(
@@ -697,12 +716,13 @@ fn poll_reviews(
         .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
-        let (repository, number, expected_head, generation) = {
+        let (repository, number, expected_head, expected_base, generation) = {
             let round = &store.state.rounds[&key];
             (
                 round.repository.clone(),
                 round.pull_request,
                 round.head.clone(),
+                round.base.clone(),
                 round.generation,
             )
         };
@@ -714,14 +734,8 @@ fn poll_reviews(
             continue;
         };
         let snapshot = fetch_pr(&repository, number)?;
-        if snapshot.head_ref_oid != expected_head {
-            let agent_ids = round_agent_ids(&store.state.rounds[&key]);
-            store
-                .state
-                .rounds
-                .get_mut(&key)
-                .expect("round exists")
-                .phase = RoundPhase::Superseded;
+        if snapshot.head_ref_oid != expected_head || snapshot.base_ref_oid != expected_base {
+            let agent_ids = mark_round_superseded(&mut store.state, &key);
             store.save()?;
             if !shadow {
                 kill_agents(server, &agent_ids);
@@ -885,15 +899,17 @@ fn fetch_pr(repository: &str, number: u64) -> Result<PullRequestSnapshot, String
         .map_err(|error| format!("GitHub PR response was not expected JSON: {error}"))
 }
 
-fn fetch_pr_diff(repository: &str, number: u64, expected_head: &str) -> Result<String, String> {
+fn fetch_pr_diff(
+    repository: &str,
+    number: u64,
+    expected_base: &str,
+    expected_head: &str,
+) -> Result<String, String> {
     let snapshot = fetch_pr(repository, number)?;
-    if snapshot.head_ref_oid != expected_head {
-        return Err("pull request head changed before reviewer dispatch".to_owned());
+    if snapshot.head_ref_oid != expected_head || snapshot.base_ref_oid != expected_base {
+        return Err("pull request comparison changed before reviewer dispatch".to_owned());
     }
-    let endpoint = format!(
-        "repos/{repository}/compare/{}...{expected_head}",
-        snapshot.base_ref_oid
-    );
+    let endpoint = format!("repos/{repository}/compare/{expected_base}...{expected_head}");
     run_allowed(
         "gh",
         vec![
@@ -1951,6 +1967,7 @@ review_loop:
             repository: "owner/repo".to_owned(),
             pull_request: 7,
             head: head.to_owned(),
+            base: "c".repeat(40),
             generation: 1,
             verification: false,
             phase,
@@ -2003,7 +2020,12 @@ review_loop:
             round.reviewers["tests"].attempt,
         );
         assert_eq!(recovered_task_id, expected_task_id);
-        let recovered_agent = latest_agent_for_task(&registry, &recovered_task_id).unwrap();
+        let mut spawn_count = 0;
+        let recovered_agent =
+            latest_agent_for_task(&registry, &recovered_task_id).unwrap_or_else(|| {
+                spawn_count += 1;
+                "new-agent".to_owned()
+            });
         round.reviewers.get_mut("tests").unwrap().agent_id = Some(recovered_agent);
         assert_eq!(round.reviewers["tests"].attempt, 1);
         assert_eq!(
@@ -2011,6 +2033,7 @@ review_loop:
             Some("existing-agent")
         );
         assert_eq!(registry.list(None, Some(&expected_task_id)).len(), 1);
+        assert_eq!(spawn_count, 0, "restart must reattach instead of spawning");
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(registry_path);
     }
@@ -2021,6 +2044,16 @@ review_loop:
         let head_b = "b".repeat(40);
         let key_a = round_key("owner/repo", 7, &head_a);
         let key_b = round_key("owner/repo", 7, &head_b);
+        let old_comment = Comment {
+            author: Some(Author {
+                login: "ShukantPal".to_owned(),
+            }),
+            body: format!(
+                "> 🤖 Codex (AI assistant) — [tests] review verdict\nVERDICT: APPROVE\nHEAD: {head_a}\nNo blocking issues."
+            ),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            id: "old-a-approval".to_owned(),
+        };
         let mut state = DurableState {
             schema_version: 1,
             rounds: BTreeMap::from([
@@ -2044,11 +2077,33 @@ review_loop:
             key_a.clone(),
             ReviewRound {
                 generation,
+                excluded_comment_ids: BTreeSet::from([old_comment.id.clone()]),
                 ..test_round(&head_a, RoundPhase::Dispatching, None)
             },
         );
         assert_eq!(state.rounds[&key_a].generation, 2);
         assert!(state.rounds[&key_a].verdicts.is_empty());
+        assert!(
+            latest_verdicts(
+                &policy(),
+                &head_a,
+                std::slice::from_ref(&old_comment),
+                &state.rounds[&key_a].excluded_comment_ids,
+            )
+            .is_empty()
+        );
+        let mut new_comment = old_comment;
+        new_comment.id = "new-a-approval".to_owned();
+        new_comment.created_at = "2026-01-02T00:00:00Z".to_owned();
+        assert!(
+            latest_verdicts(
+                &policy(),
+                &head_a,
+                &[new_comment],
+                &state.rounds[&key_a].excluded_comment_ids,
+            )
+            .contains_key("tests")
+        );
     }
 
     #[test]
@@ -2108,10 +2163,44 @@ review_loop:
     }
 
     #[test]
-    fn stale_head_poll_cleanup_includes_the_owner_agent() {
-        let mut round = test_round(&"a".repeat(40), RoundPhase::Reviewing, Some("reviewer"));
+    fn stale_comparison_poll_kills_the_owner_and_reviewer_agents() {
+        let head = "a".repeat(40);
+        let key = round_key("owner/repo", 7, &head);
+        let mut round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
         round.owner_agent_id = Some("owner".to_owned());
-        assert_eq!(round_agent_ids(&round), ["owner", "reviewer"]);
+        let mut state = DurableState {
+            schema_version: 1,
+            rounds: BTreeMap::from([(key.clone(), round)]),
+        };
+        let agent_ids = mark_round_superseded(&mut state, &key);
+        assert_eq!(agent_ids, ["owner", "reviewer"]);
+        assert_eq!(state.rounds[&key].phase, RoundPhase::Superseded);
+
+        let path = std::env::temp_dir().join(format!(
+            "zigzag-stale-agents-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let registry = AgentRegistry::open(&path).unwrap();
+        registry
+            .register(agent("owner", "owner-task", 51, "running"))
+            .unwrap();
+        registry
+            .register(agent("reviewer", "review-task", 52, "running"))
+            .unwrap();
+        let mut killed = Vec::new();
+        kill_agents_with(&registry, &agent_ids, |group| killed.push(group));
+        assert_eq!(killed, [51, 52]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unchanged_head_with_a_changed_base_starts_a_fresh_comparison() {
+        let head = "a".repeat(40);
+        let round = test_round(&head, RoundPhase::Ready, None);
+        let mut current = snapshot(&head);
+        assert!(comparison_matches(&round, &current));
+        current.base_ref_oid = "d".repeat(40);
+        assert!(!comparison_matches(&round, &current));
     }
 
     #[test]

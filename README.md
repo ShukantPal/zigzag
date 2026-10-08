@@ -91,8 +91,9 @@ admits only bounded version 1 JSON results for the exact current head, and
 publishes validated verdicts under the trusted GitHub identity. It evaluates
 every matching required CI check and emits `review_ready` or bounded
 `review_findings` events. Findings resume the owning Codex session. A new head
-supersedes the old state and approvals, and a merge kills outstanding reviewer
-process groups, including recovered orphan groups.
+or base commit supersedes the old comparison and approvals, and a merge kills
+outstanding reviewer and owner-resume process groups, including recovered
+orphan groups.
 
 Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
 Shadow mode runs discovery, verdict admission, and gate decisions alongside

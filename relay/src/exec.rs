@@ -648,6 +648,28 @@ mod tests {
                 )
                 .is_none()
         );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        &format!("repos/leveled-inc/leveled/compare/main...{head}"),
+                    ]),
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &args(&[
+                        "api",
+                        &format!("repos/leveled-inc/leveled/compare/{base}...head"),
+                    ]),
+                )
+                .is_none()
+        );
         assert_eq!(
             policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
             Some("/opt/homebrew/bin/gh")

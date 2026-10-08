@@ -37,6 +37,16 @@ jobs:
       - run: cargo build --locked --workspace --all-targets
       - run: cargo test --locked --workspace
 
+      - name: Smoke installed reviewer launcher
+        run: |
+          install -m 700 scripts/codex-review-launch.sh "$RUNNER_TEMP/codex-review-launch"
+          test "$(stat -f %Lp "$RUNNER_TEMP/codex-review-launch")" = 700
+          set +e
+          "$RUNNER_TEMP/codex-review-launch" invalid "$RUNNER_TEMP"
+          status=$?
+          set -e
+          test "$status" -eq 2
+
   release:
     # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
     # immutable image digest. The Actions, toolchain, signed binary, and
