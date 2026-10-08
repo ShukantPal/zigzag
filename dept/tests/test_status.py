@@ -18,8 +18,12 @@ from dept.status import (
     merged_events,
     observed_duration,
     read_audit_events,
+    relay_output,
     relay_snapshot,
     main as status_main,
+    transcript_command,
+    transcript_lines,
+    transcript_path,
 )
 
 
@@ -117,7 +121,7 @@ class SnapshotIngestionTests(unittest.TestCase):
                 "dept.status.get_json",
                 side_effect=[
                     {"events": [event("process_spawned", "2026-01-01T00:00:00.000Z")], "lost": True},
-                    {"agents": [{"execution_id": "execution", "state": "running"}]},
+                    {"agents": [{"id": "agent", "execution_id": "execution", "state": "running"}]},
                 ],
             ) as get_json:
                 recent, agents, lost, warnings = relay_snapshot("http://relay/", token)
@@ -127,7 +131,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(
             [call.args[0] for call in get_json.call_args_list],
-            ["http://relay/v1/events?after=0&timeout=0", "http://relay/v1/agents?state=running"],
+            ["http://relay/v1/events?after=0&timeout=0", "http://relay/v1/agents"],
         )
 
     def test_malformed_relay_shapes_warn_without_aborting(self):
@@ -145,7 +149,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         merged = merged_events([first], [latest])
         execution = build_executions(
             merged,
-            [{"execution_id": "execution", "task_id": "task", "state": "running", "audit_degraded": True, "log_degraded": True}],
+            [{"id": "agent", "execution_id": "execution", "task_id": "task", "state": "running", "audit_degraded": True, "log_degraded": True}],
             relay_lost=True,
         )
         self.assertEqual(len(merged), 1)
@@ -155,6 +159,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertIn("audit degraded", flags(merged_execution))
         self.assertIn("agent log degraded", flags(merged_execution))
         self.assertIn("relay events lost", flags(merged_execution))
+        self.assertEqual(merged_execution.agent_id, "agent")
 
     def test_status_refresh_keeps_audit_events_when_relay_requests_fail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -177,6 +182,39 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual((screen.selected, screen.offset), (3, 2))
         screen.move_selection(-3, 2)
         self.assertEqual((screen.selected, screen.offset), (0, 0))
+
+
+class TranscriptTests(unittest.TestCase):
+    def test_transcript_source_and_command_use_the_mac_dept_layout(self):
+        self.assertEqual(
+            transcript_path("t-example"),
+            Path.home() / ".codex/dept/t-example/last-message.txt",
+        )
+        self.assertEqual(
+            transcript_command("t-example"),
+            f"tail -f {Path.home() / '.codex/dept/t-example/last-message.txt'}",
+        )
+
+    def test_relay_output_reads_bounded_spool_and_keeps_last_40_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("token")
+            records = [{"data": f"line {number}\n"} for number in range(45)]
+            with patch("dept.status.get_json", return_value={"records": records}) as get_json:
+                lines, error = relay_output("http://relay/", token, "agent id")
+        self.assertIsNone(error)
+        self.assertEqual(lines, [f"line {number}" for number in range(5, 45)])
+        self.assertEqual(
+            get_json.call_args.args[0],
+            "http://relay/v1/agents/agent%20id/logs?stream=both&tail=12000&follow=0",
+        )
+
+    def test_transcript_detail_shows_path_command_and_spool(self):
+        execution = Execution("execution", "t-example", agent_id="agent")
+        lines = transcript_lines(execution, ["first", "second"], None)
+        self.assertIn(f"Source: {transcript_path('t-example')}", lines)
+        self.assertIn(f"Command: {transcript_command('t-example')}", lines)
+        self.assertEqual(lines[-3:], ["Relay output (last 40 lines):", "first", "second"])
 
 
 class CommandTests(unittest.TestCase):

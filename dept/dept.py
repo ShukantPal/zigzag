@@ -443,7 +443,8 @@ def management_main(argv):
      "resume": cmd_resume, "kill": cmd_kill}
     handler = commands.get(cmd)
     if handler is None:
-        sys.exit(f"unknown command: {cmd}")
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        return 2
     return handler(rest)
 
 
