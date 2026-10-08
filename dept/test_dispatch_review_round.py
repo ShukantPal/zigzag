@@ -87,6 +87,18 @@ class DispatchReviewRoundTest(unittest.TestCase):
             self.assertEqual(dispatcher.dispatch_reviewer("/work", pathlib.Path("/prompt")), "t-review")
         self.assertEqual(run.call_args.args[-2:], ("--read-only", "--ssh"))
 
+    def test_seed_can_include_security_lens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            info = {"headRefOid": "d" * 40, "headRefName": "branch"}
+            with patch.object(dispatcher, "ROUNDS_DIR", root / "rounds"), \
+                 patch.object(dispatcher, "PROMPT_DIR", root / "prompts"), \
+                 patch.object(dispatcher, "pr_info", return_value=info), \
+                 patch.object(dispatcher, "dispatch_reviewer", side_effect=["a", "b", "c", "s"]):
+                _, reviewers = dispatcher.seed(12, "owner/repo", "/work", "session",
+                                               lenses=dispatcher.LENSES + ("security",))
+        self.assertEqual(set(reviewers.values()), {"correctness", "simplicity", "tests", "security"})
+
 
 if __name__ == "__main__":
     unittest.main()

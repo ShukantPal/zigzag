@@ -101,7 +101,7 @@ def dispatch_reviewer(project_dir, prompt_file):
     return task_id(result.stdout + result.stderr)
 
 
-def seed(pr, repo, project_dir, owning_session, max_rounds=3):
+def seed(pr, repo, project_dir, owning_session, max_rounds=3, lenses=LENSES):
     existing = round_files(repo, pr)
     if len(existing) >= max_rounds:
         raise RuntimeError(f"PR #{pr} already has {len(existing)} active review rounds (cap {max_rounds})")
@@ -123,7 +123,7 @@ def seed(pr, repo, project_dir, owning_session, max_rounds=3):
     # reviewer tasks or let a retry dispatch duplicates invisibly.
     round_path.write_text(json.dumps(round_data, indent=2))
     try:
-      for lens in LENSES:
+      for lens in lenses:
         prompt = FULL_TEMPLATE.format(pr=pr, repo=repo, project_dir=project_dir,
                                       lens=lens, head=head)
         prompt_file = PROMPT_DIR / f"{repo_key(repo)}-pr{pr}-round{number}-{lens}.md"
@@ -146,9 +146,12 @@ def main(argv=None):
     parser.add_argument("--project-dir", required=True)
     parser.add_argument("--owning-session", required=True)
     parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--security", action="store_true",
+                        help="add the security lens for auth, credential, network, crypto, or PII changes")
     args = parser.parse_args(argv)
+    lenses = LENSES + (("security",) if args.security else ())
     path, reviewers = seed(args.pr, args.repo, args.project_dir, args.owning_session,
-                           args.max_rounds)
+                           args.max_rounds, lenses)
     print(f"seeded {path}: " + ", ".join(f"{lens}={tid}" for tid, lens in reviewers.items()))
 
 
