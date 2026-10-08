@@ -79,6 +79,10 @@ class ResumeCliTest(unittest.TestCase):
 
 
 class CommandDispatchTest(unittest.TestCase):
+    def test_tunnel_proxy_is_empty_without_https_proxy(self):
+        with patch.dict(department.os.environ, {}, clear=True):
+            self.assertEqual(department.tunnel_proxy(), "")
+
     def test_start_accepts_model_override(self):
         args = department.dispatch_args(["/project", "/prompt", "--model", "gpt-6-luna"])
         self.assertEqual(args.model, "gpt-6-luna")

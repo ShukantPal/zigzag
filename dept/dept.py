@@ -42,8 +42,11 @@ def asset_path(name):
 
 
 def tunnel_proxy():
-    hp = os.environ["HTTPS_PROXY"]
-    return hp.rsplit(":", 1)[0] + ":3130"
+    hp = os.environ.get("HTTPS_PROXY", "")
+    # Interactive invocations and local test runners do not necessarily inherit
+    # the VM cron's proxy environment.  Leave the helper's proxy unset in that
+    # case instead of crashing before SSH can report a useful transport error.
+    return hp.rsplit(":", 1)[0] + ":3130" if ":" in hp else ""
 
 
 def ssh(*remote_cmd, stdin_data=None, timeout=60):
