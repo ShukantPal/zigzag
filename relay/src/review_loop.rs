@@ -498,22 +498,24 @@ fn mark_round_superseded(state: &mut DurableState, key: &str) -> Vec<String> {
     agents
 }
 
-fn supersede_if_stale(
-    state: &mut DurableState,
+fn supersede_stale_round(
+    store: &mut StateStore,
     key: &str,
     snapshot: &PullRequestSnapshot,
     mut kill: impl FnMut(&[String]),
-) -> bool {
-    if state
+) -> Result<bool, String> {
+    if store
+        .state
         .rounds
         .get(key)
         .is_some_and(|round| comparison_matches(round, snapshot))
     {
-        return false;
+        return Ok(false);
     }
-    let agents = mark_round_superseded(state, key);
+    let agents = mark_round_superseded(&mut store.state, key);
+    store.save()?;
     kill(&agents);
-    true
+    Ok(true)
 }
 
 fn resolve_reviewer_agent(
@@ -771,12 +773,11 @@ fn poll_reviews(
             continue;
         };
         let mut snapshot = fetch_pr(&repository, number)?;
-        if supersede_if_stale(&mut store.state, &key, &snapshot, |agent_ids| {
+        if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
             }
-        }) {
-            store.save()?;
+        })? {
             continue;
         }
         let verdicts = latest_verdicts(
@@ -797,12 +798,11 @@ fn poll_reviews(
         // force-push or base retarget. Fence every downstream decision and
         // owner resume with a fresh comparison read.
         snapshot = fetch_pr(&repository, number)?;
-        if supersede_if_stale(&mut store.state, &key, &snapshot, |agent_ids| {
+        if supersede_stale_round(store, &key, &snapshot, |agent_ids| {
             if !shadow {
                 kill_agents(server, agent_ids);
             }
-        }) {
-            store.save()?;
+        })? {
             continue;
         }
         let changes: Vec<_> = store.state.rounds[&key]
@@ -2244,15 +2244,18 @@ review_loop:
         let key = round_key("owner/repo", 7, &head);
         let mut round = test_round(&head, RoundPhase::Reviewing, Some("reviewer"));
         round.owner_agent_id = Some("owner".to_owned());
-        let mut state = DurableState {
-            schema_version: 1,
-            rounds: BTreeMap::from([(key.clone(), round)]),
-        };
-        let path = std::env::temp_dir().join(format!(
+        let state_path = std::env::temp_dir().join(format!(
+            "zigzag-stale-state-{}.json",
+            super::super::random_hex_128().unwrap()
+        ));
+        let mut store = StateStore::open(state_path.clone()).unwrap();
+        store.state.rounds.insert(key.clone(), round);
+        store.save().unwrap();
+        let registry_path = std::env::temp_dir().join(format!(
             "zigzag-stale-agents-{}.json",
             super::super::random_hex_128().unwrap()
         ));
-        let registry = AgentRegistry::open(&path).unwrap();
+        let registry = AgentRegistry::open(&registry_path).unwrap();
         registry
             .register(agent("owner", "owner-task", 51, "running"))
             .unwrap();
@@ -2262,15 +2265,16 @@ review_loop:
         let mut killed = Vec::new();
         let mut changed = snapshot(&head);
         changed.base_ref_oid = "d".repeat(40);
-        assert!(supersede_if_stale(
-            &mut state,
-            &key,
-            &changed,
-            |agent_ids| kill_agents_with(&registry, agent_ids, |group| killed.push(group)),
-        ));
-        assert_eq!(state.rounds[&key].phase, RoundPhase::Superseded);
+        let superseded = supersede_stale_round(&mut store, &key, &changed, |agent_ids| {
+            let persisted = StateStore::open(state_path.clone()).unwrap();
+            assert_eq!(persisted.state.rounds[&key].phase, RoundPhase::Superseded);
+            kill_agents_with(&registry, agent_ids, |group| killed.push(group));
+        });
+        assert!(superseded.unwrap());
+        assert_eq!(store.state.rounds[&key].phase, RoundPhase::Superseded);
         assert_eq!(killed, [51, 52]);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(registry_path);
     }
 
     #[test]
