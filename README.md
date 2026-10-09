@@ -6,7 +6,7 @@ Zigzag is a Mac-hosted relay for dispatching and supervising Codex agents throug
 
 - **Relay daemon (`zigzag`, Rust):** Mac-side control plane. It supervises agent process groups, persists agent state and logs, manages permitted worktrees, serves the HTTP API, streams events, and checks signed updates. It runs as a per-user LaunchAgent so macOS Keychain access is available.
 - **CLI (`zzapi`, Rust):** Authenticated client for agent, worktree, execution, and event operations. It prints readable output by default and supports `--json` for scripts.
-- **Status TUI (`dept/status.py`):** Read-only terminal dashboard for agent/task state, output, and event history. It uses the relay API and local task metadata.
+- **Status TUI (`zzapi status`):** Read-only terminal dashboard for agent/task state, output, and event history. It uses the relay API and local task metadata.
 
 The daemon listens on loopback and the Mac's Tailscale address (HTTP on port `8765`; the bidirectional TCP event socket defaults to `8766`). Every API request requires the relay bearer token. Keep network access limited to trusted tailnet clients with a Tailscale ACL. See [architecture](docs/architecture.md) and [operations](docs/operations.md) for deployment details.
 
@@ -46,7 +46,7 @@ zzapi agents list
 zzapi agents get AGENT_ID
 ```
 
-Run `python3 dept/status.py` for the live status TUI (`python3 dept/status.py --once` prints one snapshot). Use `zzapi agents logs AGENT_ID --follow` to follow an agent's output.
+Run `zzapi status` for the live status TUI (`zzapi status --once` prints one snapshot). Use `zzapi agents logs AGENT_ID --follow` to follow an agent's output.
 
 ## API overview
 

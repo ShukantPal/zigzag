@@ -27,6 +27,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+mod status;
+
 const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_SOCKET_PORT: u16 = 8766;
@@ -102,6 +104,24 @@ enum Commands {
     Agents {
         #[command(subcommand)]
         cmd: AgentsCmd,
+    },
+    /// Live read-only agent and execution status dashboard
+    Status {
+        /// Print one snapshot without opening the interactive screen
+        #[arg(long)]
+        once: bool,
+        /// Include relay-internal maintenance tasks
+        #[arg(long)]
+        all: bool,
+        /// Refresh interval in seconds
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        /// Local dept task root used to resolve task directories
+        #[arg(long)]
+        task_root: Option<String>,
+        /// Local relay state file used to load audit events and agent worktrees
+        #[arg(long)]
+        state_file: Option<String>,
     },
     /// Manage git worktrees
     Worktrees {
@@ -1615,6 +1635,20 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 cmd_agents_transcript(&client, &id, tail, follow)
             }
         },
+        Commands::Status {
+            once,
+            all,
+            interval,
+            task_root,
+            state_file,
+        } => status::cmd_status(
+            &client,
+            once,
+            all,
+            interval,
+            task_root.as_deref(),
+            state_file.as_deref(),
+        ),
         Commands::Worktrees { cmd } => match cmd {
             WorktreesCmd::Create { path, branch, repo } => {
                 cmd_worktrees_create(&client, &path, &branch, &repo)
