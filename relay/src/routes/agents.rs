@@ -4,8 +4,8 @@ use crate::events::{
 use crate::exec;
 use crate::http::{error, query, reply};
 use crate::proc::{
-    AgentSpawnDetails, kill_process_group, process_group_running, recovered_agent_identity_matches,
-    spawn_proc,
+    AgentSpawnDetails, agent_transcript_path, kill_process_group, process_group_running,
+    recovered_agent_identity_matches, spawn_proc,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{WORKTREE_REPO_ROOT, canonical_worktree_roots};
@@ -70,7 +70,7 @@ fn agent_codex_path() -> &'static Path {
         let path = std::env::temp_dir().join(format!("zigzag-test-codex-{}", std::process::id()));
         std::fs::write(
             &path,
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *persist-transcript*)\n      printf '{\"type\":\"item.completed\",\"text\":\"persisted-agent-output\"}\\n'\n      printf 'persisted-agent-stderr\\n' >&2\n      exit 0\n      ;;\n  esac\ndone\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .expect("could not create test Codex runner");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
@@ -182,10 +182,8 @@ pub(crate) fn agent_request(
                 };
             let deadline = Instant::now() + Duration::from_secs(50);
             loop {
-                let Some(logs) = state
-                    .supervisor
-                    .registry
-                    .logs_json(id, stream_name, after, tail)
+                let Some(logs) =
+                    agent_logs_json(&state.supervisor.registry, id, stream_name, after, tail)
                 else {
                     return reply(stream, 404, error("unknown_agent"));
                 };
@@ -301,7 +299,7 @@ fn transcript_json(
     tail: Option<usize>,
 ) -> Option<Json> {
     let agent = registry.get(id)?;
-    let logs = registry.logs_json(id, "both", 0, tail)?;
+    let logs = agent_logs_json(registry, id, "both", 0, tail)?;
 
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
@@ -357,6 +355,70 @@ fn transcript_json(
         ),
         ("stdout".to_owned(), Json::String(stdout_text)),
         ("stderr".to_owned(), Json::String(stderr_text)),
+        ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
+    ]))
+}
+
+/// Read API-created Codex stdout from its durable JSONL transcript. Stderr
+/// continues to use the existing separate diagnostics spool. Older and
+/// generic agents have no transcript file and retain the original spool-only
+/// behavior.
+fn agent_logs_json(
+    registry: &relay_core::AgentRegistry,
+    id: &str,
+    stream: &str,
+    after: u64,
+    tail: Option<usize>,
+) -> Option<Json> {
+    let agent = registry.get(id)?;
+    let transcript = agent_transcript_path(id).and_then(|path| std::fs::read_to_string(path).ok());
+    let Some(transcript) = transcript else {
+        return registry.logs_json(id, stream, after, tail);
+    };
+
+    let stderr_logs = registry.logs_json(id, "stderr", after, tail)?;
+    let mut records = Vec::new();
+    if matches!(stream, "stdout" | "both") && after == 0 {
+        let data = match tail {
+            Some(limit) if transcript.len() > limit => {
+                let mut start = transcript.len() - limit;
+                while !transcript.is_char_boundary(start) {
+                    start += 1;
+                }
+                transcript[start..].to_owned()
+            }
+            _ => transcript,
+        };
+        if !data.is_empty() {
+            records.push(Json::Object(vec![
+                ("stream".to_owned(), Json::String("stdout".to_owned())),
+                ("cursor".to_owned(), Json::number(0)),
+                ("data".to_owned(), Json::String(data)),
+            ]));
+        }
+    }
+    if matches!(stream, "stderr" | "both")
+        && let Some(Json::Array(stderr_records)) = stderr_logs.object("records")
+    {
+        records.extend(stderr_records.iter().cloned());
+    }
+    Some(Json::Object(vec![
+        ("records".to_owned(), Json::Array(records)),
+        (
+            "next_cursor".to_owned(),
+            Json::number(
+                agent.log_next.max(
+                    agent_transcript_path(id)
+                        .and_then(|path| std::fs::metadata(path).ok())
+                        .map_or(0, |metadata| metadata.len()),
+                ),
+            ),
+        ),
+        (
+            "dropped_before".to_owned(),
+            Json::number(agent.log_dropped_before),
+        ),
+        ("complete".to_owned(), Json::Bool(agent.state != "running")),
         ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
     ]))
 }
@@ -666,6 +728,7 @@ fn agent_create_request(
         AgentSpawnDetails {
             worktree_path: Some(worktree_str.clone()),
             deadline_at,
+            persist_transcript: true,
         },
     ) {
         Ok(handle) => reply(
