@@ -1450,11 +1450,33 @@ fn agent_create_request_parsing_and_helpers() {
     assert_eq!(request.prompt, "do it");
     assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
     assert_eq!(request.branch, "codex/x");
+    assert!(!request.no_branch);
+    assert_eq!(request.pr, None);
     assert_eq!(request.model.as_deref(), Some(DEFAULT_CODEX_MODEL));
     assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
     assert_eq!(request.timeout_secs, Some(3600));
     assert!(request.auto_pr);
     assert!(request.worktree.is_none());
+    let no_branch = parse_agent_create_request(
+        br#"{"prompt":"inspect","project_dir":"/Users/shukant/Workspace/repo","no_branch":true}"#,
+    )
+    .unwrap();
+    assert!(no_branch.no_branch);
+    assert!(no_branch.branch.is_empty());
+    assert!(no_branch.pr.is_none());
+    assert!(parse_agent_create_request(br#"{"prompt":"x","project_dir":"y"}"#).is_err());
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","no_branch":true}"#
+        )
+        .is_err()
+    );
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","no_branch":true,"pr":123}"#
+        )
+        .is_err()
+    );
     assert!(
         parse_agent_create_request(br#"{"prompt":"x","project_dir":"y","branch":"z","nope":1}"#)
             .is_err()

@@ -286,6 +286,62 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
 }
 
+#[test]
+fn e2e_agent_no_branch_runs_in_project_without_worktree_or_checkout() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let id = unique_id("agent-no-branch");
+    let repo = agent_create_test_repo(&id).canonicalize().unwrap();
+    let repo_text = repo.to_string_lossy();
+    let body =
+        format!(r#"{{"prompt":"inspect only","project_dir":"{repo_text}","no_branch":true}}"#);
+
+    let created = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents",
+        &body,
+    ));
+    let handle = created
+        .object("id")
+        .and_then(Json::as_str)
+        .expect("agent create response missing id")
+        .to_owned();
+    assert_eq!(created.object("worktree"), Some(&Json::Null));
+    assert_eq!(
+        created.object("working_dir").and_then(Json::as_str),
+        Some(repo_text.as_ref())
+    );
+
+    let agent = state
+        .supervisor
+        .registry
+        .get(&handle)
+        .expect("no-branch agent missing from registry");
+    assert!(agent.worktree_path.is_none());
+    assert!(!repo.join(".codex-prompt.md").exists());
+    assert!(!repo.join("last-message.txt").exists());
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&repo)
+        .output()
+        .expect("could not inspect current branch");
+    assert!(branch.status.success());
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "main");
+
+    let stopped = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{handle}"),
+        "",
+    );
+    assert!(stopped.starts_with("HTTP/1.1 200"), "{stopped}");
+    drop(state);
+    let _ = std::fs::remove_dir_all(repo);
+}
+
 /// API-created Codex agents save their JSON event stream outside the bounded
 /// diagnostics spool, so it remains available through the transcript API.
 #[test]

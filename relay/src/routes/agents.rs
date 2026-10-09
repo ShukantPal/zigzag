@@ -464,6 +464,8 @@ pub(crate) struct AgentCreateRequest {
     pub(crate) prompt: String,
     pub(crate) project_dir: String,
     pub(crate) branch: String,
+    pub(crate) no_branch: bool,
+    pub(crate) pr: Option<u64>,
     pub(crate) worktree: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) approval_mode: Option<String>,
@@ -482,6 +484,8 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
             "prompt"
                 | "project_dir"
                 | "branch"
+                | "no_branch"
+                | "pr"
                 | "worktree"
                 | "model"
                 | "approval_mode"
@@ -503,6 +507,23 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
                 .ok_or("invalid_agent_create_request"),
         }
     };
+    let no_branch = match fields.iter().find(|(key, _)| key == "no_branch") {
+        None => false,
+        Some((_, Json::Bool(value))) => *value,
+        Some(_) => return Err("invalid_agent_create_request"),
+    };
+    let pr = match fields.iter().find(|(key, _)| key == "pr") {
+        None => None,
+        Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_create_request")?),
+    };
+    let branch = string_field("branch", false)?.unwrap_or_default();
+    if (!branch.is_empty() && no_branch)
+        || (!branch.is_empty() && pr.is_some())
+        || (branch.is_empty() && !no_branch && pr.is_none())
+        || (no_branch && pr.is_some())
+    {
+        return Err("invalid_agent_create_request");
+    }
     let timeout_secs = match fields.iter().find(|(key, _)| key == "timeout_secs") {
         None => None,
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_create_request")?),
@@ -515,7 +536,9 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
     Ok(AgentCreateRequest {
         prompt: string_field("prompt", true)?.expect("required field"),
         project_dir: string_field("project_dir", true)?.expect("required field"),
-        branch: string_field("branch", true)?.expect("required field"),
+        branch,
+        no_branch,
+        pr,
         worktree: string_field("worktree", false)?,
         model: string_field("model", false)?,
         approval_mode: string_field("approval_mode", false)?,
@@ -604,7 +627,7 @@ pub(crate) fn agent_create_worktree(
     Ok(path.to_path_buf())
 }
 
-/// `POST /v1/agents`: create a worktree and launch a supervised `codex exec`.
+/// `POST /v1/agents`: launch a supervised `codex exec` in a worktree or project.
 fn agent_create_request(
     stream: &mut TcpStream,
     state: &Server,
@@ -643,22 +666,60 @@ fn agent_create_request(
     {
         return reply(stream, 500, error("could_not_persist_event"));
     }
-    if !valid_worktree_branch(&request.branch) {
-        return reply(stream, 400, error("worktree_invalid_branch"));
-    }
     let roots = agent_worktree_roots();
     let repo_root = agent_worktree_repo_root();
-    let worktree_raw = request
-        .worktree
-        .clone()
-        .unwrap_or_else(|| default_agent_worktree(&request.branch));
-    let worktree_path = match resolve_new_worktree_path(&worktree_raw, &roots) {
-        Ok(path) => path,
-        Err(failure) => return reply(stream, failure.code, error(failure.message)),
-    };
     let repo = match resolve_worktree_repo(&request.project_dir, &repo_root) {
         Ok(repo) => repo,
         Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let mut request = request;
+    if let Some(pr) = request.pr {
+        let output = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr.to_string(),
+                "--json",
+                "headRefName",
+                "--jq",
+                ".headRefName",
+            ])
+            .current_dir(&repo)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                request.branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            }
+            Ok(output) => {
+                log::warn!(
+                    "agent_create could not resolve PR #{pr}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return reply(stream, 400, error("could_not_resolve_pr_branch"));
+            }
+            Err(message) => {
+                log::error!("agent_create could not run gh to resolve PR #{pr}: {message}");
+                return reply(stream, 500, error("could_not_resolve_pr_branch"));
+            }
+        }
+        if !valid_worktree_branch(&request.branch) {
+            return reply(stream, 400, error("worktree_invalid_branch"));
+        }
+    }
+    let worktree_path = if request.no_branch {
+        repo.clone()
+    } else {
+        if !valid_worktree_branch(&request.branch) {
+            return reply(stream, 400, error("worktree_invalid_branch"));
+        }
+        let worktree_raw = request
+            .worktree
+            .clone()
+            .unwrap_or_else(|| default_agent_worktree(&request.branch));
+        match resolve_new_worktree_path(&worktree_raw, &roots) {
+            Ok(path) => path,
+            Err(failure) => return reply(stream, failure.code, error(failure.message)),
+        }
     };
     let file_prompt = if Path::new(&request.prompt).is_file() {
         match std::fs::read_to_string(&request.prompt) {
@@ -696,8 +757,12 @@ fn agent_create_request(
     }
     codex_args.extend(["-m".to_owned(), model.to_owned()]);
     let agents = state.supervisor.registry.list(None, None);
-    let worktree_path = match agent_create_worktree(&repo, &worktree_path, &request.branch, &agents)
-    {
+    let worktree_creation = if request.no_branch {
+        Ok(worktree_path.clone())
+    } else {
+        agent_create_worktree(&repo, &worktree_path, &request.branch, &agents)
+    };
+    let worktree_path = match worktree_creation {
         Ok(path) => path,
         Err(AgentWorktreeFailure::Validation(failure)) => {
             return reply(stream, failure.code, error(failure.message));
@@ -721,17 +786,16 @@ fn agent_create_request(
         }
     };
     let worktree_str = worktree_path.to_string_lossy().into_owned();
-    codex_args.extend([
-        "-C".to_owned(),
-        worktree_str.clone(),
-        "-o".to_owned(),
-        format!("{worktree_str}/last-message.txt"),
-    ]);
+    codex_args.extend(["-C".to_owned(), worktree_str.clone()]);
+    if !request.no_branch {
+        codex_args.extend(["-o".to_owned(), format!("{worktree_str}/last-message.txt")]);
+    }
     let prompt_text = match file_prompt {
         Some(text) => text,
         None => {
-            if let Err(message) =
-                std::fs::write(worktree_path.join(".codex-prompt.md"), &request.prompt)
+            if !request.no_branch
+                && let Err(message) =
+                    std::fs::write(worktree_path.join(".codex-prompt.md"), &request.prompt)
             {
                 log::error!("agent_create could not write prompt file: {message}");
                 return reply(stream, 500, error("could_not_write_prompt"));
@@ -779,7 +843,7 @@ fn agent_create_request(
         command,
         execution_id.clone(),
         AgentSpawnDetails {
-            worktree_path: Some(worktree_str.clone()),
+            worktree_path: (!request.no_branch).then_some(worktree_str.clone()),
             deadline_at,
             persist_transcript: true,
         },
@@ -813,7 +877,15 @@ fn agent_create_request(
                 200,
                 Json::Object(vec![
                     ("id".to_owned(), Json::String(handle.handle)),
-                    ("worktree".to_owned(), Json::String(worktree_str)),
+                    (
+                        "worktree".to_owned(),
+                        if request.no_branch {
+                            Json::Null
+                        } else {
+                            Json::String(worktree_str.clone())
+                        },
+                    ),
+                    ("working_dir".to_owned(), Json::String(worktree_str)),
                 ]),
             )
         }
@@ -845,7 +917,11 @@ pub(crate) fn persisted_agent_config(
             Json::String(request.project_dir.clone()),
         ),
         ("branch".to_owned(), Json::String(request.branch.clone())),
-        ("auto_pr".to_owned(), Json::Bool(request.auto_pr)),
+        ("no_branch".to_owned(), Json::Bool(request.no_branch)),
+        (
+            "auto_pr".to_owned(),
+            Json::Bool(request.auto_pr && !request.no_branch),
+        ),
         ("worktree".to_owned(), Json::String(worktree.to_owned())),
         (
             "model".to_owned(),
@@ -874,6 +950,7 @@ pub(crate) fn persisted_agent_config(
 pub(crate) struct AgentRestartConfig {
     pub(crate) prompt: String,
     worktree: String,
+    no_branch: bool,
     model: Option<String>,
     approval_mode: Option<String>,
     pub(crate) timeout_secs: Option<u64>,
@@ -955,7 +1032,6 @@ pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static 
     // Validate the complete creation schema; only launch-relevant fields are
     // retained here, avoiding dead duplicate state.
     required("project_dir")?;
-    required("branch")?;
     let timeout_secs = match fields.iter().find(|(key, _)| key == "timeout_secs") {
         None | Some((_, Json::Null)) => None,
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_config")?),
@@ -963,6 +1039,10 @@ pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static 
     Ok(AgentRestartConfig {
         prompt: required("prompt")?,
         worktree: required("worktree")?,
+        no_branch: matches!(
+            fields.iter().find(|(key, _)| key == "no_branch"),
+            Some((_, Json::Bool(true)))
+        ),
         model: optional("model")?,
         approval_mode: optional("approval_mode")?,
         timeout_secs,
@@ -994,20 +1074,29 @@ pub(crate) fn restart_argv(
     }
     args.extend(["-m".to_owned(), model.to_owned()]);
     match mode {
-        RestartMode::Fresh => args.extend([
-            "-C".to_owned(),
-            config.worktree.clone(),
-            "-o".to_owned(),
-            format!("{}/last-message.txt", config.worktree),
-            prompt.to_owned(),
-        ]),
-        RestartMode::Resume => args.extend([
-            "resume".to_owned(),
-            session.expect("resume session").to_owned(),
-            prompt.to_owned(),
-            "-o".to_owned(),
-            format!("{}/last-message.txt", config.worktree),
-        ]),
+        RestartMode::Fresh => {
+            args.extend(["-C".to_owned(), config.worktree.clone()]);
+            if !config.no_branch {
+                args.extend([
+                    "-o".to_owned(),
+                    format!("{}/last-message.txt", config.worktree),
+                ]);
+            }
+            args.push(prompt.to_owned());
+        }
+        RestartMode::Resume => {
+            args.extend([
+                "resume".to_owned(),
+                session.expect("resume session").to_owned(),
+                prompt.to_owned(),
+            ]);
+            if !config.no_branch {
+                args.extend([
+                    "-o".to_owned(),
+                    format!("{}/last-message.txt", config.worktree),
+                ]);
+            }
+        }
     }
     Ok(args)
 }

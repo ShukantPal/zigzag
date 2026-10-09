@@ -109,7 +109,7 @@ zigzag updates --dir ~/.codex/zigzag/relay status|pause|pin VERSION|unpin
 
 ### Relay-native agents and worktrees
 
-The relay agent path is intentionally narrower than `/v1/exec`: callers select a provider-level request, not arbitrary binary/arguments. `POST /v1/agents` accepts a prompt (inline or file path), `project_dir`, `branch`, and optional `worktree`, `model`, `approval_mode`, and `timeout_secs`. It creates a supervised Codex process in the worktree (default under `/private/tmp/<branch-slug>/`), stores durable lifecycle state, and returns an agent ID and resolved worktree. Capacity is bounded (default 16 agents).
+The relay agent path is intentionally narrower than `/v1/exec`: callers select a provider-level request, not arbitrary binary/arguments. `POST /v1/agents` accepts a prompt (inline or file path), `project_dir`, and one of `branch`, `no_branch`, or `pr`, plus optional `worktree`, `model`, `approval_mode`, and `timeout_secs`. Branch and PR modes run in a supervised worktree (default under `/private/tmp/<branch-slug>/`). No-branch mode runs directly in `project_dir` without creating a worktree or checking out a branch; the CLI requires explicit `--no-branch` to select it. Capacity is bounded (default 16 agents).
 
 The registry reaper records terminal exit. A relay restart cannot reattach old pipes: a still-alive group becomes `orphaned`; a dead former group becomes `lost_after_restart`. Terminal registry entries and spool metadata are pruned after seven days. The generic spawn compatibility path does not create the same full transcript file; API-created agents do.
 
@@ -159,7 +159,8 @@ Configuration precedence: `--hostname` / `ZIGZAG_HOSTNAME` (default `100.101.237
 zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
-zzapi agents create --prompt TEXT --project-dir DIR --branch BRANCH
+zzapi agents create --prompt TEXT --project-dir DIR
+                    (--branch BRANCH | --no-branch | --pr NUMBER)
                     [--worktree PATH] [--model MODEL]
                     [--approval-mode MODE] [--timeout-secs N]
 zzapi agents logs ID [--stream stdout|stderr|both] [--after N] [--tail N]
@@ -777,13 +778,18 @@ prefix is ambiguous, add characters; never guess which task a prefix means.
 ### `zzapi agents create`
 
 ```sh
-zzapi agents create --prompt TEXT_OR_FILE --project-dir PATH --branch BRANCH \
+zzapi agents create --prompt TEXT_OR_FILE --project-dir PATH \
+  (--branch BRANCH | --no-branch | --pr NUMBER) \
   [--worktree PATH] [--model MODEL] [--approval-mode MODE] [--timeout-secs N]
 ```
 
-Calls native `POST /v1/agents`.  `--prompt`, `--project-dir`, and `--branch`
-are required.  `--worktree` chooses an explicit permitted worktree; otherwise
-the relay derives its default private-temp path.  `--model` and
+Calls native `POST /v1/agents`. `--prompt` and `--project-dir` are required.
+Choose `--branch` for a worktree, `--pr` to resolve an existing PR's head
+branch with `gh pr view`, or explicit `--no-branch` to run directly in the
+project directory. Exactly one mode is required; `--branch` and `--no-branch`
+cannot be combined. `--worktree` chooses an explicit permitted worktree in
+branch or PR mode; otherwise the relay derives its default private-temp path.
+`--model` and
 `--approval-mode` request provider behavior accepted by the server.  `--timeout-secs`
 sets an agent deadline where the route/provider supports it.  The CLI does not
 make an unsafe shell command: values remain JSON fields.
