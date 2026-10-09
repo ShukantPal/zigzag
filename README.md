@@ -59,6 +59,8 @@ Authenticated read-only diagnostics are available at:
 - `GET /v1/agents?state=…&task_id=…`
 - `GET /v1/agents/<agent-id>`
 - `GET /v1/agents/<agent-id>/logs?stream=stdout|stderr|both&after=…&tail=…&follow=0|1`
+- `DELETE /v1/agents/<agent-id>` — gracefully stop the agent (SIGTERM, then
+  SIGKILL) and deregister it; the worktree is left in place
 
 Logs are sensitive. They are owner-only local spools, limited to 32 MiB per
 agent; evicting old complete records advances `dropped_before` rather than

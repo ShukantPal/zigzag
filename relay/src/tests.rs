@@ -26,8 +26,9 @@ use crate::http::{
     denial_response, error, get_query, percent_decode, query, read_request, reply,
 };
 use crate::proc::{
-    COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry, prune_procs,
-    recovered_agent_identity_matches, spawn_proc, unique_handle,
+    COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
+    process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
+    spawn_proc, unique_handle,
 };
 use crate::review_loop;
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
@@ -48,8 +49,9 @@ use relay_core::{AgentRecord, AgentRegistry, Json, Store, parse_json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -682,6 +684,7 @@ fn recovery_replays_a_persisted_first_output_fact() {
         leader_pid: 1,
         process_group: 1,
         process_identity: Some("test:1".to_owned()),
+        worktree_path: None,
         started_at: "1".to_owned(),
         deadline_at: None,
         command: "sh -c".to_owned(),
@@ -1423,4 +1426,191 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
     );
     drop(state);
     let _ = std::fs::remove_file(state_path);
+}
+
+fn agent_record(id: &str) -> AgentRecord {
+    AgentRecord {
+        id: id.to_owned(),
+        task_id: "task-1".to_owned(),
+        execution_id: "exec-1".to_owned(),
+        leader_pid: 0,
+        process_group: 0,
+        process_identity: None,
+        worktree_path: None,
+        started_at: "2026-10-09T00:00:00Z".to_owned(),
+        deadline_at: None,
+        command: "sleep 300".to_owned(),
+        state: "running".to_owned(),
+        exit_code: None,
+        log_degraded: false,
+        audit_degraded: false,
+        redacted: false,
+        stdout_next: 0,
+        stderr_next: 0,
+        stdout_dropped_before: 0,
+        stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
+        first_output_at: None,
+        first_output_stream: None,
+        first_output_bytes: None,
+        paused_at: None,
+    }
+}
+
+#[test]
+fn agent_delete_unknown_agent_is_404() {
+    let (state, _state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/no-such-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    let body = response_json(response);
+    assert_eq!(
+        body.object("error").and_then(Json::as_str),
+        Some("unknown_agent")
+    );
+}
+
+#[test]
+fn agent_delete_terminal_agent_is_409() {
+    let (state, _state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    let mut record = agent_record("done-agent");
+    record.state = "succeeded".to_owned();
+    state.supervisor.registry.register(record).unwrap();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/done-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    let body = response_json(response);
+    assert_eq!(
+        body.object("error").and_then(Json::as_str),
+        Some("agent_not_running")
+    );
+    // The terminal record is untouched.
+    assert_eq!(
+        state.supervisor.registry.get("done-agent").unwrap().state,
+        "succeeded"
+    );
+}
+
+#[test]
+fn agent_delete_dead_process_deregisters_without_signalling() {
+    let (state, _state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    // A stale record: the PID no longer exists, so the identity check
+    // fails. The endpoint must deregister without signalling anything.
+    let mut record = agent_record("stale-agent");
+    record.leader_pid = 2_000_000_000;
+    record.process_group = 2_000_000_000;
+    state.supervisor.registry.register(record).unwrap();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/stale-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response_json(response);
+    assert_eq!(body.object("stopped").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        state.supervisor.registry.get("stale-agent").unwrap().state,
+        "stopped"
+    );
+}
+
+#[test]
+fn agent_delete_terminates_process_group_and_keeps_worktree() {
+    let (state, _state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    // A stand-in worktree: the endpoint must leave it in place.
+    let worktree = std::env::temp_dir().join(format!(
+        "zigzag-agent-delete-wt-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("sentinel.txt"), b"keep me").unwrap();
+
+    // A real process in its own process group.
+    let mut child = Command::new("/bin/sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn sleep");
+    let pgid = child.id() as i32;
+    let identity = process_identity(pgid).expect("process identity");
+    // The test is the parent: reap the leader when it exits, otherwise the
+    // zombie keeps kill(-pgid, 0) succeeding and the endpoint would
+    // escalate to SIGKILL.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let mut record = agent_record("delete-me");
+    record.leader_pid = pgid;
+    record.process_group = pgid;
+    record.process_identity = Some(identity);
+    record.worktree_path = Some(worktree.to_string_lossy().into_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/delete-me",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response_json(response);
+    assert_eq!(body.object("id").and_then(Json::as_str), Some("delete-me"));
+    assert_eq!(body.object("stopped").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        body.object("worktree").and_then(Json::as_str),
+        Some(worktree.to_str().unwrap())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_group_running(pgid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_group_running(pgid),
+        "process group {pgid} survived DELETE"
+    );
+
+    assert_eq!(
+        state.supervisor.registry.get("delete-me").unwrap().state,
+        "stopped"
+    );
+    // The worktree is left in place.
+    assert!(worktree.join("sentinel.txt").exists());
+    let _ = std::fs::remove_dir_all(&worktree);
+
+    // A second DELETE of the now-terminal agent is a 409.
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/delete-me",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
 }

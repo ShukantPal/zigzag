@@ -5,7 +5,7 @@ use crate::http::{ReadRequestError, denied, error, get_query, read_json, read_re
 use crate::logging;
 use crate::proc::ProcEntry;
 use crate::review_loop;
-use crate::routes::agents::{agent_post_request, agent_request, agent_route};
+use crate::routes::agents::{AgentRoute, agent_delete, agent_post_request, agent_request, agent_route};
 use crate::routes::exec::{exec_request, spawn_request};
 use crate::routes::procs::{ProcRoute, kill_proc, poll_proc, proc_route};
 use crate::routes::providers::providers_request;
@@ -206,6 +206,10 @@ where
         ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
         ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
         ("GET", "/v1/providers") => providers_request(&mut stream),
+        ("DELETE", path) => match agent_route(path) {
+            Some(AgentRoute::Status(id)) => agent_delete(&mut stream, &state, id),
+            _ => reply(&mut stream, 404, error("not_found")),
+        },
         ("GET", "/v1/review-gate") => {
             review_gate_request(&mut stream, &state, &request.target, gate_report)
         }

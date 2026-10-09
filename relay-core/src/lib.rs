@@ -22,6 +22,9 @@ pub struct AgentRecord {
     /// OS-reported process birth identity. Unlike a PID/PGID, this changes
     /// when the operating system reuses a numeric process identifier.
     pub process_identity: Option<String>,
+    /// Filesystem path of the agent's worktree, when the agent was created
+    /// with one. Deleting an agent never removes its worktree.
+    pub worktree_path: Option<String>,
     pub started_at: String,
     pub deadline_at: Option<String>,
     pub command: String,
@@ -504,6 +507,14 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .unwrap_or(Json::Null),
         ),
         (
+            "worktree_path".to_owned(),
+            entry
+                .worktree_path
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
             "started_at".to_owned(),
             Json::String(entry.started_at.clone()),
         ),
@@ -667,6 +678,7 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         leader_pid: required_integer("leader_pid")? as i32,
         process_group: required_integer("process_group")? as i32,
         process_identity: optional_string("process_identity")?,
+        worktree_path: optional_string("worktree_path")?,
         started_at: match get("started_at") {
             Some(Json::String(value)) => value.clone(),
             Some(Json::Number(value)) => value.clone(),
@@ -1590,6 +1602,7 @@ mod tests {
             leader_pid: 42,
             process_group: 42,
             process_identity: Some("test:42".to_owned()),
+            worktree_path: None,
             started_at: "1".to_owned(),
             deadline_at: None,
             command: "codex exec".to_owned(),
@@ -1671,6 +1684,7 @@ mod tests {
                     "leader_pid": 123,
                     "process_group": 456,
                     "process_identity": null,
+                    "worktree_path": "/tmp/wt-1",
                     "started_at": "2026-10-08T00:00:00Z",
                     "deadline_at": null,
                     "command": "echo hi",
@@ -1702,6 +1716,7 @@ mod tests {
         assert_eq!(record.id, "agent-1");
         assert_eq!(record.deadline_at, None);
         assert_eq!(record.process_identity, None);
+        assert_eq!(record.worktree_path, Some("/tmp/wt-1".to_owned()));
         assert_eq!(record.exit_code, None);
         // The bad record must be skipped (not crash the whole registry)
         assert_eq!(skipped.len(), 1);
@@ -1722,6 +1737,7 @@ mod tests {
             leader_pid: 123,
             process_group: 456,
             process_identity: None,
+            worktree_path: None,
             started_at: "2026-10-08T00:00:00Z".to_owned(),
             deadline_at: None,
             command: "echo".to_owned(),

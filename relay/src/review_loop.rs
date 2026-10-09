@@ -2898,6 +2898,7 @@ review_loop:
             leader_pid: process_group,
             process_group,
             process_identity: Some(format!("test:{process_group}")),
+            worktree_path: None,
             started_at: format!("2026-01-01T00:00:{process_group:02}Z"),
             deadline_at: None,
             command: "codex exec".to_owned(),
