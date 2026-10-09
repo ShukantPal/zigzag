@@ -2120,32 +2120,28 @@ fn query(target: &str) -> Result<HashMap<String, String>, String> {
     Ok(values)
 }
 fn percent_decode(input: &str) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    let mut chars = input.bytes();
-    while let Some(byte) = chars.next() {
+    // Query strings use form-encoding, where a literal '+' means space.
+    // Translate '+' first so an encoded "%2B" still decodes to '+'.
+    let translated = input.replace('+', " ");
+    // The percent-encoding crate passes malformed '%' sequences through
+    // untouched instead of failing, so validate escapes up front. This keeps
+    // the old strict contract: query values feed agent/log lookups and event
+    // reads on the auth boundary, and bad input must be a 400, never silently
+    // accepted.
+    let mut bytes = translated.bytes();
+    while let Some(byte) = bytes.next() {
         if byte == b'%' {
-            let high = chars
-                .next()
-                .ok_or_else(|| "invalid URL encoding".to_owned())?;
-            let low = chars
-                .next()
-                .ok_or_else(|| "invalid URL encoding".to_owned())?;
-            bytes.push((hex(high)? << 4) | hex(low)?);
-        } else if byte == b'+' {
-            bytes.push(b' ');
-        } else {
-            bytes.push(byte);
+            let valid = bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit());
+            if !valid {
+                return Err("invalid URL encoding".to_owned());
+            }
         }
     }
-    String::from_utf8(bytes).map_err(|_| "invalid URL encoding".to_owned())
-}
-fn hex(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("invalid URL encoding".to_owned()),
-    }
+    percent_encoding::percent_decode_str(&translated)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| "invalid URL encoding".to_owned())
 }
 fn authorized(supplied: &str, secret: &str) -> bool {
     let expected = format!("Bearer {secret}");
@@ -2196,6 +2192,70 @@ mod tests {
         assert_eq!(
             get_query("/v1/events?epoch=%ZZ").unwrap_err(),
             "invalid URL encoding"
+        );
+    }
+
+    #[test]
+    fn percent_decode_handles_form_encoding_edge_cases() {
+        for (input, expected) in [
+            ("", ""),
+            ("abc", "abc"),
+            ("hello+world", "hello world"),
+            ("+", " "),
+            ("%2B", "+"),
+            ("%2b", "+"),
+            ("%41%42%63", "ABc"),
+            ("%E2%82%AC", "\u{20ac}"),
+            ("a%20b%09c", "a b\tc"),
+            ("%25", "%"),
+            ("100%25", "100%"),
+        ] {
+            assert_eq!(percent_decode(input).unwrap(), expected, "{input:?}");
+        }
+        // Malformed escapes and invalid UTF-8 stay hard errors: query values
+        // reach authenticated lookups, so bad input must never decode to
+        // something surprising.
+        for input in [
+            "%", "%2", "a%", "%zz", "%2G", "G%2", "%%41", "%FF", "a%FFb", "%E2%82", "%C3%28",
+        ] {
+            assert_eq!(
+                percent_decode(input).unwrap_err(),
+                "invalid URL encoding",
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_decoding_matches_url_crate_form_decoding() {
+        // Cross-check our strict decoder against the `url` crate's form
+        // decoder on well-formed inputs; ours additionally rejects malformed
+        // escapes instead of passing them through.
+        for raw in [
+            "a=1&b=2",
+            "a=hello+world",
+            "a=%2B%25%3D%26",
+            "a=%E2%82%AC",
+            "empty=&flag",
+            "k=%20+%09",
+            "a=1&b=%41%42",
+        ] {
+            let expected: HashMap<String, String> = url::form_urlencoded::parse(raw.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            assert_eq!(
+                query(&format!("/v1/events?{raw}")).unwrap(),
+                expected,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            query("/v1/events?a=%ZZ").unwrap_err(),
+            "invalid URL encoding"
+        );
+        assert_eq!(
+            query("/v1/events?a=1&a=2").unwrap_err(),
+            "duplicate query parameter"
         );
     }
 
