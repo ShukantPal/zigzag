@@ -5,6 +5,7 @@
 //! the repository, workflow, source ref, and the bundled Sigstore trust root.
 
 use relay_core::{Json, parse_json};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -438,7 +439,7 @@ impl Manager {
             .map_err(|e| format!("could not create update directory: {e}"))?;
         let candidate = candidate_dir.join("zigzag");
         download(self.runtime.as_ref(), &binary_url, &candidate)?;
-        if sha256_file(self.runtime.as_ref(), &candidate)? != manifest.sha256 {
+        if sha256_file(&candidate)? != manifest.sha256 {
             let _ = fs::remove_file(&candidate);
             return Err("release binary digest does not match manifest".to_owned());
         }
@@ -1000,14 +1001,12 @@ fn valid_commit(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn sha256_file(runtime: &dyn Runtime, path: &Path) -> Result<String, String> {
-    let output = command_output(runtime, "shasum", ["-a", "256", &path.to_string_lossy()])?;
-    output
-        .split_whitespace()
-        .next()
-        .filter(|digest| valid_sha256(digest))
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(|| "shasum returned an invalid digest".to_owned())
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("could not open file for hashing: {e}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("could not hash file: {e}"))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -1030,7 +1029,6 @@ mod tests {
     struct MockRuntime {
         release: String,
         downloads: Mutex<VecDeque<Vec<u8>>>,
-        digest: String,
         codesign_detail: String,
         calls: Mutex<Vec<Call>>,
         status_index: AtomicUsize,
@@ -1039,14 +1037,13 @@ mod tests {
     }
 
     impl MockRuntime {
-        fn release(manifest: &str, binary: &[u8], digest: &str) -> Arc<Self> {
+        fn release(manifest: &str, binary: &[u8]) -> Arc<Self> {
             Arc::new(Self {
                 release: r#"{"tag_name":"v2.0.0","assets":[{"name":"zigzag-macos-aarch64.manifest.json","browser_download_url":"https://example.test/manifest"},{"name":"zigzag-macos-aarch64","browser_download_url":"https://example.test/binary"}]}"#.to_owned(),
                 downloads: Mutex::new(VecDeque::from([
                     manifest.as_bytes().to_vec(),
                     binary.to_vec(),
                 ])),
-                digest: digest.to_owned(),
                 codesign_detail:
                     "Identifier=com.shukantpal.zigzag\nTeamIdentifier=NH5F3PDHQ8\n".to_owned(),
                 calls: Mutex::new(Vec::new()),
@@ -1078,10 +1075,6 @@ mod tests {
             match command {
                 "curl" => Ok(CommandOutput {
                     stdout: self.release.clone(),
-                    stderr: String::new(),
-                }),
-                "shasum" => Ok(CommandOutput {
-                    stdout: format!("{}  {}\n", self.digest, args.last().unwrap()),
                     stderr: String::new(),
                 }),
                 "codesign" => Ok(CommandOutput {
@@ -1219,9 +1212,8 @@ mod tests {
     #[test]
     fn fetch_candidate_verifies_every_authenticated_boundary() {
         let dir = temp_dir("fetch-ok");
-        let digest = "a".repeat(64);
-        let runtime =
-            MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary", &digest);
+        let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
+        let runtime = MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary");
         let updater = manager(&dir, runtime.clone(), None);
 
         let (verified, candidate) = updater
@@ -1275,7 +1267,7 @@ mod tests {
 
     #[test]
     fn fetch_candidate_rejects_tag_target_digest_codesign_and_attestation_mismatches() {
-        let digest = "a".repeat(64);
+        let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
         let cases = [
             (
                 "v1.9.0",
@@ -1314,7 +1306,7 @@ mod tests {
         for (tag, target, manifest_digest, detail, fail_at, expected) in cases {
             let dir = temp_dir(expected);
             let mut runtime =
-                MockRuntime::release(&manifest(tag, target, &manifest_digest), b"binary", &digest);
+                MockRuntime::release(&manifest(tag, target, &manifest_digest), b"binary");
             let inner = Arc::get_mut(&mut runtime).unwrap();
             if let Some(detail) = detail {
                 inner.codesign_detail = detail.to_owned();
@@ -1333,7 +1325,6 @@ mod tests {
         let runtime = Arc::new(MockRuntime {
             release: "not json".to_owned(),
             downloads: Mutex::new(VecDeque::new()),
-            digest: String::new(),
             codesign_detail: String::new(),
             calls: Mutex::new(Vec::new()),
             status_index: AtomicUsize::new(0),
@@ -1364,9 +1355,8 @@ mod tests {
     #[test]
     fn drain_waits_for_admitted_spawn_and_active_work_before_exec() {
         let dir = temp_dir("drain");
-        let digest = "a".repeat(64);
-        let runtime =
-            MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary", &digest);
+        let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
+        let runtime = MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary");
         let updater = Arc::new(manager(&dir, runtime.clone(), None));
         save_status(&dir, &empty_status()).unwrap();
 
@@ -1417,7 +1407,7 @@ mod tests {
         fs::write(&previous, b"old").unwrap();
         fs::write(&candidate, b"new").unwrap();
         replace_symlink(&previous, &dir.join("last-known-good")).unwrap();
-        let mut runtime = MockRuntime::release("", b"", "");
+        let mut runtime = MockRuntime::release("", b"");
         Arc::get_mut(&mut runtime).unwrap().fail_spawn = true;
         let updater = manager(&dir, runtime, None);
         let result = updater.activate_and_exec(
@@ -1454,7 +1444,7 @@ mod tests {
         replace_symlink(&candidate, &current).unwrap();
         save_status(&dir, &empty_status()).unwrap();
 
-        let runtime = MockRuntime::release("", b"", "");
+        let runtime = MockRuntime::release("", b"");
         let updater = manager(&dir, runtime.clone(), Some(ready.clone()));
         updater.acknowledge_ready(Some("v2.0.0")).unwrap();
         assert!(ready.exists());
@@ -1569,14 +1559,30 @@ mod tests {
     }
 
     #[test]
-    fn sha256_matches_known_vector() {
-        let path = temp_dir("sha").join("value");
+    fn sha256_matches_known_vectors() {
+        let dir = temp_dir("sha");
+        let path = dir.join("value");
         fs::write(&path, b"abc").unwrap();
         assert_eq!(
-            sha256_file(&SystemRuntime, &path).unwrap(),
+            sha256_file(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let empty = dir.join("empty");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            sha256_file(&empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sha256_reports_unreadable_file() {
+        let error = sha256_file(&temp_dir("sha-missing").join("does-not-exist")).unwrap_err();
+        assert!(
+            error.contains("could not open file for hashing"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
