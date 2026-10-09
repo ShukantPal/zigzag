@@ -10,6 +10,8 @@ Zigzag is a Mac-hosted relay for dispatching and supervising Codex agents throug
 
 The daemon listens on loopback and the Mac's Tailscale address (HTTP on port `8765`; the bidirectional TCP event socket defaults to `8766`). Every API request requires the relay bearer token. Keep network access limited to trusted tailnet clients with a Tailscale ACL. See [architecture](docs/architecture.md) and [operations](docs/operations.md) for deployment details.
 
+The relay can also poll GitHub PR conversation comments, inline review comments, and review bodies, then resume the Codex session associated with that PR. Comment routing runs in shadow mode by default; enable live routing explicitly after reviewing the [LaunchAgent setup guide](launchd/INSTALL.md).
+
 ## Quickstart
 
 Build the two Rust binaries and create a private relay token:
@@ -88,4 +90,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-Install the repository's pre-commit hook with `./scripts/install-hooks.sh`. For a local full-stack relay/CLI check, use `bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi`. Browse [docs/](docs/README.md) for component guides and deployment runbooks.
+Install the repository's pre-commit and pre-push hooks with `./scripts/install-hooks.sh`. For a local full-stack relay/CLI check, use `bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi`. Browse [docs/](docs/README.md) for component guides and deployment runbooks.
