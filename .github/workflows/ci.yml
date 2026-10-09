@@ -25,6 +25,35 @@ jobs:
           components: clippy, rustfmt
       - run: cargo build --locked --workspace --all-targets
       - run: cargo test --locked --workspace
+      - name: Smoke-test daemon startup against legacy agent registry
+        # The registry schema must stay backward compatible: feed the freshly
+        # built binary a registry in the old on-disk format and assert it
+        # starts instead of exiting with "invalid agent registry".
+        run: |
+          SMOKE_DIR="$(mktemp -d)"
+          cp relay-core/tests/fixtures/legacy-events.agents.json "$SMOKE_DIR/events.agents.json"
+          printf '{"epoch":"00000000000000000000000000000001","next_sequence":1,"events":[]}' > "$SMOKE_DIR/events.json"
+          head -c 48 /dev/urandom | base64 > "$SMOKE_DIR/token"
+          chmod 600 "$SMOKE_DIR/token"
+          mkdir -p "$SMOKE_DIR/bin"
+          printf '#!/bin/sh\necho "127.0.0.2"\n' > "$SMOKE_DIR/bin/tailscale"
+          chmod +x "$SMOKE_DIR/bin/tailscale"
+          PATH="$SMOKE_DIR/bin:$PATH" ./target/debug/zigzag --secret-file "$SMOKE_DIR/token" --state-file "$SMOKE_DIR/events.json" --port 18923 > "$SMOKE_DIR/out.log" 2>&1 &
+          DAEMON_PID=$!
+          sleep 4
+          if grep -q "invalid agent registry" "$SMOKE_DIR/out.log"; then
+            echo "FAIL: daemon rejected the legacy agent registry"
+            cat "$SMOKE_DIR/out.log"
+            kill "$DAEMON_PID" 2>/dev/null
+            exit 1
+          fi
+          if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "FAIL: daemon exited during startup"
+            cat "$SMOKE_DIR/out.log"
+            exit 1
+          fi
+          echo "OK: daemon started against legacy registry"
+          kill "$DAEMON_PID"
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo fmt --all --check
   rust-macos:
@@ -33,6 +62,25 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
       - run: bash -n scripts/codex-review-launch.sh
+      - name: Smoke release signing policy
+        # A release without Developer ID credentials must fail rather than
+        # produce an ad-hoc artifact the updater will reject.
+        run: |
+          BINARY="$RUNNER_TEMP/zigzag-macos-aarch64"
+          : > "$BINARY"
+          set +e
+          env -u SIGNING_IDENTITY bash scripts/sign-ci-release.sh "$BINARY" > "$RUNNER_TEMP/signing-error.log" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q 'ZIGZAG_SIGNING_IDENTITY is required' "$RUNNER_TEMP/signing-error.log"
+          mkdir "$RUNNER_TEMP/signing-bin"
+          printf '%s\n' '#!/bin/bash' 'printf "%s\\n" "$*" >> "$SIGN_LOG"' > "$RUNNER_TEMP/signing-bin/codesign"
+          chmod 700 "$RUNNER_TEMP/signing-bin/codesign"
+          export SIGN_LOG="$RUNNER_TEMP/codesign.log"
+          PATH="$RUNNER_TEMP/signing-bin:$PATH" SIGNING_IDENTITY='Developer ID Application: Zigzag (NH5F3PDHQ8)' bash scripts/sign-ci-release.sh "$BINARY"
+          grep -Fq -- '--sign Developer ID Application: Zigzag (NH5F3PDHQ8)' "$SIGN_LOG"
+          ! grep -Fq -- '--sign -' "$SIGN_LOG"
       - run: plutil -lint launchd/com.shukantpal.zigzag.plist
       - run: cargo build --locked --workspace --all-targets
       - run: cargo test --locked --workspace
@@ -88,6 +136,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
         with:
           toolchain: 1.90.0
+      - name: Require Developer ID release signing credentials
+        # Release candidates must satisfy the updater's Apple Team ID
+        # requirement; never publish an ad-hoc update artifact.
+        env:
+          P12: ${{ secrets.ZIGZAG_APPLE_CERTIFICATE_P12 }}
+          SIGNING_IDENTITY: ${{ secrets.ZIGZAG_SIGNING_IDENTITY }}
+        run: |
+          test -n "$P12" || { echo "ZIGZAG_APPLE_CERTIFICATE_P12 is required" >&2; exit 1; }
+          test -n "$SIGNING_IDENTITY" || { echo "ZIGZAG_SIGNING_IDENTITY is required" >&2; exit 1; }
       - uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3
         with:
           p12-file-base64: ${{ secrets.ZIGZAG_APPLE_CERTIFICATE_P12 }}
@@ -96,13 +153,9 @@ jobs:
         env:
           SIGNING_IDENTITY: ${{ secrets.ZIGZAG_SIGNING_IDENTITY }}
         run: |
-          test -n "$SIGNING_IDENTITY"
           cargo build --release --locked -p zigzag
           cp target/release/zigzag zigzag-macos-aarch64
-          codesign --force --sign "$SIGNING_IDENTITY" \
-            --identifier com.shukantpal.zigzag --options runtime --timestamp \
-            zigzag-macos-aarch64
-          codesign --verify --strict --deep --verbose=2 zigzag-macos-aarch64
+          bash scripts/sign-ci-release.sh zigzag-macos-aarch64
       - name: Produce release manifest
         id: manifest
         run: |
