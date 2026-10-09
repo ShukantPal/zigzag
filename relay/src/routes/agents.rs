@@ -2,17 +2,18 @@ use crate::events::{
     new_execution_id, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
 };
 use crate::exec;
-use crate::http::{denial_json, error, query, reply};
+use crate::http::{error, query, reply};
 use crate::proc::{
     AgentSpawnDetails, kill_process_group, process_group_running, recovered_agent_identity_matches,
     spawn_proc,
 };
+#[cfg(not(test))]
+use crate::routes::worktrees::{WORKTREE_REPO_ROOT, canonical_worktree_roots};
 use crate::routes::worktrees::{
-    WORKTREE_REPO_ROOT, WorktreeError, canonical_worktree_roots, git_output,
-    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
-    worktree_branch_checked_out, worktree_branch_exists,
+    WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
+    valid_worktree_branch, worktree_branch_checked_out, worktree_branch_exists,
 };
-use crate::server::Server;
+use crate::server::{Server, Supervisor};
 use relay_core::{AgentRecord, Json, parse_json};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,60 @@ use std::time::{Duration, Instant};
 const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
 /// Grace period after SIGKILL before giving up.
 const AGENT_KILL_GRACE: Duration = Duration::from_secs(5);
+
+#[cfg(not(test))]
+fn agent_worktree_roots() -> Vec<PathBuf> {
+    canonical_worktree_roots()
+}
+
+#[cfg(test)]
+fn agent_worktree_roots() -> Vec<PathBuf> {
+    vec![
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("test temporary directory must exist"),
+    ]
+}
+
+#[cfg(not(test))]
+fn agent_worktree_repo_root() -> PathBuf {
+    std::fs::canonicalize(WORKTREE_REPO_ROOT).unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT))
+}
+
+#[cfg(test)]
+fn agent_worktree_repo_root() -> PathBuf {
+    std::env::temp_dir()
+        .canonicalize()
+        .expect("test temporary directory must exist")
+}
+
+/// The relay owns the Codex command used for high-level agent creation.
+/// Unlike `/v1/exec`, callers never supply this binary or its arguments, so
+/// the arbitrary-command execution policy does not apply here.
+#[cfg(not(test))]
+fn agent_codex_path() -> &'static Path {
+    Path::new("codex")
+}
+
+#[cfg(test)]
+fn agent_codex_path() -> &'static Path {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
+
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("zigzag-test-codex-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        )
+        .expect("could not create test Codex runner");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("could not make test Codex runner executable");
+        path
+    })
+    .as_path()
+}
 
 pub(crate) enum AgentRoute<'a> {
     List,
@@ -170,10 +225,9 @@ pub(crate) fn agent_post_request(
     state: &Server,
     route: AgentRoute<'_>,
     body: Vec<u8>,
-    policy: Result<exec::Policy, String>,
 ) -> Result<(), String> {
     match route {
-        AgentRoute::Create => agent_create_request(stream, state, body, policy),
+        AgentRoute::Create => agent_create_request(stream, state, body),
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
         _ => reply(stream, 404, error("not_found")),
@@ -441,7 +495,6 @@ fn agent_create_request(
     stream: &mut TcpStream,
     state: &Server,
     body: Vec<u8>,
-    policy: Result<exec::Policy, String>,
 ) -> Result<(), String> {
     if state.updater.is_draining() {
         return reply(stream, 503, error("updates_draining"));
@@ -479,9 +532,8 @@ fn agent_create_request(
     if !valid_worktree_branch(&request.branch) {
         return reply(stream, 400, error("worktree_invalid_branch"));
     }
-    let roots = canonical_worktree_roots();
-    let repo_root = std::fs::canonicalize(WORKTREE_REPO_ROOT)
-        .unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT));
+    let roots = agent_worktree_roots();
+    let repo_root = agent_worktree_repo_root();
     let worktree_raw = request
         .worktree
         .clone()
@@ -537,21 +589,6 @@ fn agent_create_request(
         "-o".to_owned(),
         format!("{worktree_str}/last-message.txt"),
     ]);
-    let policy = match policy {
-        Ok(policy) => policy,
-        Err(message) => {
-            log::error!("agent_create policy read failed: {message}");
-            return reply(stream, 500, error("could_not_read_execution_policy"));
-        }
-    };
-    let codex_path = match policy.verified_path("codex", &codex_args) {
-        Ok(path) => path,
-        Err(exec::VerifyError::Denied) => return reply(stream, 200, denial_json(&task_id)),
-        Err(exec::VerifyError::Unverifiable(reason)) => {
-            log::error!("agent_create binary verification failed: {reason}");
-            return reply(stream, 500, error("could_not_verify_binary"));
-        }
-    };
     match agent_create_worktree(&repo, &worktree_path, &request.branch) {
         Ok(()) => {}
         Err(AgentWorktreeFailure::Validation(failure)) => {
@@ -623,7 +660,7 @@ fn agent_create_request(
     match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
-        &codex_path,
+        agent_codex_path(),
         command,
         execution_id.clone(),
         AgentSpawnDetails {
@@ -673,7 +710,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     // signalling. The pgid > 0 guard keeps kill(-pgid, ..) from ever
     // resolving to the relay's own process group on a corrupt record.
     let (stopped, graceful) = if pgid > 0 && recovered_agent_identity_matches(&agent) {
-        stop_process_group(id, pgid)
+        stop_process_group(id, pgid, &state.supervisor)
     } else {
         (true, true)
     };
@@ -715,25 +752,36 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
 /// SIGTERM a verified-owned process group, escalating to SIGKILL after
 /// [`AGENT_STOP_GRACE`]. Returns `(stopped, graceful)`; `stopped` is false
 /// only when the group survived SIGKILL plus [`AGENT_KILL_GRACE`].
-fn stop_process_group(id: &str, pgid: i32) -> (bool, bool) {
+fn stop_process_group(id: &str, pgid: i32, supervisor: &Supervisor) -> (bool, bool) {
     if !kill_process_group(pgid) {
         // The signal was refused: the group vanished between the identity
         // check and the signal. Treat as already dead.
         return (true, true);
     }
-    if wait_for_group_exit(pgid, AGENT_STOP_GRACE) {
+    if wait_for_group_exit(id, pgid, AGENT_STOP_GRACE, supervisor) {
         return (true, true);
     }
     log::warn!("agent_stop id={id} pgid={pgid}: SIGTERM ignored, sending SIGKILL");
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
-    (wait_for_group_exit(pgid, AGENT_KILL_GRACE), false)
+    (
+        wait_for_group_exit(id, pgid, AGENT_KILL_GRACE, supervisor),
+        false,
+    )
 }
 
-fn wait_for_group_exit(pgid: i32, timeout: Duration) -> bool {
+fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supervisor) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
+        // Linux retains an exited child as a zombie in its process group until
+        // the parent reaps it. Reap the supervised leader while waiting so the
+        // group can disappear before the grace period expires.
+        if let Ok(mut table) = supervisor.procs.lock()
+            && let Some(entry) = table.get_mut(id)
+        {
+            let _ = entry.child.try_wait();
+        }
         if !process_group_running(pgid) {
             return true;
         }

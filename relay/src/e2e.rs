@@ -17,6 +17,8 @@ use crate::tests::{
     test_policy, test_server, worktree_test_base, worktree_test_repo, worktree_test_roots,
 };
 use relay_core::Json;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +34,29 @@ fn json_array(value: &Json) -> &[Json] {
         Json::Array(items) => items,
         other => panic!("expected JSON array, got {other:?}"),
     }
+}
+
+fn agent_create_test_repo(id: &str) -> PathBuf {
+    let repo = std::env::temp_dir().join(format!("zigzag-agent-e2e-{id}"));
+    std::fs::create_dir_all(&repo).expect("could not create agent test repository");
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "zigzag-test@example.com"],
+        vec!["config", "user.name", "Zigzag test"],
+        vec!["commit", "--allow-empty", "-m", "init"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("could not run git for agent test repository");
+        assert!(
+            output.status.success(),
+            "git setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    repo
 }
 
 /// Full agent lifecycle: spawn -> poll to completion -> agent record ->
@@ -155,6 +180,109 @@ fn e2e_spawn_to_completion_records_logs_and_events() {
                 && event.object("task_id").and_then(Json::as_str) == Some(id.as_str())
         });
     assert!(saw_completed, "no process_completed event for {id}");
+}
+
+/// Agent creation bypasses the arbitrary-command allowlist because the relay,
+/// not the caller, owns the fixed `codex exec` invocation. Exercise the
+/// complete agent API lifecycle with a policy that deliberately excludes
+/// `codex`: create -> list -> pause -> resume -> delete.
+#[test]
+fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy(); // Only /bin/sh is allowed; no `codex` entry.
+    let id = unique_id("agent-api");
+    let repo = agent_create_test_repo(&id);
+    let branch = format!("codex/{id}");
+    let worktree = std::env::temp_dir().join(format!("zigzag-{id}"));
+    let worktree_text = worktree.to_string_lossy();
+    let body = format!(
+        r#"{{"prompt":"keep running","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}"}}"#,
+        repo.display()
+    );
+
+    let created = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents",
+        &body,
+    ));
+    let handle = created
+        .object("id")
+        .and_then(Json::as_str)
+        .expect("agent create response missing id")
+        .to_owned();
+    assert!(worktree.exists(), "agent worktree was not created");
+
+    let listed = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "GET",
+        "/v1/agents",
+        "",
+    ));
+    let agent = json_array(listed.object("agents").expect("agents list missing agents"))
+        .iter()
+        .find(|agent| agent.object("id").and_then(Json::as_str) == Some(handle.as_str()))
+        .expect("created agent missing from list");
+    assert_eq!(
+        agent.object("state").and_then(Json::as_str),
+        Some("running")
+    );
+
+    let paused = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        &format!("/v1/agents/{handle}/pause"),
+        "{}",
+    ));
+    assert_eq!(paused.object("paused"), Some(&Json::Bool(true)));
+
+    let resumed = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        &format!("/v1/agents/{handle}/resume"),
+        "{}",
+    ));
+    assert_eq!(resumed.object("paused"), Some(&Json::Bool(false)));
+
+    let deleted = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{handle}"),
+        "",
+    ));
+    assert_eq!(deleted.object("stopped"), Some(&Json::Bool(true)));
+
+    let stopped = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "GET",
+        &format!("/v1/agents/{handle}"),
+        "",
+    ));
+    assert!(
+        matches!(
+            stopped.object("state").and_then(Json::as_str),
+            Some("stopped") | Some("killed")
+        ),
+        "agent was not stopped after delete: {stopped:?}"
+    );
+
+    let output = Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_text.as_ref()])
+        .current_dir(&repo)
+        .output()
+        .expect("could not clean up agent test worktree");
+    assert!(
+        output.status.success(),
+        "could not clean up agent test worktree: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
 }
 
 /// A failing command records its exit code and stderr instead of vanishing.
