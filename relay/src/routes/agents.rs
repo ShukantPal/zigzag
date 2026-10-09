@@ -197,6 +197,13 @@ pub(crate) fn agent_request(
             }
         }
         AgentRoute::Transcript(id) => {
+            let after = match values
+                .get("after")
+                .map_or(Ok(0), |value| value.parse::<u64>())
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
+            };
             let tail = match values
                 .get("tail")
                 .map(|value| value.parse::<usize>())
@@ -205,7 +212,7 @@ pub(crate) fn agent_request(
                 Ok(value) => value,
                 Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
             };
-            match transcript_json(&state.supervisor.registry, id, tail) {
+            match transcript_json(&state.supervisor.registry, id, after, tail) {
                 Some(json) => reply(stream, 200, json),
                 None => reply(stream, 404, error("unknown_agent")),
             }
@@ -296,10 +303,11 @@ fn resume_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Res
 fn transcript_json(
     registry: &relay_core::AgentRegistry,
     id: &str,
+    after: u64,
     tail: Option<usize>,
 ) -> Option<Json> {
     let agent = registry.get(id)?;
-    let logs = agent_logs_json(registry, id, "both", 0, tail)?;
+    let logs = agent_logs_json(registry, id, "both", after, tail)?;
 
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
@@ -355,6 +363,10 @@ fn transcript_json(
         ),
         ("stdout".to_owned(), Json::String(stdout_text)),
         ("stderr".to_owned(), Json::String(stderr_text)),
+        (
+            "next_cursor".to_owned(),
+            logs.object("next_cursor")?.clone(),
+        ),
         ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
     ]))
 }

@@ -15,6 +15,7 @@
 //!   zzapi agents create --prompt "Fix the flaky test" \
 //!       --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
 //!   zzapi agents logs <id> --follow
+//!   zzapi agents transcript <id> --tail 4000
 //!   zzapi exec --bin gh --args pr list --repo ShukantPal/zigzag
 //!   zzapi events --follow
 
@@ -226,6 +227,17 @@ enum AgentsCmd {
         /// Prefix each line with [stdout]/[stderr]
         #[arg(long)]
         prefix: bool,
+    },
+    /// Read an agent's captured transcript
+    Transcript {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Cap, in bytes, on newest transcript output
+        #[arg(long)]
+        tail: Option<u64>,
+        /// Poll for and print newly appended transcript output
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -836,6 +848,115 @@ fn cmd_agents_logs(
     Ok(())
 }
 
+fn cmd_agents_transcript(
+    client: &Client,
+    id: &str,
+    tail: Option<u64>,
+    follow: bool,
+) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let mut previous = None;
+    loop {
+        let mut q = Vec::new();
+        if let Some(cursor) = previous.as_ref().and_then(transcript_cursor) {
+            q.push(("after", cursor.to_string()));
+        } else if let Some(tail) = tail {
+            q.push(("tail", tail.to_string()));
+        }
+        let response = client.get(&format!("/v1/agents/{id}/transcript"), &q)?;
+        if client.json {
+            println!("{}", json_output(&response, follow));
+        } else if let Some(previous) = previous.as_ref() {
+            print_transcript_updates(&response);
+            if !transcript_log_degraded(previous) && transcript_log_degraded(&response) {
+                warn_transcript_degraded();
+            }
+        } else {
+            print_transcript(&response);
+        }
+
+        let complete = s(&response, "state") != "running";
+        previous = Some(response);
+        if !follow || complete {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
+fn print_transcript(transcript: &serde_json::Value) {
+    for key in [
+        "id",
+        "task_id",
+        "execution_id",
+        "state",
+        "started_at",
+        "exit_code",
+    ] {
+        let value = if key == "started_at" {
+            fmt_ts(transcript.get(key))
+        } else {
+            s(transcript, key)
+        };
+        println!("{key:<13} {value}");
+    }
+    let command = s(transcript, "command");
+    if !command.is_empty() {
+        println!("command       {command}");
+    }
+    for (section, field) in [
+        ("prompt", "prompt"),
+        ("last message", "last_message"),
+        ("stdout", "stdout"),
+        ("stderr", "stderr"),
+    ] {
+        print_transcript_section(section, transcript_text(transcript, field));
+    }
+    if transcript_log_degraded(transcript) {
+        warn_transcript_degraded();
+    }
+}
+
+fn transcript_text<'a>(transcript: &'a serde_json::Value, key: &str) -> &'a str {
+    transcript
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn print_transcript_section(name: &str, text: &str) {
+    if !text.is_empty() {
+        println!("\n--- {name} ---");
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+}
+
+fn print_transcript_updates(current: &serde_json::Value) {
+    for key in ["stdout", "stderr"] {
+        print_transcript_section(key, transcript_text(current, key));
+    }
+    std::io::stdout().flush().ok();
+}
+
+fn transcript_cursor(transcript: &serde_json::Value) -> Option<u64> {
+    after_u64(transcript.get("next_cursor"))
+}
+
+fn transcript_log_degraded(transcript: &serde_json::Value) -> bool {
+    transcript
+        .get("log_degraded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn warn_transcript_degraded() {
+    eprintln!("warning: agent transcript is incomplete because log capture degraded");
+}
+
 fn log_retention_lost(response: &serde_json::Value, after: u64) -> bool {
     after_u64(response.get("dropped_before")).is_some_and(|dropped_before| after < dropped_before)
 }
@@ -1140,6 +1261,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 follow,
                 prefix,
             } => cmd_agents_logs(&client, &id, stream.as_deref(), after, tail, follow, prefix),
+            AgentsCmd::Transcript { id, tail, follow } => {
+                cmd_agents_transcript(&client, &id, tail, follow)
+            }
         },
         Commands::Worktrees { cmd } => match cmd {
             WorktreesCmd::Create { path, branch, repo } => {
@@ -1194,6 +1318,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_follow_uses_the_relay_cursor() {
+        assert_eq!(
+            transcript_cursor(&serde_json::json!({"next_cursor": 7})),
+            Some(7)
+        );
+        assert_eq!(transcript_cursor(&serde_json::json!({})), None);
+    }
 
     #[test]
     fn exec_only_succeeds_with_an_explicit_zero_exit_code() {
