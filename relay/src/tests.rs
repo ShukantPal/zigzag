@@ -1213,6 +1213,20 @@ pub(crate) fn worktree_test_repo(base: &Path) -> PathBuf {
     git(&["config", "user.email", "zigzag-test@example.com"]);
     git(&["config", "user.name", "zigzag-test"]);
     git(&["commit", "--allow-empty", "-m", "init"]);
+    let origin = base.join("origin.git");
+    let output = Command::new("git")
+        .args(["init", "--bare", "--initial-branch=main"])
+        .arg(&origin)
+        .current_dir(base)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git init bare origin failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&["push", "--set-upstream", "origin", "main"]);
     repo
 }
 
@@ -1714,6 +1728,65 @@ fn agent_create_worktree_roundtrip() {
         agent_create_worktree(&repo, &root.join("codex-task-survive-restart"), branch, &[])
             .unwrap();
     assert_eq!(reused, manual_path.canonicalize().unwrap());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn new_agent_worktree_starts_at_fetched_origin_main_and_existing_branch_is_preserved() {
+    let base = worktree_test_base("agent-wt-fresh-base");
+    let root = base.join("worktrees");
+    std::fs::create_dir_all(&root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+
+    let initial_commit = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "existing-agent-branch"]);
+    git(&["branch", "stale-project-checkout"]);
+    git(&["commit", "--allow-empty", "-m", "advance origin main"]);
+    git(&["push", "origin", "main"]);
+    let origin_main = git(&["rev-parse", "HEAD"]);
+    assert_ne!(origin_main, initial_commit);
+    git(&["checkout", "stale-project-checkout"]);
+
+    let fresh_worktree = root.join("fresh-agent-branch");
+    agent_create_worktree(&repo, &fresh_worktree, "codex/fresh-agent", &[]).unwrap();
+    let fresh_head = Command::new("git")
+        .args(["-C"])
+        .arg(&fresh_worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(fresh_head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&fresh_head.stdout).trim(),
+        origin_main
+    );
+
+    let existing_worktree = root.join("existing-agent-branch");
+    agent_create_worktree(&repo, &existing_worktree, "existing-agent-branch", &[]).unwrap();
+    let existing_head = Command::new("git")
+        .args(["-C"])
+        .arg(&existing_worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(existing_head.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&existing_head.stdout).trim(),
+        initial_commit
+    );
     let _ = std::fs::remove_dir_all(base);
 }
 

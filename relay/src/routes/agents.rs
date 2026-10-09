@@ -614,7 +614,17 @@ pub(crate) fn agent_create_worktree(
     let output = if worktree_branch_exists(repo, branch).map_err(validation)? {
         git_output(repo, &["worktree", "add", path_str, branch]).map_err(validation)?
     } else {
-        git_output(repo, &["worktree", "add", "-b", branch, path_str]).map_err(validation)?
+        let fetch = git_output(repo, &["fetch", "origin", "main"]).map_err(validation)?;
+        if !fetch.status.success() {
+            return Err(AgentWorktreeFailure::GitFailed(
+                String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
+            ));
+        }
+        git_output(
+            repo,
+            &["worktree", "add", "-b", branch, path_str, "origin/main"],
+        )
+        .map_err(validation)?
     };
     if !output.status.success() {
         return Err(AgentWorktreeFailure::GitFailed(
