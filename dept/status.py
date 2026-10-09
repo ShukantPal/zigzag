@@ -277,6 +277,15 @@ def transcript_path(task_id: str, root: Path | None = None) -> Path:
     return (root or mac_dept_root()) / task_id / "last-message.txt"
 
 
+def task_workdir(task_id: str, root: Path | None = None) -> str:
+    """Return the task working directory from dir.txt, or "" if unavailable."""
+    try:
+        text = ((root or mac_dept_root()) / task_id / "dir.txt").read_text()
+        return text.strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
 def transcript_command(task_id: str, root: Path | None = None) -> str:
     # BSD tail exits when a path has not been created yet; -F retries it.
     return f"tail -F {shlex.quote(str(transcript_path(task_id, root)))}"
@@ -380,6 +389,7 @@ class StatusScreen:
         self.warnings: list[str] = []
         self.selected = 0
         self.offset = 0
+        self.h_offset = 0
         self.show_transcript = False
         self.transcript_output: list[str] = []
         self.transcript_error: str | None = None
@@ -410,6 +420,9 @@ class StatusScreen:
         if self.selected != previous:
             self.transcript_output, self.transcript_error = [], None
 
+    def move_horizontal(self, delta: int) -> None:
+        self.h_offset = max(0, self.h_offset + delta)
+
     def visible_rows(self, height: int) -> int:
         return 1 if self.show_transcript else max(1, height // 2 - 2)
 
@@ -436,22 +449,27 @@ class StatusScreen:
                 self.move_selection(-1, self.visible_rows(screen.getmaxyx()[0]))
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.move_selection(1, self.visible_rows(screen.getmaxyx()[0]))
+            elif key in (curses.KEY_LEFT, ord("h")):
+                self.move_horizontal(-8)
+            elif key in (curses.KEY_RIGHT, ord("l")):
+                self.move_horizontal(8)
 
     def draw(self, screen: curses.window) -> None:
         screen.erase()
         height, width = screen.getmaxyx()
-        header = "dept status — read-only  ↑↓ select  Enter/t transcript  q quit"
+        header = "dept status — read-only  ↑↓ select  ←→/h/l scroll  Enter/t transcript  q quit"
         if self.show_transcript:
             header = "dept status — transcript (read-only)  q/Esc back"
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
-        columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       LAST EVENT"
-        screen.addnstr(1, 0, columns, width - 1, curses.A_UNDERLINE)
+        columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       DIR                            LAST EVENT"
+        screen.addnstr(1, 0, columns[self.h_offset:self.h_offset + width - 1], width - 1, curses.A_UNDERLINE)
         rows = self.visible_rows(height)
         for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
             total, boundary = execution.total_elapsed()
             total_text = format_duration(total) + ("*" if boundary else "")
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {execution.latest_event[:24]}"
-            screen.addnstr(row, 0, line, width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
+            workdir = task_workdir(execution.task_id, self.task_root)
+            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {workdir[:30]:30} {execution.latest_event[:24]}"
+            screen.addnstr(row, 0, line[self.h_offset:self.h_offset + width - 1], width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
         if self.executions and self.show_transcript:
@@ -464,16 +482,16 @@ class StatusScreen:
             lines = ["No execution events observed."]
         lines.extend(f"WARNING: {warning}" for warning in self.warnings)
         for offset, line in enumerate(lines[: height - divider - 1], start=divider + 1):
-            screen.addnstr(offset, 0, line, width - 1)
+            screen.addnstr(offset, 0, line[self.h_offset:self.h_offset + width - 1], width - 1)
         screen.refresh()
 
 
-def print_once(executions: list[Execution], warnings: list[str]) -> None:
-    print("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tAGENT\tLAST EVENT\tFLAGS")
+def print_once(executions: list[Execution], warnings: list[str], root = None) -> None:
+    print("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tAGENT\tDIR\tLAST EVENT\tFLAGS")
     for execution in executions:
         total, boundary = execution.total_elapsed()
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, execution.latest_event, flags(execution))))
+        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, task_workdir(execution.task_id, root), execution.latest_event, flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
@@ -491,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     screen = StatusScreen(args.url, args.state_file.expanduser(), args.token_file.expanduser(), args.interval)
     if args.once:
         screen.refresh()
-        print_once(screen.executions, screen.warnings)
+        print_once(screen.executions, screen.warnings, screen.task_root)
         return 0
     curses.wrapper(screen.run)
     return 0
