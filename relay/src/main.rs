@@ -912,6 +912,8 @@ where
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
+        ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
         ("GET", "/v1/review-gate") => {
             review_gate_request(&mut stream, &state, &request.target, gate_report)
         }
@@ -1147,6 +1149,422 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
             ]),
         ),
         Err(_) => reply(stream, 500, error("could_not_persist_event")),
+    }
+}
+
+// --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
+
+/// Roots the relay may create or remove git worktrees under. Candidate paths
+/// are canonicalized before the prefix check, so `..` segments and symlinks
+/// cannot escape the root.
+const WORKTREE_ALLOWED_ROOTS: [&str; 2] = ["/private/tmp/", "/Users/shukant/.codex/worktrees/"];
+/// Root the `repo` parameter of worktree creation must live under, so callers
+/// cannot point `git worktree add` at an arbitrary repository.
+const WORKTREE_REPO_ROOT: &str = "/Users/shukant/Workspace/";
+
+/// Failure from the worktree core logic: the HTTP status and the snake_case
+/// error body the relay replies with. Handlers stay thin so tests can drive
+/// `worktree_create_plan` / `worktree_delete_plan` directly.
+#[derive(Clone, Copy, Debug)]
+struct WorktreeError {
+    code: u16,
+    message: &'static str,
+}
+
+/// Canonicalize each configured root, dropping roots that do not exist. An
+/// empty result rejects every path (fail closed).
+fn canonical_worktree_roots() -> Vec<PathBuf> {
+    WORKTREE_ALLOWED_ROOTS
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect()
+}
+
+/// Canonicalize `path` (which must exist) and require it to sit under `roots`.
+fn canonical_path_under_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, WorktreeError> {
+    let canonical = std::fs::canonicalize(path).map_err(|_| WorktreeError {
+        code: 400,
+        message: "worktree_path_not_found",
+    })?;
+    if roots.iter().any(|root| canonical.starts_with(root)) {
+        Ok(canonical)
+    } else {
+        Err(WorktreeError {
+            code: 400,
+            message: "worktree_path_outside_allowed_roots",
+        })
+    }
+}
+
+/// Resolve the worktree path for creation. The path itself may not exist yet,
+/// so canonicalize the parent directory and re-attach the leaf: canonicalizing
+/// the parent defeats `..` traversal and symlink escapes in every ancestor.
+fn resolve_new_worktree_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, WorktreeError> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_relative() {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_path_must_be_absolute",
+        });
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(WorktreeError {
+            code: 400,
+            message: "worktree_path_has_no_parent",
+        })?;
+    let leaf = path.file_name().ok_or(WorktreeError {
+        code: 400,
+        message: "worktree_path_has_no_name",
+    })?;
+    Ok(canonical_path_under_roots(parent, roots)?.join(leaf))
+}
+
+/// Resolve the worktree path for deletion: it must already exist.
+fn resolve_existing_worktree_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, WorktreeError> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_relative() {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_path_must_be_absolute",
+        });
+    }
+    canonical_path_under_roots(path, roots)
+}
+
+/// Resolve the `repo` parameter: it must exist and live under the workspace
+/// root.
+fn resolve_worktree_repo(raw: &str, repo_root: &Path) -> Result<PathBuf, WorktreeError> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_relative() {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_repo_must_be_absolute",
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| WorktreeError {
+        code: 400,
+        message: "worktree_repo_not_found",
+    })?;
+    if canonical.starts_with(repo_root) {
+        Ok(canonical)
+    } else {
+        Err(WorktreeError {
+            code: 400,
+            message: "worktree_repo_outside_workspace",
+        })
+    }
+}
+
+/// Reject branch names git would treat as options or refuse as ref names.
+/// `git` itself is the final arbiter; this keeps hostile input from ever
+/// reaching the command line.
+fn valid_worktree_branch(branch: &str) -> bool {
+    if branch.is_empty() || branch.len() > 255 {
+        return false;
+    }
+    if branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with(".lock")
+    {
+        return false;
+    }
+    if branch.contains("..") || branch.contains("@{") {
+        return false;
+    }
+    !branch
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, WorktreeError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            log::error!("worktree git invocation failed: {error}");
+            WorktreeError {
+                code: 500,
+                message: "worktree_git_failed",
+            }
+        })
+}
+
+/// True when `refs/heads/<branch>` exists. Exit 0 means present, exit 1 means
+/// absent; anything else is a genuine git failure.
+fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let output = git_output(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        }),
+    }
+}
+
+/// True when the branch is already checked out in some worktree, which `git
+/// worktree add` would refuse.
+fn worktree_branch_checked_out(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let output = git_output(repo, &["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        });
+    }
+    let wanted = format!("branch refs/heads/{branch}");
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line == wanted))
+}
+
+/// Core of `POST /v1/worktrees`: validate, then run `git worktree add`,
+/// creating the branch when it does not exist yet. Returns the 200 body.
+fn worktree_create_plan(
+    path_raw: &str,
+    branch: &str,
+    repo_raw: &str,
+    roots: &[PathBuf],
+    repo_root: &Path,
+) -> Result<Json, WorktreeError> {
+    let path = resolve_new_worktree_path(path_raw, roots)?;
+    let repo = resolve_worktree_repo(repo_raw, repo_root)?;
+    if !valid_worktree_branch(branch) {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_invalid_branch",
+        });
+    }
+    if !git_output(&repo, &["rev-parse", "--git-dir"])?
+        .status
+        .success()
+    {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_repo_not_a_git_repo",
+        });
+    }
+    if worktree_branch_checked_out(&repo, branch)? {
+        log::warn!("worktree_create refused: branch {branch} already checked out");
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_branch_already_checked_out",
+        });
+    }
+    let path_str = path.to_str().ok_or(WorktreeError {
+        code: 400,
+        message: "worktree_path_not_unicode",
+    })?;
+    let output = if worktree_branch_exists(&repo, branch)? {
+        log::info!(
+            "worktree_create path={} branch={branch} existing_branch=true",
+            path.display()
+        );
+        git_output(&repo, &["worktree", "add", path_str, branch])?
+    } else {
+        log::info!(
+            "worktree_create path={} branch={branch} existing_branch=false",
+            path.display()
+        );
+        git_output(&repo, &["worktree", "add", "-b", branch, path_str])?
+    };
+    if !output.status.success() {
+        log::warn!(
+            "worktree_create git failed for branch={branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_git_add_failed",
+        });
+    }
+    Ok(Json::Object(vec![
+        (
+            "path".to_owned(),
+            Json::String(path.to_string_lossy().into_owned()),
+        ),
+        ("branch".to_owned(), Json::String(branch.to_owned())),
+    ]))
+}
+
+/// Core of `DELETE /v1/worktrees`. `agents` carries `(state, command)` pairs
+/// from the agent registry for the live-attachment check. Returns the 200 body.
+fn worktree_delete_plan(
+    path_raw: &str,
+    roots: &[PathBuf],
+    agents: &[(&str, &str)],
+) -> Result<Json, WorktreeError> {
+    let path = resolve_existing_worktree_path(path_raw, roots)?;
+    let path_str = path.to_string_lossy();
+    // TODO: match on an explicit worktree_path field on the agent record once
+    // the agent-creation endpoints record it; command-substring matching is a
+    // stopgap until then.
+    let attached = agents.iter().any(|(state, command)| {
+        matches!(*state, "running" | "orphaned")
+            && (command.contains(&*path_str) || command.contains(path_raw))
+    });
+    if attached {
+        log::warn!(
+            "worktree_delete refused: live agent attached to {}",
+            path.display()
+        );
+        return Err(WorktreeError {
+            code: 409,
+            message: "worktree_in_use",
+        });
+    }
+    // `git worktree remove` runs from the owning repo: resolve the main repo
+    // through the worktree's common git dir.
+    let common = git_output(&path, &["rev-parse", "--git-common-dir"])?;
+    if !common.status.success() {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        });
+    }
+    let common_dir = String::from_utf8_lossy(&common.stdout);
+    let common_dir = common_dir.trim();
+    let common_dir = if Path::new(common_dir).is_absolute() {
+        PathBuf::from(common_dir)
+    } else {
+        path.join(common_dir)
+    };
+    let common_dir = std::fs::canonicalize(&common_dir).map_err(|_| WorktreeError {
+        code: 400,
+        message: "worktree_not_a_git_worktree",
+    })?;
+    if common_dir.file_name().is_none_or(|name| name != ".git") {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        });
+    }
+    let repo = common_dir
+        .parent()
+        .ok_or(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        })?
+        .to_path_buf();
+    log::info!("worktree_delete path={}", path.display());
+    let remove = git_output(&repo, &["worktree", "remove", "--force", &path_str])?;
+    if !remove.status.success() {
+        log::warn!(
+            "worktree_delete remove failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&remove.stderr).trim()
+        );
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_git_remove_failed",
+        });
+    }
+    // Prune stale administrative entries (e.g. worktrees deleted by hand).
+    if let Err(error) = git_output(&repo, &["worktree", "prune"]) {
+        log::warn!("worktree_delete prune failed: {}", error.message);
+    }
+    Ok(Json::Object(vec![
+        ("removed".to_owned(), Json::Bool(true)),
+        ("path".to_owned(), Json::String(path_str.into_owned())),
+    ]))
+}
+
+fn worktree_request_fields(
+    body: &[u8],
+    allowed: &[&str],
+) -> Result<Vec<(String, Json)>, WorktreeError> {
+    let text = std::str::from_utf8(body).map_err(|_| WorktreeError {
+        code: 400,
+        message: "invalid_worktree_request",
+    })?;
+    let parsed = parse_json(text).map_err(|_| WorktreeError {
+        code: 400,
+        message: "invalid_worktree_request",
+    })?;
+    let Json::Object(fields) = parsed else {
+        return Err(WorktreeError {
+            code: 400,
+            message: "invalid_worktree_request",
+        });
+    };
+    if fields
+        .iter()
+        .any(|(name, _)| !allowed.contains(&name.as_str()))
+    {
+        return Err(WorktreeError {
+            code: 400,
+            message: "invalid_worktree_request",
+        });
+    }
+    Ok(fields)
+}
+
+fn worktree_string_field(fields: &[(String, Json)], name: &str) -> Result<String, WorktreeError> {
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(WorktreeError {
+            code: 400,
+            message: "invalid_worktree_request",
+        })
+}
+
+fn worktree_create(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
+    let fields = match worktree_request_fields(&body, &["path", "branch", "repo"]) {
+        Ok(fields) => fields,
+        Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let (path, branch, repo) = match (
+        worktree_string_field(&fields, "path"),
+        worktree_string_field(&fields, "branch"),
+        worktree_string_field(&fields, "repo"),
+    ) {
+        (Ok(path), Ok(branch), Ok(repo)) => (path, branch, repo),
+        _ => return reply(stream, 400, error("invalid_worktree_request")),
+    };
+    let roots = canonical_worktree_roots();
+    let repo_root = std::fs::canonicalize(WORKTREE_REPO_ROOT)
+        .unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT));
+    match worktree_create_plan(&path, &branch, &repo, &roots, &repo_root) {
+        Ok(response) => reply(stream, 200, response),
+        Err(failure) => reply(stream, failure.code, error(failure.message)),
+    }
+}
+
+fn worktree_delete(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
+    let fields = match worktree_request_fields(&body, &["path"]) {
+        Ok(fields) => fields,
+        Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let path = match worktree_string_field(&fields, "path") {
+        Ok(path) => path,
+        Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let agents = state.supervisor.registry.list(None, None);
+    let commands: Vec<(&str, &str)> = agents
+        .iter()
+        .map(|agent| (agent.state.as_str(), agent.command.as_str()))
+        .collect();
+    match worktree_delete_plan(&path, &canonical_worktree_roots(), &commands) {
+        Ok(response) => reply(stream, 200, response),
+        Err(failure) => reply(stream, failure.code, error(failure.message)),
     }
 }
 
@@ -2266,6 +2684,7 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        409 => "Conflict",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
@@ -3397,5 +3816,273 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("process did not finish in time");
+    }
+    fn worktree_test_base(prefix: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "zigzag-{prefix}-{}-{}",
+            std::process::id(),
+            unique_handle(&HashMap::new()).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    fn worktree_test_roots(base: &Path) -> Vec<PathBuf> {
+        let allowed = base.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        vec![allowed.canonicalize().unwrap()]
+    }
+
+    fn worktree_test_repo(base: &Path) -> PathBuf {
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "zigzag-test@example.com"]);
+        git(&["config", "user.name", "zigzag-test"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        repo
+    }
+
+    #[test]
+    fn worktree_new_path_rejects_traversal_and_outside_roots() {
+        let base = worktree_test_base("wt-roots");
+        let roots = worktree_test_roots(&base);
+        let joined = |parts: &[&str]| {
+            let mut path = base.clone();
+            for part in parts {
+                path.push(part);
+            }
+            path.to_string_lossy().into_owned()
+        };
+        // A plain path under the root resolves to the canonical root + leaf.
+        assert_eq!(
+            resolve_new_worktree_path(&joined(&["allowed", "wt1"]), &roots).unwrap(),
+            roots[0].join("wt1")
+        );
+        // `..` traversal that escapes the root is rejected.
+        assert!(
+            resolve_new_worktree_path(&joined(&["allowed", "..", "other", "wt"]), &roots).is_err()
+        );
+        // A sibling directory outside the root is rejected.
+        assert!(resolve_new_worktree_path(&joined(&["other", "wt"]), &roots).is_err());
+        // Relative paths are rejected outright.
+        assert!(resolve_new_worktree_path("allowed/wt", &roots).is_err());
+        assert!(resolve_new_worktree_path("", &roots).is_err());
+        // A symlink inside the root pointing outside cannot smuggle a path out:
+        // the parent canonicalizes outside the root.
+        std::os::unix::fs::symlink(base.join("other"), base.join("allowed").join("evil")).unwrap();
+        assert!(resolve_new_worktree_path(&joined(&["allowed", "evil", "wt"]), &roots).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_existing_path_requires_existence_under_roots() {
+        let base = worktree_test_base("wt-existing");
+        let roots = worktree_test_roots(&base);
+        let inside = base.join("allowed").join("wt");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert_eq!(
+            resolve_existing_worktree_path(inside.to_str().unwrap(), &roots).unwrap(),
+            roots[0].join("wt")
+        );
+        // Missing path.
+        assert!(
+            resolve_existing_worktree_path(
+                &base.join("allowed").join("nope").to_string_lossy(),
+                &roots
+            )
+            .is_err()
+        );
+        // Existing but outside the roots.
+        assert!(
+            resolve_existing_worktree_path(&base.join("other").to_string_lossy(), &roots).is_err()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_branch_validation_rejects_hostile_names() {
+        assert!(valid_worktree_branch("feature/my-branch"));
+        assert!(valid_worktree_branch("codex/agent-endpoints-01-worktrees"));
+        assert!(!valid_worktree_branch(""));
+        assert!(!valid_worktree_branch("--help"));
+        assert!(!valid_worktree_branch("-b"));
+        assert!(!valid_worktree_branch("../escape"));
+        assert!(!valid_worktree_branch("a b"));
+        assert!(!valid_worktree_branch("a:b"));
+        assert!(!valid_worktree_branch("branch.lock"));
+        assert!(!valid_worktree_branch("branch@{1}"));
+        assert!(!valid_worktree_branch("/leading"));
+        assert!(!valid_worktree_branch("trailing/"));
+    }
+
+    #[test]
+    fn worktree_repo_must_live_under_workspace_root() {
+        let base = worktree_test_base("wt-repo");
+        let roots = worktree_test_roots(&base);
+        let _ = roots;
+        let repo_root = base.canonicalize().unwrap();
+        let inside = base.join("allowed").join("repo");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(resolve_worktree_repo(inside.to_str().unwrap(), &repo_root).is_ok());
+        // Existing but outside the repo root.
+        let outside_base = worktree_test_base("wt-repo-outside");
+        std::fs::create_dir_all(&outside_base).unwrap();
+        assert!(resolve_worktree_repo(outside_base.to_str().unwrap(), &repo_root).is_err());
+        let _ = std::fs::remove_dir_all(&outside_base);
+        // Missing entirely.
+        assert!(
+            resolve_worktree_repo(
+                &base.join("allowed").join("nope").to_string_lossy(),
+                &repo_root
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_create_and_delete_roundtrip() {
+        let base = worktree_test_base("wt-e2e");
+        let wt_root = base.join("worktrees");
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let repo = worktree_test_repo(&base);
+        let roots = vec![wt_root.canonicalize().unwrap()];
+        let repo_root = base.canonicalize().unwrap();
+        let plan = |path: &str, branch: &str| {
+            worktree_create_plan(path, branch, repo.to_str().unwrap(), &roots, &repo_root)
+        };
+
+        // Create on a new branch.
+        let wt = wt_root.join("feature-a");
+        let wt_canonical = wt_root.canonicalize().unwrap().join("feature-a");
+        let response = plan(wt.to_str().unwrap(), "feature-a").unwrap();
+        assert_eq!(
+            response.object("branch"),
+            Some(&Json::String("feature-a".to_owned()))
+        );
+        assert_eq!(
+            response.object("path").and_then(Json::as_str),
+            wt_canonical.to_str()
+        );
+        assert!(wt.join(".git").exists());
+
+        // The same branch cannot back a second worktree.
+        let err = plan(wt_root.join("feature-a2").to_str().unwrap(), "feature-a").unwrap_err();
+        assert_eq!(
+            (err.code, err.message),
+            (400, "worktree_branch_already_checked_out")
+        );
+
+        // A live agent attached to the worktree blocks deletion.
+        let agent_command = format!("codex exec --cd {}", wt.display());
+        let agents: Vec<(&str, &str)> = vec![("running", agent_command.as_str())];
+        let err = worktree_delete_plan(wt.to_str().unwrap(), &roots, &agents).unwrap_err();
+        assert_eq!((err.code, err.message), (409, "worktree_in_use"));
+        assert!(wt.exists(), "refused delete must leave the worktree alone");
+
+        // A finished agent does not block.
+        let agents: Vec<(&str, &str)> = vec![("succeeded", agent_command.as_str())];
+        let response = worktree_delete_plan(wt.to_str().unwrap(), &roots, &agents).unwrap();
+        assert_eq!(response.object("removed"), Some(&Json::Bool(true)));
+        assert!(!wt.exists());
+
+        // Creating on an existing branch checks it out instead of creating it.
+        let output = Command::new("git")
+            .args(["branch", "existing"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let wt2 = wt_root.join("feature-b");
+        let response = plan(wt2.to_str().unwrap(), "existing").unwrap();
+        assert_eq!(
+            response.object("branch"),
+            Some(&Json::String("existing".to_owned()))
+        );
+        assert!(wt2.join(".git").exists());
+
+        // Deleting a path that is gone fails instead of claiming success.
+        worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).unwrap();
+        assert!(worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_endpoints_reject_outside_roots_over_http() {
+        let (state, state_path) = test_server();
+        let policy =
+            exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+                .unwrap();
+        // A path no canonical root can contain is rejected with 400, through
+        // the full authenticated routing path.
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/worktrees",
+            r#"{"path":"/definitely-not-a-worktree-root/wt","branch":"b","repo":"/definitely-not-a-worktree-root/repo"}"#,
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(
+            response.ends_with(r#"{"error":"worktree_path_not_found"}"#)
+                || response.ends_with(r#"{"error":"worktree_path_outside_allowed_roots"}"#),
+            "{response}"
+        );
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            "/v1/worktrees",
+            r#"{"path":"/definitely-not-a-worktree-root/wt"}"#,
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        // Malformed bodies are rejected before any git runs.
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/worktrees",
+            r#"{"path":"/x"}"#,
+        );
+        assert!(
+            response.ends_with(r#"{"error":"invalid_worktree_request"}"#),
+            "{response}"
+        );
+        // The bearer check still guards the new routes.
+        let unauthorized = request_once_with_gate_token(
+            Arc::clone(&state),
+            &policy,
+            "POST",
+            "/v1/worktrees",
+            r#"{"path":"/x","branch":"b","repo":"/y"}"#,
+            "wrong-token",
+            |_, _, _, _, _| panic!("unauthorized worktree request reached the backend"),
+        );
+        assert!(
+            unauthorized.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{unauthorized}"
+        );
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
     }
 }
