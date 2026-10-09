@@ -164,6 +164,79 @@ pub(crate) fn git_output(
             }
         })
 }
+
+/// Find the owning repository from a worktree and return its root directory.
+fn worktree_repo(path: &Path) -> Result<PathBuf, WorktreeError> {
+    let common = git_output(path, &["rev-parse", "--git-common-dir"])?;
+    if !common.status.success() {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        });
+    }
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&common.stdout).trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        path.join(common_dir)
+    };
+    let common_dir = std::fs::canonicalize(&common_dir).map_err(|_| WorktreeError {
+        code: 400,
+        message: "worktree_not_a_git_worktree",
+    })?;
+    if common_dir.file_name().is_none_or(|name| name != ".git") {
+        return Err(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        });
+    }
+    common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or(WorktreeError {
+            code: 400,
+            message: "worktree_not_a_git_worktree",
+        })
+}
+
+/// Run an optional repository lifecycle script through the user's shell.
+/// Hook output and failures are logged, while hooks remain best-effort.
+pub(crate) fn run_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
+    let script = repo.join(".zigzag").join(hook);
+    if !script.is_file() {
+        return;
+    }
+    let path = worktree.to_string_lossy();
+    match Command::new("sh")
+        .arg(&script)
+        .arg(path.as_ref())
+        .current_dir(worktree)
+        .output()
+    {
+        Ok(output) => {
+            log::info!(
+                "worktree_hook name={} path={} status={} stdout={} stderr={}",
+                hook,
+                worktree.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            if !output.status.success() {
+                log::warn!(
+                    "worktree_hook name={} failed for {}",
+                    hook,
+                    worktree.display()
+                );
+            }
+        }
+        Err(error) => log::warn!(
+            "worktree_hook name={} could not run for {}: {error}",
+            hook,
+            worktree.display()
+        ),
+    }
+}
 /// True when `refs/heads/<branch>` exists. Exit 0 means present, exit 1 means
 /// absent; anything else is a genuine git failure.
 pub(crate) fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
@@ -277,6 +350,7 @@ pub(crate) fn worktree_create_plan(
             message: "worktree_git_add_failed",
         });
     }
+    run_worktree_hook(&repo, &path, "repo-start.sh");
     Ok(Json::Object(vec![
         (
             "path".to_owned(),
@@ -311,39 +385,8 @@ pub(crate) fn worktree_delete_plan(
             message: "worktree_in_use",
         });
     }
-    // `git worktree remove` runs from the owning repo: resolve the main repo
-    // through the worktree's common git dir.
-    let common = git_output(&path, &["rev-parse", "--git-common-dir"])?;
-    if !common.status.success() {
-        return Err(WorktreeError {
-            code: 400,
-            message: "worktree_not_a_git_worktree",
-        });
-    }
-    let common_dir = String::from_utf8_lossy(&common.stdout);
-    let common_dir = common_dir.trim();
-    let common_dir = if Path::new(common_dir).is_absolute() {
-        PathBuf::from(common_dir)
-    } else {
-        path.join(common_dir)
-    };
-    let common_dir = std::fs::canonicalize(&common_dir).map_err(|_| WorktreeError {
-        code: 400,
-        message: "worktree_not_a_git_worktree",
-    })?;
-    if common_dir.file_name().is_none_or(|name| name != ".git") {
-        return Err(WorktreeError {
-            code: 400,
-            message: "worktree_not_a_git_worktree",
-        });
-    }
-    let repo = common_dir
-        .parent()
-        .ok_or(WorktreeError {
-            code: 400,
-            message: "worktree_not_a_git_worktree",
-        })?
-        .to_path_buf();
+    let repo = worktree_repo(&path)?;
+    run_worktree_hook(&repo, &path, "repo-stop.sh");
     log::info!("worktree_delete path={}", path.display());
     let remove = git_output(&repo, &["worktree", "remove", "--force", &path_str])?;
     if !remove.status.success() {
@@ -365,6 +408,37 @@ pub(crate) fn worktree_delete_plan(
         ("removed".to_owned(), Json::Bool(true)),
         ("path".to_owned(), Json::String(path_str.into_owned())),
     ]))
+}
+
+/// Remove an agent's worktree and delete its branch when it is safe to do so.
+/// This is best-effort from the API because the process has already stopped.
+pub(crate) fn cleanup_agent_worktree(raw: &str, roots: &[PathBuf]) -> Result<(), WorktreeError> {
+    let path = resolve_existing_worktree_path(raw, roots)?;
+    let repo = worktree_repo(&path)?;
+    let branch_output = git_output(&path, &["branch", "--show-current"])?;
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_owned();
+    worktree_delete_plan(raw, roots, &[])?;
+    if branch.is_empty() || matches!(branch.as_str(), "main" | "master") {
+        return Ok(());
+    }
+    if worktree_branch_checked_out(&repo, &branch)? {
+        log::info!("agent_worktree branch retained: {branch} is checked out elsewhere");
+        return Ok(());
+    }
+    if worktree_branch_exists(&repo, &branch)? {
+        let deleted = git_output(&repo, &["branch", "-D", "--", &branch])?;
+        if deleted.status.success() {
+            log::info!("agent_worktree branch deleted: {branch}");
+        } else {
+            log::warn!(
+                "agent_worktree branch delete failed for {branch}: {}",
+                String::from_utf8_lossy(&deleted.stderr).trim()
+            );
+        }
+    }
+    Ok(())
 }
 pub(crate) fn worktree_request_fields(
     body: &[u8],
