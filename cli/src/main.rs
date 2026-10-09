@@ -508,6 +508,33 @@ fn relay_base(hostname: &str) -> String {
     }
 }
 
+fn update_proxy_url<'a>(
+    values: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Option<String> {
+    let values: Vec<_> = values.into_iter().collect();
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .into_iter()
+        .find_map(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| *value)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn make_update_agent(proxy_url: Option<&str>) -> Result<ureq::Agent, Fail> {
+    let mut builder = ureq::AgentBuilder::new();
+    if let Some(proxy_url) = proxy_url {
+        let proxy = ureq::Proxy::new(proxy_url)
+            .map_err(|e| Fail::Config(format!("invalid update proxy URL: {e}")))?;
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder.build())
+}
+
 fn cmd_update() -> Result<(), Fail> {
     let executable = std::env::current_exe()
         .map_err(|e| Fail::Config(format!("cannot locate current zzapi executable: {e}")))?;
@@ -517,7 +544,18 @@ fn cmd_update() -> Result<(), Fail> {
     let temp = parent.join(format!(".zzapi-update-{}", std::process::id()));
     let _ = std::fs::remove_file(&temp);
     let result = (|| {
-        let response = ureq::get(LATEST_ZZAPI_URL)
+        let proxy_url = update_proxy_url(
+            ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+                .map(|name| {
+                    let value = std::env::var(name).ok();
+                    (name, value)
+                })
+                .iter()
+                .map(|(name, value)| (*name, value.as_deref())),
+        );
+        let agent = make_update_agent(proxy_url.as_deref())?;
+        let response = agent
+            .get(LATEST_ZZAPI_URL)
             .timeout(Duration::from_secs(120))
             .call()
             .map_err(|e| Fail::Config(format!("cannot download latest zzapi: {e}")))?;
@@ -1656,6 +1694,28 @@ mod tests {
         assert_eq!(
             LATEST_ZZAPI_URL,
             "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64"
+        );
+    }
+
+    #[test]
+    fn update_proxy_prefers_https_and_builds_authenticated_http_proxy() {
+        let proxy = update_proxy_url([
+            ("HTTP_PROXY", Some("http://http-proxy:8080")),
+            ("HTTPS_PROXY", Some("http://user:secret@proxy.example:3128")),
+        ]);
+        assert_eq!(
+            proxy.as_deref(),
+            Some("http://user:secret@proxy.example:3128")
+        );
+        assert!(make_update_agent(proxy.as_deref()).is_ok());
+
+        assert_eq!(
+            update_proxy_url([
+                ("HTTPS_PROXY", None),
+                ("HTTP_PROXY", Some("http://http-proxy:8080")),
+            ])
+            .as_deref(),
+            Some("http://http-proxy:8080")
         );
     }
 
