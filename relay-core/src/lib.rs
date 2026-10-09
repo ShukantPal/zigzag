@@ -1,4 +1,4 @@
-//! Shared durable queue and deliberately small JSON support for Zigzag.
+//! Shared durable queue and JSON support for Zigzag.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -697,28 +697,7 @@ impl Json {
     }
 
     pub fn to_json(&self) -> String {
-        match self {
-            Self::Null => "null".to_owned(),
-            Self::Bool(value) => value.to_string(),
-            Self::Number(value) => value.clone(),
-            Self::String(value) => quote(value),
-            Self::Array(values) => format!(
-                "[{}]",
-                values
-                    .iter()
-                    .map(Self::to_json)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            Self::Object(fields) => format!(
-                "{{{}}}",
-                fields
-                    .iter()
-                    .map(|(key, value)| format!("{}:{}", quote(key), value.to_json()))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        }
+        serde_json::to_string(&json_value(self)).expect("Json values are serializable")
     }
 
     pub fn number(value: u64) -> Self {
@@ -727,36 +706,50 @@ impl Json {
 }
 
 pub fn parse_json(input: &str) -> Result<Json, String> {
-    let mut parser = Parser {
-        input: input.as_bytes(),
-        position: 0,
-    };
-    parser.space();
-    let value = parser.value()?;
-    parser.space();
-    if parser.position != parser.input.len() {
-        return Err("trailing data after JSON value".to_owned());
-    }
-    Ok(value)
+    serde_json::from_str(input)
+        .map(json_from_value)
+        .map_err(|error| error.to_string())
 }
 
 pub fn quote(value: &str) -> String {
-    let mut result = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            character if character <= '\u{1f}' => {
-                result.push_str(&format!("\\u{:04x}", character as u32))
-            }
-            character => result.push(character),
-        }
+    serde_json::to_string(value).expect("strings are serializable")
+}
+
+fn json_value(value: &Json) -> serde_json::Value {
+    match value {
+        Json::Null => serde_json::Value::Null,
+        Json::Bool(value) => serde_json::Value::Bool(*value),
+        Json::Number(value) => match serde_json::from_str(value) {
+            Ok(serde_json::Value::Number(number)) => serde_json::Value::Number(number),
+            _ => serde_json::Value::String(value.clone()),
+        },
+        Json::String(value) => serde_json::Value::String(value.clone()),
+        Json::Array(values) => serde_json::Value::Array(values.iter().map(json_value).collect()),
+        Json::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value(value)))
+                .collect(),
+        ),
     }
-    result.push('"');
-    result
+}
+
+fn json_from_value(value: serde_json::Value) -> Json {
+    match value {
+        serde_json::Value::Null => Json::Null,
+        serde_json::Value::Bool(value) => Json::Bool(value),
+        serde_json::Value::Number(value) => Json::Number(value.to_string()),
+        serde_json::Value::String(value) => Json::String(value),
+        serde_json::Value::Array(values) => {
+            Json::Array(values.into_iter().map(json_from_value).collect())
+        }
+        serde_json::Value::Object(fields) => Json::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, json_from_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 /// Reads a shared bearer token without ever putting it in a command line.
@@ -782,239 +775,6 @@ pub fn read_secret_file(path: &Path) -> Result<String, String> {
         return Err("secret must contain at least 32 bytes".to_owned());
     }
     Ok(secret)
-}
-
-struct Parser<'a> {
-    input: &'a [u8],
-    position: usize,
-}
-
-impl Parser<'_> {
-    fn space(&mut self) {
-        while self
-            .input
-            .get(self.position)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            self.position += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Json, String> {
-        self.space();
-        match self.input.get(self.position) {
-            Some(b'n') => {
-                self.word(b"null")?;
-                Ok(Json::Null)
-            }
-            Some(b't') => {
-                self.word(b"true")?;
-                Ok(Json::Bool(true))
-            }
-            Some(b'f') => {
-                self.word(b"false")?;
-                Ok(Json::Bool(false))
-            }
-            Some(b'"') => Ok(Json::String(self.string()?)),
-            Some(b'[') => self.array(),
-            Some(b'{') => self.object_value(),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err("expected JSON value".to_owned()),
-        }
-    }
-
-    fn word(&mut self, word: &[u8]) -> Result<(), String> {
-        if self.input.get(self.position..self.position + word.len()) == Some(word) {
-            self.position += word.len();
-            Ok(())
-        } else {
-            Err("invalid literal".to_owned())
-        }
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.position += 1;
-        self.space();
-        let mut values = Vec::new();
-        if self.take(b']') {
-            return Ok(Json::Array(values));
-        }
-        loop {
-            values.push(self.value()?);
-            self.space();
-            if self.take(b']') {
-                return Ok(Json::Array(values));
-            }
-            self.require(b',')?;
-        }
-    }
-
-    fn object_value(&mut self) -> Result<Json, String> {
-        self.position += 1;
-        self.space();
-        let mut fields = Vec::new();
-        if self.take(b'}') {
-            return Ok(Json::Object(fields));
-        }
-        loop {
-            self.space();
-            if self.input.get(self.position) != Some(&b'"') {
-                return Err("object key must be a string".to_owned());
-            }
-            let key = self.string()?;
-            self.space();
-            self.require(b':')?;
-            fields.push((key, self.value()?));
-            self.space();
-            if self.take(b'}') {
-                return Ok(Json::Object(fields));
-            }
-            self.require(b',')?;
-        }
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.position;
-        self.take(b'-');
-        if self.take(b'0') {
-        } else {
-            self.digits()?;
-        }
-        if self.take(b'.') {
-            self.digits()?;
-        }
-        if self.take(b'e') || self.take(b'E') {
-            self.take(b'+');
-            self.take(b'-');
-            self.digits()?;
-        }
-        Ok(Json::Number(
-            std::str::from_utf8(&self.input[start..self.position])
-                .map_err(|_| "invalid number".to_owned())?
-                .to_owned(),
-        ))
-    }
-
-    fn digits(&mut self) -> Result<(), String> {
-        let start = self.position;
-        while self
-            .input
-            .get(self.position)
-            .is_some_and(u8::is_ascii_digit)
-        {
-            self.position += 1;
-        }
-        if start == self.position {
-            Err("expected digit".to_owned())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.require(b'"')?;
-        let mut value = String::new();
-        loop {
-            let byte = *self
-                .input
-                .get(self.position)
-                .ok_or_else(|| "unterminated string".to_owned())?;
-            self.position += 1;
-            match byte {
-                b'"' => return Ok(value),
-                b'\\' => {
-                    let escaped = *self
-                        .input
-                        .get(self.position)
-                        .ok_or_else(|| "unfinished escape".to_owned())?;
-                    self.position += 1;
-                    match escaped {
-                        b'"' => value.push('"'),
-                        b'\\' => value.push('\\'),
-                        b'/' => value.push('/'),
-                        b'b' => value.push('\u{08}'),
-                        b'f' => value.push('\u{0c}'),
-                        b'n' => value.push('\n'),
-                        b'r' => value.push('\r'),
-                        b't' => value.push('\t'),
-                        b'u' => {
-                            let first = self.hex4()?;
-                            let character = if (0xd800..=0xdbff).contains(&first) {
-                                if !self.take(b'\\') || !self.take(b'u') {
-                                    return Err("high surrogate without low surrogate".to_owned());
-                                }
-                                let second = self.hex4()?;
-                                if !(0xdc00..=0xdfff).contains(&second) {
-                                    return Err("invalid low surrogate".to_owned());
-                                }
-                                char::from_u32(0x10000 + ((first - 0xd800) << 10) + second - 0xdc00)
-                            } else {
-                                char::from_u32(first)
-                            }
-                            .ok_or_else(|| "invalid unicode escape".to_owned())?;
-                            value.push(character);
-                        }
-                        _ => return Err("invalid escape".to_owned()),
-                    }
-                }
-                0..=0x1f => return Err("control character in string".to_owned()),
-                _ => {
-                    let width =
-                        utf8_width(byte).ok_or_else(|| "invalid UTF-8 in string".to_owned())?;
-                    let start = self.position - 1;
-                    let end = start + width;
-                    let text = std::str::from_utf8(
-                        self.input
-                            .get(start..end)
-                            .ok_or_else(|| "truncated UTF-8".to_owned())?,
-                    )
-                    .map_err(|_| "invalid UTF-8 in string".to_owned())?;
-                    value.push_str(text);
-                    self.position = end;
-                }
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let bytes = self
-            .input
-            .get(self.position..self.position + 4)
-            .ok_or_else(|| "short unicode escape".to_owned())?;
-        self.position += 4;
-        std::str::from_utf8(bytes)
-            .map_err(|_| "invalid unicode escape".to_owned())
-            .and_then(|text| {
-                u32::from_str_radix(text, 16).map_err(|_| "invalid unicode escape".to_owned())
-            })
-    }
-
-    fn take(&mut self, expected: u8) -> bool {
-        if self.input.get(self.position) == Some(&expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-    fn require(&mut self, expected: u8) -> Result<(), String> {
-        self.space();
-        if self.take(expected) {
-            Ok(())
-        } else {
-            Err(format!("expected {}", expected as char))
-        }
-    }
-}
-
-fn utf8_width(byte: u8) -> Option<usize> {
-    match byte {
-        0x00..=0x7f => Some(1),
-        0xc2..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf4 => Some(4),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1676,6 +1436,78 @@ mod tests {
             ("clock".to_owned(), Json::String("vm:boot-1".to_owned())),
             ("payload".to_owned(), Json::Object(vec![])),
         ])
+    }
+
+    #[test]
+    fn json_round_trips_through_serde_json() {
+        let value = Json::Object(vec![
+            ("message".to_owned(), Json::String("hello".to_owned())),
+            (
+                "values".to_owned(),
+                Json::Array(vec![Json::Bool(true), Json::number(42), Json::Null]),
+            ),
+        ]);
+
+        assert_eq!(parse_json(&value.to_json()).unwrap(), value);
+    }
+
+    #[test]
+    fn json_null_fields_remain_explicit_nulls() {
+        let value = parse_json(r#"{"a":null,"b":1}"#).unwrap();
+        let optional_a = match value.object("a") {
+            Some(Json::Null) | None => None,
+            Some(value) => value.as_str().map(str::to_owned),
+        };
+
+        assert_eq!(optional_a, None);
+        assert_eq!(value.object("a"), Some(&Json::Null));
+        assert_eq!(
+            parse_json(&value.to_json()).unwrap().object("a"),
+            Some(&Json::Null)
+        );
+    }
+
+    #[test]
+    fn json_decodes_unicode_and_standard_escapes() {
+        let value = parse_json(r#"{"text":"\uD83D\uDE00 \" \\ \b\f\n\r\t"}"#).unwrap();
+
+        assert_eq!(
+            value.object("text").and_then(Json::as_str),
+            Some("😀 \" \\ \u{08}\u{0c}\n\r\t")
+        );
+    }
+
+    #[test]
+    fn json_parses_nested_objects_and_arrays() {
+        let value = parse_json(r#"{"outer":[{"inner":[{"leaf":true}]}]}"#).unwrap();
+        let Json::Array(outer) = value.object("outer").unwrap() else {
+            panic!("outer should be an array");
+        };
+        let Json::Array(inner) = outer[0].object("inner").unwrap() else {
+            panic!("inner should be an array");
+        };
+
+        assert_eq!(inner[0].object("leaf"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn json_handles_u64_numbers_and_rejects_malformed_ones() {
+        assert_eq!(
+            parse_json("18446744073709551615").unwrap().as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_json("0").unwrap().as_u64(), Some(0));
+        for number in ["01", "1.", "1e", "-", "--1", "1e+-2"] {
+            assert!(parse_json(number).is_err(), "{number} should be rejected");
+        }
+    }
+
+    #[test]
+    fn json_rejects_trailing_and_truncated_input_without_panicking() {
+        assert!(parse_json("null true").is_err());
+        for input in ["{", "{\"a\":", "[1,", "\"unterminated", "{\"a\": invalid}"] {
+            assert!(parse_json(input).is_err(), "{input:?} should be rejected");
+        }
     }
 
     fn agent(id: &str) -> AgentRecord {
