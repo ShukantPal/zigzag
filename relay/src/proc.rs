@@ -49,9 +49,6 @@ pub(crate) struct AgentSpawnDetails {
     pub(crate) working_dir: Option<String>,
     pub(crate) harness_config: Option<String>,
     pub(crate) deadline_at: Option<String>,
-    /// API-created agents write their CLI output here. Generic
-    /// `/v1/spawn` processes continue to use only the diagnostics spool.
-    pub(crate) persist_transcript: bool,
 }
 
 /// Durable JSONL transcript for an API-created agent.
