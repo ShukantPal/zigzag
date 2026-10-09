@@ -313,7 +313,7 @@ components:
     AgentCreateRequest:
       type: object
       description: Request to create and start an agent using a supported CLI harness.
-      required: [prompt, project_dir, branch]
+      required: [prompt, project_dir]
       properties:
         prompt:
           type: string
@@ -324,6 +324,14 @@ components:
         branch:
           type: string
           description: Branch for the agent's work.
+        no_branch:
+          type: boolean
+          default: false
+          description: Run directly in project_dir without creating a worktree.
+        pr:
+          type: integer
+          format: int64
+          description: Pull request number whose head branch should be used.
         worktree:
           type: string
           description: Worktree path; defaults to /private/tmp/<branch-slug>/.

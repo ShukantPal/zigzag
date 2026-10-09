@@ -56,6 +56,14 @@ fn agent_worktree_repo_root() -> PathBuf {
         .expect("test temporary directory must exist")
 }
 
+pub(crate) fn agent_harness_bin(harness: &str) -> &'static str {
+    match harness {
+        "gemini" => "gemini",
+        "opencode" => "opencode",
+        _ => "codex",
+    }
+}
+
 fn agent_harness_path(harness: &str) -> &'static Path {
     #[cfg(test)]
     {
@@ -64,11 +72,7 @@ fn agent_harness_path(harness: &str) -> &'static Path {
     }
     #[cfg(not(test))]
     {
-        match harness {
-            "gemini" => Path::new("gemini"),
-            "opencode" => Path::new("opencode"),
-            _ => Path::new("codex"),
-        }
+        Path::new(agent_harness_bin(harness))
     }
 }
 
@@ -975,7 +979,7 @@ fn agent_create_request(
     });
     let command = exec::ExecRequest {
         id: task_id.clone(),
-        bin: request.harness.clone(),
+        bin: agent_harness_bin(&request.harness).to_owned(),
         args,
     };
     match spawn_proc(
@@ -1389,7 +1393,7 @@ pub(crate) fn agent_restart_request(
         agent_harness_path(&config.harness),
         exec::ExecRequest {
             id: agent.task_id.clone(),
-            bin: config.harness.clone(),
+            bin: agent_harness_bin(&config.harness).to_owned(),
             args,
         },
         execution_id,

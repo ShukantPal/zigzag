@@ -33,9 +33,9 @@ use crate::proc::{
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
-    AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_config,
-    agent_route, default_agent_worktree, parse_agent_create_request, persisted_agent_config,
-    restart_argv, restart_config, valid_agent_model,
+    AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
+    agent_harness_config, agent_route, default_agent_worktree, parse_agent_create_request,
+    persisted_agent_config, restart_argv, restart_config, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -1745,6 +1745,17 @@ fn agent_argv_maps_common_options_for_each_harness() {
             .contains(r#""edit":"allow""#)
     );
     assert!(agent_harness_config("gemini", "suggest").is_none());
+}
+
+#[test]
+fn agent_harness_selects_matching_cli_binary() {
+    for (harness, expected_bin) in [
+        ("codex", "codex"),
+        ("gemini", "gemini"),
+        ("opencode", "opencode"),
+    ] {
+        assert_eq!(agent_harness_bin(harness), expected_bin);
+    }
 }
 
 #[test]
