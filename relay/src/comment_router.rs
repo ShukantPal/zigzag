@@ -259,19 +259,37 @@ pub(crate) fn watch_loop(state: Arc<Server>, config: Config) {
                 Vec::new()
             }
         };
-        for watched_pr in watched {
-            match scan_pr(&state, &watched_pr, config.shadow) {
-                Ok(true) => burst_until = Instant::now() + config.burst_window,
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "GitHub comment watch for {}#{} failed: {error}",
-                    watched_pr.repository, watched_pr.number
-                ),
-            }
-        }
-        let interval = poll_interval(Instant::now(), burst_until, config.quiet_interval);
+        let interval = watch_cycle(
+            watched,
+            Instant::now(),
+            &mut burst_until,
+            config.burst_window,
+            config.quiet_interval,
+            |watched_pr| scan_pr(&state, watched_pr, config.shadow),
+        );
         thread::sleep(interval);
     }
+}
+
+fn watch_cycle(
+    watched: Vec<WatchedPr>,
+    now: Instant,
+    burst_until: &mut Instant,
+    burst_window: Duration,
+    quiet_interval: Duration,
+    mut scan: impl FnMut(&WatchedPr) -> Result<bool, String>,
+) -> Duration {
+    for watched_pr in watched {
+        match scan(&watched_pr) {
+            Ok(true) => *burst_until = now + burst_window,
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "GitHub comment watch for {}#{} failed: {error}",
+                watched_pr.repository, watched_pr.number
+            ),
+        }
+    }
+    poll_interval(now, *burst_until, quiet_interval)
 }
 
 fn poll_interval(now: Instant, burst_until: Instant, quiet_interval: Duration) -> Duration {
@@ -285,23 +303,42 @@ fn poll_interval(now: Instant, burst_until: Instant, quiet_interval: Duration) -
 fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<bool, String> {
     let comments = github_comments(&watched.repository, watched.number)?;
     let gate = session_gate();
-    let candidates = routable_comments(&comments, &gate);
+    scan_comments(
+        watched,
+        &comments,
+        shadow,
+        &gate,
+        ScanHooks {
+            persist: |event| {
+                state
+                    .store
+                    .add(event)
+                    .map(|_| ())
+                    .map_err(|error| format!("could not persist comment event: {error}"))
+            },
+            launch: |candidates: &[Comment]| {
+                launch_comment_resume(state, watched, &comments, candidates)
+            },
+            on_started: |handle: &str| {
+                release_when_finished(
+                    Arc::clone(&gate),
+                    Arc::clone(&state.supervisor.registry),
+                    watched.session_id.clone(),
+                    handle.to_owned(),
+                );
+            },
+            on_bind_failure: |handle: &str| terminate_spawned(&state.supervisor, handle),
+        },
+    )
+}
 
-    if shadow {
-        return shadow_dispatch(&gate, watched, &candidates, |event| {
-            state
-                .store
-                .add(event)
-                .map(|_| ())
-                .map_err(|error| format!("could not persist comment event: {error}"))
-        });
-    }
-
-    if candidates.is_empty() || !gate.claim(&watched.session_id) {
-        return Ok(false);
-    }
-
-    let prompt = comment_prompt(watched, &comments);
+fn launch_comment_resume(
+    state: &Arc<Server>,
+    watched: &WatchedPr,
+    comments: &[Comment],
+    candidates: &[Comment],
+) -> Result<String, String> {
+    let prompt = comment_prompt(watched, comments);
     let request = exec::ExecRequest {
         id: format!("github-comment-{}", candidates[0].node_id),
         bin: "codex".to_owned(),
@@ -315,62 +352,77 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             prompt,
         ],
     };
-    let policy = match require_gui_login_session().and_then(|_| exec::load_policy()) {
-        Ok(policy) => policy,
-        Err(error) => {
-            gate.release(&watched.session_id);
-            return Err(error);
-        }
-    };
+    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let path = policy
         .verified_path(&request.bin, &request.args)
         .map_err(|error| {
             format!("the execution policy does not allow codex comment resumes: {error}")
         });
-    let path = match path {
-        Ok(path) => path,
-        Err(error) => {
-            gate.release(&watched.session_id);
-            return Err(error);
-        }
-    };
-    let execution_id = match new_execution_id() {
-        Ok(id) => id,
-        Err(error) => {
-            gate.release(&watched.session_id);
-            return Err(error);
-        }
-    };
-    // The event must be durable before launching; the dispatch ledger is
-    // updated only after a successful spawn, so pre-launch failures retry.
-    for comment in &candidates {
-        if let Err(error) = state.store.add(comment_event(watched, comment)) {
-            gate.release(&watched.session_id);
-            return Err(format!("could not persist comment event: {error}"));
-        }
-    }
-    let spawned = match spawn_proc(
+    let path = path?;
+    let execution_id = new_execution_id()?;
+    spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
         &path,
         request,
         execution_id,
         AgentSpawnDetails::default(),
-    ) {
-        Ok(spawned) => spawned,
+    )
+    .map(|spawned| spawned.handle)
+    .map_err(|error| format!("could not spawn comment resume: {error}"))
+}
+
+struct ScanHooks<P, L, S, B> {
+    persist: P,
+    launch: L,
+    on_started: S,
+    on_bind_failure: B,
+}
+
+fn scan_comments<P, L, S, B>(
+    watched: &WatchedPr,
+    comments: &[Comment],
+    shadow: bool,
+    gate: &SessionGate,
+    hooks: ScanHooks<P, L, S, B>,
+) -> Result<bool, String>
+where
+    P: FnMut(Json) -> Result<(), String>,
+    L: for<'a> FnOnce(&'a [Comment]) -> Result<String, String>,
+    S: for<'a> FnOnce(&'a str),
+    B: for<'a> FnOnce(&'a str),
+{
+    let ScanHooks {
+        mut persist,
+        launch,
+        on_started,
+        on_bind_failure,
+    } = hooks;
+    let candidates = routable_comments(comments, gate);
+    if shadow {
+        return shadow_dispatch(gate, watched, &candidates, persist);
+    }
+    if candidates.is_empty() || !gate.claim(&watched.session_id) {
+        return Ok(false);
+    }
+    // The event must be durable before launching; the dispatch ledger is
+    // updated only after a successful spawn, so pre-launch failures retry.
+    for comment in &candidates {
+        if let Err(error) = persist(comment_event(watched, comment)) {
+            gate.release(&watched.session_id);
+            return Err(error);
+        }
+    }
+    let handle = match launch(&candidates) {
+        Ok(handle) => handle,
         Err(error) => {
             gate.release(&watched.session_id);
-            return Err(format!("could not spawn comment resume: {error}"));
+            return Err(error);
         }
     };
-    release_when_finished(
-        Arc::clone(&gate),
-        Arc::clone(&state.supervisor.registry),
-        watched.session_id.clone(),
-        spawned.handle.clone(),
-    );
-    if let Err(error) = gate.bind(&watched.session_id, &spawned.handle) {
-        terminate_spawned(&state.supervisor, &spawned.handle);
+    on_started(&handle);
+    if let Err(error) = gate.bind(&watched.session_id, &handle) {
+        on_bind_failure(&handle);
         gate.release(&watched.session_id);
         return Err(error);
     }
@@ -971,6 +1023,80 @@ mod tests {
     }
 
     #[test]
+    fn live_scan_never_launches_after_persistence_failure_and_releases_claims() {
+        use std::cell::Cell;
+
+        let watched = watched();
+        let comment = owner_comment("issue", "node");
+        let gate = SessionGate::in_memory();
+        let launches = Cell::new(0);
+        assert!(
+            scan_comments(
+                &watched,
+                std::slice::from_ref(&comment),
+                false,
+                &gate,
+                ScanHooks {
+                    persist: |_| Err("disk failed".to_owned()),
+                    launch: |_: &[Comment]| {
+                        launches.set(launches.get() + 1);
+                        Ok("agent".to_owned())
+                    },
+                    on_started: |_: &str| {},
+                    on_bind_failure: |_: &str| {},
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(launches.get(), 0);
+        assert!(gate.claim(&watched.session_id));
+        gate.release(&watched.session_id);
+
+        assert!(
+            scan_comments(
+                &watched,
+                std::slice::from_ref(&comment),
+                false,
+                &gate,
+                ScanHooks {
+                    persist: |_| Ok(()),
+                    launch: |_: &[Comment]| Err("spawn failed".to_owned()),
+                    on_started: |_: &str| {},
+                    on_bind_failure: |_: &str| {},
+                },
+            )
+            .is_err()
+        );
+        assert!(gate.claim(&watched.session_id));
+        gate.release(&watched.session_id);
+
+        let broken = SessionGate {
+            path: Some(PathBuf::from("/dev/null/comment-router")),
+            inner: Mutex::new(GateState::default()),
+        };
+        let started = Cell::new(0);
+        let terminated = Cell::new(0);
+        assert!(
+            scan_comments(
+                &watched,
+                &[comment],
+                false,
+                &broken,
+                ScanHooks {
+                    persist: |_| Ok(()),
+                    launch: |_: &[Comment]| Ok("agent".to_owned()),
+                    on_started: |_: &str| started.set(started.get() + 1),
+                    on_bind_failure: |_: &str| terminated.set(terminated.get() + 1),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(started.get(), 1);
+        assert_eq!(terminated.get(), 1);
+        assert!(broken.claim(&watched.session_id));
+    }
+
+    #[test]
     fn durable_dedup_survives_event_eviction_and_router_reopen() {
         let base = std::env::temp_dir().join(format!(
             "zigzag-comment-e2e-{}-{}",
@@ -987,9 +1113,18 @@ mod tests {
         let store = Store::open(&event_path, 1).unwrap();
         let gate = SessionGate::open(ledger_path.clone()).unwrap();
         assert!(
-            shadow_dispatch(&gate, &watched, std::slice::from_ref(&comment), |event| {
-                store.add(event).map(|_| ())
-            })
+            scan_comments(
+                &watched,
+                std::slice::from_ref(&comment),
+                true,
+                &gate,
+                ScanHooks {
+                    persist: |event| store.add(event).map(|_| ()),
+                    launch: |_: &[Comment]| panic!("shadow scans never launch"),
+                    on_started: |_: &str| {},
+                    on_bind_failure: |_: &str| {},
+                },
+            )
             .unwrap()
         );
         // Evict the delivery event; routing identity remains in its own ledger.
@@ -1004,12 +1139,19 @@ mod tests {
 
         let reopened_store = Store::open(&event_path, 1).unwrap();
         let reopened_gate = SessionGate::open(ledger_path).unwrap();
-        let candidates = routable_comments(&[comment], &reopened_gate);
-        assert!(candidates.is_empty());
         assert!(
-            !shadow_dispatch(&reopened_gate, &watched, &candidates, |event| {
-                reopened_store.add(event).map(|_| ())
-            })
+            !scan_comments(
+                &watched,
+                &[comment],
+                true,
+                &reopened_gate,
+                ScanHooks {
+                    persist: |event| reopened_store.add(event).map(|_| ()),
+                    launch: |_: &[Comment]| panic!("shadow scans never launch"),
+                    on_started: |_: &str| {},
+                    on_bind_failure: |_: &str| {},
+                },
+            )
             .unwrap()
         );
         assert_eq!(
@@ -1024,11 +1166,11 @@ mod tests {
     }
 
     #[test]
-    fn paginated_all_surface_owner_feedback_produces_routable_events() {
+    fn paginated_all_surface_feedback_routes_through_a_burst_poll_cycle() {
         let issue = parse_comments("issue", r#"[[{"id":1,"node_id":"IC_1","body":"one","user":{"login":"ShukantPal"}}],[{"id":9}]]"#).unwrap();
         let inline = parse_comments(
             "review_comment",
-            r#"[[{"id":2,"node_id":"PRRC_2","body":"two","user":{"login":"ShukantPal"}}]]"#,
+            r#"[[{"id":2,"node_id":"PRRC_2","body":"two","user":{"login":"ShukantPal"}},{"id":4,"node_id":"PRRC_bot","body":"> 🤖 done","user":{"login":"ShukantPal"}}]]"#,
         )
         .unwrap();
         let review = parse_comments(
@@ -1038,8 +1180,6 @@ mod tests {
         .unwrap();
         let comments = [issue, inline, review].concat();
         let gate = SessionGate::in_memory();
-        let candidates = routable_comments(&comments, &gate);
-        assert_eq!(candidates.len(), 3);
         let watched = watched();
         let base = std::env::temp_dir().join(format!(
             "zigzag-comment-surfaces-{}-{}",
@@ -1050,11 +1190,41 @@ mod tests {
                 .as_nanos()
         ));
         let store = Store::open(base.join("events.json"), 10).unwrap();
+        let now = Instant::now();
+        let mut burst_until = now;
         assert!(
-            shadow_dispatch(&gate, &watched, &candidates, |event| {
-                store.add(event).map(|_| ())
-            })
-            .unwrap()
+            watch_cycle(
+                vec![watched],
+                now,
+                &mut burst_until,
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                |current| {
+                    scan_comments(
+                        current,
+                        &comments,
+                        true,
+                        &gate,
+                        ScanHooks {
+                            persist: |event| store.add(event).map(|_| ()),
+                            launch: |_: &[Comment]| panic!("shadow scans never launch"),
+                            on_started: |_: &str| {},
+                            on_bind_failure: |_: &str| {},
+                        },
+                    )
+                },
+            ) == BURST_INTERVAL
+        );
+        assert_eq!(
+            watch_cycle(
+                Vec::new(),
+                now + Duration::from_secs(301),
+                &mut burst_until,
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                |_| Ok(false),
+            ),
+            Duration::from_secs(300)
         );
         let events = store.read(0, "", Duration::ZERO).unwrap();
         let surfaces: Vec<_> = events
