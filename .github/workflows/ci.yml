@@ -157,7 +157,7 @@ jobs:
           security create-keychain -p "" "$KEYCHAIN"
           security set-keychain-settings -t 3600 -u "$KEYCHAIN"
           security unlock-keychain -p "" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -A \
             -T /usr/bin/codesign -T /usr/bin/security
           security list-keychains -d user -s "$KEYCHAIN" \
             $(security list-keychains -d user | tr -d '"')
