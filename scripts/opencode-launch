@@ -314,6 +314,7 @@ def render_artifacts(
     session_id: str | None = None
     final_text = ""
     completed = False
+    last_step_reason: str | None = None
     stream_error: str | None = None
     try:
         stream = (task_dir / EVENTS_FILE).read_text(encoding="utf-8")
@@ -330,7 +331,10 @@ def render_artifacts(
             if event_session is not None:
                 if not isinstance(event_session, str) or not event_session:
                     raise RunnerError("OpenCode emitted an invalid sessionID")
-                session_id = session_id or event_session
+                if session_id is None:
+                    session_id = event_session
+                elif session_id != event_session:
+                    raise RunnerError("OpenCode emitted conflicting sessionIDs")
             event_type = event["type"]
             if event_type == "error":
                 raise RunnerError("OpenCode emitted an error event")
@@ -355,7 +359,8 @@ def render_artifacts(
                 usage["cost"] += number(part.get("cost"), "cost")
                 if not isinstance(part.get("reason"), str):
                     raise RunnerError("OpenCode step_finish is missing a reason")
-                completed = completed or part["reason"] == "stop"
+                last_step_reason = part["reason"]
+        completed = last_step_reason == "stop"
         if not completed:
             raise RunnerError("OpenCode emitted no terminal stop event")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RunnerError) as error:
@@ -476,6 +481,9 @@ def run_prepared_task(task_dir: Path, options: argparse.Namespace) -> int:
     effective_exit = process_exit_code
     if effective_exit == 0 and (timed_out or not stream_complete or stream_error):
         effective_exit = 1
+    if effective_exit != 0 and not stream_error:
+        stream_error = f"OpenCode exited with status {effective_exit}"
+        write_usage(task_dir, options.operation, effective_exit, timed_out, stream_complete, stream_error, usage)
     if effective_exit == 0 and not timed_out and stream_complete and not stream_error:
         try:
             if not session_id:

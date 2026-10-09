@@ -101,6 +101,10 @@ class OpenCodeLaunchTests(unittest.TestCase):
                 if mode == "intermediate_only":
                     print(json.dumps(finish(3, 2, 1, 4, 5, 0, "tool-calls")))
                     raise SystemExit(0)
+                if mode == "stop_then_tool_calls":
+                    print(json.dumps(finish(3, 2, 1, 4, 5, 0)))
+                    print(json.dumps(finish(7, 11, 13, 17, 19, 0, "tool-calls")))
+                    raise SystemExit(0)
                 if mode == "nonfinite":
                     print(json.dumps(finish(3, 2, 1, 4, 5, float("nan"))))
                     raise SystemExit(0)
@@ -175,10 +179,16 @@ class OpenCodeLaunchTests(unittest.TestCase):
 
     def assert_preflight_failure(self) -> None:
         self.assertEqual(self.run_calls(), [])
-        self.assertEqual(self.usage()["exit_code"], 2)
-        self.assertEqual(json.loads((self.task / runner.RUN_FILE).read_text())["state"], "failed")
+        usage = self.usage()
+        self.assertEqual(usage["exit_code"], 2)
+        self.assertFalse(usage["completed"])
+        self.assertTrue(usage["stream_error"])
+        run = json.loads((self.task / runner.RUN_FILE).read_text())
+        self.assertEqual(run["state"], "failed")
+        self.assertTrue(run["error"])
         self.assertFalse((self.task / runner.SESSION_FILE).exists())
         self.assertEqual((self.task / runner.RESULT_FILE).read_text(), "")
+        self.assertTrue((self.task / runner.STDERR_FILE).read_text().startswith("opencode-launch:"))
         self.clear_calls()
 
     def test_run_uses_staged_model_terminates_prompt_options_and_aggregates_usage(self) -> None:
@@ -272,7 +282,7 @@ class OpenCodeLaunchTests(unittest.TestCase):
         self.assert_preflight_failure()
 
     def test_missing_completion_and_postflight_model_mismatch_fail(self) -> None:
-        for mode, expected_error in (("no_completion", "no terminal stop"), ("intermediate_only", "no terminal stop"), ("nonfinite", "invalid numeric"), ("postflight_bad_model", "does not attest"), ("postflight_different_free", "differs")):
+        for mode, expected_error in (("no_completion", "no terminal stop"), ("intermediate_only", "no terminal stop"), ("stop_then_tool_calls", "no terminal stop"), ("nonfinite", "invalid numeric"), ("postflight_bad_model", "does not attest"), ("postflight_different_free", "differs")):
             with self.subTest(mode=mode):
                 self.stage(**({"model": "opencode/big-pickle"} if mode == "postflight_different_free" else {}))
                 self.set_state(mode)
@@ -294,6 +304,17 @@ class OpenCodeLaunchTests(unittest.TestCase):
                 if expected_error:
                     self.assertIn(expected_error, self.usage()["stream_error"])
                 self.assertEqual(self.usage()["timed_out"], mode == "timeout")
+                if mode == "failure":
+                    usage = self.usage()
+                    self.assertEqual(usage["exit_code"], 7)
+                    self.assertTrue(usage["completed"])
+                    self.assertEqual(usage["stream_error"], "OpenCode exited with status 7")
+                    run = json.loads((self.task / runner.RUN_FILE).read_text())
+                    self.assertEqual(run["state"], "failed")
+                    self.assertEqual(run["error"], "OpenCode exited with status 7")
+                    self.assertEqual((self.task / runner.RESULT_FILE).read_text(), "zen-ok")
+                    self.assertEqual((self.task / runner.STDERR_FILE).read_bytes(), b"")
+                    self.assertIn(b'"type": "step_finish"', (self.task / runner.EVENTS_FILE).read_bytes())
                 runner.PROCESS_TIMEOUT_SECONDS = self.original_timeout
                 self.set_state()
                 self.clear_calls()
