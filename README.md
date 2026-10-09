@@ -2,6 +2,9 @@
 
 _Managed by Pal's Muse._
 
+For component references, configuration, operations, and review procedures,
+see the [documentation index](docs/README.md).
+
 `zigzag` runs on a Mac and retains the latest 1,000 authenticated completion
 events. `poller` runs on the orchestrator VM, holds a long-poll request open,
 and writes delivered events as JSON Lines. This replaces a five-minute status
