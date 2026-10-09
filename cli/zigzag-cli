@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""zigzag-cli: command-line client for the zigzag relay REST API.
+
+Replaces hand-rolled curl commands for interacting with the relay.
+Zero dependencies -- only the Python standard library.
+
+Config (in precedence order):
+  --url / ZIGZAG_URL                 relay base URL (default http://100.101.237.83:8765)
+  --token-file / ZIGZAG_TOKEN_FILE   file holding the bearer token (default ~/.codex/zigzag.token)
+  ZIGZAG_TOKEN                      bearer token directly (overrides the file)
+  ZIGZAG_PROXY                       HTTP proxy URL for reaching the relay (needed from the VM)
+
+Examples:
+  zigzag-cli health
+  zigzag-cli agents list
+  zigzag-cli agents create --prompt "Fix the flaky test" --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
+  zigzag-cli agents logs <id> --follow
+  zigzag-cli exec --bin gh --args pr list --repo ShukantPal/zigzag
+  zigzag-cli events --follow
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+DEFAULT_URL = "http://100.101.237.83:8765"
+DEFAULT_TOKEN_FILE = os.path.expanduser("~/.codex/zigzag.token")
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        self.status = status
+        self.message = message
+        super().__init__("HTTP %s: %s" % (status, message))
+
+
+class Client:
+    def __init__(self, base_url, token, proxy=None):
+        self.base = base_url.rstrip("/")
+        self.token = token
+        if proxy:
+            self.opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            self.opener = urllib.request.build_opener()
+
+    def request(self, method, path, query=None, body=None, timeout=120):
+        url = self.base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + self.token)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            try:
+                payload = json.loads(e.read().decode("utf-8", errors="replace"))
+                msg = payload.get("error", json.dumps(payload))
+            except Exception:
+                msg = e.reason or "request failed"
+            raise ApiError(e.code, msg)
+        except urllib.error.URLError as e:
+            raise ApiError(0, "cannot reach relay at %s (%s)" % (self.base, e.reason))
+
+
+def resolve_token(args):
+    if os.environ.get("ZIGZAG_TOKEN"):
+        return os.environ["ZIGZAG_TOKEN"].strip()
+    path = args.token_file or os.environ.get("ZIGZAG_TOKEN_FILE", DEFAULT_TOKEN_FILE)
+    path = os.path.expanduser(path)
+    try:
+        with open(path) as f:
+            token = f.read().strip()
+    except OSError as e:
+        sys.stderr.write("error: cannot read token file %s: %s\n" % (path, e))
+        sys.stderr.write("set ZIGZAG_TOKEN or --token-file\n")
+        sys.exit(2)
+    if not token:
+        sys.stderr.write("error: token file %s is empty\n" % path)
+        sys.exit(2)
+    return token
+
+
+def make_client(args):
+    url = args.url or os.environ.get("ZIGZAG_URL", DEFAULT_URL)
+    proxy = os.environ.get("ZIGZAG_PROXY")
+    return Client(url, resolve_token(args), proxy=proxy)
+
+
+def print_table(headers, rows):
+    widths = [len(h) for h in headers]
+    str_rows = [[str(c) for c in r] for r in rows]
+    for r in str_rows:
+        for i, c in enumerate(r):
+            widths[i] = max(widths[i], len(c))
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    print(fmt.format(*headers))
+    print(fmt.format(*["-" * w for w in widths]))
+    for r in str_rows:
+        print(fmt.format(*r))
+
+
+def emit(args, payload, table_fn=None):
+    if args.json or table_fn is None:
+        print(json.dumps(payload, indent=2))
+    else:
+        table_fn(payload)
+
+
+# ---------------------------------------------------------------- agents ---
+
+def fmt_ts(v):
+    if v is None or v == "":
+        return ""
+    s = str(v)
+    # The relay records started_at as epoch seconds; be liberal.
+    if s.isdigit():
+        try:
+            import datetime
+            return datetime.datetime.fromtimestamp(int(s)).strftime("%m-%d %H:%M")
+        except (ValueError, OverflowError, OSError):
+            return s
+    return s[:19].replace("T", " ")
+
+
+def agents_table(resp):
+    agents = resp.get("agents", [])
+    if not agents:
+        print("(no agents)")
+        return
+    rows = []
+    for a in agents:
+        rows.append([
+            a.get("id", "")[:12],
+            a.get("task_id", ""),
+            a.get("state", ""),
+            (a.get("command", "") or "")[:40],
+            fmt_ts(a.get("started_at", "")),
+            a.get("exit_code", ""),
+        ])
+    print_table(["ID", "TASK", "STATE", "COMMAND", "STARTED", "EXIT"], rows)
+
+
+def cmd_agents_list(client, args):
+    q = {}
+    if args.state:
+        q["state"] = args.state
+    if args.task_id:
+        q["task_id"] = args.task_id
+    emit(args, client.request("GET", "/v1/agents", query=q), agents_table)
+
+
+def resolve_agent_id(client, prefix):
+    """Accept a unique id prefix; fall back to exact lookup."""
+    try:
+        client.request("GET", "/v1/agents/%s" % prefix)
+        return prefix
+    except ApiError as e:
+        if e.status != 404:
+            raise
+    agents = client.request("GET", "/v1/agents").get("agents", [])
+    matches = [a["id"] for a in agents if a.get("id", "").startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ApiError(404, "unknown_agent")
+    raise ApiError(0, "ambiguous prefix %r matches %d agents: %s" % (
+        prefix, len(matches), ", ".join(m[:12] for m in matches[:5])))
+
+
+def cmd_agents_get(client, args):
+    args.id = resolve_agent_id(client, args.id)
+    resp = client.request("GET", "/v1/agents/%s" % args.id)
+    def show(r):
+        for k in ("id", "task_id", "execution_id", "state", "command",
+                  "started_at", "deadline_at", "exit_code"):
+            v = r.get(k, "")
+            if k in ("started_at", "deadline_at"):
+                v = fmt_ts(v)
+            print("%-13s %s" % (k, v))
+    emit(args, resp, show)
+
+
+def cmd_agents_create(client, args):
+    body = {
+        "prompt": args.prompt,
+        "project_dir": args.project_dir,
+        "branch": args.branch,
+    }
+    if args.worktree:
+        body["worktree"] = args.worktree
+    if args.model:
+        body["model"] = args.model
+    if args.approval_mode:
+        body["approval_mode"] = args.approval_mode
+    if args.timeout_secs is not None:
+        body["timeout_secs"] = args.timeout_secs
+    resp = client.request("POST", "/v1/agents", body=body)
+    def show(r):
+        print("agent:    %s" % r.get("id"))
+        print("worktree: %s" % r.get("worktree"))
+    emit(args, resp, show)
+
+
+def cmd_agents_pause(client, args):
+    args.id = resolve_agent_id(client, args.id)
+    resp = client.request("POST", "/v1/agents/%s/pause" % args.id)
+    def show(r):
+        print("paused %s at %s" % (r.get("id"), r.get("paused_at")))
+    emit(args, resp, show)
+
+
+def cmd_agents_resume(client, args):
+    args.id = resolve_agent_id(client, args.id)
+    resp = client.request("POST", "/v1/agents/%s/resume" % args.id)
+    def show(r):
+        print("resumed %s (paused=%s)" % (r.get("id"), r.get("paused")))
+    emit(args, resp, show)
+
+
+def cmd_agents_stop(client, args):
+    args.id = resolve_agent_id(client, args.id)
+    resp = client.request("DELETE", "/v1/agents/%s" % args.id)
+    def show(r):
+        print("stopped %s" % r.get("id"))
+    emit(args, resp, show)
+
+
+def cmd_agents_logs(client, args):
+    args.id = resolve_agent_id(client, args.id)
+    after = args.after or 0
+    while True:
+        q = {"after": after}
+        if args.stream:
+            q["stream"] = args.stream
+        if args.tail is not None:
+            q["tail"] = args.tail
+        if args.follow:
+            q["follow"] = "1"
+        resp = client.request("GET", "/v1/agents/%s/logs" % args.id, query=q)
+        if args.json:
+            print(json.dumps(resp, indent=2))
+        else:
+            for rec in resp.get("records", []):
+                stream = rec.get("stream", "?")
+                data = rec.get("data", "")
+                if args.prefix:
+                    sys.stdout.write("[%s] %s" % (stream, data))
+                else:
+                    sys.stdout.write(data)
+            sys.stdout.flush()
+        after = resp.get("next_cursor", after)
+        if not args.follow or resp.get("complete"):
+            break
+
+
+# --------------------------------------------------------------- worktrees ---
+
+def cmd_worktrees_create(client, args):
+    body = {"path": args.path, "branch": args.branch, "repo": args.repo}
+    resp = client.request("POST", "/v1/worktrees", body=body)
+    def show(r):
+        print("worktree: %s (branch %s)" % (r.get("path"), r.get("branch")))
+    emit(args, resp, show)
+
+
+def cmd_worktrees_delete(client, args):
+    resp = client.request("DELETE", "/v1/worktrees", body={"path": args.path})
+    def show(r):
+        print("removed %s" % r.get("path") if r.get("removed") else "not removed: %s" % r.get("path"))
+    emit(args, resp, show)
+
+
+# ------------------------------------------------------------------- exec ---
+
+def cmd_exec(client, args):
+    req_id = args.id or ("cli-%s" % uuid.uuid4().hex[:12])
+    body = {"id": req_id, "bin": args.bin, "args": args.args or []}
+    resp = client.request("POST", "/v1/exec", body=body)
+    if resp.get("error") == "denied":
+        print("denied (id=%s)" % resp.get("id"))
+        sys.exit(1)
+    def show(r):
+        if r.get("stdout"):
+            sys.stdout.write(r["stdout"])
+        if r.get("stderr"):
+            sys.stderr.write(r["stderr"])
+        print("exit=%s timed_out=%s truncated=%s" % (
+            r.get("exit_code"), r.get("timed_out"), r.get("truncated")),
+            file=sys.stderr)
+    emit(args, resp, show)
+    if resp.get("exit_code") not in (0, None):
+        sys.exit(1)
+
+
+def cmd_spawn(client, args):
+    body = {"id": args.id or ("cli-%s" % uuid.uuid4().hex[:12]),
+            "bin": args.bin, "args": args.args or []}
+    if args.execution_id:
+        body["execution_id"] = args.execution_id
+    resp = client.request("POST", "/v1/spawn", body=body)
+    if resp.get("error") == "denied":
+        print("denied (id=%s)" % resp.get("id"))
+        sys.exit(1)
+    def show(r):
+        print("proc: %s" % r.get("proc"))
+    emit(args, resp, show)
+
+
+def cmd_proc_get(client, args):
+    resp = client.request("GET", "/v1/proc/%s" % args.id)
+    def show(r):
+        print("running:   %s" % r.get("running"))
+        print("exit_code: %s" % r.get("exit_code"))
+        if r.get("stdout"):
+            print("--- stdout ---")
+            sys.stdout.write(r["stdout"])
+        if r.get("stderr"):
+            print("--- stderr ---")
+            sys.stderr.write(r["stderr"])
+    emit(args, resp, show)
+
+
+# ----------------------------------------------------------------- events ---
+
+def cmd_events(client, args):
+    after = args.after or 0
+    epoch = args.epoch or ""
+    while True:
+        q = {"after": after, "timeout": args.timeout, "epoch": epoch}
+        resp = client.request("GET", "/v1/events", query=q,
+                              timeout=args.timeout + 30)
+        if args.json:
+            print(json.dumps(resp, indent=2))
+        else:
+            for ev in resp.get("events", []):
+                print("%s %-22s task=%s" % (
+                    (ev.get("occurred_at", "") or "")[:19].replace("T", " "),
+                    ev.get("kind", ""),
+                    ev.get("task_id", "")))
+            sys.stdout.flush()
+        if resp.get("reset"):
+            sys.stderr.write("warning: event store reset; restarting from 0\n")
+            after, epoch = 0, ""
+            if not args.follow:
+                break
+            continue
+        after = resp.get("next", after)
+        epoch = resp.get("epoch", epoch)
+        if not args.follow:
+            break
+
+
+# ------------------------------------------------------------------ misc ---
+
+def cmd_health(client, args):
+    emit(args, client.request("GET", "/v1/health"),
+         lambda r: print("ok" if r.get("status") == "ok" else r))
+
+
+def cmd_review_gate(client, args):
+    q = {"repository": args.repo, "pull_request": args.pr}
+    resp = client.request("GET", "/v1/review-gate", query=q)
+    def show(r):
+        # The gate report is report-shaped; summarize the top level.
+        if isinstance(r, dict):
+            print(json.dumps(r, indent=2)[:4000])
+        else:
+            print(r)
+    emit(args, resp, show)
+
+
+# ------------------------------------------------------------------- main ---
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="zigzag-cli",
+        description="Command-line client for the zigzag relay REST API.")
+    p.add_argument("--url", help="relay base URL (or ZIGZAG_URL)")
+    p.add_argument("--token-file", help="file with bearer token (or ZIGZAG_TOKEN_FILE)")
+    p.add_argument("--json", action="store_true", help="print raw JSON instead of tables")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    h = sub.add_parser("health", help="liveness probe")
+    h.set_defaults(func=cmd_health)
+
+    ag = sub.add_parser("agents", help="manage agents")
+    agsub = ag.add_subparsers(dest="agents_cmd", required=True)
+
+    l = agsub.add_parser("list", help="list registered agents")
+    l.add_argument("--state", help="filter by state, e.g. running")
+    l.add_argument("--task-id", help="filter by task id")
+    l.set_defaults(func=cmd_agents_list)
+
+    g = agsub.add_parser("get", help="show one agent's record")
+    g.add_argument("id", help="agent handle")
+    g.set_defaults(func=cmd_agents_get)
+
+    c = agsub.add_parser("create", help="create and start a Codex agent")
+    c.add_argument("--prompt", required=True, help="inline prompt text or prompt-file path")
+    c.add_argument("--project-dir", required=True, help="project directory the agent works in")
+    c.add_argument("--branch", required=True, help="branch for the agent's work")
+    c.add_argument("--worktree", help="worktree path (default /private/tmp/<branch-slug>/)")
+    c.add_argument("--model", help="model override")
+    c.add_argument("--approval-mode", help="approval mode override")
+    c.add_argument("--timeout-secs", type=int, help="agent timeout in seconds")
+    c.set_defaults(func=cmd_agents_create)
+
+    for name, help_text, func in (
+            ("pause", "SIGSTOP the agent's process group", cmd_agents_pause),
+            ("resume", "SIGCONT a paused agent", cmd_agents_resume),
+            ("stop", "gracefully stop an agent (leaves worktree)", cmd_agents_stop)):
+        sp = agsub.add_parser(name, help=help_text)
+        sp.add_argument("id", help="agent handle")
+        sp.set_defaults(func=func)
+
+    lg = agsub.add_parser("logs", help="read an agent's captured output")
+    lg.add_argument("id", help="agent handle")
+    lg.add_argument("--stream", choices=["stdout", "stderr", "both"],
+                    help="which stream to read (default both)")
+    lg.add_argument("--after", type=int, help="cursor offset to read from")
+    lg.add_argument("--tail", type=int, help="cap, in bytes, on newest records")
+    lg.add_argument("--follow", action="store_true", help="long-poll for new records")
+    lg.add_argument("--prefix", action="store_true",
+                    help="prefix each line with [stdout]/[stderr]")
+    lg.set_defaults(func=cmd_agents_logs)
+
+    wt = sub.add_parser("worktrees", help="manage git worktrees")
+    wtsub = wt.add_subparsers(dest="worktrees_cmd", required=True)
+    wc = wtsub.add_parser("create", help="create a git worktree")
+    wc.add_argument("--path", required=True, help="worktree path")
+    wc.add_argument("--branch", required=True, help="branch name")
+    wc.add_argument("--repo", required=True, help="repo path the worktree is created from")
+    wc.set_defaults(func=cmd_worktrees_create)
+    wd = wtsub.add_parser("delete", help="remove a git worktree")
+    wd.add_argument("--path", required=True, help="worktree path")
+    wd.set_defaults(func=cmd_worktrees_delete)
+
+    e = sub.add_parser("exec", help="run an allowlisted command synchronously")
+    e.add_argument("--bin", required=True, help="allowlisted binary name/prefix")
+    e.add_argument("--args", nargs=argparse.REMAINDER, default=[],
+                   help="arguments (everything after --args)")
+    e.add_argument("--id", help="correlation id (auto-generated if omitted)")
+    e.set_defaults(func=cmd_exec)
+
+    s = sub.add_parser("spawn", help="spawn a supervised background process")
+    s.add_argument("--bin", required=True, help="allowlisted binary name/prefix")
+    s.add_argument("--args", nargs=argparse.REMAINDER, default=[],
+                   help="arguments (everything after --args)")
+    s.add_argument("--id", help="correlation id (auto-generated if omitted)")
+    s.add_argument("--execution-id", help="client correlation id for one attempt")
+    s.set_defaults(func=cmd_spawn)
+
+    pg = sub.add_parser("proc", help="inspect a spawned process")
+    pgsub = pg.add_subparsers(dest="proc_cmd", required=True)
+    pget = pgsub.add_parser("get", help="poll a process handle")
+    pget.add_argument("id", help="proc handle from spawn")
+    pget.set_defaults(func=cmd_proc_get)
+
+    ev = sub.add_parser("events", help="read the relay event store")
+    ev.add_argument("--after", type=int, default=0, help="sequence number to read from")
+    ev.add_argument("--timeout", type=int, default=10,
+                    help="long-poll timeout in seconds (max 55)")
+    ev.add_argument("--epoch", default="", help="epoch from a previous read")
+    ev.add_argument("--follow", action="store_true",
+                    help="keep long-polling for new events")
+    ev.set_defaults(func=cmd_events)
+
+    rg = sub.add_parser("review-gate", help="review-gate report for a PR")
+    rg.add_argument("--repo", required=True, help='repository in "owner/name" form')
+    rg.add_argument("--pr", required=True, type=int, help="pull request number")
+    rg.set_defaults(func=cmd_review_gate)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    # argparse.REMAINDER swallows a leading "--"; drop it for ergonomics.
+    if getattr(args, "args", None) and args.args[:1] == ["--"]:
+        args.args = args.args[1:]
+    client = make_client(args)
+    try:
+        args.func(client, args)
+    except ApiError as e:
+        if e.status == 401:
+            sys.stderr.write("error: auth failed (bad or missing bearer token)\n")
+        elif e.status == 404:
+            sys.stderr.write("error: not found: %s\n" % e.message)
+        elif e.status == 0:
+            sys.stderr.write("error: %s\n" % e.message)
+        else:
+            sys.stderr.write("error: %s\n" % e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
