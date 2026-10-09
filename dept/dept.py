@@ -308,12 +308,18 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
     if not TASK_ID_RE.fullmatch(tid):
         sys.exit("invalid task id")
     relay_path = asset_path("relay-announce.md")
-    # A restarted task reuses the stored prompt byte-for-byte; it already
-    # carries the SOP decoration and the relay announce block.
-    if not read_only and not restarted_from and os.path.exists(relay_path):
+    if not read_only and os.path.exists(relay_path):
         with open(relay_path, "rb") as f:
-            relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
-        prompt = prompt + b"\n\n---\n\n" + relay
+            template = f.read()
+        relay = template.replace(b"{{TASK_ID}}", tid.encode())
+        if restarted_from:
+            # Keep the original prompt intact, but replace the standard
+            # completion block at its tail so this attempt announces itself.
+            old_relay = template.replace(b"{{TASK_ID}}", restarted_from.encode())
+            if prompt.endswith(old_relay):
+                prompt = prompt[:-len(old_relay)] + relay
+        else:
+            prompt = prompt + b"\n\n---\n\n" + relay
     rdir = setup_task_dir(tid, project_dir, prompt, session_id, model, read_only)
     if restarted_from:
         action = "restarted"
@@ -520,13 +526,14 @@ def cmd_restart(args):
         sys.exit(f"task {tid} is still running; kill it before restarting")
 
     rdir = f"{REMOTE_DEPT}/{tid}"
-    # The stored prompt is already decorated (SOP + relay announce); reuse it
-    # as-is so the restarted task is byte-identical to the original launch.
-    r = ssh(f"cat {rdir}/prompt.txt", timeout=60)
+    # The stored prompt is already decorated (SOP + relay announce).  Its
+    # completion block is refreshed with the new id by dispatch_task.
+    r = ssh(f"cat {shq(f'{rdir}/prompt.txt')}", timeout=60)
     if r.returncode != 0 or not r.stdout.strip():
         sys.exit(f"task {tid} has no stored prompt; cannot restart")
     prompt = r.stdout
-    r = ssh(f"cat {rdir}/dir.txt 2>/dev/null; echo ---; cat {rdir}/model.txt 2>/dev/null",
+    r = ssh(f"cat {shq(f'{rdir}/dir.txt')} 2>/dev/null; echo ---; "
+            f"cat {shq(f'{rdir}/model.txt')} 2>/dev/null",
             timeout=60)
     parts = r.stdout.decode(errors="replace").split("---\n")
     project_dir = parts[0].strip() if parts else ""
@@ -540,31 +547,19 @@ def cmd_restart(args):
 
     session_id = None
     if ns.mode == "resume":
-        # The Codex session id is emitted in the task's --json event stream;
-        # scan the captured stdout for the thread/session identifier.
-        extractor = (
-            "import json\n"
-            f"path = {rdir!r} + '/events.jsonl'\n"
-            "def find_id(value):\n"
-            "    if isinstance(value, dict):\n"
-            "        for key in ('thread_id', 'session_id', 'threadId', 'sessionId'):\n"
-            "            if isinstance(value.get(key), str) and value[key]: return value[key]\n"
-            "        for child in value.values():\n"
-            "            found = find_id(child)\n"
-            "            if found: return found\n"
-            "    elif isinstance(value, list):\n"
-            "        for child in value:\n"
-            "            found = find_id(child)\n"
-            "            if found: return found\n"
-            "for line in open(path, errors='replace'):\n"
-            "    try: found = find_id(json.loads(line))\n"
-            "    except (TypeError, json.JSONDecodeError): continue\n"
-            "    if found:\n"
-            "        print(found)\n"
-            "        break\n"
+        # Fetch the JSONL remotely, then use the same structured parser that
+        # is unit-tested locally.  Keeping one parser prevents resume formats
+        # from drifting between the CLI and its tests.
+        events_reader = (
+            "from pathlib import Path\n"
+            f"path = Path({rdir!r}) / 'events.jsonl'\n"
+            "try:\n"
+            "    print(path.read_text(errors='replace'), end='')\n"
+            "except OSError:\n"
+            "    pass\n"
         )
-        r = ssh("python3", "-", stdin_data=extractor.encode(), timeout=60)
-        session_id = r.stdout.decode().strip()
+        r = ssh("python3", "-", stdin_data=events_reader.encode(), timeout=60)
+        session_id = session_id_from_events(r.stdout.decode(errors="replace").splitlines(True))
         if not session_id:
             sys.exit(f"task {tid} has no resumable Codex session in its logs; "
                      "use --mode fresh instead")

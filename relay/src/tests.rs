@@ -33,7 +33,8 @@ use crate::proc::{
 use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_create_worktree, agent_route, default_agent_worktree,
-    parse_agent_create_request, valid_agent_model,
+    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
+    valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -1468,6 +1469,50 @@ fn agent_create_request_parsing_and_helpers() {
 }
 
 #[test]
+fn restart_config_replays_prompt_contents_timeout_and_argv() {
+    let request = parse_agent_create_request(
+        br#"{"prompt":"/temporary/prompt.md","project_dir":"/repo","branch":"codex/restart","model":"gpt-6","approval_mode":"auto-edit","timeout_secs":42}"#,
+    )
+    .unwrap();
+    let persisted = persisted_agent_config(&request, "/tmp/worktree", "original prompt contents");
+    let config = restart_config(&persisted).unwrap();
+    assert_eq!(config.prompt, "original prompt contents");
+    assert_eq!(config.timeout_secs, Some(42));
+
+    let fresh = restart_argv(
+        &config,
+        super::routes::agents::RestartMode::Fresh,
+        &config.prompt,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.last().map(String::as_str),
+        Some("original prompt contents")
+    );
+    assert!(fresh.windows(2).any(|args| args == ["-m", "gpt-6"]));
+    assert!(
+        fresh
+            .windows(2)
+            .any(|args| args == ["--auto-edit", "--skip-git-repo-check"])
+    );
+
+    let resumed = restart_argv(
+        &config,
+        super::routes::agents::RestartMode::Resume,
+        "continue from override",
+        Some("thread-123"),
+    )
+    .unwrap();
+    assert!(
+        resumed
+            .windows(2)
+            .any(|args| args == ["resume", "thread-123"])
+    );
+    assert!(resumed.iter().any(|arg| arg == "continue from override"));
+}
+
+#[test]
 fn agent_route_selects_create_only_for_post_collection() {
     assert!(matches!(
         agent_route("GET", "/v1/agents"),
@@ -1710,7 +1755,7 @@ fn agent_restart_endpoint_covers_success_and_guards() {
     let policy = test_policy();
     let worktree = std::env::temp_dir().to_string_lossy().into_owned();
     let config = format!(
-        r#"{{"prompt":"continue","project_dir":"/repo","branch":"codex/restart","worktree":"{worktree}","model":null,"approval_mode":null,"timeout_secs":null}}"#
+        r#"{{"prompt":"continue","project_dir":"/repo","branch":"codex/restart","worktree":"{worktree}","model":null,"approval_mode":null,"timeout_secs":60}}"#
     );
     let mut stopped = agent_record("restartable");
     stopped.state = "succeeded".to_owned();
@@ -1732,6 +1777,32 @@ fn agent_restart_endpoint_covers_success_and_guards() {
         resumed.ends_with(r#"{"error":"no_resumable_session"}"#),
         "{resumed}"
     );
+    state
+        .supervisor
+        .registry
+        .append_log(
+            "restartable",
+            "stdout",
+            b"{\"payload\":{\"thread\":{\"id\":\"thread-from-jsonl\"}}}\n",
+        )
+        .unwrap();
+    let resumed = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/restartable/restart",
+        r#"{"mode":"resume","prompt":"continue from override"}"#,
+    );
+    assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
+    let resumed_id = response_json(resumed)
+        .object("id")
+        .and_then(Json::as_str)
+        .unwrap()
+        .to_owned();
+    let resumed_agent = state.supervisor.registry.get(&resumed_id).unwrap();
+    assert_eq!(resumed_agent.restarted_from.as_deref(), Some("restartable"));
+    assert_eq!(resumed_agent.agent_config.as_deref(), Some(config.as_str()));
+    assert!(resumed_agent.deadline_at.is_some());
 
     let response = request_once(
         Arc::clone(&state),
@@ -1771,6 +1842,54 @@ fn agent_restart_endpoint_covers_success_and_guards() {
     );
     assert!(paused_response.ends_with(r#"{"error":"agent_not_stopped"}"#));
 
+    // A running agent must never get a second process in the same worktree.
+    let running = agent_record("running-restart");
+    state.supervisor.registry.register(running).unwrap();
+    let running_response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/running-restart/restart",
+        "",
+    );
+    assert!(running_response.ends_with(r#"{"error":"agent_not_stopped"}"#));
+
+    // Recovery marks live processes orphaned.  They remain non-restartable
+    // until the original process is no longer alive.
+    let orphan = spawn_proc(
+        &state.supervisor,
+        Arc::clone(&state.store),
+        Path::new("/bin/sh"),
+        exec::ExecRequest {
+            id: "orphan-task".to_owned(),
+            bin: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+        },
+        "orphan-execution".to_owned(),
+        AgentSpawnDetails::default(),
+    )
+    .unwrap();
+    state
+        .supervisor
+        .registry
+        .transition(&orphan.handle, "orphaned", None)
+        .unwrap();
+    let orphan_response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        &format!("/v1/agents/{}/restart", orphan.handle),
+        "",
+    );
+    assert!(orphan_response.ends_with(r#"{"error":"agent_not_stopped"}"#));
+    let _ = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{}", orphan.handle),
+        "",
+    );
+
     let mut missing = agent_record("missing-worktree");
     missing.state = "succeeded".to_owned();
     missing.agent_config = Some(config.replace(&worktree, "/definitely/missing-worktree"));
@@ -1784,11 +1903,31 @@ fn agent_restart_endpoint_covers_success_and_guards() {
     );
     assert!(missing_response.ends_with(r#"{"error":"worktree_missing"}"#));
 
+    let mut malformed = agent_record("bad-config");
+    malformed.state = "succeeded".to_owned();
+    malformed.agent_config = Some("not json".to_owned());
+    state.supervisor.registry.register(malformed).unwrap();
+    let malformed_response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/bad-config/restart",
+        "",
+    );
+    assert!(malformed_response.ends_with(r#"{"error":"invalid_agent_config"}"#));
+
     let _ = request_once(
         Arc::clone(&state),
         &policy,
         "DELETE",
         &format!("/v1/agents/{restarted}"),
+        "",
+    );
+    let _ = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{resumed_id}"),
         "",
     );
     drop(state);

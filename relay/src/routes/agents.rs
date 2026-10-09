@@ -693,7 +693,7 @@ fn agent_create_request(
             request.prompt.clone()
         }
     };
-    codex_args.push(prompt_text);
+    codex_args.push(prompt_text.clone());
     let _spawn_admission = match state.updater.spawn_admission() {
         Ok(Some(guard)) => guard,
         Ok(None) => return reply(stream, 503, error("updates_draining")),
@@ -739,7 +739,10 @@ fn agent_create_request(
         },
     ) {
         Ok(handle) => {
-            let config = persisted_agent_config(&request, &worktree_str);
+            // Persist the text actually passed to Codex.  In particular, a
+            // prompt-file request must remain restartable after the caller's
+            // file has changed or disappeared.
+            let config = persisted_agent_config(&request, &worktree_str, &prompt_text);
             if !matches!(
                 state
                     .supervisor
@@ -784,9 +787,13 @@ fn agent_create_request(
     }
 }
 
-fn persisted_agent_config(request: &AgentCreateRequest, worktree: &str) -> String {
+pub(crate) fn persisted_agent_config(
+    request: &AgentCreateRequest,
+    worktree: &str,
+    prompt: &str,
+) -> String {
     Json::Object(vec![
-        ("prompt".to_owned(), Json::String(request.prompt.clone())),
+        ("prompt".to_owned(), Json::String(prompt.to_owned())),
         (
             "project_dir".to_owned(),
             Json::String(request.project_dir.clone()),
@@ -817,15 +824,16 @@ fn persisted_agent_config(request: &AgentCreateRequest, worktree: &str) -> Strin
     .to_json()
 }
 
-struct AgentRestartConfig {
-    prompt: String,
+pub(crate) struct AgentRestartConfig {
+    pub(crate) prompt: String,
     worktree: String,
     model: Option<String>,
     approval_mode: Option<String>,
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RestartMode {
+pub(crate) enum RestartMode {
     Fresh,
     Resume,
 }
@@ -873,7 +881,7 @@ fn parse_restart_request(body: &[u8]) -> Result<RestartRequest, &'static str> {
     Ok(RestartRequest { mode, prompt })
 }
 
-fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static str> {
+pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static str> {
     let Json::Object(fields) = parse_json(text).map_err(|_| "invalid_agent_config")? else {
         return Err("invalid_agent_config");
     };
@@ -901,21 +909,20 @@ fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static str> {
     // retained here, avoiding dead duplicate state.
     required("project_dir")?;
     required("branch")?;
-    if let Some((_, value)) = fields.iter().find(|(key, _)| key == "timeout_secs")
-        && !matches!(value, Json::Null)
-        && value.as_u64().is_none()
-    {
-        return Err("invalid_agent_config");
-    }
+    let timeout_secs = match fields.iter().find(|(key, _)| key == "timeout_secs") {
+        None | Some((_, Json::Null)) => None,
+        Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_config")?),
+    };
     Ok(AgentRestartConfig {
         prompt: required("prompt")?,
         worktree: required("worktree")?,
         model: optional("model")?,
         approval_mode: optional("approval_mode")?,
+        timeout_secs,
     })
 }
 
-fn restart_argv(
+pub(crate) fn restart_argv(
     config: &AgentRestartConfig,
     mode: RestartMode,
     prompt: &str,
@@ -980,6 +987,21 @@ fn session_id_in_json(value: &serde_json::Value) -> Option<&str> {
     let object = value.as_object()?;
     for key in ["thread_id", "session_id", "threadId", "sessionId"] {
         if let Some(id) = object.get(key).and_then(serde_json::Value::as_str)
+            && !id.is_empty()
+            && id.len() < 128
+        {
+            return Some(id);
+        }
+    }
+    // Codex event streams also carry the identifier as `thread.id` or
+    // `payload.id`; recognize those shapes without treating unrelated `id`
+    // fields elsewhere in an event as resumable sessions.
+    for container in ["thread", "payload"] {
+        if let Some(id) = object
+            .get(container)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|nested| nested.get("id"))
+            .and_then(serde_json::Value::as_str)
             && !id.is_empty()
             && id.len() < 128
         {
@@ -1061,7 +1083,13 @@ pub(crate) fn agent_restart_request(
         execution_id,
         AgentSpawnDetails {
             worktree_path: Some(config.worktree.clone()),
-            deadline_at: None,
+            deadline_at: config.timeout_secs.map(|secs| {
+                unix_timestamp()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+                    .saturating_add(secs)
+                    .to_string()
+            }),
             persist_transcript: true,
         },
     ) {
