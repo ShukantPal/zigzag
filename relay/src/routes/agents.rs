@@ -1,10 +1,16 @@
 use crate::events::relay_timestamp;
 use crate::http::{error, query, reply};
+use crate::proc::{kill_process_group, process_group_running, recovered_agent_identity_matches};
 use crate::server::Server;
 use relay_core::{AgentRecord, Json};
 use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Grace period after SIGTERM before escalating to SIGKILL.
+const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
+/// Grace period after SIGKILL before giving up.
+const AGENT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) enum AgentRoute<'a> {
     List,
@@ -285,4 +291,93 @@ fn dept_task_dir(task_id: &str) -> Option<std::path::PathBuf> {
     let dir_name = task_id.strip_prefix("codex-").unwrap_or(task_id);
     let dir = home.join(".codex/dept").join(dir_name);
     dir.is_dir().then_some(dir)
+}
+
+/// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
+/// group and deregister it. The worktree is deliberately left in place; use
+/// `DELETE /v1/worktrees` to remove it.
+pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
+    let Some(agent) = state.supervisor.registry.get(id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if !matches!(agent.state.as_str(), "running" | "orphaned") {
+        return reply(stream, 409, error("agent_not_running"));
+    }
+    let pgid = agent.process_group;
+    let worktree = agent.worktree_path.clone();
+    // Security: never signal a process group that does not belong to this
+    // registered agent. A stale record (PID/PGID reuse, or a leader that has
+    // already exited) is treated as already dead: deregister without
+    // signalling. The pgid > 0 guard keeps kill(-pgid, ..) from ever
+    // resolving to the relay's own process group on a corrupt record.
+    let (stopped, graceful) = if pgid > 0 && recovered_agent_identity_matches(&agent) {
+        stop_process_group(id, pgid)
+    } else {
+        (true, true)
+    };
+    if stopped {
+        // Mark any live proc-table entry finished so the reaper does not
+        // overwrite the terminal state with its own exit classification.
+        if let Ok(mut table) = state.supervisor.procs.lock()
+            && let Some(entry) = table.get_mut(id)
+        {
+            let _ = entry.child.try_wait();
+            entry.finished_at = Some(Instant::now());
+        }
+        let terminal = if graceful { "stopped" } else { "killed" };
+        let _ = state.supervisor.registry.transition(id, terminal, None);
+    } else {
+        log::error!(
+            "agent_stop id={id} pgid={pgid}: process group survived SIGKILL; left registered"
+        );
+    }
+    log::info!("agent_stop id={id} pgid={pgid} graceful={graceful}");
+    match &worktree {
+        Some(path) => log::info!("agent_stop id={id}: worktree retained at {path}"),
+        None => log::info!("agent_stop id={id}: no worktree recorded"),
+    }
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id.to_owned())),
+            ("stopped".to_owned(), Json::Bool(stopped)),
+            (
+                "worktree".to_owned(),
+                worktree.map(Json::String).unwrap_or(Json::Null),
+            ),
+        ]),
+    )
+}
+
+/// SIGTERM a verified-owned process group, escalating to SIGKILL after
+/// [`AGENT_STOP_GRACE`]. Returns `(stopped, graceful)`; `stopped` is false
+/// only when the group survived SIGKILL plus [`AGENT_KILL_GRACE`].
+fn stop_process_group(id: &str, pgid: i32) -> (bool, bool) {
+    if !kill_process_group(pgid) {
+        // The signal was refused: the group vanished between the identity
+        // check and the signal. Treat as already dead.
+        return (true, true);
+    }
+    if wait_for_group_exit(pgid, AGENT_STOP_GRACE) {
+        return (true, true);
+    }
+    log::warn!("agent_stop id={id} pgid={pgid}: SIGTERM ignored, sending SIGKILL");
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    (wait_for_group_exit(pgid, AGENT_KILL_GRACE), false)
+}
+
+fn wait_for_group_exit(pgid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_group_running(pgid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }

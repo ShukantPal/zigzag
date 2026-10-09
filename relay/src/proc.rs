@@ -77,6 +77,7 @@ pub(crate) fn spawn_proc(
         leader_pid: process_group,
         process_group,
         process_identity: Some(process_identity),
+        worktree_path: None,
         started_at: unix_timestamp(),
         deadline_at: None,
         command: format!(
