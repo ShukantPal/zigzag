@@ -1,0 +1,16 @@
+[package]
+name = "zzapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line client for the zigzag relay REST API"
+
+[[bin]]
+name = "zzapi"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }
