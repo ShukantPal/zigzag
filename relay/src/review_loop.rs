@@ -2902,6 +2902,7 @@ review_loop:
             deadline_at: None,
             command: "codex exec".to_owned(),
             state: state.to_owned(),
+            paused_at: None,
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,

@@ -5,7 +5,7 @@ use crate::http::{ReadRequestError, denied, error, get_query, read_json, read_re
 use crate::logging;
 use crate::proc::ProcEntry;
 use crate::review_loop;
-use crate::routes::agents::{agent_request, agent_route};
+use crate::routes::agents::{agent_post_request, agent_request, agent_route};
 use crate::routes::exec::{exec_request, spawn_request};
 use crate::routes::procs::{ProcRoute, kill_proc, poll_proc, proc_route};
 use crate::routes::providers::providers_request;
@@ -220,6 +220,11 @@ where
             Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
             None => reply(&mut stream, 404, error("not_found")),
         },
+        ("POST", path) if agent_route(path).is_some() => agent_post_request(
+            &mut stream,
+            &state,
+            agent_route(path).expect("checked"),
+        ),
         ("POST", path) => match proc_route(path) {
             Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
             Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),
