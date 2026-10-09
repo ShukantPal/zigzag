@@ -22,7 +22,14 @@ const TARGET: &str = "aarch64-apple-darwin";
 const BINARY: &str = "zigzag-macos-aarch64";
 const MANIFEST: &str = "zigzag-macos-aarch64.manifest.json";
 const TRUST_ROOT: &str = include_str!("../trust/sigstore-trusted-root.json");
-const TEAM_ID: &str = "NH5F3PDHQ8";
+/// Apple Team ID pinned by the updater's code-signature requirement.
+///
+/// Ground truth from the issued signing certificate (leaf subject OU), not the
+/// stale team ID in the certificate's display name: releases are signed with an
+/// Apple Development certificate whose CN still reads
+/// "Apple Development: Shukant Pal (NH5F3PDHQ8)" but whose subject OU -- the
+/// authoritative team identifier -- is 7YZK8D3B48 (Leveled Platforms, Inc).
+const TEAM_ID: &str = "7YZK8D3B48";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Policy {
@@ -671,22 +678,12 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
 }
 
 fn verify_codesign(runtime: &dyn Runtime, candidate: &Path) -> Result<(), String> {
-    // SECURITY TRADEOFF: this requirement intentionally accepts Apple Development
-    // certificates, not just Developer ID. `anchor apple` only demands that the
-    // leaf certificate chain up to *some* Apple-issued root; the real trust
-    // boundary is the TeamIdentifier check (`certificate leaf[subject.OU]`),
-    // which only certificates issued to Shukant's team (NH5F3PDHQ8) can satisfy.
-    //
-    // Apple Development certs are issued to anyone with a free Apple ID, so they
-    // carry weaker issuance guarantees than Developer ID (no legal-identity
-    // verification by Apple). What they do NOT allow is forgery by an unrelated
-    // third party: an attacker would need to compromise Shukant's Apple
-    // Developer account to obtain a certificate with his Team ID. For a personal
-    // tool's auto-updater, team-scoped trust is the right bar; Developer ID
-    // (which requires the paid $99/yr membership) can be reinstated by swapping
-    // `anchor apple` back to `anchor apple generic` below.
+    // NOTE: `-R` takes a bare requirement expression. A "designated =>" prefix
+    // (as printed by `codesign -d -r-`) is a syntax error and fails every
+    // verification; `anchor apple generic` is the correct anchor for
+    // Apple-issued developer certificates (verified against release v0.1.206).
     let requirement = format!(
-        "=designated => anchor apple and identifier \"com.shukantpal.zigzag\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
+        "anchor apple generic and identifier \"com.shukantpal.zigzag\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
     );
     command_status(
         runtime,
@@ -1059,7 +1056,7 @@ mod tests {
                     binary.to_vec(),
                 ])),
                 codesign_detail:
-                    "Identifier=com.shukantpal.zigzag\nTeamIdentifier=NH5F3PDHQ8\n".to_owned(),
+                    "Identifier=com.shukantpal.zigzag\nTeamIdentifier=7YZK8D3B48\n".to_owned(),
                 calls: Mutex::new(Vec::new()),
                 status_index: AtomicUsize::new(0),
                 fail_status_at: None,
@@ -1270,12 +1267,10 @@ mod tests {
             .find(|call| call.command == "codesign" && call.operation == "status")
             .unwrap();
         assert!(codesign.args.iter().any(|arg| {
-            // Accepts Apple Development certs: any Apple-anchored cert with the
-            // right identifier and team, not just Developer ID.
-            arg.contains("anchor apple")
-                && !arg.contains("anchor apple generic")
+            arg.contains("anchor apple generic")
+                && !arg.contains("designated =>")
                 && arg.contains("identifier \"com.shukantpal.zigzag\"")
-                && arg.contains("certificate leaf[subject.OU] = \"NH5F3PDHQ8\"")
+                && arg.contains("certificate leaf[subject.OU] = \"7YZK8D3B48\"")
         }));
         let root = fs::read_to_string(dir.join("sigstore-trusted-root.json")).unwrap();
         assert!(root.contains("fulcio.githubapp.com"));
