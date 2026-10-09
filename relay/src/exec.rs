@@ -1359,9 +1359,13 @@ mod tests {
                 )
                 .is_none()
         );
-        // The configured gh path does not exist on this machine, so the
-        // verified lookup refuses it instead of returning a blind path.
-        assert_eq!(policy.trusted_gh_path_for_repo("leveled-inc/leveled"), None);
+        // The verified lookup returns the canonicalized configured path
+        // when it exists, and refuses (None) when it does not — either way,
+        // never a blind unverified path.
+        assert_eq!(
+            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
+            std::fs::canonicalize("/opt/homebrew/bin/gh").ok()
+        );
         assert!(
             policy
                 .allowed_path(
