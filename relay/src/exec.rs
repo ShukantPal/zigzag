@@ -7,8 +7,10 @@
 use keyring::Entry;
 use relay_core::{Json, parse_json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,11 +30,62 @@ pub struct Policy {
     bins: BTreeMap<String, BinPolicy>,
 }
 
+/// A binary pinned at policy load time: the symlink-resolved path plus the
+/// file's (device, inode) identity. Re-checked before every spawn, so a
+/// symlink swap or file replacement in the binary's directory cannot silently
+/// redirect execution to an attacker-controlled file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BinaryIdentity {
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BinPolicy {
     path: String,
     commands: Vec<Vec<String>>,
     gh_read_repos: BTreeSet<String>,
+    /// `None` when the path did not resolve at load time; spawning is then
+    /// refused outright instead of trusting whatever appears later.
+    identity: Option<BinaryIdentity>,
+}
+
+/// Resolve the configured path once, at policy load: canonicalize away
+/// symlinks and record the file's (device, inode) identity for later
+/// re-verification.
+fn resolve_binary_identity(path: &str) -> Option<BinaryIdentity> {
+    let canonical = fs::canonicalize(path).ok()?;
+    let metadata = fs::metadata(&canonical).ok()?;
+    Some(BinaryIdentity {
+        canonical,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Re-resolve and re-stat the binary, refusing to spawn unless the file
+/// behind the policy path is the same one recorded at load time.
+///
+/// Errors deliberately never name the path: it is policy data and must not
+/// leak to API callers. A residual check-then-spawn window remains (macOS
+/// has no `openat2`-style symlink-safe exec); this shrinks the attack window
+/// from the daemon's whole lifetime to the microseconds before spawn.
+fn verify_binary_identity(identity: &BinaryIdentity) -> Result<PathBuf, String> {
+    // A swapped symlink, or a new symlink component anywhere in the path,
+    // changes what canonicalization resolves to.
+    let canonical = fs::canonicalize(&identity.canonical)
+        .map_err(|_| "configured binary could not be re-resolved".to_owned())?;
+    if canonical != identity.canonical {
+        return Err("configured binary path changed since policy load".to_owned());
+    }
+    // Same path, different file: replaced between policy load and exec.
+    let metadata = fs::metadata(&canonical)
+        .map_err(|_| "configured binary could not be re-read".to_owned())?;
+    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+        return Err("configured binary was replaced since policy load".to_owned());
+    }
+    Ok(canonical)
 }
 
 pub struct ExecRequest {
@@ -66,6 +119,26 @@ impl ExecResult {
             ("truncated".to_owned(), Json::Bool(self.truncated)),
             ("timed_out".to_owned(), Json::Bool(self.timed_out)),
         ])
+    }
+}
+
+/// Why `Policy::verified_path` refused to produce a spawn path.
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The bin/args are not allowlisted. Answer with the opaque denial.
+    Denied,
+    /// The bin/args are allowlisted, but the binary failed integrity
+    /// verification. A server-side failure: log the reason, report
+    /// generically.
+    Unverifiable(String),
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyError::Denied => write!(f, "command not allowlisted"),
+            VerifyError::Unverifiable(reason) => write!(f, "{reason}"),
+        }
     }
 }
 
@@ -151,6 +224,7 @@ impl Policy {
                     path: path.to_owned(),
                     commands: parsed_commands,
                     gh_read_repos,
+                    identity: resolve_binary_identity(path),
                 },
             );
         }
@@ -197,6 +271,9 @@ impl Policy {
         Json::Object(vec![("bins".to_owned(), Json::Object(bins))]).to_json()
     }
 
+    /// Pure allowlist predicate: does the policy allow these args? The
+    /// returned path is the *configured* path, unverified. Anything that
+    /// spawns must go through `verified_path` instead.
     pub fn allowed_path(&self, bin: &str, args: &[String]) -> Option<&str> {
         let policy = self.bins.get(bin)?;
         (policy.commands.iter().any(|prefix| args.starts_with(prefix))
@@ -208,14 +285,40 @@ impl Policy {
         .then_some(policy.path.as_str())
     }
 
+    /// Allowlist check plus binary integrity verification, for every spawn
+    /// path. Returns the canonical binary path to hand to `Command`.
+    ///
+    /// `Denied` means the bin/args are not allowlisted: answer with the
+    /// opaque denial. `Unverifiable` means they are allowlisted but the
+    /// binary failed integrity verification: a server-side failure, reported
+    /// as such without naming the path.
+    pub fn verified_path(&self, bin: &str, args: &[String]) -> Result<PathBuf, VerifyError> {
+        if self.allowed_path(bin, args).is_none() {
+            return Err(VerifyError::Denied);
+        }
+        let identity = self
+            .bins
+            .get(bin)
+            .and_then(|policy| policy.identity.as_ref())
+            .ok_or_else(|| {
+                VerifyError::Unverifiable(
+                    "binary identity was not resolvable at policy load".to_owned(),
+                )
+            })?;
+        verify_binary_identity(identity).map_err(VerifyError::Unverifiable)
+    }
+
     /// Internal review-loop publication uses the same repository-scoped `gh`
     /// identity without exposing a general GitHub write prefix on `/v1/exec`.
-    pub fn trusted_gh_path_for_repo(&self, repo: &str) -> Option<&str> {
+    pub fn trusted_gh_path_for_repo(&self, repo: &str) -> Option<PathBuf> {
         let policy = self.bins.get("gh")?;
+        if !policy.gh_read_repos.contains(repo) {
+            return None;
+        }
         policy
-            .gh_read_repos
-            .contains(repo)
-            .then_some(policy.path.as_str())
+            .identity
+            .as_ref()
+            .and_then(|identity| verify_binary_identity(identity).ok())
     }
 }
 
@@ -455,11 +558,11 @@ fn keychain_entry() -> Result<Entry, String> {
         .map_err(|error| format!("could not access exec allowlist keychain item: {error}"))
 }
 
-pub fn run(path: &str, request: ExecRequest) -> ExecResult {
+pub fn run(path: &Path, request: ExecRequest) -> ExecResult {
     run_with_timeout(path, request, EXEC_TIMEOUT)
 }
 
-fn run_with_timeout(path: &str, request: ExecRequest, timeout: Duration) -> ExecResult {
+fn run_with_timeout(path: &Path, request: ExecRequest, timeout: Duration) -> ExecResult {
     let mut child = match Command::new(path)
         .args(&request.args)
         .stdin(Stdio::null())
@@ -1018,6 +1121,158 @@ mod tests {
         }
     }
 
+    fn temp_bin_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zigzag-sec02-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn bin_policy_json(path: &Path) -> String {
+        format!(
+            r#"{{"bins":{{"ztool":{{"path":"{}","commands":[["run"]]}}}}}}"#,
+            path.display()
+        )
+    }
+
+    fn gh_policy_json(path: &Path) -> String {
+        format!(
+            r#"{{"bins":{{"gh":{{"path":"{}","commands":[["pr","list"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}}}}"#,
+            path.display()
+        )
+    }
+
+    #[test]
+    fn verified_path_canonicalizes_a_symlinked_binary_at_policy_load() {
+        let dir = temp_bin_dir("symlink");
+        let real = dir.join("real-bin");
+        std::fs::write(&real, "v1").unwrap();
+        let link = dir.join("link-bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let policy = policy(&bin_policy_json(&link));
+        // The spawn path is the fully resolved binary, not the symlink.
+        assert_eq!(
+            policy.verified_path("ztool", &args(&["run"])).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_path_rejects_a_binary_replaced_after_policy_load() {
+        let dir = temp_bin_dir("replaced");
+        let bin = dir.join("bin");
+        std::fs::write(&bin, "v1").unwrap();
+        let policy = policy(&bin_policy_json(&bin));
+        assert!(policy.verified_path("ztool", &args(&["run"])).is_ok());
+        // Same path, new file: the recorded (device, inode) no longer matches.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::write(&bin, "v2").unwrap();
+        assert!(policy.verified_path("ztool", &args(&["run"])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_path_survives_a_symlink_retarget_after_policy_load() {
+        let dir = temp_bin_dir("retarget");
+        let target_a = dir.join("target-a");
+        let target_b = dir.join("target-b");
+        std::fs::write(&target_a, "a").unwrap();
+        std::fs::write(&target_b, "b").unwrap();
+        let link = dir.join("link-bin");
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+        let policy = policy(&bin_policy_json(&link));
+        let pinned = std::fs::canonicalize(&target_a).unwrap();
+        assert_eq!(
+            policy.verified_path("ztool", &args(&["run"])).unwrap(),
+            pinned
+        );
+        // Retargeting the symlink after load cannot redirect the spawn: the
+        // policy pinned the resolved file at load, and the link is never
+        // used again.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+        assert_eq!(
+            policy.verified_path("ztool", &args(&["run"])).unwrap(),
+            pinned
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_path_rejects_a_binary_missing_at_policy_load() {
+        let dir = temp_bin_dir("missing");
+        let policy = policy(&bin_policy_json(&dir.join("no-such-bin")));
+        // Parse succeeds (the binary may be installed later), but spawning is
+        // refused: there is no load-time identity to verify against.
+        assert!(policy.verified_path("ztool", &args(&["run"])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_path_still_enforces_prefixes_and_unknown_bins() {
+        let dir = temp_bin_dir("prefix");
+        let bin = dir.join("bin");
+        std::fs::write(&bin, "v1").unwrap();
+        let policy = policy(&bin_policy_json(&bin));
+        assert!(
+            policy
+                .verified_path("ztool", &args(&["run", "extra"]))
+                .is_ok()
+        );
+        assert!(policy.verified_path("ztool", &args(&["stop"])).is_err());
+        assert!(policy.verified_path("unknown", &args(&["run"])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_binary_identity_rejects_inode_and_path_mismatch() {
+        let dir = temp_bin_dir("identity");
+        let bin = dir.join("bin");
+        std::fs::write(&bin, "v1").unwrap();
+        let canonical = std::fs::canonicalize(&bin).unwrap();
+        let metadata = std::fs::metadata(&canonical).unwrap();
+        let good = BinaryIdentity {
+            canonical: canonical.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        assert!(verify_binary_identity(&good).is_ok());
+        // Same path, different file.
+        let tampered_inode = BinaryIdentity {
+            inode: metadata.ino().wrapping_add(1),
+            ..good.clone()
+        };
+        assert!(verify_binary_identity(&tampered_inode).is_err());
+        // Same identity fields, but the path now resolves elsewhere.
+        let other = dir.join("other");
+        std::fs::write(&other, "other").unwrap();
+        let tampered_path = BinaryIdentity {
+            canonical: std::fs::canonicalize(&other).unwrap(),
+            ..good.clone()
+        };
+        assert!(verify_binary_identity(&tampered_path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_gh_path_is_verified_before_it_is_returned() {
+        let dir = temp_bin_dir("gh-trusted");
+        let gh = dir.join("gh");
+        std::fs::write(&gh, "fake").unwrap();
+        let policy = policy(&gh_policy_json(&gh));
+        assert_eq!(
+            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
+            Some(std::fs::canonicalize(&gh).unwrap())
+        );
+        assert_eq!(policy.trusted_gh_path_for_repo("other/repo"), None);
+        // Replacing the binary after policy load invalidates the trust.
+        std::fs::remove_file(&gh).unwrap();
+        std::fs::write(&gh, "evil").unwrap();
+        assert_eq!(policy.trusted_gh_path_for_repo("leveled-inc/leveled"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
         let policy = policy(
@@ -1076,10 +1331,9 @@ mod tests {
                 )
                 .is_none()
         );
-        assert_eq!(
-            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
-            Some("/opt/homebrew/bin/gh")
-        );
+        // The configured gh path does not exist on this machine, so the
+        // verified lookup refuses it instead of returning a blind path.
+        assert_eq!(policy.trusted_gh_path_for_repo("leveled-inc/leveled"), None);
         assert!(
             policy
                 .allowed_path(
@@ -1267,7 +1521,7 @@ mod tests {
             bin: "echo".to_owned(),
             args: args(&["new"]),
         };
-        let result = run_with_timeout("/bin/echo", request, Duration::from_secs(10));
+        let result = run_with_timeout(Path::new("/bin/echo"), request, Duration::from_secs(10));
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout, "new\n");
         assert!(!result.timed_out);
@@ -1282,7 +1536,7 @@ mod tests {
             args: args(&["new"]),
         };
         let result = run_with_timeout(
-            "/nonexistent/exec-test-binary",
+            Path::new("/nonexistent/exec-test-binary"),
             request,
             Duration::from_secs(10),
         );
@@ -1300,7 +1554,7 @@ mod tests {
             args: args(&["30"]),
         };
         let start = Instant::now();
-        let result = run_with_timeout("/bin/sleep", request, Duration::from_millis(300));
+        let result = run_with_timeout(Path::new("/bin/sleep"), request, Duration::from_millis(300));
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None);
         assert!(start.elapsed() < Duration::from_secs(10));
