@@ -550,6 +550,7 @@ mod tests {
 
     #[test]
     fn socket_reports_a_bounded_event_queue_drop_before_the_next_frame() {
+        let (state, state_path) = crate::tests::test_server();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
@@ -559,7 +560,42 @@ mod tests {
                 .unwrap();
         }
         let alive = Arc::new(AtomicBool::new(true));
-        let dropped = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let subscriptions = Arc::new(Mutex::new(HashSet::from(["events".to_owned()])));
+        let epoch = state.store.read(0, "", Duration::ZERO).unwrap().epoch;
+        state
+            .store
+            .add(Json::Object(vec![(
+                "id".to_owned(),
+                Json::String("overflow-event".to_owned()),
+            )]))
+            .unwrap();
+        let publisher_state = state.store.clone();
+        let publisher_sender = sender.clone();
+        let publisher_alive = Arc::clone(&alive);
+        let publisher_dropped = Arc::clone(&dropped);
+        let publisher_subscriptions = Arc::clone(&subscriptions);
+        thread::spawn(move || {
+            publish_events(
+                publisher_state,
+                publisher_sender,
+                publisher_alive,
+                publisher_dropped,
+                publisher_subscriptions,
+                "events".to_owned(),
+                (0, epoch),
+            );
+        });
+        for _ in 0..100 {
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the event publisher did not report the full queue"
+        );
         let writer_alive = Arc::clone(&alive);
         let writer_dropped = Arc::clone(&dropped);
         let server = thread::spawn(move || {
@@ -582,19 +618,25 @@ mod tests {
             Some("queued")
         );
         alive.store(false, Ordering::Release);
+        subscriptions.lock().unwrap().clear();
         drop(sender);
         drop(client);
         server.join().unwrap();
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
     fn socket_streams_agent_logs_and_rejects_unknown_log_agents() {
         let (state, state_path) = crate::tests::test_server();
+        let id = "a".repeat(32);
+        let transcript_path = crate::proc::agent_transcript_path(&id).unwrap();
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        std::fs::write(&transcript_path, "initial API transcript\n").unwrap();
         state
             .supervisor
             .registry
             .register(AgentRecord {
-                id: "log-agent".to_owned(),
+                id: id.clone(),
                 task_id: "task".to_owned(),
                 execution_id: "execution".to_owned(),
                 leader_pid: 1,
@@ -621,6 +663,13 @@ mod tests {
                 first_output_bytes: None,
             })
             .unwrap();
+        // API-created agents retain this durable transcript, but their live
+        // stdout is also now recorded in the ordered spool used by sockets.
+        state
+            .supervisor
+            .registry
+            .append_log(&id, "stdout", b"initial API transcript\n")
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handler_state = Arc::clone(&state);
@@ -643,17 +692,17 @@ mod tests {
         );
         write_frame(
             &mut client,
-            &json!({"type":"subscribe","topic":"logs.log-agent"}),
+            &json!({"type":"subscribe","topic":format!("logs.{id}")}),
         )
         .unwrap();
         assert_eq!(
             read_frame(&mut client).unwrap(),
-            json!({"type":"subscribed","topic":"logs.log-agent"})
+            json!({"type":"subscribed","topic":format!("logs.{id}")})
         );
         state
             .supervisor
             .registry
-            .append_log("log-agent", "stdout", b"socket-log\n")
+            .append_log(&id, "stdout", b"socket-log\n")
             .unwrap();
         let record = (0..4)
             .map(|_| read_frame(&mut client).unwrap())
@@ -681,6 +730,7 @@ mod tests {
         let _ = std::fs::remove_file(state_path.with_extension("agents"));
         let _ = std::fs::remove_dir_all(state_path.with_extension("agent-logs"));
         let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(transcript_path);
     }
 
     #[test]
