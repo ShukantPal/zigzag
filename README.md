@@ -1,224 +1,85 @@
 # Zigzag
 
-_Managed by Pal's Muse._
+Zigzag is a Mac-hosted relay for dispatching and supervising Codex agents through an authenticated API. A Rust daemon runs in the Mac user's login session, starts agents in isolated Git worktrees, records their state and output, and exposes controlled execution and event-delivery endpoints to local tools or remote automation hosts. Its companion Rust CLI, `zzapi`, makes the API convenient to use; a read-only status TUI shows running and completed work. The relay can keep supervised tasks alive across daemon restarts, stream events and agent output over an authenticated bidirectional socket, and verify its own updates.
 
-For component references, configuration, operations, and review procedures,
-see the [documentation index](docs/README.md).
+## Architecture
 
-`zigzag` runs on a Mac and retains the latest 1,000 authenticated completion
-events. `poller` runs on the orchestrator VM, holds a long-poll request open,
-and writes delivered events as JSON Lines. This replaces a five-minute status
-poll with normal delivery latency close to one network round trip.
+- **Relay daemon (`zigzag`, Rust):** Mac-side control plane. It supervises agent process groups, persists agent state and logs, manages permitted worktrees, serves the HTTP API, streams events, and checks signed updates. It runs as a per-user LaunchAgent so macOS Keychain access is available.
+- **CLI (`zzapi`, Rust):** Authenticated client for agent, worktree, execution, and event operations. It prints readable output by default and supports `--json` for scripts.
+- **Status TUI (`dept/status.py`):** Read-only terminal dashboard for agent/task state, output, and event history. It uses the relay API and local task metadata.
 
-Delivery is at least once: downstream consumers must deduplicate using the
-event `id` (or Zigzag epoch and sequence). POST idempotency applies while an
-event remains in the durable bounded queue; a replay after eviction is a new
-delivery. The queue is durable but bounded; when it overflows, the poller
-reports a warning on stderr.
+The daemon listens on loopback and the Mac's Tailscale address (HTTP on port `8765`; the bidirectional TCP event socket defaults to `8766`). Every API request requires the relay bearer token. Keep network access limited to trusted tailnet clients with a Tailscale ACL. See [architecture](docs/architecture.md) and [operations](docs/operations.md) for deployment details.
 
-## Execution audit trail
+## Quickstart
 
-The relay also keeps append-only JSON Lines audit logs beside its state file
-(`events.audit/` for an `events.json` state file). These are per execution,
-separate from the 1,000-event live-delivery queue, and capped at 20 MiB total;
-the oldest execution logs are removed first when the cap is exceeded. Audit
-records contain the posted event envelope plus relay `sequence` and
-`received_at` fields. They never contain command arguments, prompts, or raw
-agent output.
-
-New audit events use schema version 1 and include `id`, `task_id`,
-`execution_id`, `kind`, `source`, `occurred_at` (RFC 3339 UTC milliseconds),
-`clock`, and an object payload. The relay accepts `vm-department`,
-`mac-relay`, and `vm-poller` sources. Existing id-only event posts remain
-wire-compatible for live delivery, but cannot be archived by execution because
-they have no execution key.
-
-`POST /v1/spawn` also accepts an optional safe `execution_id` field. A VM that
-has already assigned an execution should supply it so its dispatch/poll facts
-and the relay's launch/process facts land in the same per-execution log;
-callers that omit it retain the existing request shape and receive a
-relay-generated execution identifier internally.
-
-The Mac reader is `zigzag timeline`, rather than `dept timeline`: this
-repository owns the `zigzag` relay binary while `dept.py` is VM-owned and is
-not present here.
+Build the two Rust binaries and create a private relay token:
 
 ```sh
-zigzag timeline TASK_ID --state-file ~/.codex/zigzag/events.json
+cargo build --release -p zigzag -p zzapi
+mkdir -p ~/.codex/zigzag
+umask 077
+openssl rand -hex 32 > ~/.codex/zigzag/zigzag.token
+chmod 600 ~/.codex/zigzag/zigzag.token
 ```
 
-## Native PR comment routing
+Start the relay in a terminal for a first run (for persistent use, install the [LaunchAgent](launchd/INSTALL.md)):
 
-Zigzag can poll PR conversation comments, inline review comments, and review
-bodies, then resume the Codex session recorded for that PR. The Mac-local,
-reloadable session file, shadow-mode behavior, and cutover flags are described
-in [the LaunchAgent installation guide](launchd/INSTALL.md#native-comment-router-shadow-mode).
-
-The router is shadow-on by default. It keys durable comment events by GitHub's
-GraphQL `node_id` rather than the REST numeric ID, skips replies whose first
-line begins `> 🤖`, and logs the direct Codex resume it would dispatch.
-`--comment-router-live` is the explicit cutover flag. Live resumes use the
-relay supervisor and a shared session-operation gate.
-
-It renders the persisted events and named duration summaries. Durations are
-shown only when both facts came from the same `clock`; a Mac/VM handoff prints
-both timestamps as cross-clock rather than fabricating a transit time.
-
-## Supervised agent diagnostics
-
-`POST /v1/spawn` keeps its existing `{"id", "proc"}` response and
-`/v1/proc/<proc>` compatibility status view. During migration, `proc` is also
-the relay-generated agent ID. The relay persists a private agent registry next
-to its event state and continuously drains each agent's stdout and stderr.
-Authenticated read-only diagnostics are available at:
-
-- `GET /v1/agents?state=…&task_id=…`
-- `GET /v1/agents/<agent-id>`
-- `GET /v1/agents/<agent-id>/logs?stream=stdout|stderr|both&after=…&tail=…&follow=0|1`
-- `DELETE /v1/agents/<agent-id>` — gracefully stop the agent (SIGTERM, then
-  SIGKILL) and deregister it; the worktree is left in place
-
-Logs are sensitive. They are owner-only local spools, limited to 32 MiB per
-agent; evicting old complete records advances `dropped_before` rather than
-silently truncating. Readers use `next_cursor` and must handle that explicit
-loss marker. Known bearer/API-key/private-key forms are redacted before the
-spool is written, but redaction is not a guarantee—treat the relay bearer
-token as granting log access and rotate it after suspected exposure.
-
-After a relay restart, live process groups become `orphaned` (their former
-pipes cannot be reattached); dead groups become `lost_after_restart`. Terminal
-registry records and their bounded spool metadata are pruned after seven days.
-The relay keeps its HTTP API on loopback/Tailscale and also exposes a native
-TCP subscription port for interactive status clients. The bearer token and
-GUI-session Keychain allowlist are unchanged. The legacy kill route is only
-enabled when a distinct `--control-secret-file` (or
-`ZIGZAG_CONTROL_SECRET_FILE`) is configured.
-
-## Interactive socket protocol
-
-The relay listens on TCP port 8766 by default (`--socket-port` overrides it).
-Each frame is a four-byte big-endian length followed by one UTF-8 JSON object;
-there are no WebSocket, TLS, or new dependency requirements. The first frame
-must arrive within ten seconds and be:
-
-```json
-{"type":"auth","authorization":"Bearer <relay-token>"}
+```sh
+target/release/zigzag \
+  --secret-file ~/.codex/zigzag/zigzag.token \
+  --state-file ~/.codex/zigzag/events.json
 ```
 
-After `{"type":"authenticated"}`, clients send
-`{"type":"subscribe","topic":"…"}`. Topics are `agents` (a coalesced
-full snapshot on change), `events` (one frame per newly persisted event), and
-`logs.<agent-id>` (an opt-in live tail). Event delivery has a bounded
-256-frame queue; if a client falls behind it receives
-`{"topic":"events","dropped":true}` and must resynchronize through the
-unchanged HTTP events endpoint. `dept/status.py` prefers this socket after its
-HTTP bootstrap and automatically falls back to HTTP long-polling when the
-socket is unavailable.
+In another terminal, point `zzapi` at the local relay and dispatch an agent. Codex CLI must be installed and signed in for the Mac user. The agent gets its own branch/worktree under `/private/tmp` by default.
 
-`zzapi events stream` is the command-line client for the event topic. It
-authenticates to the bidi socket and prints pushed event frames; pass
-`--socket-port` (or set `ZIGZAG_SOCKET_PORT`) when the relay does not use 8766.
+```sh
+export ZIGZAG_HOSTNAME=127.0.0.1:8765
+export ZIGZAG_TOKEN_FILE=~/.codex/zigzag/zigzag.token
+alias zzapi="$PWD/target/release/zzapi"
 
-## Network security: Tailscale ACLs
-
-The relay never binds to a public interface. On startup it listens on
-`127.0.0.1` and on the Mac's Tailscale IPv4 address (`100.64.0.0/10`,
-resolved via `tailscale ip -4`; `--tailscale-ip` overrides it for testing and
-is rejected unless it is a Tailscale IPv4 address). The default HTTP port is
-8765 and the default interactive socket port is 8766.
-
-Binding to the tailnet is necessary but not sufficient: **Tailscale ACLs are
-the relay's network-level access control.** The relay speaks plain HTTP and
-the authenticated subscription protocol on the tailnet — but any tailnet
-device that can reach either port can attempt authentication indefinitely,
-probe for weaknesses, and burn relay resources. The ACL is what keeps that
-set to exactly the orchestrator. Tailscale's default ACL allows all tailnet
-traffic (`*` to `*:*`), so if you have never edited your ACLs, every device on
-your tailnet can already reach the relay's ports.
-
-### Recommended policy
-
-In the Tailscale admin console, restrict the relay's port to the devices that
-need it — the owner and the tagged orchestrator nodes — and nothing else:
-
-```json
-{
-  "tagOwners": {
-    "tag:zigzag-client": ["autogroup:member"]
-  },
-  "acls": [
-    {
-      "action": "accept",
-      "src": ["autogroup:member", "tag:zigzag-client"],
-      "dst": ["100.x.y.z:8765"]
-    }
-  ]
-}
+zzapi health
+zzapi agents create --prompt "Inspect this project and summarize its architecture" \
+  --project-dir "$PWD" --branch codex/architecture-summary
+zzapi agents list
+zzapi agents get AGENT_ID
 ```
 
-Replace `100.x.y.z` with the Mac's Tailscale IPv4 address (`tailscale ip -4`
-on the Mac). Notes:
+Run `python3 dept/status.py` for the live status TUI (`python3 dept/status.py --once` prints one snapshot). Use `zzapi agents logs AGENT_ID --follow` to follow an agent's output.
 
-- Prefer a tag (`tag:zigzag-client`) for the orchestrator VM over naming
-  individual devices, so a rebuilt VM keeps access without an ACL change —
-  but keep the tag's membership minimal.
-- Do not open the port to `autogroup:shared` or `*`: shared nodes and future
-  tailnet members would gain network access to the relay.
-- The relay host itself needs no inbound rule beyond this one; with a
-  default-deny policy, everything not explicitly accepted is dropped.
+## API overview
 
-### If the ACL is misconfigured
+All routes below require `Authorization: Bearer <token>`.
 
-- **Too open** (the default allow-all, or the relay port left reachable
-  during a default-deny migration): every tailnet device — including
-  compromised or shared nodes — can reach the relay. The bearer token still
-  guards every route, and the exec allowlist can only be changed from the
-  Mac's GUI login session, but a network-reachable attacker can attempt
-  authentication without limit, exploit any future unauthenticated endpoint,
-  and run resource-exhaustion attacks against the HTTP server.
-- **Too closed** (orchestrator not in `src`, wrong IP in `dst`): the poller
-  and orchestrator tooling lose connectivity — events stop flowing and
-  `/v1/spawn` calls fail. The relay itself keeps running; this fails safe,
-  not open.
-- **Stale IP in `dst`**: the Mac's Tailscale address can change (reinstall,
-  `tailscale logout`/`login`). If the relay becomes unreachable after such a
-  change, compare `tailscale ip -4` on the Mac against the ACL.
+| Operation | Endpoint / CLI |
+| --- | --- |
+| Create a supervised Codex agent | `POST /v1/agents` · `zzapi agents create --prompt TEXT --project-dir DIR --branch BRANCH` |
+| List agents (filter by state or task) | `GET /v1/agents` · `zzapi agents list [--state running] [--task-id ID]` |
+| Get agent details | `GET /v1/agents/{id}` · `zzapi agents get ID` |
+| Stop an agent | `DELETE /v1/agents/{id}` · `zzapi agents stop ID` |
+| Pause / resume an agent | `POST /v1/agents/{id}/pause` and `/resume` · `zzapi agents pause|resume ID` |
+| Read captured output | `GET /v1/agents/{id}/logs` · `zzapi agents logs ID [--follow]` |
+| Run a synchronous allowlisted command | `POST /v1/exec` · `zzapi exec --bin NAME --args ...` |
+| Post events or read the retained event stream | `POST /v1/events`, `GET /v1/events?after=...&epoch=...&timeout=...` · `zzapi events [--follow]` |
+| Stream events and agent output interactively | Authenticated bidirectional TCP socket · `zzapi events stream` |
 
-When in doubt, verify from both sides: from an allowed host, `curl` against
-the Tailscale IP without the bearer token should return `401` (reachable and
-authenticated), and with the token `200`. From anything not in `src`, the
-connection should time out — if it instead returns `401`, the ACL is too open.
+Agent creation accepts an inline prompt or prompt-file path, project directory, branch, and optional worktree, model, approval mode, and timeout. The relay records lifecycle state and bounded stdout/stderr logs; stopping an agent leaves its worktree in place. Events are retained in a bounded durable queue, so consumers should use cursors and deduplicate by event ID. See [agents and events](docs/agents.md), [zzapi](docs/zzapi.md), and [relay API details](docs/relay.md).
 
-## Mac-owned review loop
+## Configuration and security
 
-At startup, the daemon reads `~/.zigzag/config.yaml`, validates it against the
-embedded draft 2020-12 JSON Schema (including the `regex` format), and rejects
-YAML duplicate keys, custom tags, unknown fields, and duplicate repository
-entries. Configuration errors fail closed
-for reviews only and are logged with paths; the relay keeps serving.
+The relay token lives at `~/.codex/zigzag/zigzag.token`; keep it owner-readable only. `zzapi` reads it from `ZIGZAG_TOKEN_FILE` (or `--token-file`) and uses `ZIGZAG_HOSTNAME` to select the relay. For a remote client, use the Mac's Tailscale address and restrict port `8765` (and socket port `8766`, if used) with a Tailscale ACL.
 
-When enabled, Zigzag owns a durable state machine for each
-`(repository, pull request, head)` in `events.reviews.json`. It dispatches
-independent configured lenses through a dedicated tool-free Codex launcher,
-admits only bounded version 1 JSON results for the exact current head, and
-publishes validated verdicts under the trusted GitHub identity. It evaluates
-every matching required CI check and emits `review_ready` or bounded
-`review_findings` events. Findings resume the owning Codex session only as
-escaped, explicitly untrusted JSON claims that the owner must independently
-verify. A new head or base commit supersedes the old comparison and approvals,
-and a merge kills outstanding reviewer and owner-resume process groups,
-including recovered orphan groups. Comparisons at GitHub's 300-file response
-cap are rejected as potentially truncated and put the round in `Attention`.
+`/v1/exec` can run only binaries and argument prefixes in the relay's allowlist. The policy is stored in the macOS login Keychain, not a config file, and can only be read or changed from the Mac's GUI login session:
 
-Set `ZIGZAG_REVIEW_LOOP_SHADOW=1` during the migration comparison window.
-Shadow mode runs discovery, verdict admission, and gate decisions alongside
-the VM tooling, preserves the legacy `--watch-repo` `github_pr_opened` feed,
-and suppresses agent dispatch, owner resume, and process kills.
-Remove it only after decisions match and the VM review jobs have drained and
-stopped. See [launchd/INSTALL.md](launchd/INSTALL.md) for configuration and
-cutover.
+```sh
+zigzag config get-allowlist
+zigzag config set-allowlist --file /path/to/policy.json
+```
 
-## Build and test
+The JSON policy maps binary names to absolute paths and permitted argv prefixes. `set-allowlist` replaces the complete policy. The first Keychain access may prompt for permission; review the binary before granting it. See [configuration and security](docs/configuration.md) and the [Mac installation guide](launchd/INSTALL.md).
+
+## Development
+
+The workspace includes the relay, shared relay core, CLI, and event poller. From the repository root:
 
 ```sh
 cargo build --workspace
@@ -227,207 +88,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-## Local CI hooks
-
-Install the repository hooks once per worktree:
-
-```sh
-./scripts/install-hooks.sh
-```
-
-The pre-commit hook runs the CI formatting and Python checks, and retains the
-existing automatic regeneration of `dept/config.materialized.json` when
-`dept/config.py` is staged. The pre-push hook runs the CI Clippy gate. They
-run `cargo fmt --all --check`, the Python commands from `.github/workflows/ci.yml`,
-and `cargo clippy --locked --workspace --all-targets -- -D warnings`,
-respectively. CI remains the required enforcement point.
-
-## Verified relay updates
-
-On every successful `main` build, CI produces a signed ARM64 relay binary, a
-SHA-256 manifest, and GitHub SLSA provenance attestations for both files. The newest
-non-prerelease GitHub Release is the floating discovery location; it is never
-trusted merely because it is named `latest`.
-
-The relay checks hourly by default. Before accepting an update it requires the
-release target/version to be newer, the manifest digest to match, the expected
-Apple-anchored code-signing identifier and team, an attested manifest, and an
-attested binary verified with the bundled GitHub and Sigstore trust roots.
-Verification constrains the repository, `ci.yml` workflow, and `main` source
-ref/commit. A root rotation is a reviewed source change embedded in each relay;
-downloaded release metadata and stale on-disk material cannot replace it.
-
-Install the initial relay under the managed directory and configure the
-LaunchAgent to execute its stable `current` symlink, for example
-`~/.codex/zigzag/relay/current`. This ensures LaunchAgent recovery starts the
-last known-good release after an acknowledged update. The running relay keeps
-the previous image, stops accepting `/v1/spawn` requests, waits for the durable
-agent registry to have no `running` records, atomically switches `current`, and
-`exec`s the candidate. A small child watchdog stays in the same GUI session;
-if the replacement cannot bind, open state, and answer authenticated
-`/v1/health` within one minute, it `exec`s the saved binary. This deliberately
-does not invoke `launchctl bootout` or `bootstrap`, preserving Keychain access.
-
-The durable local controls are:
-
-```sh
-zigzag updates --dir ~/.codex/zigzag/relay status
-zigzag updates --dir ~/.codex/zigzag/relay pause
-zigzag updates --dir ~/.codex/zigzag/relay pin v0.1.42
-zigzag updates --dir ~/.codex/zigzag/relay unpin
-```
-
-`--update-interval SECONDS` changes the cadence (`0` disables scheduled
-checks); `--update-policy enabled|paused|pin:VERSION` supplies the initial
-policy. The `update-status.json` control file records the accepted version,
-policy, last check, and candidate result. Update attempts and the applied or
-failed result are schema-v1 `mac-relay` audit events under `task_id=relay-update`.
-
-### Update threat model
-
-Auto-update is deliberate remote code execution. A network attacker, a forged
-manifest, an altered release asset, or an unrelated GitHub workflow cannot
-pass the digest and identity-constrained attestation verification. Shipping a
-malicious relay requires valid provenance records from the pinned Zigzag CI
-workflow (or compromise of the local trusted binary/state). A
-repository maintainer, protected workflow, GitHub Actions credential, or GitHub
-organization compromise can still produce a trusted malicious release; those
-are the remaining trust assumptions, not claims this mechanism eliminates.
-
-## Release signing and deploy (Mac)
-
-Every `cargo build` re-generates the binary's ad-hoc signature (new
-identifier, new cdhash), so the keychain treats each rebuild as a different
-app and re-prompts for allowlist access. Sign every release build with a
-stable certificate identity instead:
-
-```sh
-./scripts/sign-release.sh
-```
-
-This builds, signs with `Apple Development: Shukant Pal` under the fixed
-identifier `com.shukantpal.zigzag`, verifies, and restarts the LaunchAgent.
-Run it in an interactive Mac terminal, never over SSH: code signing needs
-the login keychain, and restarting the LaunchAgent from SSH puts the daemon
-in the wrong macOS security session (its keychain reads hang and `/v1/exec`
-stops responding). The script refuses to run over SSH.
-
-The first run after switching to stable signing triggers one keychain
-prompt when the daemon first reads the allowlist; choose **Always Allow**
-so all future rebuilds keep working with no further prompts.
-
-### Allowlist management
-
-```sh
-# Read the current policy (GUI session only)
-zigzag config get-allowlist
-# Replace the entire policy with the JSON in FILE (GUI session only).
-# This REPLACES, not merges: export first, edit, then set.
-zigzag config set-allowlist --file /path/to/policy.json
-```
-
-Policy JSON shape: `{"bins": {"<name>": {"path": "/abs/path", "commands": [["sub", "..."]], ...}}}`.
-`commands` entries are argv prefixes. The `gh` bin also accepts
-`"gh_read_repos": ["owner/repo"]` to scope `gh api` / `pr` commands.
-
-### OpenCode pilot runner
-
-`scripts/opencode-launch` is the only OpenCode launcher owned by Zigzag. A
-department client stages a directory, asks the existing `/v1/spawn` flow to
-invoke the runner, and records the returned process handle. It must not
-construct a separate `opencode run` command itself.
-
-The runner accepts exactly one operation and an absolute staged-task directory:
-
-```sh
-scripts/opencode-launch run --task-dir /absolute/staged-task
-scripts/opencode-launch resume --task-dir /absolute/staged-task
-```
-
-Each staged task has two UTF-8, regular (non-symlink) input files:
-
-```text
-prompt.txt
-runtime.json
-```
-
-For `run`, `runtime.json` requires an absolute, non-symlink `project_dir` and
-may contain `model` and `title`. The model defaults to
-`opencode/muse-spark-1.3-contributor-free`; selecting another free model is a
-staged `model` setting, not a CLI override. For `resume`, it instead requires
-only `project_dir` and `session_id`. Before resuming, the runner exports the
-session and requires its project and effective model to match the staged
-project and a free Zen model.
-
-The pilot deliberately does not accept a staged `agent`: an agent definition
-can itself select a model or subagent, which cannot yet be attested as part of
-this one-runner contract. The runner starts OpenCode in pure mode with a
-minimal environment, a fresh configuration directory, and an empty inline
-configuration for catalog inspection; it discards caller-supplied
-`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, and
-model-catalog overrides. (The account's local model cache remains available so
-the approved default catalog is not replaced by an empty-home fallback.) It
-pins both primary and small-model config to the approved model, then exports
-the completed session and verifies the effective project, model, standard
-`build` agent, and every assistant turn before reporting success.
-
-Project roots are source-controlled OSS/Talon allowlists. Models are checked
-against OpenCode's current local `models opencode --verbose` metadata: the
-provider must be `opencode`, the endpoint must be Zen, and every reported cost
-must be zero. This admits newly available free Zen models (including
-`opencode/big-pickle`) while rejecting OpenAI, Anthropic, and paid models.
-
-After every invocation the task directory contains the raw structured stream
-in `opencode-events.jsonl`, stderr in `opencode-stderr.log`, and rendered
-artifacts: `opencode-result.txt`, `opencode-session-id.txt` (when OpenCode
-emits one), `opencode-usage.json`, and `opencode-run.json`. The result is the
-last text event; usage is labeled `runtime: "opencode"` and aggregates input,
-output, reasoning, cache-read, cache-write, and cost from every `step_finish`
-event. `opencode-usage.json` also records `completed`, `stream_error`, and
-`timed_out` so a child exit code of zero cannot hide an OpenCode error event,
-malformed stream, non-finite usage, or a stream missing a terminal `stop`
-completion.
-Preflight rejection clears prior artifacts and writes the same structured
-failure status whenever the staged task directory is usable.
-
-The runner always invokes OpenCode with closed stdin and places `--` before
-the staged prompt. Leaving stdin open makes non-interactive `opencode run`
-wait forever for an interactive session; the option terminator keeps prompt
-text from being interpreted as an OpenCode flag.
-
-Install its relay policy from Shukant's GUI login session after reviewing the
-absolute path for the deployed checkout. The following is a **policy fragment**
-to merge under `bins`; `set-allowlist` replaces the entire policy, so first run
-`zigzag config get-allowlist`, merge this entry with the existing bins, then
-write the complete policy back with `zigzag config set-allowlist --file …`.
-
-```json
-{
-  "bins": {
-    "opencode-launch": {
-      "path": "/Users/shukant/Workspace/ShukantPal/zigzag/scripts/opencode-launch",
-      "commands": [["run"], ["resume"]]
-    }
-  }
-}
-```
-
-## Linux VM build
-
-The poller uses only the Rust standard library. Cross-compile for the VM after
-installing the target and a compatible linker:
-
-```sh
-rustup target add x86_64-unknown-linux-gnu
-cargo build --release --target x86_64-unknown-linux-gnu -p poller
-```
-
-For a static binary, if the musl target/toolchain is available:
-
-```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl -p poller
-```
-
-See [launchd/INSTALL.md](launchd/INSTALL.md) for Mac installation and both
-binary command-line interfaces.
+Install the repository's pre-commit hook with `./scripts/install-hooks.sh`. For a local full-stack relay/CLI check, use `bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi`. Browse [docs/](docs/README.md) for component guides and deployment runbooks.
