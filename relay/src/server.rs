@@ -6,7 +6,8 @@ use crate::logging;
 use crate::proc::ProcEntry;
 use crate::review_loop;
 use crate::routes::agents::{
-    AgentRoute, agent_delete, agent_post_request, agent_request, agent_route,
+    AgentRoute, agent_delete, agent_post_request, agent_request, agent_restart_request,
+    agent_restart_route, agent_route,
 };
 use crate::routes::exec::{exec_request, spawn_request};
 use crate::routes::procs::{ProcRoute, kill_proc, poll_proc, proc_route};
@@ -232,10 +233,13 @@ where
             agent_route("POST", path).expect("checked"),
             request.body,
         ),
-        ("POST", path) => match proc_route(path) {
-            Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
-            Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),
-            None => reply(&mut stream, 404, error("not_found")),
+        ("POST", path) => match agent_restart_route(path) {
+            Some(id) => agent_restart_request(&mut stream, &state, id, request.body),
+            None => match proc_route(path) {
+                Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
+                Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),
+                None => reply(&mut stream, 404, error("not_found")),
+            },
         },
         _ => reply(&mut stream, 404, error("not_found")),
     }

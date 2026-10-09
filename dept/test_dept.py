@@ -48,6 +48,21 @@ class SessionResolutionTest(unittest.TestCase):
                 returncode=0, stdout=b'["/one/project", "/another/project"]\n')):
             self.assertIsNone(department.resolve_session_cwd("session_123"))
 
+    def test_session_id_parser_accepts_nested_legacy_and_spaced_events(self):
+        self.assertEqual(
+            department.session_id_from_events([
+                "not json\n",
+                '{"type": "thread.started", "payload": {"thread_id": "thread-123"}}\n',
+            ]),
+            "thread-123",
+        )
+        self.assertEqual(
+            department.session_id_from_events([
+                '{"sessionId": "legacy-456"}\n',
+            ]),
+            "legacy-456",
+        )
+
 
 class ResumeCliTest(unittest.TestCase):
     def setUp(self):
@@ -94,6 +109,74 @@ class ResumeCliTest(unittest.TestCase):
             self.assertTrue(dispatch.call_args.args[5])
 
 
+class RestartCliTest(unittest.TestCase):
+    def test_restart_rejects_invalid_task_id_before_any_remote_command(self):
+        with patch.object(department, "ledger_read") as ledger, \
+             self.assertRaisesRegex(SystemExit, "invalid task id"):
+            department.cmd_restart(["t-safe;rm -rf /"])
+        ledger.assert_not_called()
+
+    def test_restart_refuses_missing_worktree_before_dispatch(self):
+        responses = [
+            SimpleNamespace(returncode=0, stdout=b"prompt", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"/gone\n---\n", stderr=b""),
+        ]
+        with patch.object(department, "ledger_read", return_value=[{
+                "id": "t-abc123", "status": "done"}]), \
+             patch.object(department, "ssh", side_effect=responses), \
+             patch.object(department, "remote_isdir", return_value=False), \
+             patch.object(department, "dispatch_task") as dispatch, \
+             self.assertRaisesRegex(SystemExit, "worktree no longer exists"):
+            department.cmd_restart(["t-abc123"])
+        dispatch.assert_not_called()
+
+    def test_restart_dispatches_fresh_task_with_original_prompt(self):
+        responses = [
+            SimpleNamespace(returncode=0, stdout=b"prompt", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"/repo\n---\nmodel-x", stderr=b""),
+        ]
+        with patch.object(department, "ledger_read", return_value=[{
+                "id": "t-abc123", "status": "done"}]), \
+             patch.object(department, "ssh", side_effect=responses), \
+             patch.object(department, "remote_isdir", return_value=True), \
+             patch.object(department, "dispatch_task") as dispatch:
+            department.cmd_restart(["t-abc123"])
+        self.assertEqual(dispatch.call_args.args[:3], ("/repo", b"prompt", False))
+        self.assertEqual(dispatch.call_args.kwargs["model"], "model-x")
+        self.assertEqual(dispatch.call_args.kwargs["restarted_from"], "t-abc123")
+
+    def test_restart_resume_uses_shared_jsonl_parser(self):
+        responses = [
+            SimpleNamespace(returncode=0, stdout=b"prompt", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"/repo\n---\n", stderr=b""),
+            SimpleNamespace(returncode=0,
+                            stdout=b'{"payload":{"thread_id":"thread-123"}}\n', stderr=b""),
+        ]
+        with patch.object(department, "ledger_read", return_value=[{
+                "id": "t-abc123", "status": "done"}]), \
+             patch.object(department, "ssh", side_effect=responses) as ssh, \
+             patch.object(department, "remote_isdir", return_value=True), \
+             patch.object(department, "dispatch_task") as dispatch:
+            department.cmd_restart(["t-abc123", "--mode", "resume"])
+        self.assertEqual(dispatch.call_args.kwargs["session_id"], "thread-123")
+        self.assertEqual(ssh.call_args_list[-1].args[:2], ("python3", "-"))
+
+    def test_restart_resume_refuses_logs_without_a_session(self):
+        responses = [
+            SimpleNamespace(returncode=0, stdout=b"prompt", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b"/repo\n---\n", stderr=b""),
+            SimpleNamespace(returncode=0, stdout=b'{"type":"item.completed"}\n', stderr=b""),
+        ]
+        with patch.object(department, "ledger_read", return_value=[{
+                "id": "t-abc123", "status": "done"}]), \
+             patch.object(department, "ssh", side_effect=responses), \
+             patch.object(department, "remote_isdir", return_value=True), \
+             patch.object(department, "dispatch_task") as dispatch, \
+             self.assertRaisesRegex(SystemExit, "no resumable Codex session"):
+            department.cmd_restart(["t-abc123", "--mode", "resume"])
+        dispatch.assert_not_called()
+
+
 class CommandDispatchTest(unittest.TestCase):
     def test_tunnel_proxy_is_empty_without_https_proxy(self):
         with patch.dict(department.os.environ, {}, clear=True):
@@ -116,6 +199,19 @@ class CommandDispatchTest(unittest.TestCase):
             department.dispatch_task("/project", b"prompt", True,
                                      task_id="../../bad")
         setup.assert_not_called()
+
+    def test_restart_rewrites_completion_announcement_with_new_task_id(self):
+        relay = pathlib.Path(department.asset_path("relay-announce.md")).read_bytes()
+        original = b"work the task\n\n---\n\n" + relay.replace(b"{{TASK_ID}}", b"t-abc123")
+        result = SimpleNamespace(returncode=0, stdout=b"42\n", stderr=b"")
+        with patch.object(department.uuid, "uuid4", return_value=SimpleNamespace(hex="def456")), \
+             patch.object(department, "setup_task_dir", return_value="/remote/t") as setup, \
+             patch.object(department, "ssh", return_value=result), \
+             patch.object(department, "ledger_append"):
+            department.dispatch_task("/project", original, True, restarted_from="t-abc123")
+        stored_prompt = setup.call_args.args[2]
+        self.assertIn(b"t-def456", stored_prompt)
+        self.assertNotIn(b"t-abc123", stored_prompt)
 
     def test_command_handler_key_error_is_not_reported_as_unknown_command(self):
         with patch.object(department, "cmd_start", side_effect=KeyError("connection")):

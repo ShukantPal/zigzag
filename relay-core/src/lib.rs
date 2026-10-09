@@ -45,6 +45,12 @@ pub struct AgentRecord {
     pub first_output_at: Option<String>,
     pub first_output_stream: Option<String>,
     pub first_output_bytes: Option<u64>,
+    /// Handle of the agent this one was restarted from, if any.
+    pub restarted_from: Option<String>,
+    /// JSON blob of the original agent-creation parameters
+    /// (prompt, project_dir, branch, worktree, model, approval_mode,
+    /// timeout_secs), enabling `POST /v1/agents/{id}/restart`.
+    pub agent_config: Option<String>,
 }
 
 impl AgentRecord {
@@ -96,6 +102,17 @@ impl AgentRecord {
             (
                 "dropped_before".to_owned(),
                 Json::number(self.log_dropped_before),
+            ),
+            (
+                "restarted_from".to_owned(),
+                self.restarted_from
+                    .clone()
+                    .map(Json::String)
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "restartable".to_owned(),
+                Json::Bool(self.agent_config.is_some()),
             ),
         ])
     }
@@ -274,6 +291,57 @@ impl AgentRegistry {
 
     /// Mark formerly live agents honestly after a relay restart.  The caller
     /// supplies a non-signalling identity probe; no lost pipe is ever reattached.
+    /// Record restart linkage on a freshly spawned agent: which agent it was
+    /// restarted from, and carry over the original creation config so the new
+    /// agent can itself be restarted later.
+    pub fn set_restart_metadata(
+        &self,
+        id: &str,
+        restarted_from: &str,
+        agent_config: Option<&str>,
+    ) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        if !entries.contains_key(id) {
+            return Ok(None);
+        }
+        let mut updated = entries.clone();
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.restarted_from = Some(restarted_from.to_owned());
+        entry.agent_config = agent_config.map(str::to_owned);
+        let result = entry.clone();
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(Some(result))
+    }
+
+    /// Persist the original creation parameters for a newly-created agent so
+    /// a later restart can reconstruct its managed Codex invocation.
+    pub fn set_agent_config(
+        &self,
+        id: &str,
+        agent_config: &str,
+    ) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(old) = entries.get(id) else {
+            return Ok(None);
+        };
+        if old.agent_config.as_deref() == Some(agent_config) {
+            return Ok(Some(old.clone()));
+        }
+        let mut updated = entries.clone();
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.agent_config = Some(agent_config.to_owned());
+        let result = entry.clone();
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(Some(result))
+    }
     pub fn recover<F>(&self, process_is_current: F) -> Result<Vec<AgentRecord>, String>
     where
         F: Fn(&AgentRecord) -> bool,
@@ -587,6 +655,22 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .map(Json::number)
                 .unwrap_or(Json::Null),
         ),
+        (
+            "restarted_from".to_owned(),
+            entry
+                .restarted_from
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "agent_config".to_owned(),
+            entry
+                .agent_config
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
     ];
     // Omit null fields instead of writing explicit nulls.
     // The reader handles both forms, but omitting avoids round-trip
@@ -703,6 +787,8 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         first_output_at: optional_string("first_output_at")?,
         first_output_stream: optional_string("first_output_stream")?,
         first_output_bytes: optional_integer("first_output_bytes")?,
+        restarted_from: optional_string("restarted_from")?,
+        agent_config: optional_string("agent_config")?,
     };
     Ok(record)
 }
@@ -1621,6 +1707,8 @@ mod tests {
             first_output_at: None,
             first_output_stream: None,
             first_output_bytes: None,
+            restarted_from: None,
+            agent_config: None,
         }
     }
 
@@ -1652,6 +1740,37 @@ mod tests {
         let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
     }
 
+    #[test]
+    fn agent_restart_metadata_links_new_agent_to_old_and_persists() {
+        let file = path("agents-restart");
+        let registry = AgentRegistry::open(&file).unwrap();
+        registry.register(agent("old")).unwrap();
+        registry.register(agent("new")).unwrap();
+        let config = "CONFIG-BLOB";
+        registry
+            .set_restart_metadata("new", "old", Some(config))
+            .unwrap();
+        let fetched = registry.get("new").unwrap();
+        assert_eq!(fetched.restarted_from.as_deref(), Some("old"));
+        assert_eq!(fetched.agent_config.as_deref(), Some(config));
+        assert_eq!(registry.get("old").unwrap().restarted_from, None);
+        let status = fetched.status_json().to_json();
+        assert!(status.contains("restarted_from"));
+        assert!(status.contains("restartable"));
+        drop(registry);
+        let reopened = AgentRegistry::open(&file).unwrap();
+        let refetched = reopened.get("new").unwrap();
+        assert_eq!(refetched.restarted_from.as_deref(), Some("old"));
+        assert_eq!(refetched.agent_config.as_deref(), Some(config));
+        assert!(
+            reopened
+                .set_restart_metadata("missing", "old", None)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
+    }
     #[test]
     fn decode_agents_accepts_legacy_string_counters() {
         let (agents, skipped) =
@@ -1756,6 +1875,8 @@ mod tests {
             first_output_at: None,
             first_output_stream: None,
             first_output_bytes: None,
+            restarted_from: None,
+            agent_config: None,
         };
         let json = agent_json(&record);
         let text = json.to_json();
