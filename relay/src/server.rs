@@ -200,7 +200,7 @@ where
         ),
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
-        ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
+        ("POST", "/v1/exec") => exec_request(&mut stream, request.body, load_policy()),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
         ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
         ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
