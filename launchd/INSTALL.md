@@ -244,8 +244,12 @@ returns immediately with a 128-bit hexadecimal process handle. Use
 `POST /v1/proc/<handle>/kill` to terminate a still-running process group.
 Output follows the same 1 MiB-per-stream limit as `/v1/exec`; completed
 process records are retained for up to one hour (with at most 128 retained).
-The relay terminates tracked process groups during normal shutdown and does not
-restore process records after a restart.
+Each supervised task runs in its own session and writes stdout/stderr to
+durable private files. A relay self-update, `launchctl` restart, or crash does
+not signal those task sessions; on startup the durable registry verifies the
+recorded PID birth identity and retains a live task as `orphaned` until it
+finishes. Process-handle polling remains live-daemon-only, but agent status
+and durable logs remain available after recovery.
 
 ## VM poller
 

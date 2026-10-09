@@ -27,8 +27,8 @@ use crate::http::{
 };
 use crate::proc::{
     AgentSpawnDetails, COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
-    process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
-    spawn_proc, unique_handle,
+    agent_stderr_path, agent_transcript_path, process_group_running, process_identity, prune_procs,
+    recovered_agent_identity_matches, spawn_proc, unique_handle,
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
@@ -825,6 +825,60 @@ fn prune_drops_finished_entries_past_the_retention_window() {
 }
 
 #[test]
+fn persistent_agent_streams_and_session_survive_relay_teardown() {
+    let registry_path = std::env::temp_dir().join(format!(
+        "zigzag-test-survive-restart-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    let supervisor = Supervisor {
+        registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
+        procs: Mutex::new(HashMap::new()),
+    };
+    let store = Arc::new(Store::open(registry_path.with_extension("events"), 10).unwrap());
+    let spawned = spawn_proc(
+        &supervisor,
+        Arc::clone(&store),
+        Path::new("/bin/sh"),
+        exec::ExecRequest {
+            id: "survive-restart".to_owned(),
+            bin: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf 'durable stdout'; printf 'durable stderr' >&2; sleep 1".to_owned(),
+            ],
+        },
+        "execution-survive-restart".to_owned(),
+        AgentSpawnDetails::default(),
+    )
+    .unwrap();
+    let mut entries = supervisor.procs.lock().unwrap();
+    let entry = entries.get_mut(&spawned.handle).unwrap();
+    // Neither stream is a relay-owned pipe. If the relay exits here, later
+    // Codex writes retain a valid file descriptor rather than seeing SIGPIPE.
+    assert!(entry.child.stdout.is_none());
+    assert!(entry.child.stderr.is_none());
+    assert_eq!(
+        unsafe { libc::getsid(entry.child.id() as libc::pid_t) },
+        entry.process_group
+    );
+    entry.child.wait().unwrap();
+    drop(entries);
+
+    let transcript = agent_transcript_path(&spawned.handle).unwrap();
+    let stderr = agent_stderr_path(&spawned.handle).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&transcript).unwrap(),
+        "durable stdout"
+    );
+    assert_eq!(std::fs::read_to_string(&stderr).unwrap(), "durable stderr");
+    let _ = std::fs::remove_file(transcript);
+    let _ = std::fs::remove_file(stderr);
+    let _ = std::fs::remove_file(registry_path.with_extension("events"));
+    let _ = std::fs::remove_file(&registry_path);
+    let _ = std::fs::remove_dir_all(registry_path.with_extension("agent-logs"));
+}
+
+#[test]
 fn prune_keeps_at_most_128_finished_processes() {
     let mut entries = HashMap::new();
     for index in 0..=MAX_FINISHED_PROCS {
@@ -1086,6 +1140,10 @@ fn completed_entry() -> ProcEntry {
             complete: true,
             ..CappedOutput::default()
         })),
+        stdout_path: None,
+        stderr_path: None,
+        stdout_read: 0,
+        stderr_read: 0,
     }
 }
 

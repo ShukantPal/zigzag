@@ -2,7 +2,7 @@ use crate::events::{persist_first_output, relay_event};
 use crate::http::{error, reply};
 use crate::proc::{
     ProcEntry, agent_transcript_path, kill_process_group, output_is_complete, proc_json,
-    process_group_running, prune_procs,
+    process_group_running, prune_procs, sync_durable_output,
 };
 use crate::server::Server;
 use relay_core::{AgentRegistry, Json, Store};
@@ -29,6 +29,7 @@ pub(crate) fn poll_proc(
         let Some(entry) = table.get_mut(handle) else {
             return reply(stream, 404, error("unknown_proc"));
         };
+        sync_durable_output(entry, handle, &state.supervisor.registry, &state.store);
         update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         log::debug!(
             "poll id={} bin={} subcommand={}",
@@ -55,6 +56,7 @@ pub(crate) fn kill_proc(
         let Some(entry) = table.get_mut(handle) else {
             return reply(stream, 404, error("unknown_proc"));
         };
+        sync_durable_output(entry, handle, &state.supervisor.registry, &state.store);
         update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         let killed = if entry.finished_at.is_none() {
             kill_process_group(entry.process_group)

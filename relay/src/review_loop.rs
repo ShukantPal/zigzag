@@ -4460,6 +4460,10 @@ review_loop:
             exit_code: None,
             stdout: complete_output(),
             stderr: complete_output(),
+            stdout_path: None,
+            stderr_path: None,
+            stdout_read: 0,
+            stderr_read: 0,
         };
         let server = Server {
             secret: "x".repeat(32),
