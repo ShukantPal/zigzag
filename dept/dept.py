@@ -106,13 +106,73 @@ def zigzag_spawn(bin_name, args, ident):
     return payload["proc"]
 
 
-def zigzag_poll(handle):
-    status, payload = _zigzag_call("GET", f"/v1/proc/{handle}")
-    if status == 404:
-        return None  # pruned from the relay's table: treat as done
-    if status != 200:
-        sys.exit(f"zigzag poll failed (http {status}): {payload}")
-    return payload
+_relay_events_cache = None
+
+
+def relay_events_snapshot():
+    """Fetch the relay event window once per process invocation.
+
+    The /v1/events stream replaces per-task /v1/proc polling: a single
+    request serves every status lookup below, and there is nothing to 404.
+    """
+    global _relay_events_cache
+    if _relay_events_cache is None:
+        status, payload = _zigzag_call("GET", "/v1/events?after=0&timeout=0")
+        if status != 200:
+            sys.exit(f"zigzag events failed (http {status}): {payload}")
+        events = payload.get("events")
+        _relay_events_cache = list(events) if isinstance(events, list) else []
+    return _relay_events_cache
+
+
+def relay_task_outcome(tid):
+    """Derive (done, exit_code, agent_id, found) for a relay task from the event stream."""
+    want = f"codex-{tid}"
+    latest = None
+    latest_seq = -1
+    for event in relay_events_snapshot():
+        if not isinstance(event, dict):
+            continue
+        if event.get("task_id") != want:
+            continue
+        if event.get("kind") not in ("process_spawned", "process_completed", "process_failed"):
+            continue
+        try:
+            seq = int(event.get("sequence") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        if seq >= latest_seq:
+            latest, latest_seq = event, seq
+    if latest is None:
+        # Aged out of the relay's retention: treat as done, like the old 404.
+        return True, None, None, False
+    payload = latest.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    done = latest.get("kind") in ("process_completed", "process_failed")
+    return done, payload.get("exit_code"), payload.get("agent_id"), True
+
+
+def relay_stderr_tail(agent_id):
+    """Fetch the tail of a relay agent's stderr via the logs endpoint."""
+    import urllib.parse
+    if not agent_id:
+        return ""
+    status, logs = _zigzag_call(
+        "GET",
+        f"/v1/agents/{urllib.parse.quote(str(agent_id), safe='')}/logs?stream=stderr&tail=1500&follow=0",
+    )
+    if status != 200 or not isinstance(logs, dict):
+        return ""
+    records = logs.get("records")
+    if not isinstance(records, list):
+        return ""
+    text = "".join(
+        record.get("data", "") for record in records
+        if isinstance(record, dict) and isinstance(record.get("data"), str)
+    )
+    if not text.strip():
+        return ""
+    return "relay stderr (tail):\n" + text[-1500:]
 
 
 def zigzag_kill(handle):
@@ -372,10 +432,11 @@ def remote_status_detail(entry):
     """Return (status, relay payload) from one liveness lookup."""
     tid = entry["id"]
     if entry.get("via") == "relay" and entry.get("proc"):
-        payload = zigzag_poll(entry["proc"])
-        if payload is None:
-            return "DONE", {"pruned": True}
-        return ("RUNNING" if payload.get("running") else "DONE"), payload
+        done, exit_code, agent_id, found = relay_task_outcome(tid)
+        payload = {"exit_code": exit_code, "agent_id": agent_id}
+        if not found:
+            payload["pruned"] = True
+        return ("DONE" if done else "RUNNING"), payload
     r = ssh(f"rdir={REMOTE_DEPT}/{tid}; "
             f"if [ ! -f $rdir/pid ]; then echo MISSING; exit 0; fi; "
             f"if kill -0 $(cat $rdir/pid) 2>/dev/null; then echo RUNNING; "
@@ -441,10 +502,9 @@ def cmd_result(args):
         if payload is not None:
             print("--- diagnostics ---")
             print(f"relay exit_code: {payload.get('exit_code', 'unknown')}")
-            stderr = payload.get("stderr") or ""
-            if stderr:
-                print("relay stderr (tail):")
-                print(stderr[-1500:])
+            tail = relay_stderr_tail(payload.get("agent_id"))
+            if tail:
+                print(tail)
         diag = ssh(f"tail -c 1500 {rdir}/stderr.log 2>/dev/null || true", timeout=60)
         print("stderr.log (tail):")
         print(diag.stdout.decode(errors="replace"))

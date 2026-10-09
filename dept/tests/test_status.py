@@ -9,11 +9,13 @@ from unittest.mock import patch
 
 from dept import dept
 from dept.status import (
+    EventStream,
     Execution,
     RELAY_OUTPUT_TAIL_BYTES,
     StatusScreen,
     build_executions,
     detail_lines,
+    dept_task_id,
     duration_between,
     flags,
     mac_dept_root,
@@ -21,8 +23,8 @@ from dept.status import (
     observed_duration,
     read_audit_events,
     relay_output,
-    relay_snapshot,
     main as status_main,
+    task_workdir,
     transcript_command,
     transcript_lines,
     transcript_path,
@@ -132,47 +134,101 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertTrue(any("sequence is not numeric" in warning for warning in warnings))
 
     def test_missing_token_degrades_to_audit_only_snapshot(self):
-        recent, agents, lost, warnings = relay_snapshot("http://relay", Path("/not/a/token"))
-        self.assertEqual((recent, agents, lost), ([], [], False))
-        self.assertTrue(any("credentials unavailable" in warning for warning in warnings))
+        screen = StatusScreen("http://relay", Path("events.json"), Path("/not/a/token"), 1)
+        screen.bootstrap()
+        self.assertEqual(screen.executions, [])
+        self.assertTrue(any("credentials unavailable" in warning for warning in screen.warnings))
 
     def test_invalid_token_encoding_degrades_to_audit_only_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             token = Path(directory) / "token"
             token.write_bytes(b"\xff")
-            recent, agents, lost, warnings = relay_snapshot("http://relay", token)
-        self.assertEqual((recent, agents, lost), ([], [], False))
-        self.assertTrue(any("credentials unavailable" in warning for warning in warnings))
+            screen = StatusScreen("http://relay", Path("events.json"), token, 1)
+            screen.bootstrap()
+        self.assertEqual(screen.executions, [])
+        self.assertTrue(any("credentials unavailable" in warning for warning in screen.warnings))
 
-    def test_relay_snapshot_reads_live_events_and_running_agents(self):
-        with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "token"
-            token.write_text("token")
-            with patch(
-                "dept.status.get_json",
-                side_effect=[
-                    {"events": [event("process_spawned", "2026-01-01T00:00:00.000Z")], "lost": True},
-                    {"agents": [{"id": "agent", "execution_id": "execution", "state": "running"}]},
-                ],
-            ) as get_json:
-                recent, agents, lost, warnings = relay_snapshot("http://relay/", token)
-        self.assertEqual([item["kind"] for item in recent], ["process_spawned"])
-        self.assertEqual(agents[0]["state"], "running")
-        self.assertTrue(lost)
-        self.assertEqual(warnings, [])
+    def test_event_stream_bootstrap_reads_live_events_and_running_agents(self):
+        stream = EventStream("http://relay/", "token")
+        with patch.object(
+            EventStream,
+            "_get",
+            side_effect=[
+                {
+                    "epoch": "e1", "reset": False, "lost": True, "next": 3,
+                    "events": [event("process_spawned", "2026-01-01T00:00:00.000Z")],
+                },
+                {"agents": [{"id": "agent", "execution_id": "execution", "state": "running"}]},
+            ],
+        ) as get:
+            stream.bootstrap()
+        self.assertEqual([item["kind"] for item in stream.events], ["process_spawned"])
+        self.assertEqual(stream.agents["agent"]["state"], "running")
+        self.assertTrue(stream.lost)
+        self.assertEqual((stream.epoch, stream.after), ("e1", 3))
         self.assertEqual(
-            [call.args[0] for call in get_json.call_args_list],
-            ["http://relay/v1/events?after=0&timeout=0", "http://relay/v1/agents"],
+            [call.args[0] for call in get.call_args_list],
+            ["/v1/events?after=0&timeout=0", "/v1/agents"],
         )
 
     def test_malformed_relay_shapes_warn_without_aborting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "token"
-            token.write_text("token")
-            with patch("dept.status.get_json", side_effect=[{"events": None}, {"agents": None}]):
-                recent, agents, lost, warnings = relay_snapshot("http://relay", token)
-        self.assertEqual((recent, agents, lost), ([], [], False))
-        self.assertEqual(len(warnings), 2)
+        stream = EventStream("http://relay", "token")
+        with patch.object(
+            EventStream, "_get",
+            side_effect=[{"epoch": "e1", "events": None, "next": 0}, {"agents": None}],
+        ):
+            stream.bootstrap()
+        self.assertEqual((stream.events, stream.agents, stream.lost), ([], {}, False))
+        self.assertEqual(len(stream.poll_warnings), 2)
+
+    def test_event_stream_poll_long_polls_with_cursor_and_folds_new_events(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "e1", 7
+        spawned = event("process_spawned", "2026-01-01T00:00:00.000Z", sequence=8)
+        spawned["payload"] = {"agent_id": "agent-1"}
+        completed = event("process_completed", "2026-01-01T00:00:01.000Z", sequence=9)
+        completed["payload"] = {"agent_id": "agent-1", "state": "succeeded", "exit_code": 0}
+        with patch.object(
+            EventStream, "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 10,
+                          "events": [spawned, completed]},
+        ) as get:
+            changed = stream.poll(25)
+        self.assertTrue(changed)
+        self.assertEqual(
+            get.call_args.args[0],
+            "/v1/events?after=7&epoch=e1&timeout=25",
+        )
+        self.assertEqual((stream.epoch, stream.after), ("e1", 10))
+        self.assertEqual(stream.agents["agent-1"]["state"], "succeeded")
+        self.assertEqual(stream.agents["agent-1"]["exit_code"], 0)
+
+    def test_event_stream_poll_reports_no_change_on_empty_batch(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "e1", 7
+        with patch.object(
+            EventStream, "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 7, "events": []},
+        ):
+            self.assertFalse(stream.poll(25))
+
+    def test_event_stream_resets_on_epoch_roll(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "old", 99
+        stream.events = [{"id": "stale"}]
+        stream.agents = {"gone": {"id": "gone"}}
+        fresh = event("process_spawned", "2026-01-01T00:00:00.000Z", sequence=1)
+        with patch.object(
+            EventStream, "_get",
+            side_effect=[
+                {"epoch": "new", "reset": True, "lost": False, "next": 2, "events": [fresh]},
+                {"agents": [{"id": "agent", "execution_id": "execution", "state": "running"}]},
+            ],
+        ):
+            self.assertTrue(stream.poll(25))
+        self.assertEqual((stream.epoch, stream.after), ("new", 2))
+        self.assertEqual([item["kind"] for item in stream.events], ["process_spawned"])
+        self.assertEqual(set(stream.agents), {"agent"})
 
     def test_agent_flags_relay_loss_and_duplicate_events_are_merged(self):
         first = event("task_dispatched", "2026-01-01T00:00:00.000Z", id="same")
@@ -192,7 +248,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertIn("relay events lost", flags(merged_execution))
         self.assertEqual(merged_execution.agent_id, "agent")
 
-    def test_status_refresh_keeps_audit_events_when_relay_requests_fail(self):
+    def test_status_bootstrap_keeps_audit_events_when_relay_requests_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "events.json"
             audit = state_file.with_suffix(".audit")
@@ -200,9 +256,9 @@ class SnapshotIngestionTests(unittest.TestCase):
             (audit / "execution.jsonl").write_text(json.dumps(event("task_dispatched", "2026-01-01T00:00:00.000Z")) + "\n")
             token = Path(directory) / "token"
             token.write_text("token")
-            with patch("dept.status.get_json", side_effect=OSError("relay down")):
+            with patch.object(EventStream, "_get", side_effect=OSError("relay down")):
                 screen = StatusScreen("http://relay", state_file, token, 1)
-                screen.refresh()
+                screen.bootstrap()
         self.assertEqual([item.execution_id for item in screen.executions], ["execution"])
         self.assertTrue(any("unavailable" in warning for warning in screen.warnings))
 
@@ -294,21 +350,29 @@ class TranscriptTests(unittest.TestCase):
             {"id": "agent-zero", "execution_id": "zero", "task_id": "task-zero", "state": "running"},
             {"id": "agent-one", "execution_id": "one", "task_id": "task-one", "state": "running"},
         ]
-        screen = StatusScreen("http://relay", Path("events.json"), Path("token"), 1, Path("/Mac/dept"))
-        fake = FakeScreen([10, ord("j"), ord("q"), 10, 27, ord("q")])
-        with patch("dept.status.curses.curs_set"), \
-             patch("dept.status.read_audit_events", return_value=(events, [])), \
-             patch("dept.status.relay_snapshot", return_value=([], agents, False, [])), \
-             patch("dept.status.relay_output", side_effect=[(["one output"], None), (["zero output"], None), (["zero output"], None)]) as output:
-            screen.run(fake)
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("token")
+            screen = StatusScreen("http://relay", Path("events.json"), token, 1, Path("/Mac/dept"))
+            fake = FakeScreen([10, ord("j"), ord("q"), 10, 27, ord("q")])
+            with patch("dept.status.curses.curs_set"), \
+                 patch("dept.status.read_audit_events", return_value=(events, [])), \
+                 patch("dept.status.EventStream") as stream_cls, \
+                 patch("dept.status.relay_output", side_effect=[(["one output"], None), (["zero output"], None), (["zero output"], None)]) as output:
+                stream = stream_cls.return_value
+                stream.events = []
+                stream.agents = {agent["id"]: agent for agent in agents}
+                stream.lost = False
+                stream.poll_warnings = []
+                stream.poll.return_value = False
+                screen.run(fake)
         self.assertEqual([call.args[2] for call in output.call_args_list], ["agent-one", "agent-zero", "agent-zero"])
         self.assertIn("task-one", "\n".join(fake.frames[1]))
         self.assertIn("one output", "\n".join(fake.frames[1]))
         self.assertIn("task-zero", "\n".join(fake.frames[2]))
         self.assertIn("zero output", "\n".join(fake.frames[2]))
-        self.assertTrue(any("read-only  ↑↓ select" in "\n".join(frame) for frame in fake.frames[3:]))
+        self.assertTrue(any("read-only  \u2191\u2193 select" in "\n".join(frame) for frame in fake.frames[3:]))
         self.assertEqual((screen.selected, screen.offset, screen.show_transcript), (1, 1, False))
-
 
 class CommandTests(unittest.TestCase):
     def test_dept_entry_point_forwards_status_and_rejects_unknown_commands(self):
@@ -319,12 +383,12 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(dept.main(["unknown"]), 2)
 
     def test_status_once_prints_a_snapshot_and_interval_validation_rejects_zero(self):
-        def refresh(screen):
+        def bootstrap(screen):
             screen.executions = [Execution("execution", "task", [event("process_spawned", "2026-01-01T00:00:00.000Z")])]
             screen.warnings = ["relay unavailable"]
 
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch("dept.status.StatusScreen.refresh", refresh), redirect_stdout(stdout), redirect_stderr(stderr):
+        with patch("dept.status.StatusScreen.bootstrap", bootstrap), redirect_stdout(stdout), redirect_stderr(stderr):
             self.assertEqual(status_main(["--once"]), 0)
         self.assertIn("TASK\tPHASE", stdout.getvalue())
         self.assertIn("process_spawned", stdout.getvalue())
@@ -333,6 +397,70 @@ class CommandTests(unittest.TestCase):
             status_main(["--once", "--interval", "0"])
         self.assertEqual(error.exception.code, 2)
 
-
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelayIdMappingTests(unittest.TestCase):
+    def test_dept_task_id_strips_relay_spawn_prefix(self):
+        self.assertEqual(dept_task_id("codex-t-abc123"), "t-abc123")
+        self.assertEqual(dept_task_id("t-abc123"), "t-abc123")
+        self.assertEqual(dept_task_id("relay-update"), "relay-update")
+
+    def test_task_workdir_resolves_relay_spawn_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "t-abc123").mkdir()
+            (root / "t-abc123" / "dir.txt").write_text("/work/tree\n")
+            self.assertEqual(task_workdir("codex-t-abc123", root), "/work/tree")
+            self.assertEqual(task_workdir("t-abc123", root), "/work/tree")
+            self.assertEqual(task_workdir("codex-t-missing", root), "")
+
+    def test_transcript_path_strips_relay_spawn_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                transcript_path("codex-t-abc123", root),
+                root / "t-abc123" / "last-message.txt",
+            )
+
+
+class InternalTaskFilterTests(unittest.TestCase):
+    def test_relay_update_hidden_from_default_view(self):
+        update = event("relay_update_check_started", "2026-01-01T00:00:00.000Z",
+                       task_id="relay-update", execution_id="update-1")
+        user = event("process_spawned", "2026-01-01T00:00:01.000Z",
+                     task_id="t-one", execution_id="exec-1")
+        executions = build_executions([update, user], [])
+        self.assertEqual([execution.task_id for execution in executions], ["t-one"])
+
+    def test_relay_update_visible_with_all_flag(self):
+        update = event("relay_update_check_started", "2026-01-01T00:00:00.000Z",
+                       task_id="relay-update", execution_id="update-1")
+        agents = [{"id": "agent", "execution_id": "update-1", "task_id": "relay-update", "state": "running"}]
+        executions = build_executions([update], agents, include_internal=True)
+        self.assertEqual([execution.task_id for execution in executions], ["relay-update"])
+        self.assertEqual(executions[0].agent_state, "running")
+
+
+class StreamUpdateTests(unittest.TestCase):
+    def test_update_rebuilds_only_on_pushed_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = Path(directory) / "token"
+            token.write_text("token")
+            screen = StatusScreen("http://relay", Path("events.json"), token, 1)
+            with patch("dept.status.read_audit_events", return_value=([], [])), \
+                 patch("dept.status.EventStream") as stream_cls:
+                stream = stream_cls.return_value
+                stream.events = []
+                stream.agents = {}
+                stream.lost = False
+                stream.poll_warnings = []
+                stream.poll.return_value = False
+                screen.bootstrap()
+                self.assertEqual(screen.executions, [])
+                self.assertFalse(screen.update())
+                stream.events = [event("process_spawned", "2026-01-01T00:00:00.000Z")]
+                stream.poll.return_value = True
+                self.assertTrue(screen.update())
+                self.assertEqual([execution.task_id for execution in screen.executions], ["task"])

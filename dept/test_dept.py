@@ -233,19 +233,44 @@ class CommandDispatchTest(unittest.TestCase):
         self.assertEqual(spawn.call_args.args[1][0], "resume")
         self.assertIn("model.txt", setup)
 
-    def test_status_uses_one_relay_poll_for_liveness_and_exit_diagnostic(self):
+    def test_status_reads_liveness_from_the_event_stream(self):
         entry = {"id": "t-one", "via": "relay", "proc": "proc"}
+        events = [{
+            "id": "e1", "sequence": 9, "task_id": "codex-t-one", "execution_id": "ex",
+            "kind": "process_completed",
+            "payload": {"exit_code": 7, "agent_id": "agent-1"},
+        }]
         with patch.object(department, "ledger_read", return_value=[entry]), \
-             patch.object(department, "zigzag_poll", return_value={"running": False, "exit_code": 7}) as poll, \
+             patch.object(department, "relay_events_snapshot", return_value=events), \
              patch("builtins.print") as output:
             department.cmd_status(["t-one"])
-        poll.assert_called_once_with("proc")
         output.assert_called_once_with("t-one: DONE (exit 7)")
+
+    def test_status_reports_running_from_spawn_event(self):
+        entry = {"id": "t-one", "via": "relay", "proc": "proc"}
+        events = [{
+            "id": "e1", "sequence": 9, "task_id": "codex-t-one", "execution_id": "ex",
+            "kind": "process_spawned", "payload": {"agent_id": "agent-1"},
+        }]
+        with patch.object(department, "ledger_read", return_value=[entry]), \
+             patch.object(department, "relay_events_snapshot", return_value=events), \
+             patch("builtins.print") as output:
+            department.cmd_status(["t-one"])
+        output.assert_called_once_with("t-one: RUNNING")
+
+    def test_relay_events_snapshot_fetches_once_per_process(self):
+        department._relay_events_cache = None
+        with patch.object(department, "_zigzag_call", return_value=(200, {"events": [{"id": "e"}]})) as call:
+            first = department.relay_events_snapshot()
+            second = department.relay_events_snapshot()
+        self.assertEqual((first, second), ([{"id": "e"}], [{"id": "e"}]))
+        call.assert_called_once_with("GET", "/v1/events?after=0&timeout=0")
+        department._relay_events_cache = None
 
     def test_status_distinguishes_pruned_relay_from_unknown_exit(self):
         entry = {"id": "t-one", "via": "relay", "proc": "proc"}
         with patch.object(department, "ledger_read", return_value=[entry]), \
-             patch.object(department, "zigzag_poll", return_value=None), \
+             patch.object(department, "relay_events_snapshot", return_value=[]), \
              patch("builtins.print") as output:
             department.cmd_status(["t-one"])
         output.assert_called_once_with("t-one: DONE (pruned)")
@@ -278,8 +303,10 @@ class CommandDispatchTest(unittest.TestCase):
         result = SimpleNamespace(stdout=b"final message\n", stderr=b"")
         stderr = SimpleNamespace(stdout=b"launcher failure\n", stderr=b"")
         tokens = SimpleNamespace(stdout=b'"total_tokens":3\n', stderr=b"")
+        logs = (200, {"records": [{"data": "relay failure\n"}]})
         with patch.object(department, "ledger_read", return_value=[entry]), \
-             patch.object(department, "remote_status_detail", return_value=("DONE", {"exit_code": 7, "stderr": "relay failure"})), \
+             patch.object(department, "remote_status_detail", return_value=("DONE", {"exit_code": 7, "agent_id": "agent-1"})), \
+             patch.object(department, "_zigzag_call", return_value=logs) as zigzag, \
              patch.object(department, "ssh", side_effect=[result, stderr, tokens]), \
              patch("builtins.print") as output:
             department.cmd_result(["t-one"])
@@ -287,6 +314,7 @@ class CommandDispatchTest(unittest.TestCase):
         self.assertIn("relay exit_code: 7", rendered)
         self.assertIn("relay failure", rendered)
         self.assertIn("launcher failure", rendered)
+        self.assertIn("/v1/agents/agent-1/logs", zigzag.call_args.args[1])
 
     def test_result_reports_pruned_relay_and_ssh_stderr(self):
         relay = {"id": "t-relay", "via": "relay", "proc": "proc"}
