@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use relay_core::{
     AgentRecord, AgentRegistry, Json, ReadResult, Store, parse_json, parse_rfc3339_millis,
     read_secret_file,
@@ -35,6 +36,7 @@ const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
 #[cfg(any(target_os = "macos", test))]
 const SESSION_IS_REMOTE: u32 = 0x1000;
 
+#[derive(Debug)]
 struct Config {
     secret_file: PathBuf,
     control_secret_file: Option<PathBuf>,
@@ -134,6 +136,143 @@ enum ReadRequestError {
     Message(String),
     ExecutionDenied,
     HeadersTooLarge,
+}
+
+const SERVER_USAGE: &str = "usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]";
+const TIMELINE_USAGE: &str =
+    "usage: zigzag timeline <task-id> --state-file PATH (or ZIGZAG_STATE_FILE)";
+const CONFIG_USAGE: &str = "usage: zigzag config (get-allowlist | set-allowlist --file PATH)";
+
+/// Server-mode flags. clap handles tokenizing, `--flag value` pairing, and
+/// environment fallbacks; the domain validation in `server_config` keeps the
+/// exact historical error strings so invoker behavior is unchanged.
+#[derive(Parser, Debug)]
+#[command(name = "zigzag", disable_help_flag = true, disable_version_flag = true)]
+struct ServeArgs {
+    #[arg(long = "secret-file", env = "ZIGZAG_SECRET_FILE")]
+    secret_file: Option<PathBuf>,
+    #[arg(long = "control-secret-file", env = "ZIGZAG_CONTROL_SECRET_FILE")]
+    control_secret_file: Option<PathBuf>,
+    #[arg(long = "state-file", env = "ZIGZAG_STATE_FILE")]
+    state_file: Option<PathBuf>,
+    #[arg(long = "port", default_value = "8765", value_parser = parse_port)]
+    port: u16,
+    #[arg(long = "tailscale-ip", value_parser = parse_ip_address)]
+    tailscale_ip: Option<IpAddr>,
+    #[arg(
+        long = "max-events",
+        default_value = "1000",
+        value_parser = parse_max_events
+    )]
+    max_events: usize,
+    #[arg(long = "watch-repo", value_parser = parse_github_repo)]
+    github_watch_repos: Vec<String>,
+    #[arg(
+        long = "watch-interval",
+        default_value = "30",
+        value_parser = parse_watch_interval
+    )]
+    github_watch_interval_secs: u64,
+    #[arg(long = "update-dir", env = "ZIGZAG_UPDATE_DIR")]
+    update_directory: Option<PathBuf>,
+    #[arg(
+        long = "update-interval",
+        env = "ZIGZAG_UPDATE_INTERVAL",
+        default_value = "3600",
+        value_parser = parse_update_interval
+    )]
+    update_interval_secs: u64,
+    #[arg(
+        long = "update-policy",
+        env = "ZIGZAG_UPDATE_POLICY",
+        default_value = "enabled",
+        value_parser = update::Policy::parse
+    )]
+    update_policy: update::Policy,
+    #[arg(long = "update-ready-file")]
+    update_ready_file: Option<PathBuf>,
+    /// Manual help flag: `--help` historically returns the usage string as an
+    /// error (exit 1 via main), so clap's auto help stays disabled.
+    #[arg(long = "help", short = 'h', action = clap::ArgAction::SetTrue)]
+    help: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "zigzag timeline",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
+struct TimelineArgs {
+    task_id: Option<String>,
+    #[arg(long = "state-file", env = "ZIGZAG_STATE_FILE")]
+    state_file: Option<PathBuf>,
+    /// Manual help flag preserving the historical usage-error behavior.
+    #[arg(long = "help", short = 'h', action = clap::ArgAction::SetTrue)]
+    help: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "zigzag config",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: Option<ConfigCommand>,
+    /// Manual help flag preserving the historical usage-error behavior.
+    #[arg(long = "help", short = 'h', action = clap::ArgAction::SetTrue)]
+    help: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    #[command(name = "get-allowlist")]
+    GetAllowlist,
+    #[command(name = "set-allowlist")]
+    SetAllowlist {
+        #[arg(long = "file")]
+        file: String,
+    },
+}
+
+fn parse_port(value: &str) -> Result<u16, String> {
+    value
+        .parse()
+        .map_err(|_| "--port must be a valid u16".to_owned())
+}
+
+fn parse_ip_address(value: &str) -> Result<IpAddr, String> {
+    value
+        .parse()
+        .map_err(|_| "--tailscale-ip must be an IP address".to_owned())
+}
+
+fn parse_max_events(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| "--max-events must be a positive integer".to_owned())
+}
+
+fn parse_github_repo(value: &str) -> Result<String, String> {
+    if valid_github_repo(value) {
+        Ok(value.to_owned())
+    } else {
+        Err("--watch-repo must be an OWNER/REPO GitHub name".to_owned())
+    }
+}
+
+fn parse_watch_interval(value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| "--watch-interval must be an integer".to_owned())
+}
+
+fn parse_update_interval(value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| "--update-interval must be an integer".to_owned())
 }
 
 fn main() {
@@ -298,32 +437,18 @@ fn run() -> Result<(), String> {
 }
 
 fn run_timeline(arguments: &[String]) -> Result<(), String> {
-    let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
-    let mut task_id = None;
-    let mut values = arguments.iter();
-    while let Some(argument) = values.next() {
-        match argument.as_str() {
-            "--state-file" => {
-                state_file = Some(PathBuf::from(
-                    values
-                        .next()
-                        .ok_or_else(|| "--state-file requires a value".to_owned())?,
-                ));
-            }
-            "--help" | "-h" => {
-                return Err(
-                    "usage: zigzag timeline <task-id> --state-file PATH (or ZIGZAG_STATE_FILE)"
-                        .to_owned(),
-                );
-            }
-            value if !value.starts_with('-') && task_id.is_none() => {
-                task_id = Some(value.to_owned())
-            }
-            value => return Err(format!("unknown timeline argument: {value}")),
-        }
+    let args = TimelineArgs::try_parse_from(
+        std::iter::once("zigzag".to_owned()).chain(arguments.iter().cloned()),
+    )
+    .map_err(|error| error.to_string())?;
+    if args.help {
+        return Err(TIMELINE_USAGE.to_owned());
     }
-    let task_id = task_id.ok_or_else(|| "timeline requires a task id".to_owned())?;
-    let state_file = state_file
+    let task_id = args
+        .task_id
+        .ok_or_else(|| "timeline requires a task id".to_owned())?;
+    let state_file = args
+        .state_file
         .ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required for timeline".to_owned())?;
     let events = Store::open(state_file, 1_000)?.timeline(&task_id)?;
     print!("{}", timeline_output(&task_id, &events));
@@ -409,89 +534,42 @@ fn format_duration(millis: u64) -> String {
 }
 
 fn server_config(arguments: Vec<String>) -> Result<Config, String> {
-    let mut secret_file = env::var_os("ZIGZAG_SECRET_FILE").map(PathBuf::from);
-    let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
-    let mut control_secret_file = env::var_os("ZIGZAG_CONTROL_SECRET_FILE").map(PathBuf::from);
-    let mut port = 8765;
-    let mut tailscale_ip = None;
-    let mut max_events = 1000;
-    let mut github_watch_repos = Vec::new();
-    let mut github_watch_interval = Duration::from_secs(30);
-    let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);
-    let mut update_interval = env::var("ZIGZAG_UPDATE_INTERVAL")
-        .ok()
-        .map(|value| value.parse::<u64>().map(Duration::from_secs))
-        .transpose()
-        .map_err(|_| "ZIGZAG_UPDATE_INTERVAL must be an integer".to_owned())?
-        .unwrap_or(Duration::from_secs(60 * 60));
-    let mut update_policy = env::var("ZIGZAG_UPDATE_POLICY")
-        .ok()
-        .map(|value| update::Policy::parse(&value))
-        .transpose()?
-        .unwrap_or(update::Policy::Enabled);
-    let mut update_ready_file = None;
-    let mut values = arguments.into_iter();
-    while let Some(argument) = values.next() {
-        let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
-            values
-                .next()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
-        match argument.as_str() {
-            "--secret-file" => secret_file = Some(PathBuf::from(value(&mut values, "--secret-file")?)),
-            "--control-secret-file" => control_secret_file = Some(PathBuf::from(value(&mut values, "--control-secret-file")?)),
-            "--state-file" => state_file = Some(PathBuf::from(value(&mut values, "--state-file")?)),
-            "--port" => port = value(&mut values, "--port")?.parse().map_err(|_| "--port must be a valid u16".to_owned())?,
-            "--tailscale-ip" => {
-                let address = value(&mut values, "--tailscale-ip")?
-                    .parse()
-                    .map_err(|_| "--tailscale-ip must be an IP address".to_owned())?;
-                if !is_tailscale_ipv4(address) {
-                    return Err("--tailscale-ip must be a Tailscale IPv4 address".to_owned());
-                }
-                tailscale_ip = Some(address);
-            }
-            "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--watch-repo" => {
-                let repo = value(&mut values, "--watch-repo")?;
-                if !valid_github_repo(&repo) {
-                    return Err("--watch-repo must be an OWNER/REPO GitHub name".to_owned());
-                }
-                if !github_watch_repos.contains(&repo) {
-                    github_watch_repos.push(repo);
-                }
-            }
-            "--watch-interval" => {
-                let seconds = value(&mut values, "--watch-interval")?
-                    .parse::<u64>()
-                    .map_err(|_| "--watch-interval must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
-                }
-                github_watch_interval = Duration::from_secs(seconds);
-            }
-            "--update-dir" => update_directory = Some(PathBuf::from(value(&mut values, "--update-dir")?)),
-            "--update-interval" => {
-                let seconds = value(&mut values, "--update-interval")?.parse::<u64>()
-                    .map_err(|_| "--update-interval must be an integer".to_owned())?;
-                if seconds > 24 * 60 * 60 { return Err("--update-interval must be at most 86400 seconds".to_owned()); }
-                update_interval = Duration::from_secs(seconds);
-            }
-            "--update-policy" => update_policy = update::Policy::parse(&value(&mut values, "--update-policy")?)?,
-            "--update-ready-file" => update_ready_file = Some(PathBuf::from(value(&mut values, "--update-ready-file")?)),
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
-            _ => return Err(format!("unknown argument: {argument}")),
-        }
+    let args = ServeArgs::try_parse_from(std::iter::once("zigzag".to_owned()).chain(arguments))
+        .map_err(|error| error.to_string())?;
+    if args.help {
+        return Err(SERVER_USAGE.to_owned());
     }
-    let secret_file =
-        secret_file.ok_or_else(|| "--secret-file or ZIGZAG_SECRET_FILE is required".to_owned())?;
-    let state_file =
-        state_file.ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required".to_owned())?;
-    if max_events == 0 {
+    let secret_file = args
+        .secret_file
+        .ok_or_else(|| "--secret-file or ZIGZAG_SECRET_FILE is required".to_owned())?;
+    let state_file = args
+        .state_file
+        .ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required".to_owned())?;
+    if args.max_events == 0 {
         return Err("--max-events must be greater than zero".to_owned());
     }
+    if let Some(address) = args.tailscale_ip
+        && !is_tailscale_ipv4(address)
+    {
+        return Err("--tailscale-ip must be a Tailscale IPv4 address".to_owned());
+    }
+    if !(30..=3600).contains(&args.github_watch_interval_secs) {
+        return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
+    }
+    // The old hand-rolled parser only applied this bound to the flag, not the
+    // environment variable; applying it uniformly turns a misconfiguration
+    // into a loud startup error either way.
+    if args.update_interval_secs > 24 * 60 * 60 {
+        return Err("--update-interval must be at most 86400 seconds".to_owned());
+    }
+    let mut github_watch_repos = Vec::new();
+    for repo in args.github_watch_repos {
+        if !github_watch_repos.contains(&repo) {
+            github_watch_repos.push(repo);
+        }
+    }
     let agent_registry_file = state_file.with_extension("agents.json");
-    let update_directory = update_directory.unwrap_or_else(|| {
+    let update_directory = args.update_directory.unwrap_or_else(|| {
         state_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -500,18 +578,18 @@ fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let review_state_file = state_file.with_extension("reviews.json");
     Ok(Config {
         secret_file,
-        control_secret_file,
+        control_secret_file: args.control_secret_file,
         state_file,
         agent_registry_file,
-        port,
-        tailscale_ip,
-        max_events,
+        port: args.port,
+        tailscale_ip: args.tailscale_ip,
+        max_events: args.max_events,
         github_watch_repos,
-        github_watch_interval,
+        github_watch_interval: Duration::from_secs(args.github_watch_interval_secs),
         update_directory,
-        update_interval,
-        update_policy,
-        update_ready_file,
+        update_interval: Duration::from_secs(args.update_interval_secs),
+        update_policy: args.update_policy,
+        update_ready_file: args.update_ready_file,
         review_state_file,
     })
 }
@@ -621,32 +699,40 @@ fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
 
 fn run_config(arguments: &[String]) -> Result<(), String> {
     require_gui_login_session()?;
-    if is_get_allowlist(arguments) {
-        let policy = exec::load_policy()?;
-        println!("{}", policy.canonical_json());
-        return Ok(());
+    let args = ConfigArgs::try_parse_from(
+        std::iter::once("zigzag".to_owned()).chain(arguments.iter().cloned()),
+    )
+    .map_err(|error| error.to_string())?;
+    match config_command(args)? {
+        ConfigCommand::GetAllowlist => {
+            let policy = exec::load_policy()?;
+            println!("{}", policy.canonical_json());
+            Ok(())
+        }
+        ConfigCommand::SetAllowlist { file } => {
+            let contents = std::fs::read_to_string(&file)
+                .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
+            let policy = exec::Policy::parse(&contents)?;
+            exec::store_policy(&policy)?;
+            println!("{}", policy.canonical_json());
+            Ok(())
+        }
     }
-    let file = allowlist_file(arguments)?;
-    let contents = std::fs::read_to_string(file)
-        .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
-    let policy = exec::Policy::parse(&contents)?;
-    exec::store_policy(&policy)?;
-    println!("{}", policy.canonical_json());
-    Ok(())
 }
 
-fn is_get_allowlist(arguments: &[String]) -> bool {
-    arguments.len() == 1 && arguments[0] == "get-allowlist"
-}
-
-fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
-    let [command, flag, file] = arguments else {
-        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
-    };
-    if command != "set-allowlist" || flag != "--file" || file.is_empty() {
-        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
+/// Validates the parsed `config` subcommand, preserving the old hand-rolled
+/// usage errors for missing/extra arguments.
+fn config_command(args: ConfigArgs) -> Result<ConfigCommand, String> {
+    if args.help {
+        return Err(CONFIG_USAGE.to_owned());
     }
-    Ok(file)
+    match args.command {
+        None => Err(CONFIG_USAGE.to_owned()),
+        Some(ConfigCommand::SetAllowlist { ref file }) if file.is_empty() => {
+            Err(CONFIG_USAGE.to_owned())
+        }
+        Some(command) => Ok(command),
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2380,42 +2466,217 @@ mod tests {
     }
 
     #[test]
-    fn get_allowlist_matches_only_its_exact_arguments() {
-        assert!(is_get_allowlist(&["get-allowlist".to_owned()]));
+    fn config_parses_only_its_documented_forms() {
+        let get = ConfigArgs::try_parse_from(["zigzag", "get-allowlist"]).unwrap();
+        assert!(matches!(
+            config_command(get).unwrap(),
+            ConfigCommand::GetAllowlist
+        ));
+        let set = ConfigArgs::try_parse_from([
+            "zigzag",
+            "set-allowlist",
+            "--file",
+            "/secure/policy.json",
+        ])
+        .unwrap();
+        match config_command(set).unwrap() {
+            ConfigCommand::SetAllowlist { file } => assert_eq!(file, "/secure/policy.json"),
+            ConfigCommand::GetAllowlist => panic!("parsed the wrong subcommand"),
+        }
+        // Bare `config`, unknown subcommands, missing/empty --file, and stray
+        // flags are all usage errors, exactly like the old hand-rolled parser.
         for invalid in [
-            Vec::new(),
-            vec!["get-allowlist".to_owned(), "--file".to_owned()],
-            vec!["set-allowlist".to_owned()],
+            vec!["zigzag"],
+            vec!["zigzag", "get-allowlist", "--file", "x"],
+            vec!["zigzag", "set-allowlist"],
+            vec!["zigzag", "set-allowlist", "--other", "x"],
+            vec!["zigzag", "bogus"],
         ] {
-            assert!(!is_get_allowlist(&invalid));
+            let rejected = match ConfigArgs::try_parse_from(invalid.clone()) {
+                Err(_) => true,
+                Ok(parsed) => config_command(parsed).is_err(),
+            };
+            assert!(rejected, "{invalid:?}");
+        }
+        let empty = ConfigArgs::try_parse_from(["zigzag", "set-allowlist", "--file", ""]).unwrap();
+        assert_eq!(config_command(empty).unwrap_err(), CONFIG_USAGE);
+        for flag in ["--help", "-h"] {
+            let help = ConfigArgs::try_parse_from(["zigzag", flag]).unwrap();
+            assert_eq!(config_command(help).unwrap_err(), CONFIG_USAGE);
         }
     }
 
     #[test]
-    fn allowlist_updater_accepts_only_its_exact_arguments() {
-        let valid = vec![
-            "set-allowlist".to_owned(),
-            "--file".to_owned(),
-            "/secure/policy.json".to_owned(),
-        ];
-        assert_eq!(allowlist_file(&valid).unwrap(), "/secure/policy.json");
-        for invalid in [
-            vec![],
-            vec!["set-allowlist".to_owned()],
-            vec!["set-allowlist".to_owned(), "--file".to_owned()],
+    fn serve_args_keep_flags_defaults_and_validation() {
+        let base = || {
             vec![
-                "set-allowlist".to_owned(),
-                "--other".to_owned(),
-                "/secure/policy.json".to_owned(),
-            ],
-            vec![
-                "set-allowlist".to_owned(),
-                "--file".to_owned(),
-                "".to_owned(),
-            ],
+                "--secret-file".to_owned(),
+                "/token".to_owned(),
+                "--state-file".to_owned(),
+                "/state".to_owned(),
+            ]
+        };
+        let config = server_config(base()).unwrap();
+        assert_eq!(config.secret_file, PathBuf::from("/token"));
+        assert_eq!(config.state_file, PathBuf::from("/state"));
+        assert_eq!(config.port, 8765);
+        assert_eq!(config.max_events, 1000);
+        assert!(config.github_watch_repos.is_empty());
+        assert_eq!(config.github_watch_interval, Duration::from_secs(30));
+        assert_eq!(config.update_interval, Duration::from_secs(3600));
+        assert!(matches!(config.update_policy, update::Policy::Enabled));
+        assert_eq!(
+            config.agent_registry_file,
+            PathBuf::from("/state").with_extension("agents.json")
+        );
+        assert_eq!(config.update_directory, PathBuf::from("/").join("relay"));
+
+        // Every flag still validates with its historical error message.
+        // clap wraps value-parser failures, so those assert `contains`;
+        // post-parse domain checks keep their exact strings.
+        for (arguments, message) in [
+            (
+                vec!["--port".to_owned(), "not-a-port".to_owned()],
+                "--port must be a valid u16",
+            ),
+            (
+                vec!["--tailscale-ip".to_owned(), "not-an-ip".to_owned()],
+                "--tailscale-ip must be an IP address",
+            ),
+            (
+                vec!["--max-events".to_owned(), "many".to_owned()],
+                "--max-events must be a positive integer",
+            ),
+            (
+                vec!["--watch-repo".to_owned(), "not-a-repo".to_owned()],
+                "--watch-repo must be an OWNER/REPO GitHub name",
+            ),
+            (
+                vec!["--watch-interval".to_owned(), "soon".to_owned()],
+                "--watch-interval must be an integer",
+            ),
+            (
+                vec!["--update-interval".to_owned(), "soon".to_owned()],
+                "--update-interval must be an integer",
+            ),
+            (
+                vec!["--update-policy".to_owned(), "sometimes".to_owned()],
+                "update policy must be enabled, paused, or pin:<version>",
+            ),
         ] {
-            assert!(allowlist_file(&invalid).is_err());
+            let mut full = base();
+            full.extend(arguments);
+            let error = server_config(full).unwrap_err();
+            assert!(error.contains(message), "{error:?}");
         }
+        for (arguments, message) in [
+            (
+                vec!["--tailscale-ip".to_owned(), "8.8.8.8".to_owned()],
+                "--tailscale-ip must be a Tailscale IPv4 address",
+            ),
+            (
+                vec!["--max-events".to_owned(), "0".to_owned()],
+                "--max-events must be greater than zero",
+            ),
+            (
+                vec!["--watch-interval".to_owned(), "29".to_owned()],
+                "--watch-interval must be between 30 and 3600 seconds",
+            ),
+            (
+                vec!["--update-interval".to_owned(), "86401".to_owned()],
+                "--update-interval must be at most 86400 seconds",
+            ),
+        ] {
+            let mut full = base();
+            full.extend(arguments);
+            assert_eq!(server_config(full).unwrap_err(), message);
+        }
+
+        // Accepted values flow through to the config, with --watch-repo deduped.
+        let mut arguments = base();
+        arguments.extend([
+            "--port".to_owned(),
+            "9000".to_owned(),
+            "--tailscale-ip".to_owned(),
+            "100.101.237.83".to_owned(),
+            "--watch-repo".to_owned(),
+            "leveled-inc/leveled".to_owned(),
+            "--watch-repo".to_owned(),
+            "leveled-inc/leveled".to_owned(),
+            "--update-policy".to_owned(),
+            "pin:1.2.3".to_owned(),
+        ]);
+        let config = server_config(arguments).unwrap();
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.tailscale_ip, Some("100.101.237.83".parse().unwrap()));
+        assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
+        assert!(matches!(
+            config.update_policy,
+            update::Policy::Pin(ref version) if version == "1.2.3"
+        ));
+
+        // Missing secrets, unknown flags, and --help keep their old shapes.
+        assert_eq!(
+            server_config(vec!["--state-file".to_owned(), "/s".to_owned()]).unwrap_err(),
+            "--secret-file or ZIGZAG_SECRET_FILE is required"
+        );
+        assert_eq!(
+            server_config(vec!["--secret-file".to_owned(), "/t".to_owned()]).unwrap_err(),
+            "--state-file or ZIGZAG_STATE_FILE is required"
+        );
+        assert!(server_config(vec!["--bogus".to_owned()]).is_err());
+        for flag in ["--help", "-h"] {
+            assert_eq!(
+                server_config(vec![flag.to_owned()]).unwrap_err(),
+                SERVER_USAGE
+            );
+        }
+    }
+
+    #[test]
+    fn serve_args_fall_back_to_environment() {
+        // SAFETY: no other test reads these variables without also passing
+        // explicit flags, which take precedence over the environment.
+        unsafe {
+            std::env::set_var("ZIGZAG_SECRET_FILE", "/env-token");
+            std::env::set_var("ZIGZAG_STATE_FILE", "/env-state");
+            std::env::set_var("ZIGZAG_UPDATE_DIR", "/env-updates");
+        }
+        let config = server_config(Vec::new()).unwrap();
+        assert_eq!(config.secret_file, PathBuf::from("/env-token"));
+        assert_eq!(config.state_file, PathBuf::from("/env-state"));
+        assert_eq!(config.update_directory, PathBuf::from("/env-updates"));
+        // Flags still win over the environment.
+        let config =
+            server_config(vec!["--secret-file".to_owned(), "/flag-token".to_owned()]).unwrap();
+        assert_eq!(config.secret_file, PathBuf::from("/flag-token"));
+        unsafe {
+            std::env::remove_var("ZIGZAG_SECRET_FILE");
+            std::env::remove_var("ZIGZAG_STATE_FILE");
+            std::env::remove_var("ZIGZAG_UPDATE_DIR");
+        }
+    }
+
+    #[test]
+    fn timeline_args_parse_positional_task_id_and_state_file() {
+        let args =
+            TimelineArgs::try_parse_from(["zigzag", "task-1", "--state-file", "/s"]).unwrap();
+        assert!(!args.help);
+        assert_eq!(args.task_id.as_deref(), Some("task-1"));
+        assert_eq!(args.state_file, Some(PathBuf::from("/s")));
+        // --state-file may precede the task id, like the old parser allowed.
+        let args =
+            TimelineArgs::try_parse_from(["zigzag", "--state-file", "/s", "task-1"]).unwrap();
+        assert_eq!(args.task_id.as_deref(), Some("task-1"));
+        // --help keeps the historical usage error.
+        for flag in ["--help", "-h"] {
+            let args = TimelineArgs::try_parse_from(["zigzag", flag]).unwrap();
+            assert!(args.help);
+        }
+        // Unknown flags, extra positionals, and valueless --state-file fail.
+        assert!(TimelineArgs::try_parse_from(["zigzag", "a", "b"]).is_err());
+        assert!(TimelineArgs::try_parse_from(["zigzag", "--bogus"]).is_err());
+        assert!(TimelineArgs::try_parse_from(["zigzag", "--state-file"]).is_err());
     }
 
     #[test]
