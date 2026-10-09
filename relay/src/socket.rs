@@ -22,6 +22,15 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
+#[derive(Clone)]
+struct TopicPublisher {
+    state: Arc<Server>,
+    sender: SyncSender<Value>,
+    alive: Arc<AtomicBool>,
+    events_dropped: Arc<AtomicBool>,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+}
+
 /// Accept socket clients using the same global connection budget as HTTP.
 pub(crate) fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimiter>) {
     for stream in listener.incoming() {
@@ -76,6 +85,13 @@ pub(crate) fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), St
         thread::spawn(move || write_loop(writer, receiver, writer_alive, writer_dropped));
 
     let subscriptions = Arc::new(Mutex::new(HashSet::new()));
+    let publisher = TopicPublisher {
+        state: Arc::clone(&state),
+        sender: sender.clone(),
+        alive: Arc::clone(&alive),
+        events_dropped: Arc::clone(&events_dropped),
+        subscriptions: Arc::clone(&subscriptions),
+    };
     while alive.load(Ordering::Acquire) {
         let frame = match read_frame(&mut stream) {
             Ok(frame) => frame,
@@ -130,16 +146,7 @@ pub(crate) fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), St
                     .insert(topic.to_owned());
                 if added {
                     let _ = enqueue(&sender, json!({"type":"subscribed","topic":topic}));
-                    start_topic(
-                        topic.to_owned(),
-                        Arc::clone(&state),
-                        sender.clone(),
-                        Arc::clone(&alive),
-                        Arc::clone(&events_dropped),
-                        Arc::clone(&subscriptions),
-                        event_cursor,
-                        log_after,
-                    );
+                    start_topic(topic.to_owned(), publisher.clone(), event_cursor, log_after);
                 }
             }
             Some("unsubscribe") => {
@@ -193,22 +200,24 @@ fn valid_topic(topic: &str) -> bool {
 
 fn start_topic(
     topic: String,
-    state: Arc<Server>,
-    sender: SyncSender<Value>,
-    alive: Arc<AtomicBool>,
-    events_dropped: Arc<AtomicBool>,
-    subscriptions: Arc<Mutex<HashSet<String>>>,
+    publisher: TopicPublisher,
     event_cursor: Option<(u64, String)>,
     log_after: Option<u64>,
 ) {
     thread::spawn(move || match topic.as_str() {
-        "agents" => publish_agents(state, sender, alive, subscriptions, topic),
+        "agents" => publish_agents(
+            publisher.state,
+            publisher.sender,
+            publisher.alive,
+            publisher.subscriptions,
+            topic,
+        ),
         "events" => publish_events(
-            state.store.clone(),
-            sender,
-            alive,
-            events_dropped,
-            subscriptions,
+            publisher.state.store.clone(),
+            publisher.sender,
+            publisher.alive,
+            publisher.events_dropped,
+            publisher.subscriptions,
             topic,
             event_cursor.expect("event cursor captured"),
         ),
@@ -217,10 +226,10 @@ fn start_topic(
                 .strip_prefix("logs.")
                 .expect("validated topic")
                 .to_owned(),
-            state,
-            sender,
-            alive,
-            subscriptions,
+            publisher.state,
+            publisher.sender,
+            publisher.alive,
+            publisher.subscriptions,
             topic,
             log_after.expect("log cursor captured"),
         ),
