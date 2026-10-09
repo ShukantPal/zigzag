@@ -1576,9 +1576,31 @@ fn agent_create_worktree_roundtrip() {
     std::fs::create_dir_all(&root).unwrap();
     let repo = worktree_test_repo(&base);
     let worktree = root.join("codex-feature");
-    agent_create_worktree(&repo, &worktree, "codex/feature").unwrap();
+    agent_create_worktree(&repo, &worktree, "codex/feature", &[]).unwrap();
     assert!(worktree.join(".git").exists());
-    let error = agent_create_worktree(&repo, &root.join("second"), "codex/feature").unwrap_err();
+    // A completed agent leaves its worktree available to the next agent.
+    let mut completed = agent_record("completed-agent");
+    completed.state = "succeeded".to_owned();
+    completed.worktree_path = Some(worktree.to_string_lossy().into_owned());
+    agent_create_worktree(&repo, &worktree, "codex/feature", &[completed]).unwrap();
+
+    // Running and paused agents retain exclusive use of the worktree.
+    for state in ["running", "paused"] {
+        let mut active = agent_record("active-agent");
+        active.state = state.to_owned();
+        active.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        let error =
+            agent_create_worktree(&repo, &worktree, "codex/feature", &[active]).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentWorktreeFailure::Validation(failure)
+                if failure.message == "worktree_branch_already_checked_out"
+        ));
+    }
+
+    // A different path still cannot check out the same branch twice.
+    let error =
+        agent_create_worktree(&repo, &root.join("second"), "codex/feature", &[]).unwrap_err();
     assert!(matches!(
         error,
         AgentWorktreeFailure::Validation(failure)
