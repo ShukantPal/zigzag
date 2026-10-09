@@ -1,6 +1,5 @@
-use super::{
-    Json, Server, exec, force_kill_process_group, new_execution_id, relay_event, spawn_proc,
-};
+use super::{Json, Server, exec, force_kill_process_group, spawn_proc};
+use crate::events::{new_execution_id, relay_event};
 use regex::Regex;
 use relay_core::AgentRegistry;
 use serde::{Deserialize, Serialize};

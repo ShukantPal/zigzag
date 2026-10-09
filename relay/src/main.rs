@@ -1,33 +1,39 @@
-use relay_core::{
-    AgentRecord, AgentRegistry, Json, ReadResult, Store, parse_json, parse_rfc3339_millis,
-    read_secret_file,
-};
-use std::collections::HashMap;
-use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
-
+mod auth;
+mod config;
+mod events;
 mod exec;
+mod http;
 mod logging;
 mod review_loop;
 mod update;
 
-const MAX_BODY: usize = 64 * 1024;
+use crate::auth::authorized;
+use crate::config::{run_config, server_config};
+use crate::events::{
+    new_execution_id, persist_first_output, random_hex_128, relay_event, relay_timestamp,
+    replay_recovered_lifecycle, unix_timestamp,
+};
+use crate::http::{
+    ReadRequestError, denial_json, denied, error, get_query, query, read_json, read_request, reply,
+};
+use relay_core::{
+    AgentRecord, AgentRegistry, Json, Store, parse_json, parse_rfc3339_millis, read_secret_file,
+};
+use std::collections::HashMap;
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, thread};
+
 /// Upper bound on simultaneous in-flight connections. The accept loop
 /// sheds excess connections with 503 instead of spawning unbounded
 /// threads: each thread carries a stack plus a 10s read timeout, so a
 /// slow flood could otherwise exhaust memory or file descriptors.
 const MAX_CONNECTIONS: usize = 32;
-/// Upper bound on the request line plus all header lines, in bytes.
-const MAX_HEADER_BLOCK_BYTES: usize = 8 * 1024;
-/// Upper bound on the number of header lines in one request.
-const MAX_HEADER_COUNT: usize = 100;
 const MAX_FINISHED_PROCS: usize = 128;
 const FINISHED_PROC_RETENTION: Duration = Duration::from_secs(60 * 60);
 const COMPAT_OUTPUT_CAP: usize = 2 * 1024 * 1024;
@@ -35,23 +41,6 @@ const COMPAT_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
 #[cfg(any(target_os = "macos", test))]
 const SESSION_IS_REMOTE: u32 = 0x1000;
-
-struct Config {
-    secret_file: PathBuf,
-    control_secret_file: Option<PathBuf>,
-    state_file: PathBuf,
-    agent_registry_file: PathBuf,
-    port: u16,
-    tailscale_ip: Option<IpAddr>,
-    max_events: usize,
-    github_watch_repos: Vec<String>,
-    github_watch_interval: Duration,
-    update_directory: PathBuf,
-    update_interval: Duration,
-    update_policy: update::Policy,
-    update_ready_file: Option<PathBuf>,
-    review_state_file: PathBuf,
-}
 struct Server {
     secret: String,
     control_secret: Option<String>,
@@ -62,14 +51,12 @@ struct Server {
     review_loop_shadow: bool,
     review_config: Mutex<Option<Arc<review_loop::ReviewLoopConfig>>>,
 }
-
 /// Live handles deliberately disappear on restart; the durable half lives in
 /// `relay-core::AgentRegistry` and records the resulting orphan/loss state.
 struct Supervisor {
     registry: Arc<AgentRegistry>,
     procs: Mutex<HashMap<String, ProcEntry>>,
 }
-
 struct ProcEntry {
     child: Child,
     process_group: i32,
@@ -85,7 +72,6 @@ struct ProcEntry {
     stdout: Arc<Mutex<CappedOutput>>,
     stderr: Arc<Mutex<CappedOutput>>,
 }
-
 #[derive(Default)]
 struct CappedOutput {
     bytes: Vec<u8>,
@@ -108,7 +94,6 @@ impl CappedOutput {
         )
     }
 }
-
 enum ProcRoute<'a> {
     Poll(&'a str),
     Kill(&'a str),
@@ -118,25 +103,10 @@ enum AgentRoute<'a> {
     Status(&'a str),
     Logs(&'a str),
 }
-struct Request {
-    method: String,
-    target: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
 struct SpawnRequest {
     command: exec::ExecRequest,
     execution_id: Option<String>,
 }
-
-#[derive(Debug)]
-enum ReadRequestError {
-    Message(String),
-    ExecutionDenied,
-    HeadersTooLarge,
-}
-
 fn main() {
     logging::init();
     if let Err(error) = run() {
@@ -144,7 +114,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 fn run() -> Result<(), String> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("config") {
@@ -336,7 +305,6 @@ fn run() -> Result<(), String> {
         thread::park();
     }
 }
-
 fn run_timeline(arguments: &[String]) -> Result<(), String> {
     let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
     let mut task_id = None;
@@ -369,7 +337,6 @@ fn run_timeline(arguments: &[String]) -> Result<(), String> {
     print!("{}", timeline_output(&task_id, &events));
     Ok(())
 }
-
 fn timeline_output(task_id: &str, events: &[Json]) -> String {
     if events.is_empty() {
         return format!("No durable audit events for task {task_id}.\n");
@@ -411,11 +378,9 @@ fn timeline_output(task_id: &str, events: &[Json]) -> String {
     }
     output
 }
-
 fn event_text<'a>(event: &'a Json, field: &str) -> &'a str {
     event.object(field).and_then(Json::as_str).unwrap_or("?")
 }
-
 fn phase_events<'a>(events: &'a [Json], start: &str, end: &str) -> Option<(&'a Json, &'a Json)> {
     for (index, left) in events.iter().enumerate() {
         if event_text(left, "kind") != start {
@@ -430,7 +395,6 @@ fn phase_events<'a>(events: &'a [Json], start: &str, end: &str) -> Option<(&'a J
     }
     None
 }
-
 fn same_clock_duration(left: &Json, right: &Json) -> Option<u64> {
     (event_text(left, "clock") == event_text(right, "clock"))
         .then(|| {
@@ -439,140 +403,15 @@ fn same_clock_duration(left: &Json, right: &Json) -> Option<u64> {
         })
         .flatten()
 }
-
 fn timestamp_millis(value: &str) -> Option<u64> {
     parse_rfc3339_millis(value)
 }
-
 fn format_duration(millis: u64) -> String {
     format!("{}.{:03}s", millis / 1_000, millis % 1_000)
 }
-
-fn server_config(arguments: Vec<String>) -> Result<Config, String> {
-    let mut secret_file = env::var_os("ZIGZAG_SECRET_FILE").map(PathBuf::from);
-    let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
-    let mut control_secret_file = env::var_os("ZIGZAG_CONTROL_SECRET_FILE").map(PathBuf::from);
-    let mut port = 8765;
-    let mut tailscale_ip = None;
-    let mut max_events = 1000;
-    let mut github_watch_repos = Vec::new();
-    let mut github_watch_interval = Duration::from_secs(30);
-    let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);
-    let mut update_interval = env::var("ZIGZAG_UPDATE_INTERVAL")
-        .ok()
-        .map(|value| value.parse::<u64>().map(Duration::from_secs))
-        .transpose()
-        .map_err(|_| "ZIGZAG_UPDATE_INTERVAL must be an integer".to_owned())?
-        .unwrap_or(Duration::from_secs(60 * 60));
-    let mut update_policy = env::var("ZIGZAG_UPDATE_POLICY")
-        .ok()
-        .map(|value| update::Policy::parse(&value))
-        .transpose()?
-        .unwrap_or(update::Policy::Enabled);
-    let mut update_ready_file = None;
-    let mut values = arguments.into_iter();
-    while let Some(argument) = values.next() {
-        let value = |values: &mut std::vec::IntoIter<String>, name: &str| {
-            values
-                .next()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
-        match argument.as_str() {
-            "--secret-file" => secret_file = Some(PathBuf::from(value(&mut values, "--secret-file")?)),
-            "--control-secret-file" => control_secret_file = Some(PathBuf::from(value(&mut values, "--control-secret-file")?)),
-            "--state-file" => state_file = Some(PathBuf::from(value(&mut values, "--state-file")?)),
-            "--port" => port = value(&mut values, "--port")?.parse().map_err(|_| "--port must be a valid u16".to_owned())?,
-            "--tailscale-ip" => {
-                let address = value(&mut values, "--tailscale-ip")?
-                    .parse()
-                    .map_err(|_| "--tailscale-ip must be an IP address".to_owned())?;
-                if !is_tailscale_ipv4(address) {
-                    return Err("--tailscale-ip must be a Tailscale IPv4 address".to_owned());
-                }
-                tailscale_ip = Some(address);
-            }
-            "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
-            "--watch-repo" => {
-                let repo = value(&mut values, "--watch-repo")?;
-                if !valid_github_repo(&repo) {
-                    return Err("--watch-repo must be an OWNER/REPO GitHub name".to_owned());
-                }
-                if !github_watch_repos.contains(&repo) {
-                    github_watch_repos.push(repo);
-                }
-            }
-            "--watch-interval" => {
-                let seconds = value(&mut values, "--watch-interval")?
-                    .parse::<u64>()
-                    .map_err(|_| "--watch-interval must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
-                }
-                github_watch_interval = Duration::from_secs(seconds);
-            }
-            "--update-dir" => update_directory = Some(PathBuf::from(value(&mut values, "--update-dir")?)),
-            "--update-interval" => {
-                let seconds = value(&mut values, "--update-interval")?.parse::<u64>()
-                    .map_err(|_| "--update-interval must be an integer".to_owned())?;
-                if seconds > 24 * 60 * 60 { return Err("--update-interval must be at most 86400 seconds".to_owned()); }
-                update_interval = Duration::from_secs(seconds);
-            }
-            "--update-policy" => update_policy = update::Policy::parse(&value(&mut values, "--update-policy")?)?,
-            "--update-ready-file" => update_ready_file = Some(PathBuf::from(value(&mut values, "--update-ready-file")?)),
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
-            _ => return Err(format!("unknown argument: {argument}")),
-        }
-    }
-    let secret_file =
-        secret_file.ok_or_else(|| "--secret-file or ZIGZAG_SECRET_FILE is required".to_owned())?;
-    let state_file =
-        state_file.ok_or_else(|| "--state-file or ZIGZAG_STATE_FILE is required".to_owned())?;
-    if max_events == 0 {
-        return Err("--max-events must be greater than zero".to_owned());
-    }
-    let agent_registry_file = state_file.with_extension("agents.json");
-    let update_directory = update_directory.unwrap_or_else(|| {
-        state_file
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("relay")
-    });
-    let review_state_file = state_file.with_extension("reviews.json");
-    Ok(Config {
-        secret_file,
-        control_secret_file,
-        state_file,
-        agent_registry_file,
-        port,
-        tailscale_ip,
-        max_events,
-        github_watch_repos,
-        github_watch_interval,
-        update_directory,
-        update_interval,
-        update_policy,
-        update_ready_file,
-        review_state_file,
-    })
-}
-
-fn valid_github_repo(repo: &str) -> bool {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return false;
-    };
-    !owner.is_empty()
-        && !name.is_empty()
-        && !name.contains('/')
-        && owner
-            .bytes()
-            .chain(name.bytes())
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
 fn should_start_legacy_watch(review_loop_authoritative: bool, repositories: &[String]) -> bool {
     !review_loop_authoritative && !repositories.is_empty()
 }
-
 fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration) {
     loop {
         for repo in &repos {
@@ -610,7 +449,6 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
         thread::sleep(interval);
     }
 }
-
 pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> {
     let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
     let request = exec::ExecRequest {
@@ -632,7 +470,6 @@ pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> 
     }
     parse_github_open_pull_requests(&result.stdout)
 }
-
 fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
     let value = parse_json(output)
         .map_err(|_| "GitHub PR discovery did not return the expected JSON".to_owned())?;
@@ -658,44 +495,12 @@ fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
         })
         .collect()
 }
-
-fn run_config(arguments: &[String]) -> Result<(), String> {
-    require_gui_login_session()?;
-    if is_get_allowlist(arguments) {
-        let policy = exec::load_policy()?;
-        println!("{}", policy.canonical_json());
-        return Ok(());
-    }
-    let file = allowlist_file(arguments)?;
-    let contents = std::fs::read_to_string(file)
-        .map_err(|error| format!("could not read allowlist file {file}: {error}"))?;
-    let policy = exec::Policy::parse(&contents)?;
-    exec::store_policy(&policy)?;
-    println!("{}", policy.canonical_json());
-    Ok(())
-}
-
-fn is_get_allowlist(arguments: &[String]) -> bool {
-    arguments.len() == 1 && arguments[0] == "get-allowlist"
-}
-
-fn allowlist_file(arguments: &[String]) -> Result<&str, String> {
-    let [command, flag, file] = arguments else {
-        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
-    };
-    if command != "set-allowlist" || flag != "--file" || file.is_empty() {
-        return Err("usage: zigzag config (get-allowlist | set-allowlist --file PATH)".to_owned());
-    }
-    Ok(file)
-}
-
 #[cfg(any(target_os = "macos", test))]
 fn is_local_gui_session(status: i32, attributes: u32) -> bool {
     status == 0
         && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
         && attributes & SESSION_IS_REMOTE == 0
 }
-
 /// Policy updates are intentionally an owner action from the local Aqua
 /// session, never an SSH action. Keychain access alone does not establish
 /// which terminal invoked this executable, so check the caller's session too.
@@ -721,12 +526,10 @@ fn require_gui_login_session() -> Result<(), String> {
         )
     }
 }
-
 #[cfg(not(target_os = "macos"))]
 fn require_gui_login_session() -> Result<(), String> {
     Err("privileged daemon operations require Shukant's local macOS GUI login session".to_owned())
 }
-
 fn resolve_tailscale_ip() -> Result<IpAddr, String> {
     let output = Command::new("tailscale").args(["ip", "-4"]).output().map_err(|error| format!("could not run tailscale ip -4: {error}; use --tailscale-ip only for explicit test/development overrides"))?;
     if !output.status.success() {
@@ -741,11 +544,9 @@ fn resolve_tailscale_ip() -> Result<IpAddr, String> {
         .parse()
         .map_err(|_| "tailscale ip -4 returned an invalid address".to_owned())
 }
-
 fn is_tailscale_ipv4(address: IpAddr) -> bool {
     matches!(address, IpAddr::V4(address) if address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
 }
-
 /// Admission control for inbound connections. The permit is held for the
 /// whole handler thread and released on drop, so at most `max` connections
 /// are ever in flight at once.
@@ -790,7 +591,6 @@ impl Drop for ConnectionPermit {
         *active = active.saturating_sub(1);
     }
 }
-
 fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimiter>) {
     for stream in listener.incoming() {
         match stream {
@@ -811,13 +611,11 @@ fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimit
         }
     }
 }
-
 fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
     handle_with_policy(stream, state, || {
         require_gui_login_session().and_then(|_| exec::load_policy())
     })
 }
-
 fn handle_with_policy<F>(
     stream: TcpStream,
     state: Arc<Server>,
@@ -828,7 +626,6 @@ where
 {
     handle_with_services(stream, state, load_policy, review_loop::gate_report)
 }
-
 fn handle_with_services<F, G>(
     mut stream: TcpStream,
     state: Arc<Server>,
@@ -936,7 +733,6 @@ where
         _ => reply(&mut stream, 404, error("not_found")),
     }
 }
-
 fn review_gate_request<G>(
     stream: &mut TcpStream,
     state: &Server,
@@ -983,7 +779,6 @@ where
         }
     }
 }
-
 fn review_gate_parameters(target: &str) -> Result<(String, u64), ()> {
     let values = query(target).map_err(|_| ())?;
     let allowed = ["repository", "pull_request"];
@@ -1002,7 +797,6 @@ fn review_gate_parameters(target: &str) -> Result<(String, u64), ()> {
         .ok_or(())?;
     Ok((repository, number))
 }
-
 fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
     if path == "/v1/agents" {
         return Some(AgentRoute::List);
@@ -1013,7 +807,6 @@ fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
     }
     (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
 }
-
 fn agent_request(
     stream: &mut TcpStream,
     state: &Server,
@@ -1102,7 +895,6 @@ fn agent_request(
         }
     }
 }
-
 fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
     let body = match String::from_utf8(body) {
         Ok(body) => body,
@@ -1151,9 +943,7 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
         Err(_) => reply(stream, 500, error("could_not_persist_event")),
     }
 }
-
 // --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
-
 /// Roots the relay may create or remove git worktrees under. Candidate paths
 /// are canonicalized before the prefix check, so `..` segments and symlinks
 /// cannot escape the root.
@@ -1161,7 +951,6 @@ const WORKTREE_ALLOWED_ROOTS: [&str; 2] = ["/private/tmp/", "/Users/shukant/.cod
 /// Root the `repo` parameter of worktree creation must live under, so callers
 /// cannot point `git worktree add` at an arbitrary repository.
 const WORKTREE_REPO_ROOT: &str = "/Users/shukant/Workspace/";
-
 /// Failure from the worktree core logic: the HTTP status and the snake_case
 /// error body the relay replies with. Handlers stay thin so tests can drive
 /// `worktree_create_plan` / `worktree_delete_plan` directly.
@@ -1170,7 +959,6 @@ struct WorktreeError {
     code: u16,
     message: &'static str,
 }
-
 /// Canonicalize each configured root, dropping roots that do not exist. An
 /// empty result rejects every path (fail closed).
 fn canonical_worktree_roots() -> Vec<PathBuf> {
@@ -1179,7 +967,6 @@ fn canonical_worktree_roots() -> Vec<PathBuf> {
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect()
 }
-
 /// Canonicalize `path` (which must exist) and require it to sit under `roots`.
 fn canonical_path_under_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, WorktreeError> {
     let canonical = std::fs::canonicalize(path).map_err(|_| WorktreeError {
@@ -1195,7 +982,6 @@ fn canonical_path_under_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf,
         })
     }
 }
-
 /// Resolve the worktree path for creation. The path itself may not exist yet,
 /// so canonicalize the parent directory and re-attach the leaf: canonicalizing
 /// the parent defeats `..` traversal and symlink escapes in every ancestor.
@@ -1220,7 +1006,6 @@ fn resolve_new_worktree_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, Wo
     })?;
     Ok(canonical_path_under_roots(parent, roots)?.join(leaf))
 }
-
 /// Resolve the worktree path for deletion: it must already exist.
 fn resolve_existing_worktree_path(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, WorktreeError> {
     let path = Path::new(raw);
@@ -1232,7 +1017,6 @@ fn resolve_existing_worktree_path(raw: &str, roots: &[PathBuf]) -> Result<PathBu
     }
     canonical_path_under_roots(path, roots)
 }
-
 /// Resolve the `repo` parameter: it must exist and live under the workspace
 /// root.
 fn resolve_worktree_repo(raw: &str, repo_root: &Path) -> Result<PathBuf, WorktreeError> {
@@ -1256,7 +1040,6 @@ fn resolve_worktree_repo(raw: &str, repo_root: &Path) -> Result<PathBuf, Worktre
         })
     }
 }
-
 /// Reject branch names git would treat as options or refuse as ref names.
 /// `git` itself is the final arbiter; this keeps hostile input from ever
 /// reaching the command line.
@@ -1278,7 +1061,6 @@ fn valid_worktree_branch(branch: &str) -> bool {
         .chars()
         .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
 }
-
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, WorktreeError> {
     Command::new("git")
         .arg("-C")
@@ -1293,7 +1075,6 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, Worktr
             }
         })
 }
-
 /// True when `refs/heads/<branch>` exists. Exit 0 means present, exit 1 means
 /// absent; anything else is a genuine git failure.
 fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
@@ -1315,7 +1096,6 @@ fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeErr
         }),
     }
 }
-
 /// True when the branch is already checked out in some worktree, which `git
 /// worktree add` would refuse.
 fn worktree_branch_checked_out(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
@@ -1331,7 +1111,6 @@ fn worktree_branch_checked_out(repo: &Path, branch: &str) -> Result<bool, Worktr
         .lines()
         .any(|line| line == wanted))
 }
-
 /// Core of `POST /v1/worktrees`: validate, then run `git worktree add`,
 /// creating the branch when it does not exist yet. Returns the 200 body.
 fn worktree_create_plan(
@@ -1400,7 +1179,6 @@ fn worktree_create_plan(
         ("branch".to_owned(), Json::String(branch.to_owned())),
     ]))
 }
-
 /// Core of `DELETE /v1/worktrees`. `agents` carries `(state, command)` pairs
 /// from the agent registry for the live-attachment check. Returns the 200 body.
 fn worktree_delete_plan(
@@ -1482,7 +1260,6 @@ fn worktree_delete_plan(
         ("path".to_owned(), Json::String(path_str.into_owned())),
     ]))
 }
-
 fn worktree_request_fields(
     body: &[u8],
     allowed: &[&str],
@@ -1512,7 +1289,6 @@ fn worktree_request_fields(
     }
     Ok(fields)
 }
-
 fn worktree_string_field(fields: &[(String, Json)], name: &str) -> Result<String, WorktreeError> {
     fields
         .iter()
@@ -1525,7 +1301,6 @@ fn worktree_string_field(fields: &[(String, Json)], name: &str) -> Result<String
             message: "invalid_worktree_request",
         })
 }
-
 fn worktree_create(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     let fields = match worktree_request_fields(&body, &["path", "branch", "repo"]) {
         Ok(fields) => fields,
@@ -1547,7 +1322,6 @@ fn worktree_create(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> 
         Err(failure) => reply(stream, failure.code, error(failure.message)),
     }
 }
-
 fn worktree_delete(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
     let fields = match worktree_request_fields(&body, &["path"]) {
         Ok(fields) => fields,
@@ -1567,7 +1341,6 @@ fn worktree_delete(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Res
         Err(failure) => reply(stream, failure.code, error(failure.message)),
     }
 }
-
 fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     let request = match parse_exec_request(&body) {
         Ok(request) => request,
@@ -1630,7 +1403,6 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     }
     reply(stream, 200, result.to_json())
 }
-
 fn spawn_request(
     stream: &mut TcpStream,
     state: &Server,
@@ -1763,12 +1535,10 @@ fn spawn_request(
         }
     }
 }
-
 struct SpawnedProc {
     id: String,
     handle: String,
 }
-
 fn spawn_proc(
     supervisor: &Supervisor,
     store: Arc<Store>,
@@ -1885,7 +1655,6 @@ fn spawn_proc(
     prune_procs(&mut table, Instant::now());
     Ok(SpawnedProc { id, handle })
 }
-
 fn drain_to_capture(
     mut pipe: impl Read + Send + 'static,
     capture: Arc<Mutex<CappedOutput>>,
@@ -1925,7 +1694,6 @@ fn drain_to_capture(
         }
     });
 }
-
 fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
@@ -1948,7 +1716,6 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
     };
     reply(stream, 200, result)
 }
-
 fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
@@ -1987,12 +1754,10 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
     };
     reply(stream, 200, result)
 }
-
 fn output_is_complete(entry: &ProcEntry) -> bool {
     entry.stdout.lock().is_ok_and(|output| output.complete)
         && entry.stderr.lock().is_ok_and(|output| output.complete)
 }
-
 fn proc_json(entry: &ProcEntry) -> Json {
     let (stdout, stdout_truncated) = entry
         .stdout
@@ -2024,12 +1789,10 @@ fn proc_json(entry: &ProcEntry) -> Json {
         ),
     ])
 }
-
 fn kill_process_group(process_group: i32) -> bool {
     // `process_group(0)` above creates a group whose id is the child PID.
     unsafe { libc::kill(-process_group, libc::SIGTERM) == 0 }
 }
-
 fn force_kill_process_group(process_group: i32) -> bool {
     // Review-loop cleanup is terminal: obsolete reviewers and owners must not
     // survive supersession or merge, including shells that ignore SIGTERM.
@@ -2037,11 +1800,9 @@ fn force_kill_process_group(process_group: i32) -> bool {
     let killed = unsafe { libc::kill(-process_group, libc::SIGKILL) == 0 };
     terminated || killed
 }
-
 fn process_group_running(process_group: i32) -> bool {
     unsafe { libc::kill(-process_group, 0) == 0 }
 }
-
 #[cfg(target_os = "macos")]
 fn process_identity(pid: i32) -> Option<String> {
     let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
@@ -2058,7 +1819,6 @@ fn process_identity(pid: i32) -> Option<String> {
     (written as usize == size)
         .then(|| format!("macos:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
-
 #[cfg(target_os = "linux")]
 fn process_identity(pid: i32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -2066,12 +1826,10 @@ fn process_identity(pid: i32) -> Option<String> {
     let start_ticks = after_command.split_whitespace().nth(19)?;
     Some(format!("linux:{start_ticks}"))
 }
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn process_identity(_pid: i32) -> Option<String> {
     None
 }
-
 fn recovered_agent_identity_matches(agent: &AgentRecord) -> bool {
     process_group_running(agent.process_group)
         && agent
@@ -2080,11 +1838,9 @@ fn recovered_agent_identity_matches(agent: &AgentRecord) -> bool {
             .zip(process_identity(agent.leader_pid).as_deref())
             .is_some_and(|(expected, current)| expected == current)
 }
-
 fn managed_agent_running(agent: &AgentRecord) -> bool {
     managed_agent_running_with(agent, recovered_agent_identity_matches)
 }
-
 fn managed_agent_running_with(
     agent: &AgentRecord,
     orphan_is_current: impl Fn(&AgentRecord) -> bool,
@@ -2095,7 +1851,6 @@ fn managed_agent_running_with(
         _ => false,
     }
 }
-
 fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String> {
     loop {
         let handle = random_hex_128()?;
@@ -2104,7 +1859,6 @@ fn unique_handle(entries: &HashMap<String, ProcEntry>) -> Result<String, String>
         }
     }
 }
-
 fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant) {
     // The independent reaper does durable transitions. This compatibility
     // pruning pass only bounds completed in-memory handles.
@@ -2123,128 +1877,6 @@ fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant) {
         entries.remove(&handle);
     }
 }
-
-fn unix_timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}
-
-fn relay_timestamp() -> String {
-    relay_core::rfc3339_timestamp()
-}
-
-fn relay_clock() -> String {
-    static CLOCK: OnceLock<String> = OnceLock::new();
-    CLOCK
-        .get_or_init(|| {
-            let host = std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("COMPUTERNAME"))
-                .unwrap_or_else(|_| "unknown-host".to_owned());
-            // Linux exposes a real boot identifier; macOS has no equivalent stable
-            // portable file in this no-dependency relay, so make that absence explicit.
-            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "boot-unknown".to_owned());
-            // The instance suffix prevents a relay restart from being treated
-            // as one continuous clock when a host boot identifier is absent.
-            format!(
-                "mac-relay:{host}:{boot}:instance-{}",
-                random_hex_128().unwrap_or_else(|_| format!("pid-{}", std::process::id()))
-            )
-        })
-        .clone()
-}
-
-fn random_hex_128() -> Result<String, String> {
-    let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut bytes))
-        .map_err(|error| format!("could not generate identifier: {error}"))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-fn new_execution_id() -> Result<String, String> {
-    Ok(format!("relay-{}", random_hex_128()?))
-}
-
-fn relay_event(kind: &str, task_id: &str, execution_id: &str, payload: Json) -> Json {
-    relay_event_at(kind, task_id, execution_id, relay_timestamp(), payload)
-}
-
-fn relay_event_at(
-    kind: &str,
-    task_id: &str,
-    execution_id: &str,
-    occurred_at: String,
-    payload: Json,
-) -> Json {
-    Json::Object(vec![
-        (
-            "id".to_owned(),
-            Json::String(format!("relay:{execution_id}:{kind}")),
-        ),
-        ("schema_version".to_owned(), Json::number(1)),
-        ("task_id".to_owned(), Json::String(task_id.to_owned())),
-        (
-            "execution_id".to_owned(),
-            Json::String(execution_id.to_owned()),
-        ),
-        ("kind".to_owned(), Json::String(kind.to_owned())),
-        ("source".to_owned(), Json::String("mac-relay".to_owned())),
-        ("occurred_at".to_owned(), Json::String(occurred_at)),
-        ("clock".to_owned(), Json::String(relay_clock())),
-        ("payload".to_owned(), payload),
-    ])
-}
-
-fn persist_first_output(store: &Store, agent: &AgentRecord) -> Result<(), String> {
-    let Some(occurred_at) = agent.first_output_at.clone() else {
-        return Ok(());
-    };
-    store
-        .add(relay_event_at(
-            "first_output",
-            &agent.task_id,
-            &agent.execution_id,
-            occurred_at,
-            Json::Object(vec![
-                ("agent_id".to_owned(), Json::String(agent.id.clone())),
-                (
-                    "stream".to_owned(),
-                    Json::String(
-                        agent
-                            .first_output_stream
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                    ),
-                ),
-                (
-                    "bytes".to_owned(),
-                    Json::number(agent.first_output_bytes.unwrap_or_default()),
-                ),
-            ]),
-        ))
-        .map(|_| ())
-}
-
-fn replay_recovered_lifecycle(store: &Store, agent: &AgentRecord) -> Result<(), String> {
-    store.add(relay_event(
-        "process_spawned",
-        &agent.task_id,
-        &agent.execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(agent.id.clone())),
-            ("recovered".to_owned(), Json::Bool(true)),
-        ]),
-    ))?;
-    persist_first_output(store, agent)
-}
-
 fn start_reaper(state: Arc<Server>) {
     thread::spawn(move || {
         loop {
@@ -2267,7 +1899,6 @@ fn start_reaper(state: Arc<Server>) {
         }
     });
 }
-
 fn update_proc_status_with_handle(
     entry: &mut ProcEntry,
     handle: &str,
@@ -2350,7 +1981,6 @@ fn update_proc_status_with_handle(
         }
     }
 }
-
 fn proc_route(path: &str) -> Option<ProcRoute<'_>> {
     let path = path.strip_prefix("/v1/proc/")?;
     if let Some(handle) = path.strip_suffix("/kill") {
@@ -2359,7 +1989,6 @@ fn proc_route(path: &str) -> Option<ProcRoute<'_>> {
         (!path.is_empty() && !path.contains('/')).then_some(ProcRoute::Poll(path))
     }
 }
-
 fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
     let parsed = std::str::from_utf8(body)
         .ok()
@@ -2370,7 +1999,6 @@ fn parse_exec_request(body: &[u8]) -> Result<exec::ExecRequest, Json> {
     let denied_id = exec::request_id(&parsed);
     exec::parse_request(&parsed).map_err(|_| denial_json(&denied_id))
 }
-
 fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
     let parsed = std::str::from_utf8(body)
         .ok()
@@ -2421,23 +2049,6 @@ fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
         execution_id,
     })
 }
-
-fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
-    let (status, body) = denial_response(id);
-    reply(stream, status, body)
-}
-
-fn denial_response(id: &str) -> (u16, Json) {
-    (200, denial_json(id))
-}
-
-fn denial_json(id: &str) -> Json {
-    Json::Object(vec![
-        ("id".to_owned(), Json::String(id.to_owned())),
-        ("error".to_owned(), Json::String("denied".to_owned())),
-    ])
-}
-
 fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
     let (after, timeout, epoch) = match get_query(target) {
         Ok(query) => query,
@@ -2459,239 +2070,6 @@ fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), Strin
     reply(stream, 200, read_json(result))
 }
 
-fn get_query(target: &str) -> Result<(u64, u64, String), String> {
-    let query = query(target)?;
-    let after = query.get("after").map_or(Ok(0), |value| {
-        value
-            .parse::<u64>()
-            .map_err(|_| "after must be a non-negative integer".to_owned())
-    })?;
-    let timeout = query.get("timeout").map_or(Ok(50), |value| {
-        value
-            .parse::<u64>()
-            .map_err(|_| "timeout must be an integer".to_owned())
-    })?;
-    if timeout > 55 {
-        return Err("timeout must be between 0 and 55".to_owned());
-    }
-    Ok((
-        after,
-        timeout,
-        query.get("epoch").cloned().unwrap_or_default(),
-    ))
-}
-
-fn read_json(result: ReadResult) -> Json {
-    Json::Object(vec![
-        ("epoch".to_owned(), Json::String(result.epoch)),
-        ("reset".to_owned(), Json::Bool(result.reset)),
-        ("lost".to_owned(), Json::Bool(result.lost)),
-        (
-            "events".to_owned(),
-            Json::Array(
-                result
-                    .events
-                    .iter()
-                    .map(|event| event.response_json())
-                    .collect(),
-            ),
-        ),
-        ("next".to_owned(), Json::number(result.next)),
-    ])
-}
-
-fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
-    let mut reader = BufReader::new(stream);
-    // The budget covers the request line too: an unbounded request line is
-    // the same allocation attack as unbounded headers.
-    let mut budget = MAX_HEADER_BLOCK_BYTES;
-    let first = read_header_line(&mut reader, &mut budget)?
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?;
-    let mut parts = first.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
-        .to_owned();
-    let target = parts
-        .next()
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
-        .to_owned();
-    if parts.next().is_none() {
-        return Err(ReadRequestError::Message(
-            "malformed request line".to_owned(),
-        ));
-    }
-    let mut headers = HashMap::new();
-    let mut header_count = 0;
-    loop {
-        let line = read_header_line(&mut reader, &mut budget)?
-            .ok_or_else(|| ReadRequestError::Message("could not read headers".to_owned()))?;
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        // Count lines, not map entries: duplicate header names collapse in
-        // the map, but each line still costs the peer nothing to send.
-        header_count += 1;
-        if header_count > MAX_HEADER_COUNT {
-            return Err(ReadRequestError::HeadersTooLarge);
-        }
-        let (name, value) = line
-            .trim_end()
-            .split_once(':')
-            .ok_or_else(|| ReadRequestError::Message("malformed header".to_owned()))?;
-        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-    }
-    let length = headers.get("content-length").map_or(Ok(0), |value| {
-        value
-            .parse::<usize>()
-            .map_err(|_| ReadRequestError::Message("invalid content length".to_owned()))
-    })?;
-    if length > MAX_BODY {
-        if method == "POST"
-            && matches!(
-                target.split('?').next(),
-                Some("/v1/exec") | Some("/v1/spawn")
-            )
-        {
-            return Err(ReadRequestError::ExecutionDenied);
-        }
-        return Err(ReadRequestError::Message(
-            "request body too large".to_owned(),
-        ));
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).map_err(|_| {
-        if method == "POST"
-            && matches!(
-                target.split('?').next(),
-                Some("/v1/exec") | Some("/v1/spawn")
-            )
-        {
-            ReadRequestError::ExecutionDenied
-        } else {
-            ReadRequestError::Message("short request body".to_owned())
-        }
-    })?;
-    Ok(Request {
-        method,
-        target,
-        headers,
-        body,
-    })
-}
-
-/// Read one header line, deducting its bytes from `budget`.
-///
-/// The budget caps the whole header block (request line included). Reads go
-/// through `take(budget)`, so a peer can never make the block larger than the
-/// cap no matter how long a single line is: `read_until` returns as soon as
-/// the budget is consumed, even without a line terminator. `None` is a clean
-/// EOF before any byte of the line.
-fn read_header_line(
-    reader: &mut BufReader<&mut TcpStream>,
-    budget: &mut usize,
-) -> Result<Option<String>, ReadRequestError> {
-    if *budget == 0 {
-        return Err(ReadRequestError::HeadersTooLarge);
-    }
-    let mut line = Vec::new();
-    let consumed = reader
-        .by_ref()
-        .take(*budget as u64)
-        .read_until(b'\n', &mut line)
-        .map_err(|_| ReadRequestError::Message("could not read headers".to_owned()))?;
-    *budget -= consumed;
-    if consumed == 0 {
-        return Ok(None);
-    }
-    if !line.ends_with(b"\n") {
-        // Budget exhausted before the terminator: the header block is over
-        // the cap. (A peer that disconnects mid-header lands here too; it is
-        // still a client error, as before.)
-        return Err(ReadRequestError::HeadersTooLarge);
-    }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|_| ReadRequestError::Message("malformed header".to_owned()))
-}
-
-fn query(target: &str) -> Result<HashMap<String, String>, String> {
-    let Some((_, raw)) = target.split_once('?') else {
-        return Ok(HashMap::new());
-    };
-    let pairs: Vec<_> = raw
-        .split('&')
-        .filter(|value| !value.is_empty())
-        .map(|item| {
-            let (key, value) = item.split_once('=').unwrap_or((item, ""));
-            Ok::<_, String>((percent_decode(key)?, percent_decode(value)?))
-        })
-        .collect::<Result<_, _>>()?;
-    let mut values = HashMap::new();
-    for (key, value) in pairs {
-        if values.insert(key, value).is_some() {
-            return Err("duplicate query parameter".to_owned());
-        }
-    }
-    Ok(values)
-}
-fn percent_decode(input: &str) -> Result<String, String> {
-    // Query strings use form-encoding, where a literal '+' means space.
-    // Translate '+' first so an encoded "%2B" still decodes to '+'.
-    let translated = input.replace('+', " ");
-    // The percent-encoding crate passes malformed '%' sequences through
-    // untouched instead of failing, so validate escapes up front. This keeps
-    // the old strict contract: query values feed agent/log lookups and event
-    // reads on the auth boundary, and bad input must be a 400, never silently
-    // accepted.
-    let mut bytes = translated.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            let valid = bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                && bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit());
-            if !valid {
-                return Err("invalid URL encoding".to_owned());
-            }
-        }
-    }
-    percent_encoding::percent_decode_str(&translated)
-        .decode_utf8()
-        .map(|decoded| decoded.into_owned())
-        .map_err(|_| "invalid URL encoding".to_owned())
-}
-fn authorized(supplied: &str, secret: &str) -> bool {
-    let expected = format!("Bearer {secret}");
-    let mut difference = expected.len() ^ supplied.len();
-    for (index, left) in expected.bytes().enumerate() {
-        difference |= (left ^ supplied.as_bytes().get(index).copied().unwrap_or(0)) as usize;
-    }
-    difference == 0
-}
-fn error(message: &str) -> Json {
-    Json::Object(vec![("error".to_owned(), Json::String(message.to_owned()))])
-}
-fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
-    // Log response completion with status code and duration.
-    let log_source = stream
-        .peer_addr()
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-    logging::log_response(code, &log_source);
-    let body = value.to_json();
-    let reason = match code {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        409 => "Conflict",
-        431 => "Request Header Fields Too Large",
-        503 => "Service Unavailable",
-        _ => "Internal Server Error",
-    };
-    stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 pub(crate) fn test_updater() -> Arc<update::Manager> {
     Arc::new(update::Manager::new(update::Config {
@@ -2701,10 +2079,18 @@ pub(crate) fn test_updater() -> Arc<update::Manager> {
         ready_file: None,
     }))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{allowlist_file, is_get_allowlist, valid_github_repo};
+    use crate::events::relay_event_at;
+    use crate::exec;
+    use crate::http::{
+        MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, denial_response, percent_decode,
+    };
+    use crate::review_loop;
+    use crate::update;
+    use std::io::Write;
 
     #[test]
     fn malformed_get_query_is_a_bad_request() {
