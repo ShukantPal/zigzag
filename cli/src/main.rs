@@ -15,6 +15,7 @@
 //!   zzapi agents create --prompt "Fix the flaky test" \
 //!       --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
 //!   zzapi agents logs <id> --follow
+//!   zzapi agents transcript <id> --tail 4000
 //!   zzapi exec --bin gh --args pr list --repo ShukantPal/zigzag
 //!   zzapi events --follow
 
@@ -226,6 +227,17 @@ enum AgentsCmd {
         /// Prefix each line with [stdout]/[stderr]
         #[arg(long)]
         prefix: bool,
+    },
+    /// Read an agent's captured transcript
+    Transcript {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Cap, in bytes, on newest transcript output
+        #[arg(long)]
+        tail: Option<u64>,
+        /// Poll for and print newly appended transcript output
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -836,6 +848,125 @@ fn cmd_agents_logs(
     Ok(())
 }
 
+fn cmd_agents_transcript(
+    client: &Client,
+    id: &str,
+    tail: Option<u64>,
+    follow: bool,
+) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let mut previous = None;
+    loop {
+        let mut q = Vec::new();
+        if let Some(tail) = tail {
+            q.push(("tail", tail.to_string()));
+        }
+        let response = client.get(&format!("/v1/agents/{id}/transcript"), &q)?;
+        if client.json {
+            println!("{}", json_output(&response, follow));
+        } else if let Some(previous) = previous.as_ref() {
+            print_transcript_updates(previous, &response);
+        } else {
+            print_transcript(&response);
+        }
+
+        let complete = s(&response, "state") != "running";
+        previous = Some(response);
+        if !follow || complete {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
+fn print_transcript(transcript: &serde_json::Value) {
+    for key in [
+        "id",
+        "task_id",
+        "execution_id",
+        "state",
+        "started_at",
+        "exit_code",
+    ] {
+        let value = if key == "started_at" {
+            fmt_ts(transcript.get(key))
+        } else {
+            s(transcript, key)
+        };
+        println!("{key:<13} {value}");
+    }
+    let command = s(transcript, "command");
+    if !command.is_empty() {
+        println!("command       {command}");
+    }
+    print_transcript_section("prompt", transcript.get("prompt"));
+    print_transcript_section("last message", transcript.get("last_message"));
+    print_transcript_section("stdout", transcript.get("stdout"));
+    print_transcript_section("stderr", transcript.get("stderr"));
+    if transcript
+        .get("log_degraded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        eprintln!("warning: agent transcript is incomplete because log capture degraded");
+    }
+}
+
+fn print_transcript_section(name: &str, value: Option<&serde_json::Value>) {
+    let text = value.and_then(serde_json::Value::as_str).unwrap_or("");
+    if !text.is_empty() {
+        println!("\n--- {name} ---");
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+}
+
+fn print_transcript_updates(previous: &serde_json::Value, current: &serde_json::Value) {
+    for key in ["stdout", "stderr"] {
+        let before = previous
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let after = current
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let appended = appended_text(before, after);
+        if !appended.is_empty() {
+            println!("\n--- {key} ---");
+            print!("{appended}");
+            if !appended.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+}
+
+/// Return the text appended after `previous`. When `--tail` causes the relay
+/// to drop a leading prefix, preserve the longest suffix/prefix overlap.
+fn appended_text(previous: &str, current: &str) -> String {
+    if let Some(appended) = current.strip_prefix(previous) {
+        return appended.to_string();
+    }
+    if previous.contains(current) {
+        return String::new();
+    }
+    let max_overlap = previous.len().min(current.len());
+    for overlap in (0..=max_overlap).rev() {
+        let previous_start = previous.len() - overlap;
+        if previous.is_char_boundary(previous_start)
+            && current.is_char_boundary(overlap)
+            && previous[previous_start..] == current[..overlap]
+        {
+            return current[overlap..].to_string();
+        }
+    }
+    current.to_string()
+}
+
 fn log_retention_lost(response: &serde_json::Value, after: u64) -> bool {
     after_u64(response.get("dropped_before")).is_some_and(|dropped_before| after < dropped_before)
 }
@@ -1140,6 +1271,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 follow,
                 prefix,
             } => cmd_agents_logs(&client, &id, stream.as_deref(), after, tail, follow, prefix),
+            AgentsCmd::Transcript { id, tail, follow } => {
+                cmd_agents_transcript(&client, &id, tail, follow)
+            }
         },
         Commands::Worktrees { cmd } => match cmd {
             WorktreesCmd::Create { path, branch, repo } => {
@@ -1194,6 +1328,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_follow_emits_only_appended_output() {
+        assert_eq!(appended_text("first", "first second"), " second");
+        assert_eq!(appended_text("abcdef", "cdefghi"), "ghi");
+        assert_eq!(appended_text("already seen", "seen"), "");
+        assert_eq!(appended_text("hello ", "hello 🌍"), "🌍");
+    }
 
     #[test]
     fn exec_only_succeeds_with_an_explicit_zero_exit_code() {
