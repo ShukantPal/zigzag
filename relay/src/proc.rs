@@ -7,9 +7,10 @@ use crate::server::{Server, Supervisor};
 use crate::session::CappedOutput;
 use relay_core::{AgentRecord, AgentRegistry, Json, Store};
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,6 +43,49 @@ pub(crate) struct SpawnedProc {
 pub(crate) struct AgentSpawnDetails {
     pub(crate) worktree_path: Option<String>,
     pub(crate) deadline_at: Option<String>,
+    /// API-created Codex agents write their JSON event stream here. Generic
+    /// `/v1/spawn` processes continue to use only the diagnostics spool.
+    pub(crate) persist_transcript: bool,
+}
+
+/// Durable JSONL transcript for an API-created Codex agent.
+///
+/// This is deliberately independent of the agent registry's bounded
+/// diagnostics spool: users need the complete Codex event stream after the
+/// process has exited or the relay has restarted.
+pub(crate) fn agent_transcript_path(agent_id: &str) -> Option<PathBuf> {
+    if agent_id.len() != 32 || !agent_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join(".zigzag/agents/codex")
+            .join(format!("{agent_id}.jsonl")),
+    )
+}
+
+fn create_agent_transcript(agent_id: &str) -> Result<File, String> {
+    let path = agent_transcript_path(agent_id)
+        .ok_or_else(|| "could not construct agent transcript path".to_owned())?;
+    let parent = path
+        .parent()
+        .expect("agent transcript path always has a parent");
+    fs::create_dir_all(parent).map_err(|_| "could not create agent transcript directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|_| "could not create agent transcript".to_owned())
 }
 pub(crate) fn spawn_proc(
     supervisor: &Supervisor,
@@ -53,17 +97,41 @@ pub(crate) fn spawn_proc(
 ) -> Result<SpawnedProc, String> {
     let stdout = Arc::new(Mutex::new(CappedOutput::default()));
     let stderr = Arc::new(Mutex::new(CappedOutput::default()));
+    // Allocate the agent handle before launching so the child can write to a
+    // filename keyed by that handle rather than the (non-unique) task id.
+    let handle = {
+        let mut table = supervisor
+            .procs
+            .lock()
+            .map_err(|_| "process table lock poisoned".to_owned())?;
+        prune_procs(&mut table, Instant::now());
+        unique_handle(&table)?
+    };
+    let transcript = if details.persist_transcript {
+        Some(create_agent_transcript(&handle)?)
+    } else {
+        None
+    };
+    let stdout_stdio = transcript
+        .as_ref()
+        .map(File::try_clone)
+        .transpose()
+        .map_err(|_| "could not open agent transcript".to_owned())?
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::piped);
     let mut child = Command::new(path)
         .args(&request.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(stdout_stdio)
+        // Stderr remains in the existing diagnostics spool so callers can
+        // request it independently from Codex's JSONL stdout transcript.
         .stderr(Stdio::piped())
         // A dedicated process group makes kill requests cover the command's
         // descendants without involving the relay itself.
         .process_group(0)
         .spawn()
         .map_err(|error| error.to_string())?;
-    let child_stdout = child.stdout.take().expect("stdout was piped");
+    let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take().expect("stderr was piped");
     let process_group = child.id() as i32;
     let Some(process_identity) = process_identity(process_group) else {
@@ -75,7 +143,6 @@ pub(crate) fn spawn_proc(
         .lock()
         .map_err(|_| "process table lock poisoned".to_owned())?;
     prune_procs(&mut table, Instant::now());
-    let handle = unique_handle(&table)?;
     let id = request.id;
     let record = AgentRecord {
         id: handle.clone(),
@@ -125,14 +192,21 @@ pub(crate) fn spawn_proc(
         let _ = kill_process_group(process_group);
         return Err(error);
     }
-    drain_to_capture(
-        child_stdout,
-        Arc::clone(&stdout),
-        Arc::clone(&supervisor.registry),
-        Arc::clone(&store),
-        handle.clone(),
-        "stdout",
-    );
+    if let Some(child_stdout) = child_stdout {
+        drain_to_capture(
+            child_stdout,
+            Arc::clone(&stdout),
+            Arc::clone(&supervisor.registry),
+            Arc::clone(&store),
+            handle.clone(),
+            "stdout",
+        );
+    } else {
+        stdout
+            .lock()
+            .expect("stdout capture lock poisoned")
+            .complete = true;
+    }
     drain_to_capture(
         child_stderr,
         Arc::clone(&stderr),

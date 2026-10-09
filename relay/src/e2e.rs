@@ -10,6 +10,7 @@
 //! git repo, and no network is touched.
 
 use crate::exec;
+use crate::proc::agent_transcript_path;
 use crate::review_loop;
 use crate::routes::worktrees::{worktree_create_plan, worktree_delete_plan};
 use crate::tests::{
@@ -283,6 +284,73 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
         String::from_utf8_lossy(&output.stderr)
     );
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
+}
+
+/// API-created Codex agents save their JSON event stream outside the bounded
+/// diagnostics spool, so it remains available through the transcript API.
+#[test]
+fn e2e_agent_create_persists_transcript_and_serves_it() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let id = unique_id("agent-transcript");
+    let repo = agent_create_test_repo(&id);
+    let branch = format!("codex/{id}");
+    let worktree = std::env::temp_dir().join(format!("zigzag-{id}"));
+    let worktree_text = worktree.to_string_lossy();
+    let body = format!(
+        r#"{{"prompt":"persist-transcript","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}"}}"#,
+        repo.display()
+    );
+
+    let created = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents",
+        &body,
+    ));
+    let handle = created
+        .object("id")
+        .and_then(Json::as_str)
+        .expect("agent create response missing id")
+        .to_owned();
+    let completed = poll_until_complete(&state, &policy, &handle);
+    assert_eq!(
+        completed.object("exit_code").and_then(Json::as_u64),
+        Some(0)
+    );
+
+    let transcript_path = agent_transcript_path(&handle).expect("valid agent transcript path");
+    let transcript = std::fs::read_to_string(&transcript_path)
+        .expect("API-created agent transcript was not persisted");
+    assert!(
+        transcript.contains("persisted-agent-output"),
+        "persisted transcript missing Codex output: {transcript}"
+    );
+
+    let served = response_json(request_once(
+        Arc::clone(&state),
+        &policy,
+        "GET",
+        &format!("/v1/agents/{handle}/transcript"),
+        "",
+    ));
+    assert!(
+        served
+            .object("stdout")
+            .and_then(Json::as_str)
+            .is_some_and(|stdout| stdout.contains("persisted-agent-output")),
+        "transcript endpoint did not return persisted output: {served:?}"
+    );
+
+    let output = Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_text.as_ref()])
+        .current_dir(&repo)
+        .output()
+        .expect("could not clean up agent test worktree");
+    assert!(output.status.success());
+    std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
+    std::fs::remove_file(transcript_path).expect("could not clean up agent transcript");
 }
 
 /// A failing command records its exit code and stderr instead of vanishing.
