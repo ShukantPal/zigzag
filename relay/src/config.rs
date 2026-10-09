@@ -36,7 +36,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut github_watch_interval = Duration::from_secs(30);
     let mut watch_pr_state = None;
     let mut watch_prs = Vec::new();
-    let mut comment_router_shadow = true;
+    let mut comment_router_shadow = false;
     let mut comment_router_quiet_interval = Duration::from_secs(300);
     let mut comment_router_burst_window = Duration::from_secs(10 * 60);
     let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);

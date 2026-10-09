@@ -1,9 +1,9 @@
 //! Native GitHub PR-comment routing.
 //!
 //! The router deliberately reads GitHub through the same read-only `gh`
-//! policy as the PR watchdog.  It only launches Codex after persisting a
-//! GraphQL-node-id event, and defaults to shadow mode while it is compared to
-//! the incumbent watcher.
+//! policy as the PR watchdog. It only launches Codex after persisting a
+//! GraphQL-node-id event and runs live by default. The legacy
+//! `--comment-router-live` flag remains accepted for compatibility.
 
 use crate::config::valid_github_repo;
 use crate::events::new_execution_id;
