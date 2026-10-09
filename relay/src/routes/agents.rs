@@ -461,6 +461,7 @@ pub(crate) struct AgentCreateRequest {
     pub(crate) model: Option<String>,
     pub(crate) approval_mode: Option<String>,
     pub(crate) timeout_secs: Option<u64>,
+    pub(crate) auto_pr: bool,
 }
 
 pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateRequest, &'static str> {
@@ -478,6 +479,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
                 | "model"
                 | "approval_mode"
                 | "timeout_secs"
+                | "no_auto_pr"
         )
     }) {
         return Err("invalid_agent_create_request");
@@ -498,6 +500,11 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         None => None,
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_create_request")?),
     };
+    let auto_pr = match fields.iter().find(|(key, _)| key == "no_auto_pr") {
+        None => true,
+        Some((_, Json::Bool(no_auto_pr))) => !no_auto_pr,
+        Some(_) => return Err("invalid_agent_create_request"),
+    };
     Ok(AgentCreateRequest {
         prompt: string_field("prompt", true)?.expect("required field"),
         project_dir: string_field("project_dir", true)?.expect("required field"),
@@ -506,6 +513,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         model: string_field("model", false)?,
         approval_mode: string_field("approval_mode", false)?,
         timeout_secs,
+        auto_pr,
     })
 }
 
@@ -811,6 +819,7 @@ pub(crate) fn persisted_agent_config(
             Json::String(request.project_dir.clone()),
         ),
         ("branch".to_owned(), Json::String(request.branch.clone())),
+        ("auto_pr".to_owned(), Json::Bool(request.auto_pr)),
         ("worktree".to_owned(), Json::String(worktree.to_owned())),
         (
             "model".to_owned(),

@@ -1448,12 +1448,24 @@ fn agent_create_request_parsing_and_helpers() {
     assert_eq!(request.model.as_deref(), Some("gpt-5"));
     assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
     assert_eq!(request.timeout_secs, Some(3600));
+    assert!(request.auto_pr);
     assert!(request.worktree.is_none());
     assert!(
         parse_agent_create_request(br#"{"prompt":"x","project_dir":"y","branch":"z","nope":1}"#)
             .is_err()
     );
     assert!(parse_agent_create_request(br#"{"project_dir":"y","branch":"z"}"#).is_err());
+    let no_auto_pr = parse_agent_create_request(
+        br#"{"prompt":"x","project_dir":"y","branch":"z","no_auto_pr":true}"#,
+    )
+    .unwrap();
+    assert!(!no_auto_pr.auto_pr);
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","no_auto_pr":"yes"}"#
+        )
+        .is_err()
+    );
     assert!(
         parse_agent_create_request(
             br#"{"prompt":"x","project_dir":"y","branch":"z","timeout_secs":"3600"}"#
@@ -1475,6 +1487,7 @@ fn restart_config_replays_prompt_contents_timeout_and_argv() {
     )
     .unwrap();
     let persisted = persisted_agent_config(&request, "/tmp/worktree", "original prompt contents");
+    assert!(persisted.contains("\"auto_pr\":true"));
     let config = restart_config(&persisted).unwrap();
     assert_eq!(config.prompt, "original prompt contents");
     assert_eq!(config.timeout_secs, Some(42));
