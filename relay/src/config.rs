@@ -1,6 +1,6 @@
-use crate::exec;
 use crate::session::{is_tailscale_ipv4, require_gui_login_session};
 use crate::update;
+use crate::{comment_router, exec};
 use std::env;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ pub(crate) struct Config {
     pub(crate) max_events: usize,
     pub(crate) github_watch_repos: Vec<String>,
     pub(crate) github_watch_interval: Duration,
+    pub(crate) comment_router: comment_router::Config,
     pub(crate) update_directory: PathBuf,
     pub(crate) update_interval: Duration,
     pub(crate) update_policy: update::Policy,
@@ -31,6 +32,11 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut max_events = 1000;
     let mut github_watch_repos = Vec::new();
     let mut github_watch_interval = Duration::from_secs(30);
+    let mut watch_pr_state = None;
+    let mut watch_prs = Vec::new();
+    let mut comment_router_shadow = true;
+    let mut comment_router_quiet_interval = Duration::from_secs(300);
+    let mut comment_router_burst_window = Duration::from_secs(10 * 60);
     let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);
     let mut update_interval = env::var("ZIGZAG_UPDATE_INTERVAL")
         .ok()
@@ -76,13 +82,16 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
             }
             "--watch-interval" => {
-                let seconds = value(&mut values, "--watch-interval")?
-                    .parse::<u64>()
-                    .map_err(|_| "--watch-interval must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
-                }
-                github_watch_interval = Duration::from_secs(seconds);
+                github_watch_interval = bounded_duration(&mut values, "--watch-interval")?;
+            }
+            "--watch-pr-state" => watch_pr_state = Some(PathBuf::from(value(&mut values, "--watch-pr-state")?)),
+            "--watch-pr" => watch_prs.push(value(&mut values, "--watch-pr")?),
+            "--comment-router-live" => comment_router_shadow = false,
+            "--comment-router-quiet-interval" => {
+                comment_router_quiet_interval = bounded_duration(&mut values, "--comment-router-quiet-interval")?;
+            }
+            "--comment-router-burst-window" => {
+                comment_router_burst_window = bounded_duration(&mut values, "--comment-router-burst-window")?;
             }
             "--update-dir" => update_directory = Some(PathBuf::from(value(&mut values, "--update-dir")?)),
             "--update-interval" => {
@@ -93,7 +102,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
             }
             "--update-policy" => update_policy = update::Policy::parse(&value(&mut values, "--update-policy")?)?,
             "--update-ready-file" => update_ready_file = Some(PathBuf::from(value(&mut values, "--update-ready-file")?)),
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--watch-pr-state PATH] [--watch-pr OWNER/REPO#NUMBER:SESSION] [--comment-router-live] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -105,6 +114,13 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         return Err("--max-events must be greater than zero".to_owned());
     }
     let agent_registry_file = state_file.with_extension("agents.json");
+    let comment_router = comment_router::Config::new(
+        watch_pr_state.unwrap_or_else(|| state_file.with_extension("pr_sessions.json")),
+        watch_prs,
+        comment_router_shadow,
+        comment_router_quiet_interval,
+        comment_router_burst_window,
+    )?;
     let update_directory = update_directory.unwrap_or_else(|| {
         state_file
             .parent()
@@ -122,12 +138,28 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         max_events,
         github_watch_repos,
         github_watch_interval,
+        comment_router,
         update_directory,
         update_interval,
         update_policy,
         update_ready_file,
         review_state_file,
     })
+}
+
+fn bounded_duration(
+    values: &mut std::vec::IntoIter<String>,
+    name: &str,
+) -> Result<Duration, String> {
+    let seconds = values
+        .next()
+        .ok_or_else(|| format!("{name} requires a value"))?
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be an integer"))?;
+    if !(30..=3600).contains(&seconds) {
+        return Err(format!("{name} must be between 30 and 3600 seconds"));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 pub(crate) fn valid_github_repo(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {
