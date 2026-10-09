@@ -548,7 +548,7 @@ pub(crate) fn agent_create_worktree(
     path: &Path,
     branch: &str,
     agents: &[AgentRecord],
-) -> Result<(), AgentWorktreeFailure> {
+) -> Result<PathBuf, AgentWorktreeFailure> {
     let validation = AgentWorktreeFailure::Validation;
     if !git_output(repo, &["rev-parse", "--git-dir"])
         .map_err(validation)?
@@ -563,20 +563,15 @@ pub(crate) fn agent_create_worktree(
     if let Some(checked_out_path) =
         worktree_branch_checkout_path(repo, branch).map_err(validation)?
     {
-        let same_path = std::fs::canonicalize(&checked_out_path)
-            .ok()
-            .zip(std::fs::canonicalize(path).ok())
-            .is_some_and(|(checked_out, requested)| checked_out == requested);
+        let checked_out_path = std::fs::canonicalize(&checked_out_path).unwrap_or(checked_out_path);
         let active_agent_uses_worktree = agents.iter().any(|agent| {
             matches!(agent.state.as_str(), "running" | "paused")
                 && agent.worktree_path.as_deref().is_some_and(|agent_path| {
                     std::fs::canonicalize(agent_path)
-                        .ok()
-                        .zip(std::fs::canonicalize(&checked_out_path).ok())
-                        .is_some_and(|(agent_path, checkout_path)| agent_path == checkout_path)
+                        .is_ok_and(|agent_path| agent_path == checked_out_path)
                 })
         });
-        if !same_path || active_agent_uses_worktree {
+        if active_agent_uses_worktree {
             return Err(validation(WorktreeError {
                 code: 400,
                 message: "worktree_branch_already_checked_out",
@@ -584,9 +579,9 @@ pub(crate) fn agent_create_worktree(
         }
         log::info!(
             "agent_create reusing worktree path={} branch={branch}",
-            path.display()
+            checked_out_path.display()
         );
-        return Ok(());
+        return Ok(checked_out_path);
     }
     let path_str = path.to_str().ok_or(validation(WorktreeError {
         code: 400,
@@ -606,7 +601,7 @@ pub(crate) fn agent_create_worktree(
         "agent_create worktree path={} branch={branch}",
         path.display()
     );
-    Ok(())
+    Ok(path.to_path_buf())
 }
 
 /// `POST /v1/agents`: create a worktree and launch a supervised `codex exec`.
@@ -700,16 +695,10 @@ fn agent_create_request(
         return reply(stream, 400, error("invalid_model"));
     }
     codex_args.extend(["-m".to_owned(), model.to_owned()]);
-    let worktree_str = worktree_path.to_string_lossy().into_owned();
-    codex_args.extend([
-        "-C".to_owned(),
-        worktree_str.clone(),
-        "-o".to_owned(),
-        format!("{worktree_str}/last-message.txt"),
-    ]);
     let agents = state.supervisor.registry.list(None, None);
-    match agent_create_worktree(&repo, &worktree_path, &request.branch, &agents) {
-        Ok(()) => {}
+    let worktree_path = match agent_create_worktree(&repo, &worktree_path, &request.branch, &agents)
+    {
+        Ok(path) => path,
         Err(AgentWorktreeFailure::Validation(failure)) => {
             return reply(stream, failure.code, error(failure.message));
         }
@@ -730,7 +719,14 @@ fn agent_create_request(
                 ]),
             );
         }
-    }
+    };
+    let worktree_str = worktree_path.to_string_lossy().into_owned();
+    codex_args.extend([
+        "-C".to_owned(),
+        worktree_str.clone(),
+        "-o".to_owned(),
+        format!("{worktree_str}/last-message.txt"),
+    ]);
     let prompt_text = match file_prompt {
         Some(text) => text,
         None => {
