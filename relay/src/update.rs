@@ -987,20 +987,24 @@ fn replace_symlink(target: &Path, link: &Path) -> Result<(), String> {
 }
 
 fn valid_version(value: &str) -> bool {
-    let v = value.strip_prefix('v').unwrap_or(value);
-    v.split('.').count() == 3
-        && v.split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    semver::Version::parse(value.strip_prefix('v').unwrap_or(value)).is_ok()
 }
 fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    let parse = |v: &str| {
-        v.strip_prefix('v')
-            .unwrap_or(v)
-            .split('.')
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
-    };
-    parse(left).cmp(&parse(right))
+    fn parse(value: &str) -> Option<semver::Version> {
+        let mut version = semver::Version::parse(value.strip_prefix('v').unwrap_or(value)).ok()?;
+        // The semver crate's Ord weighs build metadata, but the spec says it
+        // MUST be ignored for precedence, so strip it before comparing.
+        version.build = semver::BuildMetadata::EMPTY;
+        Some(version)
+    }
+    match (parse(left), parse(right)) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        // Every production caller gates on valid_version, so unparseable
+        // input is unreachable here; still, keep a total order and never panic.
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => left.cmp(right),
+    }
 }
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1020,6 +1024,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering as CmpOrdering;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
@@ -1666,6 +1671,53 @@ mod tests {
             download(&format!("http://127.0.0.1:{closed_port}/zigzag"), &output).unwrap_err();
         assert!(!error.is_empty(), "transport failure produced no error");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_cmp_orders_releases_numerically() {
+        assert_eq!(version_cmp("v2.0.0", "v1.9.9"), CmpOrdering::Greater);
+        assert_eq!(version_cmp("v1.10.0", "v1.9.0"), CmpOrdering::Greater);
+        assert_eq!(version_cmp("v1.2.3", "1.2.3"), CmpOrdering::Equal);
+        assert_eq!(version_cmp("v1.2.3", "v1.2.4"), CmpOrdering::Less);
+    }
+
+    #[test]
+    fn version_cmp_orders_prereleases_per_semver() {
+        assert_eq!(version_cmp("v2.0.0-alpha", "v2.0.0"), CmpOrdering::Less);
+        assert_eq!(
+            version_cmp("v2.0.0-alpha", "v2.0.0-beta"),
+            CmpOrdering::Less
+        );
+        assert_eq!(version_cmp("v2.0.0-rc.1", "v2.0.0-rc.2"), CmpOrdering::Less);
+        assert_eq!(version_cmp("v2.0.0-rc.1", "v2.0.0"), CmpOrdering::Less);
+    }
+
+    #[test]
+    fn version_cmp_ignores_build_metadata() {
+        assert_eq!(
+            version_cmp("v2.0.0+build.1", "v2.0.0+build.2"),
+            CmpOrdering::Equal
+        );
+        assert_eq!(version_cmp("v2.0.0+build", "v2.0.0"), CmpOrdering::Equal);
+    }
+
+    #[test]
+    fn version_cmp_never_panics_on_invalid_input() {
+        assert_eq!(version_cmp("nope", "v1.0.0"), CmpOrdering::Less);
+        assert_eq!(version_cmp("v1.0.0", "nope"), CmpOrdering::Greater);
+        assert_eq!(version_cmp("zzz", "aaa"), CmpOrdering::Greater);
+    }
+
+    #[test]
+    fn valid_version_accepts_semver() {
+        assert!(valid_version("v2.0.0"));
+        assert!(valid_version("2.0.0"));
+        assert!(valid_version("v2.0.0-rc.1"));
+        assert!(valid_version("v1.2.3+build.5"));
+        assert!(!valid_version("v2.0"));
+        assert!(!valid_version("later"));
+        assert!(!valid_version(""));
+        assert!(!valid_version("v1.2.3.4"));
     }
 
     #[test]
