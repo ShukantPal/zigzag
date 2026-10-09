@@ -33,9 +33,9 @@ use crate::proc::{
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
-    AgentRoute, AgentWorktreeFailure, agent_create_worktree, agent_route, default_agent_worktree,
-    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
-    valid_agent_model,
+    AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_config,
+    agent_route, default_agent_worktree, parse_agent_create_request, persisted_agent_config,
+    restart_argv, restart_config, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -1614,6 +1614,7 @@ fn agent_create_request_parsing_and_helpers() {
     assert_eq!(request.prompt, "do it");
     assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
     assert_eq!(request.branch, "codex/x");
+    assert_eq!(request.harness, "codex");
     assert!(!request.no_branch);
     assert_eq!(request.pr, None);
     assert_eq!(request.model.as_deref(), Some(DEFAULT_CODEX_MODEL));
@@ -1669,6 +1670,81 @@ fn agent_create_request_parsing_and_helpers() {
     );
     assert!(valid_agent_model("org/model:1.0"));
     assert!(!valid_agent_model("model name"));
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","harness":"unknown"}"#
+        )
+        .is_err()
+    );
+    for harness in ["gemini", "opencode"] {
+        let body =
+            format!(r#"{{"prompt":"x","project_dir":"y","branch":"z","harness":"{harness}"}}"#);
+        assert_eq!(
+            parse_agent_create_request(body.as_bytes()).unwrap().harness,
+            harness
+        );
+    }
+}
+
+#[test]
+fn agent_argv_maps_common_options_for_each_harness() {
+    let codex = agent_argv("codex", "gpt-6", "full-auto", "/tmp/wt", true, "do it");
+    assert_eq!(codex.first().map(String::as_str), Some("exec"));
+    assert!(codex.windows(2).any(|v| v == ["-m", "gpt-6"]));
+    assert!(codex.iter().any(|v| v == "--full-auto"));
+    assert_eq!(codex.last().map(String::as_str), Some("do it"));
+
+    let gemini = agent_argv(
+        "gemini",
+        "gemini-2.5-pro",
+        "auto-edit",
+        "/tmp/wt",
+        true,
+        "do it",
+    );
+    assert_eq!(gemini.first().map(String::as_str), Some("--prompt"));
+    assert!(
+        gemini
+            .windows(2)
+            .any(|v| v == ["--model", "gemini-2.5-pro"])
+    );
+    assert!(
+        gemini
+            .windows(2)
+            .any(|v| v == ["--approval-mode", "auto_edit"])
+    );
+    assert!(
+        gemini
+            .windows(2)
+            .any(|v| v == ["--output-format", "stream-json"])
+    );
+
+    let opencode = agent_argv(
+        "opencode",
+        "anthropic/claude",
+        "full-auto",
+        "/tmp/wt",
+        true,
+        "do it",
+    );
+    assert_eq!(opencode.first().map(String::as_str), Some("run"));
+    assert!(
+        opencode
+            .windows(2)
+            .any(|v| v == ["--model", "anthropic/claude"])
+    );
+    assert!(opencode.iter().any(|v| v == "--auto"));
+    assert_eq!(opencode.last().map(String::as_str), Some("do it"));
+    assert_eq!(
+        agent_harness_config("opencode", "suggest").as_deref(),
+        Some(r#"{"permission":{"*":"ask"}}"#)
+    );
+    assert!(
+        agent_harness_config("opencode", "auto-edit")
+            .unwrap()
+            .contains(r#""edit":"allow""#)
+    );
+    assert!(agent_harness_config("gemini", "suggest").is_none());
 }
 
 #[test]

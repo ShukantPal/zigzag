@@ -46,10 +46,15 @@ pub(crate) struct SpawnedProc {
 #[derive(Default)]
 pub(crate) struct AgentSpawnDetails {
     pub(crate) worktree_path: Option<String>,
+    pub(crate) working_dir: Option<String>,
+    pub(crate) harness_config: Option<String>,
     pub(crate) deadline_at: Option<String>,
+    /// API-created agents write their CLI output here. Generic
+    /// `/v1/spawn` processes continue to use only the diagnostics spool.
+    pub(crate) persist_transcript: bool,
 }
 
-/// Durable JSONL transcript for an API-created Codex agent.
+/// Durable JSONL transcript for an API-created agent.
 ///
 /// This is deliberately independent of the agent registry's bounded
 /// diagnostics spool: users need the complete Codex event stream after the
@@ -146,6 +151,12 @@ pub(crate) fn spawn_proc(
         .map(Stdio::from)
         .map_err(|_| "could not open agent stderr".to_owned())?;
     let mut command = Command::new(path);
+    if let Some(directory) = details.working_dir.as_deref() {
+        command.current_dir(directory);
+    }
+    if let Some(config) = details.harness_config.as_deref() {
+        command.env("OPENCODE_CONFIG_CONTENT", config);
+    }
     command
         .args(&request.args)
         .stdin(Stdio::null())

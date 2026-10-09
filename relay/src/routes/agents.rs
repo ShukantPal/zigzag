@@ -56,12 +56,20 @@ fn agent_worktree_repo_root() -> PathBuf {
         .expect("test temporary directory must exist")
 }
 
-/// The relay owns the Codex command used for high-level agent creation.
-/// Unlike `/v1/exec`, callers never supply this binary or its arguments, so
-/// the arbitrary-command execution policy does not apply here.
-#[cfg(not(test))]
-fn agent_codex_path() -> &'static Path {
-    Path::new("codex")
+fn agent_harness_path(harness: &str) -> &'static Path {
+    #[cfg(test)]
+    {
+        let _ = harness;
+        agent_codex_path()
+    }
+    #[cfg(not(test))]
+    {
+        match harness {
+            "gemini" => Path::new("gemini"),
+            "opencode" => Path::new("opencode"),
+            _ => Path::new("codex"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -491,7 +499,7 @@ fn dept_task_dir(task_id: &str) -> Option<std::path::PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// Request body for `POST /v1/agents`: launch a supervised Codex agent in a
+/// Request body for `POST /v1/agents`: launch a supervised CLI agent in a
 /// fresh worktree.
 pub(crate) struct AgentCreateRequest {
     pub(crate) prompt: String,
@@ -500,6 +508,7 @@ pub(crate) struct AgentCreateRequest {
     pub(crate) no_branch: bool,
     pub(crate) pr: Option<u64>,
     pub(crate) worktree: Option<String>,
+    pub(crate) harness: String,
     pub(crate) model: Option<String>,
     pub(crate) approval_mode: Option<String>,
     pub(crate) timeout_secs: Option<u64>,
@@ -520,6 +529,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
                 | "no_branch"
                 | "pr"
                 | "worktree"
+                | "harness"
                 | "model"
                 | "approval_mode"
                 | "timeout_secs"
@@ -566,6 +576,10 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         Some((_, Json::Bool(no_auto_pr))) => !no_auto_pr,
         Some(_) => return Err("invalid_agent_create_request"),
     };
+    let harness = string_field("harness", false)?.unwrap_or_else(|| "codex".to_owned());
+    if !matches!(harness.as_str(), "codex" | "gemini" | "opencode") {
+        return Err("invalid_agent_create_request");
+    }
     Ok(AgentCreateRequest {
         prompt: string_field("prompt", true)?.expect("required field"),
         project_dir: string_field("project_dir", true)?.expect("required field"),
@@ -573,6 +587,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         no_branch,
         pr,
         worktree: string_field("worktree", false)?,
+        harness,
         model: string_field("model", false)?,
         approval_mode: string_field("approval_mode", false)?,
         timeout_secs,
@@ -590,6 +605,86 @@ pub(crate) fn valid_agent_model(model: &str) -> bool {
     let mut chars = model.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+}
+
+/// Build argv for each CLI. The child process working directory is configured
+/// separately so all harnesses operate against the selected worktree.
+pub(crate) fn agent_argv(
+    harness: &str,
+    model: &str,
+    approval: &str,
+    worktree: &str,
+    has_worktree: bool,
+    prompt: &str,
+) -> Vec<String> {
+    match harness {
+        "gemini" => {
+            let mut args = vec!["--prompt".into(), prompt.into()];
+            if !model.is_empty() {
+                args.extend(["--model".into(), model.into()]);
+            }
+            args.extend([
+                "--approval-mode".into(),
+                match approval {
+                    "auto-edit" => "auto_edit",
+                    "full-auto" => "yolo",
+                    _ => "default",
+                }
+                .into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--skip-trust".into(),
+            ]);
+            args
+        }
+        "opencode" => {
+            let mut args = vec!["run".into(), "--format".into(), "json".into()];
+            if !model.is_empty() {
+                args.extend(["--model".into(), model.into()]);
+            }
+            if approval == "full-auto" {
+                args.push("--auto".into());
+            }
+            args.push(prompt.into());
+            args
+        }
+        _ => {
+            let mut args = vec![
+                "exec".into(),
+                "--json".into(),
+                match approval {
+                    "suggest" => "--suggest",
+                    "auto-edit" => "--auto-edit",
+                    "full-auto" => "--full-auto",
+                    _ => "--approve-for-me",
+                }
+                .into(),
+                "--skip-git-repo-check".into(),
+            ];
+            if !model.is_empty() {
+                args.extend(["-m".into(), model.into()]);
+            }
+            args.extend(["-C".into(), worktree.into()]);
+            if has_worktree {
+                args.extend(["-o".into(), format!("{worktree}/last-message.txt")]);
+            }
+            args.push(prompt.into());
+            args
+        }
+    }
+}
+
+pub(crate) fn agent_harness_config(harness: &str, approval: &str) -> Option<String> {
+    if harness != "opencode" || approval == "full-auto" {
+        return None;
+    }
+    let permissions = match approval {
+        "auto-edit" => {
+            r#"{"*":"ask","read":"allow","edit":"allow","glob":"allow","grep":"allow","list":"allow"}"#
+        }
+        _ => r#"{"*":"ask"}"#,
+    };
+    Some(format!(r#"{{"permission":{permissions}}}"#))
 }
 
 /// Worktree creation errors distinguish validation from a failed git command.
@@ -671,7 +766,7 @@ pub(crate) fn agent_create_worktree(
     Ok(path.to_path_buf())
 }
 
-/// `POST /v1/agents`: launch a supervised `codex exec` in a worktree or project.
+/// `POST /v1/agents`: launch a supervised CLI agent in a worktree or project.
 fn agent_create_request(
     stream: &mut TcpStream,
     state: &Server,
@@ -780,26 +875,26 @@ fn agent_create_request(
         None
     };
     let approval_flag = match request.approval_mode.as_deref() {
-        None => "--approve-for-me",
-        Some("suggest") => "--suggest",
-        Some("auto-edit") => "--auto-edit",
-        Some("full-auto") => "--full-auto",
+        None => "default",
+        Some("suggest") => "suggest",
+        Some("auto-edit") => "auto-edit",
+        Some("full-auto") => "full-auto",
         Some(other) => {
             log::warn!("agent_create refused: unknown approval_mode={other}");
             return reply(stream, 400, error("invalid_approval_mode"));
         }
     };
-    let mut codex_args = vec![
-        "exec".to_owned(),
-        "--json".to_owned(),
-        approval_flag.to_owned(),
-        "--skip-git-repo-check".to_owned(),
-    ];
-    let model = request.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
-    if !valid_agent_model(model) {
+    let model = request
+        .model
+        .as_deref()
+        .unwrap_or(if request.harness == "codex" {
+            DEFAULT_CODEX_MODEL
+        } else {
+            ""
+        });
+    if !model.is_empty() && !valid_agent_model(model) {
         return reply(stream, 400, error("invalid_model"));
     }
-    codex_args.extend(["-m".to_owned(), model.to_owned()]);
     let agents = state.supervisor.registry.list(None, None);
     let worktree_creation = if request.no_branch {
         Ok(worktree_path.clone())
@@ -830,10 +925,6 @@ fn agent_create_request(
         }
     };
     let worktree_str = worktree_path.to_string_lossy().into_owned();
-    codex_args.extend(["-C".to_owned(), worktree_str.clone()]);
-    if !request.no_branch {
-        codex_args.extend(["-o".to_owned(), format!("{worktree_str}/last-message.txt")]);
-    }
     let prompt_text = match file_prompt {
         Some(text) => text,
         None => {
@@ -847,7 +938,14 @@ fn agent_create_request(
             request.prompt.clone()
         }
     };
-    codex_args.push(prompt_text.clone());
+    let args = agent_argv(
+        &request.harness,
+        model,
+        approval_flag,
+        &worktree_str,
+        !request.no_branch,
+        &prompt_text,
+    );
     let _spawn_admission = match state.updater.spawn_admission() {
         Ok(Some(guard)) => guard,
         Ok(None) => return reply(stream, 503, error("updates_draining")),
@@ -877,17 +975,19 @@ fn agent_create_request(
     });
     let command = exec::ExecRequest {
         id: task_id.clone(),
-        bin: "codex".to_owned(),
-        args: codex_args,
+        bin: request.harness.clone(),
+        args,
     };
     match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
-        agent_codex_path(),
+        agent_harness_path(&request.harness),
         command,
         execution_id.clone(),
         AgentSpawnDetails {
             worktree_path: (!request.no_branch).then_some(worktree_str.clone()),
+            working_dir: Some(worktree_str.clone()),
+            harness_config: agent_harness_config(&request.harness, approval_flag),
             deadline_at,
         },
     ) {
@@ -966,6 +1066,7 @@ pub(crate) fn persisted_agent_config(
             Json::Bool(request.auto_pr && !request.no_branch),
         ),
         ("worktree".to_owned(), Json::String(worktree.to_owned())),
+        ("harness".to_owned(), Json::String(request.harness.clone())),
         (
             "model".to_owned(),
             request
@@ -994,6 +1095,7 @@ pub(crate) struct AgentRestartConfig {
     pub(crate) prompt: String,
     worktree: String,
     no_branch: bool,
+    harness: String,
     model: Option<String>,
     approval_mode: Option<String>,
     pub(crate) timeout_secs: Option<u64>,
@@ -1079,6 +1181,10 @@ pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static 
         None | Some((_, Json::Null)) => None,
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_config")?),
     };
+    let harness = optional("harness")?.unwrap_or_else(|| "codex".to_owned());
+    if !matches!(harness.as_str(), "codex" | "gemini" | "opencode") {
+        return Err("invalid_agent_config");
+    }
     Ok(AgentRestartConfig {
         prompt: required("prompt")?,
         worktree: required("worktree")?,
@@ -1086,6 +1192,7 @@ pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static 
             fields.iter().find(|(key, _)| key == "no_branch"),
             Some((_, Json::Bool(true)))
         ),
+        harness,
         model: optional("model")?,
         approval_mode: optional("approval_mode")?,
         timeout_secs,
@@ -1111,9 +1218,36 @@ pub(crate) fn restart_argv(
         approval.to_owned(),
         "--skip-git-repo-check".to_owned(),
     ];
-    let model = config.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
-    if !valid_agent_model(model) {
+    let model = config
+        .model
+        .as_deref()
+        .unwrap_or(if config.harness == "codex" {
+            DEFAULT_CODEX_MODEL
+        } else {
+            ""
+        });
+    if !model.is_empty() && !valid_agent_model(model) {
         return Err("invalid_model");
+    }
+    if config.harness != "codex" {
+        if mode == RestartMode::Resume {
+            return Err("resume_not_supported_for_harness");
+        }
+        let approval = match config.approval_mode.as_deref() {
+            None => "default",
+            Some("suggest") => "suggest",
+            Some("auto-edit") => "auto-edit",
+            Some("full-auto") => "full-auto",
+            _ => return Err("invalid_approval_mode"),
+        };
+        return Ok(agent_argv(
+            &config.harness,
+            model,
+            approval,
+            &config.worktree,
+            !config.no_branch,
+            prompt,
+        ));
     }
     args.extend(["-m".to_owned(), model.to_owned()]);
     match mode {
@@ -1252,15 +1386,20 @@ pub(crate) fn agent_restart_request(
     let spawned = match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
-        agent_codex_path(),
+        agent_harness_path(&config.harness),
         exec::ExecRequest {
             id: agent.task_id.clone(),
-            bin: "codex".to_owned(),
+            bin: config.harness.clone(),
             args,
         },
         execution_id,
         AgentSpawnDetails {
             worktree_path: Some(config.worktree.clone()),
+            working_dir: Some(config.worktree.clone()),
+            harness_config: agent_harness_config(
+                &config.harness,
+                config.approval_mode.as_deref().unwrap_or("suggest"),
+            ),
             deadline_at: config.timeout_secs.map(|secs| {
                 unix_timestamp()
                     .parse::<u64>()

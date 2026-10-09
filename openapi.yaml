@@ -312,9 +312,7 @@ components:
           description: Whether a live process was actually signalled.
     AgentCreateRequest:
       type: object
-      description: >
-        Request to create and start a Codex agent. Implemented in a parallel
-        PR; this documents the intended contract.
+      description: Request to create and start an agent using a supported CLI harness.
       required: [prompt, project_dir, branch]
       properties:
         prompt:
@@ -331,6 +329,11 @@ components:
           description: Worktree path; defaults to /private/tmp/<branch-slug>/.
         model:
           type: string
+        harness:
+          type: string
+          enum: [codex, gemini, opencode]
+          default: codex
+          description: CLI used to run the agent.
         approval_mode:
           type: string
         timeout_secs:

@@ -179,7 +179,7 @@ enum AgentsCmd {
         /// Agent handle (unique prefix accepted)
         id: String,
     },
-    /// Create and start a Codex agent
+    /// Create and start an agent using a supported AI CLI
     Create {
         /// Inline prompt text or prompt-file path
         #[arg(long)]
@@ -199,6 +199,9 @@ enum AgentsCmd {
         /// Worktree path (default /private/tmp/<branch-slug>/)
         #[arg(long)]
         worktree: Option<String>,
+        /// CLI harness to run
+        #[arg(long, value_parser = ["codex", "gemini", "opencode"], default_value = "codex")]
+        harness: String,
         /// Model override
         #[arg(long)]
         model: Option<String>,
@@ -852,6 +855,7 @@ fn cmd_agents_create(
     no_branch: bool,
     pr: Option<u64>,
     worktree: Option<&str>,
+    harness: &str,
     model: Option<&str>,
     approval_mode: Option<&str>,
     timeout_secs: Option<u64>,
@@ -871,6 +875,7 @@ fn cmd_agents_create(
     if let Some(w) = worktree {
         body["worktree"] = serde_json::Value::String(w.to_string());
     }
+    body["harness"] = serde_json::Value::String(harness.to_owned());
     if let Some(m) = model {
         body["model"] = serde_json::Value::String(m.to_string());
     }
@@ -1536,6 +1541,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 no_branch,
                 pr,
                 worktree,
+                harness,
                 model,
                 approval_mode,
                 timeout_secs,
@@ -1547,6 +1553,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 no_branch,
                 pr,
                 worktree.as_deref(),
+                &harness,
                 model.as_deref(),
                 approval_mode.as_deref(),
                 timeout_secs,
