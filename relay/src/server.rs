@@ -203,6 +203,7 @@ where
             Json::Object(vec![("status".to_owned(), Json::String("ok".to_owned()))]),
         ),
         ("POST", "/v1/events") => post(&mut stream, &state, request.body),
+        ("POST", "/v1/update/check") => update_check_request(&mut stream, &state),
         ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
         ("POST", "/v1/exec") => exec_request(&mut stream, request.body, load_policy()),
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
@@ -244,6 +245,38 @@ where
         _ => reply(&mut stream, 404, error("not_found")),
     }
 }
+
+fn update_check_request(stream: &mut TcpStream, state: &Server) -> Result<(), String> {
+    match state.updater.check_now() {
+        Ok(result) => reply(
+            stream,
+            200,
+            Json::Object(vec![
+                (
+                    "current_version".to_owned(),
+                    Json::String(result.current_version),
+                ),
+                (
+                    "latest_available_version".to_owned(),
+                    result
+                        .latest_available_version
+                        .map(Json::String)
+                        .unwrap_or(Json::Null),
+                ),
+                (
+                    "update_applied".to_owned(),
+                    Json::Bool(result.update_applied),
+                ),
+            ]),
+        ),
+        Err(error) => reply(
+            stream,
+            502,
+            Json::Object(vec![("error".to_owned(), Json::String(error))]),
+        ),
+    }
+}
+
 pub(crate) fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
     let body = match String::from_utf8(body) {
         Ok(body) => body,

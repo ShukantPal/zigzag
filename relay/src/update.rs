@@ -74,7 +74,17 @@ pub struct Manager {
     config: Config,
     draining: Arc<AtomicBool>,
     spawn_gate: Mutex<()>,
+    check_gate: Mutex<()>,
     runtime: Arc<dyn Runtime>,
+    manual_context: Mutex<Option<ManualContext>>,
+    latest_available: Mutex<Option<String>>,
+}
+struct ManualContext {
+    active_work: Arc<ActiveWork>,
+    audit: Arc<Audit>,
+    original_args: Vec<String>,
+    secret_file: PathBuf,
+    health_port: u16,
 }
 type ActiveWork = dyn Fn() -> bool + Send + Sync;
 type Audit = dyn Fn(&str, Json) + Send + Sync;
@@ -201,6 +211,13 @@ pub struct Status {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckResult {
+    pub current_version: String,
+    pub latest_available_version: Option<String>,
+    pub update_applied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Manifest {
     version: String,
     target: String,
@@ -214,7 +231,10 @@ impl Manager {
             config,
             draining: Arc::new(AtomicBool::new(false)),
             spawn_gate: Mutex::new(()),
+            check_gate: Mutex::new(()),
             runtime: Arc::new(SystemRuntime),
+            manual_context: Mutex::new(None),
+            latest_available: Mutex::new(None),
         }
     }
 
@@ -224,7 +244,10 @@ impl Manager {
             config,
             draining: Arc::new(AtomicBool::new(false)),
             spawn_gate: Mutex::new(()),
+            check_gate: Mutex::new(()),
             runtime,
+            manual_context: Mutex::new(None),
+            latest_available: Mutex::new(None),
         }
     }
 
@@ -295,6 +318,15 @@ impl Manager {
         secret_file: PathBuf,
         health_port: u16,
     ) {
+        if let Ok(mut context) = self.manual_context.lock() {
+            *context = Some(ManualContext {
+                active_work: Arc::clone(&active_work),
+                audit: Arc::clone(&audit),
+                original_args: original_args.clone(),
+                secret_file: secret_file.clone(),
+                health_port,
+            });
+        }
         if self.config.interval.is_zero() {
             return;
         }
@@ -314,6 +346,47 @@ impl Manager {
         });
     }
 
+    /// Perform an update check immediately using the same policy and
+    /// verification path as the scheduled updater.
+    pub fn check_now(&self) -> Result<CheckResult, String> {
+        let (active_work, audit, original_args, secret_file, health_port) = {
+            let context = self
+                .manual_context
+                .lock()
+                .map_err(|_| "update context lock poisoned".to_owned())?;
+            let context = context
+                .as_ref()
+                .ok_or_else(|| "update manager is not ready".to_owned())?;
+            (
+                Arc::clone(&context.active_work),
+                Arc::clone(&context.audit),
+                context.original_args.clone(),
+                context.secret_file.clone(),
+                context.health_port,
+            )
+        };
+        let outcome = self.check_and_apply(
+            active_work.as_ref(),
+            audit.as_ref(),
+            &original_args,
+            &secret_file,
+            health_port,
+        );
+        outcome?;
+        let status = self.status();
+        let latest_available_version = self
+            .latest_available
+            .lock()
+            .map_err(|_| "update version lock poisoned".to_owned())?
+            .clone();
+        Ok(CheckResult {
+            current_version: std::env::var("ZIGZAG_UPDATE_VERSION")
+                .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned()),
+            latest_available_version,
+            update_applied: status.last_result.as_deref() == Some("applied"),
+        })
+    }
+
     fn check_and_apply(
         &self,
         active_work: &dyn Fn() -> bool,
@@ -322,6 +395,10 @@ impl Manager {
         secret_file: &Path,
         health_port: u16,
     ) -> Result<(), String> {
+        let _check = self
+            .check_gate
+            .lock()
+            .map_err(|_| "update check lock poisoned".to_owned())?;
         let mut status = self.status();
         if matches!(status.policy, Policy::Paused) {
             status.last_check = Some(relay_core::rfc3339_timestamp());
@@ -412,6 +489,10 @@ impl Manager {
             .and_then(Json::as_str)
             .filter(|v| valid_version(v))
             .ok_or_else(|| "release has invalid version".to_owned())?;
+        *self
+            .latest_available
+            .lock()
+            .map_err(|_| "update version lock poisoned".to_owned())? = Some(tag.to_owned());
         if status
             .accepted_version
             .as_deref()
