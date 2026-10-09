@@ -5,9 +5,274 @@ use crate::server::Server;
 use crate::session::require_gui_login_session;
 use relay_core::{Json, parse_json};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+static WATCHED_PR_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct WatchedPr {
+    pub(crate) repository: String,
+    pub(crate) number: u64,
+    pub(crate) branch: String,
+    pub(crate) worktree: String,
+    pub(crate) repository_path: String,
+}
+
+fn watched_pr_path() -> PathBuf {
+    std::env::var_os("ZIGZAG_WATCHED_PRS_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".zigzag/watched-prs.json"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".zigzag/watched-prs.json"))
+}
+
+pub(crate) fn watched_prs() -> Result<Vec<WatchedPr>, String> {
+    let path = watched_pr_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("could not parse watched PR state: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("could not read watched PR state: {error}")),
+    }
+}
+
+fn save_watched_prs(prs: &[WatchedPr]) -> Result<(), String> {
+    let path = watched_pr_path();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create watched PR directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(prs).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("could not write watched PR state: {error}"))?;
+    std::fs::rename(temporary, path)
+        .map_err(|error| format!("could not persist watched PR state: {error}"))
+}
+
+fn add_watched_pr(pr: WatchedPr) -> Result<(), String> {
+    let _guard = WATCHED_PR_WRITE
+        .lock()
+        .map_err(|_| "watched PR state lock poisoned")?;
+    let mut prs = watched_prs()?;
+    if let Some(existing) = prs
+        .iter_mut()
+        .find(|entry| entry.repository == pr.repository && entry.number == pr.number)
+    {
+        *existing = pr;
+    } else {
+        prs.push(pr);
+    }
+    save_watched_prs(&prs)
+}
+
+/// Discover and persist an open PR for an agent's pushed branch.
+pub(crate) fn watch_agent_pr(agent: &relay_core::AgentRecord) -> Result<bool, String> {
+    let Some(worktree) = agent.worktree_path.as_deref() else {
+        return Ok(false);
+    };
+    let worktree_path = Path::new(worktree);
+    let branch = git_text(worktree_path, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Ok(false);
+    }
+    let remote = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| format!("could not inspect agent git remote: {error}"))?;
+    if !remote.status.success() {
+        return Ok(false);
+    }
+    let repository = github_repository(&String::from_utf8_lossy(&remote.stdout))
+        .ok_or_else(|| "agent origin is not a GitHub repository".to_owned())?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let pushed = Command::new("git")
+        .args(["ls-remote", "--exit-code", "origin", &branch_ref])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|error| format!("could not check pushed branch: {error}"))?;
+    if !pushed.status.success() || pushed.stdout.is_empty() {
+        return Ok(false);
+    }
+    let request = exec::ExecRequest {
+        id: format!("github-pr-lookup-{}", agent.id),
+        bin: "gh".to_owned(),
+        args: vec![
+            "api".to_owned(),
+            "--paginate".to_owned(),
+            "--slurp".to_owned(),
+            format!("repos/{repository}/pulls?state=open&per_page=100"),
+        ],
+    };
+    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
+    let path = policy
+        .verified_path(&request.bin, &request.args)
+        .map_err(|error| format!("gh policy does not allow PR lookup: {error}"))?;
+    let result = exec::run(&path, request);
+    if result.timed_out || result.truncated || result.exit_code != Some(0) {
+        return Err("GitHub PR lookup failed".to_owned());
+    }
+    let value = parse_json(&result.stdout)
+        .map_err(|_| "GitHub PR lookup returned invalid JSON".to_owned())?;
+    let Json::Array(pages) = value else {
+        return Err("GitHub PR lookup returned an unexpected response".to_owned());
+    };
+    let Some(number) = pages
+        .iter()
+        .flat_map(|page| match page {
+            Json::Array(items) => items.iter().collect::<Vec<_>>(),
+            item => vec![item],
+        })
+        .find(|item| {
+            item.object("head")
+                .and_then(|head| head.object("ref"))
+                .and_then(Json::as_str)
+                == Some(branch.as_str())
+                && item
+                    .object("head")
+                    .and_then(|head| head.object("repo"))
+                    .and_then(|repo| repo.object("full_name"))
+                    .and_then(Json::as_str)
+                    == Some(repository.as_str())
+        })
+        .and_then(|item| item.object("number").and_then(Json::as_u64))
+    else {
+        return Ok(false);
+    };
+    let repo_path = git_text(worktree_path, &["rev-parse", "--show-toplevel"])?;
+    add_watched_pr(WatchedPr {
+        repository,
+        number,
+        branch,
+        worktree: worktree.to_owned(),
+        repository_path: repo_path,
+    })?;
+    log::info!("watching PR for agent {}", agent.id);
+    Ok(true)
+}
+
+fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("git metadata lookup failed".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn github_repository(origin: &str) -> Option<String> {
+    let origin = origin.trim().trim_end_matches(".git");
+    let path = origin
+        .strip_prefix("git@github.com:")
+        .or_else(|| origin.strip_prefix("https://github.com/"))
+        .or_else(|| origin.strip_prefix("http://github.com/"))?;
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    (parts.next().is_none() && crate::config::valid_github_repo(&format!("{owner}/{repo}")))
+        .then(|| format!("{owner}/{repo}"))
+}
+
+pub(crate) fn watched_pr_cleanup_loop(state: Arc<Server>, interval: Duration) {
+    loop {
+        match watched_prs() {
+            Ok(prs) => {
+                for pr in prs {
+                    if let Err(error) = cleanup_if_merged(&state, &pr) {
+                        log::warn!(
+                            "watched PR cleanup for {}#{} failed: {error}",
+                            pr.repository,
+                            pr.number
+                        );
+                    }
+                }
+            }
+            Err(error) => log::warn!("could not load watched PR state: {error}"),
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn cleanup_if_merged(state: &Server, pr: &WatchedPr) -> Result<(), String> {
+    let request = exec::ExecRequest {
+        id: format!(
+            "github-pr-state-{}-{}",
+            pr.repository.replace('/', "-"),
+            pr.number
+        ),
+        bin: "gh".to_owned(),
+        args: vec![
+            "api".to_owned(),
+            format!("repos/{}/pulls/{}", pr.repository, pr.number),
+        ],
+    };
+    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
+    let path = policy
+        .verified_path(&request.bin, &request.args)
+        .map_err(|error| error.to_string())?;
+    let result = exec::run(&path, request);
+    if result.exit_code != Some(0) || result.timed_out || result.truncated {
+        return Ok(());
+    }
+    let value = parse_json(&result.stdout).map_err(|error| error.to_string())?;
+    if value.object("merged").and_then(Json::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let agents = state.supervisor.registry.list(None, None);
+    for agent in agents.iter().filter(|agent| {
+        agent.worktree_path.as_deref() == Some(pr.worktree.as_str())
+            || agent.worktree_path.as_deref().is_some_and(|path| {
+                Path::new(path).exists()
+                    && git_text(Path::new(path), &["branch", "--show-current"])
+                        .ok()
+                        .as_deref()
+                        == Some(pr.branch.as_str())
+            })
+    }) {
+        if agent.state == "running" || agent.state == "orphaned" {
+            if agent.process_group > 0 && crate::proc::recovered_agent_identity_matches(agent) {
+                crate::proc::force_kill_process_group(agent.process_group);
+            }
+            if let Ok(mut processes) = state.supervisor.procs.lock()
+                && let Some(entry) = processes.get_mut(&agent.id)
+            {
+                let _ = entry.child.try_wait();
+                entry.finished_at = Some(std::time::Instant::now());
+            }
+            let _ = state
+                .supervisor
+                .registry
+                .transition(&agent.id, "stopped", None);
+        }
+    }
+    let path = Path::new(&pr.worktree);
+    if path.exists() {
+        let roots = crate::routes::worktrees::canonical_worktree_roots();
+        crate::routes::worktrees::cleanup_agent_worktree(&pr.worktree, &roots)
+            .map_err(|error| error.message.to_owned())?;
+    }
+    let _guard = WATCHED_PR_WRITE
+        .lock()
+        .map_err(|_| "watched PR state lock poisoned")?;
+    let mut remaining = watched_prs()?;
+    remaining.retain(|entry| !(entry.repository == pr.repository && entry.number == pr.number));
+    save_watched_prs(&remaining)?;
+    log::info!(
+        "cleaned worktree for merged PR {}#{}",
+        pr.repository,
+        pr.number
+    );
+    Ok(())
+}
 
 pub(crate) fn should_start_legacy_watch(
     review_loop_authoritative: bool,
@@ -161,4 +426,40 @@ pub(crate) fn review_gate_parameters(target: &str) -> Result<(String, u64), ()> 
         .filter(|number| *number > 0)
         .ok_or(())?;
     Ok((repository, number))
+}
+
+#[cfg(test)]
+mod watched_pr_tests {
+    use super::*;
+
+    #[test]
+    fn github_repository_accepts_ssh_and_https_origins() {
+        assert_eq!(
+            github_repository("git@github.com:ShukantPal/zigzag.git"),
+            Some("ShukantPal/zigzag".to_owned())
+        );
+        assert_eq!(
+            github_repository("https://github.com/owner/repo"),
+            Some("owner/repo".to_owned())
+        );
+        assert_eq!(github_repository("https://example.com/owner/repo"), None);
+        assert_eq!(
+            github_repository("git@github.com:owner/repo/extra.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn watched_pr_state_round_trips() {
+        let pr = WatchedPr {
+            repository: "owner/repo".to_owned(),
+            number: 7,
+            branch: "codex/feature".to_owned(),
+            worktree: "/private/tmp/codex-feature".to_owned(),
+            repository_path: "/workspace/repo".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&vec![pr.clone()]).unwrap();
+        let decoded: Vec<WatchedPr> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, vec![pr]);
+    }
 }

@@ -2,6 +2,7 @@ use crate::events::{
     new_execution_id, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
 };
 use crate::exec;
+use crate::github::watch_agent_pr;
 use crate::http::{error, query, reply};
 use crate::proc::{
     AgentSpawnDetails, agent_stderr_path, agent_transcript_path, force_kill_process_group,
@@ -259,6 +260,9 @@ fn pause_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Resu
     }
     if agent.paused_at.is_some() {
         return reply(stream, 409, error("already_paused"));
+    }
+    if let Err(error) = watch_agent_pr(&agent) {
+        log::warn!("agent_pause PR discovery id={id} failed: {error}");
     }
     let process_group = agent.process_group;
     // Signal the whole process group, matching how agents are spawned and killed.
@@ -1318,6 +1322,13 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     }
     let pgid = agent.process_group;
     let worktree = agent.worktree_path.clone();
+    let watching_pr = match watch_agent_pr(&agent) {
+        Ok(watching) => watching,
+        Err(error) => {
+            log::warn!("agent_stop PR discovery id={id} failed: {error}");
+            false
+        }
+    };
     // Security: never signal a process group that does not belong to this
     // registered agent. A stale record (PID/PGID reuse, or a leader that has
     // already exited) is treated as already dead: deregister without
@@ -1346,6 +1357,9 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     }
     log::info!("agent_stop id={id} pgid={pgid} graceful={graceful}");
     match &worktree {
+        Some(_path) if stopped && watching_pr => {
+            log::info!("agent_stop id={id}: retaining worktree for watched pull request")
+        }
         Some(path) if stopped => match cleanup_agent_worktree(path, &agent_worktree_roots()) {
             Ok(()) => log::info!("agent_stop id={id}: worktree cleaned up at {path}"),
             Err(failure) => log::warn!(
