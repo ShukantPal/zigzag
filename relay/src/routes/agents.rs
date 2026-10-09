@@ -9,7 +9,7 @@ use crate::proc::{
 };
 use crate::routes::worktrees::{
     WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
-    valid_worktree_branch, worktree_branch_checked_out, worktree_branch_exists,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_branch_exists,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
@@ -532,6 +532,7 @@ pub(crate) fn agent_create_worktree(
     repo: &Path,
     path: &Path,
     branch: &str,
+    agents: &[AgentRecord],
 ) -> Result<(), AgentWorktreeFailure> {
     let validation = AgentWorktreeFailure::Validation;
     if !git_output(repo, &["rev-parse", "--git-dir"])
@@ -544,11 +545,33 @@ pub(crate) fn agent_create_worktree(
             message: "worktree_repo_not_a_git_repo",
         }));
     }
-    if worktree_branch_checked_out(repo, branch).map_err(validation)? {
-        return Err(validation(WorktreeError {
-            code: 400,
-            message: "worktree_branch_already_checked_out",
-        }));
+    if let Some(checked_out_path) =
+        worktree_branch_checkout_path(repo, branch).map_err(validation)?
+    {
+        let same_path = std::fs::canonicalize(&checked_out_path)
+            .ok()
+            .zip(std::fs::canonicalize(path).ok())
+            .is_some_and(|(checked_out, requested)| checked_out == requested);
+        let active_agent_uses_worktree = agents.iter().any(|agent| {
+            matches!(agent.state.as_str(), "running" | "paused")
+                && agent.worktree_path.as_deref().is_some_and(|agent_path| {
+                    std::fs::canonicalize(agent_path)
+                        .ok()
+                        .zip(std::fs::canonicalize(&checked_out_path).ok())
+                        .is_some_and(|(agent_path, checkout_path)| agent_path == checkout_path)
+                })
+        });
+        if !same_path || active_agent_uses_worktree {
+            return Err(validation(WorktreeError {
+                code: 400,
+                message: "worktree_branch_already_checked_out",
+            }));
+        }
+        log::info!(
+            "agent_create reusing worktree path={} branch={branch}",
+            path.display()
+        );
+        return Ok(());
     }
     let path_str = path.to_str().ok_or(validation(WorktreeError {
         code: 400,
@@ -670,7 +693,8 @@ fn agent_create_request(
         "-o".to_owned(),
         format!("{worktree_str}/last-message.txt"),
     ]);
-    match agent_create_worktree(&repo, &worktree_path, &request.branch) {
+    let agents = state.supervisor.registry.list(None, None);
+    match agent_create_worktree(&repo, &worktree_path, &request.branch, &agents) {
         Ok(()) => {}
         Err(AgentWorktreeFailure::Validation(failure)) => {
             return reply(stream, failure.code, error(failure.message));
