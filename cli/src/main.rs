@@ -11,6 +11,7 @@
 //!
 //! Examples:
 //!   zzapi health
+//!   zzapi update
 //!   zzapi agents list
 //!   zzapi agents create --prompt "Fix the flaky test" \
 //!       --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
@@ -29,6 +30,8 @@ const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_SOCKET_PORT: u16 = 8766;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
+const LATEST_ZZAPI_URL: &str =
+    "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64";
 /// The relay permits synchronous executions for up to five minutes. Leave a
 /// little room for the response to cross the network after that deadline.
 const EXEC_CLIENT_TIMEOUT_SECS: u64 = 330;
@@ -85,6 +88,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Download and install the latest zzapi binary from GitHub releases
+    Update,
     /// Liveness probe
     Health,
     /// Manage agents
@@ -501,6 +506,64 @@ fn relay_base(hostname: &str) -> String {
     } else {
         format!("http://{hostname}:{DEFAULT_PORT}")
     }
+}
+
+fn cmd_update() -> Result<(), Fail> {
+    let executable = std::env::current_exe()
+        .map_err(|e| Fail::Config(format!("cannot locate current zzapi executable: {e}")))?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| Fail::Config("current zzapi executable has no parent directory".into()))?;
+    let temp = parent.join(format!(".zzapi-update-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let result = (|| {
+        let response = ureq::get(LATEST_ZZAPI_URL)
+            .timeout(Duration::from_secs(120))
+            .call()
+            .map_err(|e| Fail::Config(format!("cannot download latest zzapi: {e}")))?;
+        let mut reader = response.into_reader();
+        let mut binary = Vec::new();
+        reader
+            .read_to_end(&mut binary)
+            .map_err(|e| Fail::Config(format!("cannot read downloaded zzapi: {e}")))?;
+        if binary.is_empty() {
+            return Err(Fail::Config("downloaded zzapi is empty".into()));
+        }
+        std::fs::write(&temp, binary)
+            .map_err(|e| Fail::Config(format!("cannot save downloaded zzapi: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| Fail::Config(format!("cannot make downloaded zzapi executable: {e}")),
+            )?;
+        }
+        let version = std::process::Command::new(&temp)
+            .arg("--version")
+            .output()
+            .map_err(|e| {
+                Fail::Config(format!("downloaded zzapi cannot run on this system: {e}"))
+            })?;
+        if !version.status.success() {
+            return Err(Fail::Config(
+                "downloaded zzapi failed its --version check".into(),
+            ));
+        }
+        let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+        if version.is_empty() {
+            return Err(Fail::Config(
+                "downloaded zzapi did not report a version".into(),
+            ));
+        }
+        std::fs::rename(&temp, &executable)
+            .map_err(|e| Fail::Config(format!("cannot replace {}: {e}", executable.display())))?;
+        println!("updated successfully ({version})");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1460,9 @@ fn report_api_error(e: &ApiError) {
 }
 
 fn run(cli: Cli) -> Result<(), Fail> {
+    if matches!(&cli.command, Commands::Update) {
+        return cmd_update();
+    }
     if let Commands::Agents {
         cmd:
             AgentsCmd::Create {
@@ -1418,6 +1484,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
         }
     };
     match cli.command {
+        Commands::Update => unreachable!("update command handled before relay client setup"),
         Commands::Health => cmd_health(&client),
         Commands::Agents { cmd } => match cmd {
             AgentsCmd::List { state, task_id } => {
@@ -1582,6 +1649,14 @@ mod tests {
     fn relay_base_accepts_an_explicit_port_for_local_or_proxied_relays() {
         assert_eq!(relay_base("relay.example"), "http://relay.example:8765");
         assert_eq!(relay_base("127.0.0.1:19876"), "http://127.0.0.1:19876");
+    }
+
+    #[test]
+    fn update_downloads_the_linux_release_asset() {
+        assert_eq!(
+            LATEST_ZZAPI_URL,
+            "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64"
+        );
     }
 
     #[test]

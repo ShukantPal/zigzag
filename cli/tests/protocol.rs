@@ -41,6 +41,28 @@ fn transcript_server(
     (port, server)
 }
 
+#[test]
+fn update_is_listed_in_help_and_needs_no_agent_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("update"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args(["update", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Download and install")
+    );
+}
+
 fn read_socket_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
     let mut prefix = [0; 4];
     stream.read_exact(&mut prefix).unwrap();

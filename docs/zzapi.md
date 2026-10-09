@@ -13,6 +13,7 @@ Token files must be owned by the current user and mode 0600. Global `--json`
 emits raw JSON.
 
 ```text
+zzapi [--hostname HOST[:PORT]] update
 zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
@@ -30,6 +31,10 @@ zzapi proc get ID
 zzapi events [--after N] [--epoch E] [--timeout N] [--follow]
 zzapi review-gate --repo OWNER/REPO --pr N
 ```
+
+`zzapi update` downloads the latest `zzapi-linux-x86_64` GitHub release asset,
+checks that it can run and report its version, then atomically replaces the
+current executable. It does not require relay credentials or agent flags.
 
 The CLI intentionally exposes the common surface only. Use an authenticated
 HTTP client for provider and transcript endpoints until corresponding verbs
