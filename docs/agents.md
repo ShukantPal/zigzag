@@ -4,7 +4,8 @@
 
 Relay-native agent creation is deliberately narrower than `/v1/exec`: callers
 submit a provider request instead of arbitrary commands. The relay starts a
-supervised Codex group in a permitted worktree, persists lifecycle state,
+supervised Codex group in a permitted worktree or, with explicit `--no-branch`,
+directly in the project directory; it persists lifecycle state,
 captures stdout/stderr, and records an API-created transcript.
 
 The registry reaper records terminal exit. After relay restart it cannot

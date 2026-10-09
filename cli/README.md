@@ -43,6 +43,14 @@ zzapi agents get <id-or-prefix>
 zzapi agents create --prompt "Fix the flaky test" \
     --project-dir /Users/shukant/Workspace/leveled-inc/leveled \
     --branch codex/fix-flaky
+
+# Read-only investigation in the project checkout (explicit opt-in)
+zzapi agents create --prompt "Trace the request flow" \
+    --project-dir /Users/shukant/Workspace/leveled-inc/leveled --no-branch
+
+# Work on an existing pull request's head branch
+zzapi agents create --prompt "Address review feedback" \
+    --project-dir /Users/shukant/Workspace/leveled-inc/leveled --pr 1031
 zzapi agents logs <id-or-prefix> --follow
 zzapi agents logs <id> --stream stderr --tail 5000
 zzapi agents pause <id>      # relay PR in flight

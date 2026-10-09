@@ -184,7 +184,13 @@ enum AgentsCmd {
         project_dir: String,
         /// Branch for the agent's work
         #[arg(long)]
-        branch: String,
+        branch: Option<String>,
+        /// Run in the project directory without creating a worktree
+        #[arg(long)]
+        no_branch: bool,
+        /// Pull request number; its head branch is resolved by the relay
+        #[arg(long)]
+        pr: Option<u64>,
         /// Worktree path (default /private/tmp/<branch-slug>/)
         #[arg(long)]
         worktree: Option<String>,
@@ -741,17 +747,26 @@ fn cmd_agents_create(
     client: &Client,
     prompt: &str,
     project_dir: &str,
-    branch: &str,
+    branch: Option<&str>,
+    no_branch: bool,
+    pr: Option<u64>,
     worktree: Option<&str>,
     model: Option<&str>,
     approval_mode: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<(), Fail> {
+    validate_agents_create_options(branch, no_branch, pr)?;
     let mut body = serde_json::json!({
         "prompt": prompt,
         "project_dir": project_dir,
-        "branch": branch,
+        "no_branch": no_branch,
     });
+    if let Some(branch) = branch {
+        body["branch"] = serde_json::Value::String(branch.to_owned());
+    }
+    if let Some(pr) = pr {
+        body["pr"] = serde_json::Value::Number(pr.into());
+    }
     if let Some(w) = worktree {
         body["worktree"] = serde_json::Value::String(w.to_string());
     }
@@ -767,8 +782,42 @@ fn cmd_agents_create(
     let resp = client.post("/v1/agents", &body)?;
     emit(client, &resp, || {
         println!("agent:    {}", s(&resp, "id"));
-        println!("worktree: {}", s(&resp, "worktree"));
+        if let Some(worktree) = resp.get("worktree").and_then(serde_json::Value::as_str) {
+            println!("worktree: {worktree}");
+        } else if let Some(working_dir) =
+            resp.get("working_dir").and_then(serde_json::Value::as_str)
+        {
+            println!("working directory: {working_dir}");
+        }
     });
+    Ok(())
+}
+
+fn validate_agents_create_options(
+    branch: Option<&str>,
+    no_branch: bool,
+    pr: Option<u64>,
+) -> Result<(), Fail> {
+    if branch.is_some() && no_branch {
+        return Err(Fail::Config(
+            "cannot specify both --branch and --no-branch".to_owned(),
+        ));
+    }
+    if branch.is_some() && pr.is_some() {
+        return Err(Fail::Config(
+            "cannot specify both --branch and --pr".to_owned(),
+        ));
+    }
+    if no_branch && pr.is_some() {
+        return Err(Fail::Config(
+            "cannot specify both --pr and --no-branch".to_owned(),
+        ));
+    }
+    if branch.is_none() && !no_branch && pr.is_none() {
+        return Err(Fail::Config(
+            "must specify --branch or --no-branch".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1348,6 +1397,18 @@ fn report_api_error(e: &ApiError) {
 }
 
 fn run(cli: Cli) -> Result<(), Fail> {
+    if let Commands::Agents {
+        cmd:
+            AgentsCmd::Create {
+                branch,
+                no_branch,
+                pr,
+                ..
+            },
+    } = &cli.command
+    {
+        validate_agents_create_options(branch.as_deref(), *no_branch, *pr)?;
+    }
     let client = make_client(&cli)?;
     // clap's trailing_var_arg keeps a leading "--" out, but strip it anyway
     // for ergonomics (matches the old Python client).
@@ -1367,6 +1428,8 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 prompt,
                 project_dir,
                 branch,
+                no_branch,
+                pr,
                 worktree,
                 model,
                 approval_mode,
@@ -1375,7 +1438,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 &client,
                 &prompt,
                 &project_dir,
-                &branch,
+                branch.as_deref(),
+                no_branch,
+                pr,
                 worktree.as_deref(),
                 model.as_deref(),
                 approval_mode.as_deref(),
@@ -1537,6 +1602,24 @@ mod tests {
             assert!(serde_json::from_str::<serde_json::Value>(&line).is_ok());
             assert!(!line.contains('\n'));
         }
+    }
+
+    #[test]
+    fn agent_create_requires_an_explicit_execution_mode() {
+        assert!(matches!(
+            validate_agents_create_options(None, false, None),
+            Err(Fail::Config(message)) if message == "must specify --branch or --no-branch"
+        ));
+        assert!(matches!(
+            validate_agents_create_options(Some("codex/x"), true, None),
+            Err(Fail::Config(message)) if message == "cannot specify both --branch and --no-branch"
+        ));
+        assert!(matches!(
+            validate_agents_create_options(Some("codex/x"), false, Some(123)),
+            Err(Fail::Config(message)) if message == "cannot specify both --branch and --pr"
+        ));
+        assert!(validate_agents_create_options(None, true, None).is_ok());
+        assert!(validate_agents_create_options(None, false, Some(123)).is_ok());
     }
 
     #[cfg(unix)]

@@ -46,9 +46,12 @@ implemented route; check `relay/src/routes/` when they differ.
 
 ## Worktrees and provider agents
 
-`POST /v1/agents` takes a prompt (inline or file), `project_dir`, `branch`,
-and optional `worktree`, `model`, `approval_mode`, and `timeout_secs`. Its
-default worktree is `/private/tmp/<branch-slug>/`; capacity defaults to 16.
+`POST /v1/agents` takes a prompt (inline or file), `project_dir`, and exactly
+one of `branch`, `no_branch: true`, or `pr`. Branch mode creates or reuses a
+worktree under `/private/tmp/<branch-slug>/` by default. PR mode resolves the
+head branch with `gh pr view` and uses a worktree. No-branch mode runs directly
+in `project_dir` without creating a worktree or checking out a branch. Capacity
+defaults to 16.
 Worktree routes canonicalize paths, permit only `/private/tmp` or
 `/Users/shukant/.codex/worktrees`, reject traversal, and will not remove a
 live agent's worktree. Stopping an agent deliberately does not clean it up.
