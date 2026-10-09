@@ -671,8 +671,22 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
 }
 
 fn verify_codesign(runtime: &dyn Runtime, candidate: &Path) -> Result<(), String> {
+    // SECURITY TRADEOFF: this requirement intentionally accepts Apple Development
+    // certificates, not just Developer ID. `anchor apple` only demands that the
+    // leaf certificate chain up to *some* Apple-issued root; the real trust
+    // boundary is the TeamIdentifier check (`certificate leaf[subject.OU]`),
+    // which only certificates issued to Shukant's team (NH5F3PDHQ8) can satisfy.
+    //
+    // Apple Development certs are issued to anyone with a free Apple ID, so they
+    // carry weaker issuance guarantees than Developer ID (no legal-identity
+    // verification by Apple). What they do NOT allow is forgery by an unrelated
+    // third party: an attacker would need to compromise Shukant's Apple
+    // Developer account to obtain a certificate with his Team ID. For a personal
+    // tool's auto-updater, team-scoped trust is the right bar; Developer ID
+    // (which requires the paid $99/yr membership) can be reinstated by swapping
+    // `anchor apple` back to `anchor apple generic` below.
     let requirement = format!(
-        "=designated => anchor apple generic and identifier \"com.shukantpal.zigzag\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
+        "=designated => anchor apple and identifier \"com.shukantpal.zigzag\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
     );
     command_status(
         runtime,
@@ -1256,7 +1270,10 @@ mod tests {
             .find(|call| call.command == "codesign" && call.operation == "status")
             .unwrap();
         assert!(codesign.args.iter().any(|arg| {
-            arg.contains("anchor apple generic")
+            // Accepts Apple Development certs: any Apple-anchored cert with the
+            // right identifier and team, not just Developer ID.
+            arg.contains("anchor apple")
+                && !arg.contains("anchor apple generic")
                 && arg.contains("identifier \"com.shukantpal.zigzag\"")
                 && arg.contains("certificate leaf[subject.OU] = \"NH5F3PDHQ8\"")
         }));
