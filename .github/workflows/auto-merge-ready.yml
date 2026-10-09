@@ -1,0 +1,97 @@
+name: Auto-merge ready pull requests
+
+on:
+  pull_request:
+    types: [labeled]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  checks: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: auto-merge-ready-${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  merge-ready:
+    if: github.event_name == 'check_suite' || github.event.label.name == 'ready'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check eligible pull requests and merge when CI is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          LABELED_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHECK_SUITE_PULL_REQUESTS: ${{ toJSON(github.event.check_suite.pull_requests) }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # The job-level condition filters unrelated labels; retain this
+            # guard so changes to that condition cannot trigger an unintended run.
+            [[ "$LABEL_NAME" == "ready" ]] || exit 0
+            pr_numbers="$LABELED_PR_NUMBER"
+          else
+            pr_numbers="$(jq -r '.[].number // empty' <<<"${CHECK_SUITE_PULL_REQUESTS:-[]}")"
+          fi
+
+          [[ -n "$pr_numbers" ]] || exit 0
+
+          while IFS= read -r pr_number; do
+            [[ -n "$pr_number" ]] || continue
+
+            pr="$(gh pr view "$pr_number" --json additions,deletions,changedFiles,labels)"
+            is_ready="$(jq -r '[.labels[].name] | index("ready") != null' <<<"$pr")"
+            [[ "$is_ready" == "true" ]] || continue
+
+            changed_files="$(jq -r '.changedFiles' <<<"$pr")"
+            changed_lines="$(jq -r '.additions + .deletions' <<<"$pr")"
+            if (( changed_files >= 5 || changed_lines >= 500 )); then
+              gh pr edit "$pr_number" --remove-label ready
+              gh pr comment "$pr_number" --body \
+                "Auto-merge was not enabled: the ready label is limited to PRs changing fewer than 5 files and fewer than 500 total added and deleted lines. This PR changes ${changed_files} files and ${changed_lines} lines."
+              continue
+            fi
+
+            # Exit code 8 means checks are pending. Capture JSON in either case
+            # so failures can remove the label while pending checks keep it.
+            set +e
+            checks="$(gh pr checks "$pr_number" --required --json bucket,name 2>&1)"
+            checks_status=$?
+            set -e
+            if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks"; then
+              echo "Could not read required checks for PR #${pr_number}: ${checks}" >&2
+              exit 1
+            fi
+
+            check_count="$(jq 'length' <<<"$checks")"
+            if (( check_count == 0 )); then
+              echo "No required checks were reported for PR #${pr_number}; leaving the label in place."
+              continue
+            fi
+
+            has_failure="$(jq '[.[].bucket] | any(. == "fail" or . == "cancel")' <<<"$checks")"
+            if [[ "$has_failure" == "true" ]]; then
+              gh pr edit "$pr_number" --remove-label ready
+              continue
+            fi
+
+            has_pending="$(jq '[.[].bucket] | any(. == "pending")' <<<"$checks")"
+            if [[ "$has_pending" == "true" || "$checks_status" -eq 8 ]]; then
+              echo "Required checks are still pending for PR #${pr_number}."
+              continue
+            fi
+
+            all_green="$(jq 'all(.[]; .bucket == "pass" or .bucket == "skipping")' <<<"$checks")"
+            if [[ "$all_green" == "true" ]]; then
+              gh pr merge "$pr_number" --merge
+            else
+              echo "Required checks are not all green for PR #${pr_number}; leaving the label in place."
+            fi
+          done <<<"$pr_numbers"
