@@ -32,7 +32,6 @@ pub struct AgentRecord {
     /// RFC 3339 timestamp of the most recent pause; `None` when the agent is
     /// not paused.  A paused agent's process group is stopped with SIGSTOP.
     pub paused_at: Option<String>,
-    pub worktree_path: Option<String>,
     pub exit_code: Option<i32>,
     pub log_degraded: bool,
     pub audit_degraded: bool,
@@ -689,7 +688,6 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         command: text("command")?,
         state: text("state")?,
         paused_at: optional_string("paused_at")?,
-        worktree_path: optional_string("worktree_path")?,
         exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
         log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
         audit_degraded: get("audit_degraded")
