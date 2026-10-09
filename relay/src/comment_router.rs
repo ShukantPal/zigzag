@@ -310,8 +310,7 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
             return Err(error);
         }
         eprintln!(
-            "shadow: would resume session {} for {}#{} on {} new GitHub comment(s)",
-            watched.session_id,
+            "shadow: would resume a session for {}#{} on {} new GitHub comment(s)",
             watched.repository,
             watched.number,
             fresh.len()
