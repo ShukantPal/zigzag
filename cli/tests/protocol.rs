@@ -229,12 +229,14 @@ fn transcript_json_once_is_pretty_json() {
         .output()
         .unwrap();
 
+    let requests = server.join().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("GET /v1/agents/agent-1/transcript HTTP/1.1\r\n"));
     assert!(stdout.contains("\n  \"id\": \"agent-1\","));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["stdout"],
         "done\n"
     );
-    server.join().unwrap();
 }
