@@ -549,14 +549,12 @@ fn agent_json(entry: &AgentRecord) -> Json {
     )
 }
 
-fn decode_agents(
-    text: &str,
-) -> (
-    std::collections::BTreeMap<String, AgentRecord>,
-    Vec<String>,
-) {
+fn decode_agents(text: &str) -> (std::collections::BTreeMap<String, AgentRecord>, Vec<String>) {
     let mut skipped: Vec<String> = Vec::new();
-    let values = match parse_json(text).ok().and_then(|v| v.object("agents").cloned()) {
+    let values = match parse_json(text)
+        .ok()
+        .and_then(|v| v.object("agents").cloned())
+    {
         Some(Json::Array(values)) => values,
         _ => {
             skipped.push("registry root: missing or invalid 'agents' array".to_owned());
@@ -1772,7 +1770,11 @@ mod tests {
     fn decode_agents_accepts_legacy_string_counters() {
         let (agents, skipped) =
             decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json"));
-        assert!(skipped.is_empty(), "unexpected skipped records: {:?}", skipped);
+        assert!(
+            skipped.is_empty(),
+            "unexpected skipped records: {:?}",
+            skipped
+        );
         let record = agents.get("legacy-0003").unwrap();
         assert_eq!(record.stdout_next, 0);
         assert_eq!(record.stderr_next, 64);
@@ -1868,7 +1870,11 @@ mod tests {
         let json = agent_json(&record);
         let text = json.to_json();
         // None of the optional fields should appear as explicit nulls
-        assert!(!text.contains("null"), "writer should omit nulls, got: {}", text);
+        assert!(
+            !text.contains("null"),
+            "writer should omit nulls, got: {}",
+            text
+        );
         // Required fields must still be present
         assert!(text.contains("test-1"));
     }
