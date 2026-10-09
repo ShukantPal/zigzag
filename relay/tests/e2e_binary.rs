@@ -9,7 +9,7 @@
 //!   loopback only
 //! - no `--watch-repo` flags and no `~/.zigzag/config.yaml`, so neither the
 //!   GitHub watch loop nor the review loop starts
-//! - `--port 0`: the OS assigns a free port, parsed from the daemon's
+//! - the OS assigns free ports, parsed from the daemon's
 //!   `listening on http://127.0.0.1:PORT` log line
 //!
 //! `/v1/exec` and `/v1/spawn` are expected to fail closed (500) here: the
@@ -75,31 +75,15 @@ impl TestRelay {
         );
 
         let state_file = dir.join("events.json");
-        // Pick a free port ourselves: the daemon logs the *requested* bind
-        // address, so `--port 0` would leave us unable to discover the real
-        // port from its log line.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("could not find a free port")
-            .local_addr()
-            .unwrap()
-            .port();
-        // The relay now owns a second listener.  Give each concurrently run
-        // binary test its own socket port too; using the production default
-        // would make all but one daemon fail during startup.
-        let socket_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("could not find a free relay socket port")
-            .local_addr()
-            .unwrap()
-            .port();
         let mut child = Command::new(env!("CARGO_BIN_EXE_zigzag"))
             .arg("--secret-file")
             .arg(&secret_file)
             .arg("--state-file")
             .arg(&state_file)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--socket-port")
-            .arg(socket_port.to_string())
+            .arg("0")
             .env("PATH", path)
             .env("HOME", &dir)
             .env("ZIGZAG_UPDATE_POLICY", "paused")

@@ -196,9 +196,12 @@ fn run() -> Result<(), String> {
     for address in addresses {
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("could not bind {address}: {error}"))?;
+        let bound_address = listener
+            .local_addr()
+            .map_err(|error| format!("could not inspect bound address {address}: {error}"))?;
         let state = Arc::clone(&state);
         let limiter = Arc::clone(&limiter);
-        log::info!("listening on http://{address}");
+        log::info!("listening on http://{bound_address}");
         thread::spawn(move || serve(listener, state, limiter));
     }
     let socket_addresses = [
@@ -208,9 +211,12 @@ fn run() -> Result<(), String> {
     for address in socket_addresses {
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("could not bind socket {address}: {error}"))?;
+        let bound_address = listener.local_addr().map_err(|error| {
+            format!("could not inspect bound socket address {address}: {error}")
+        })?;
         let state = Arc::clone(&state);
         let limiter = Arc::clone(&limiter);
-        log::info!("listening for relay socket clients on tcp://{address}");
+        log::info!("listening for relay socket clients on tcp://{bound_address}");
         thread::spawn(move || socket::serve(listener, state, limiter));
     }
     // The replacement only signals readiness after it has opened durable state
