@@ -7,9 +7,10 @@ use crate::proc::{
     AgentSpawnDetails, agent_transcript_path, force_kill_process_group, kill_process_group,
     managed_agent_running, process_group_running, recovered_agent_identity_matches, spawn_proc,
 };
+use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::{
     WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
-    valid_worktree_branch, worktree_branch_checked_out, worktree_branch_exists,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_branch_exists,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
@@ -378,11 +379,11 @@ fn transcript_json(
     ]))
 }
 
-/// Read API-created Codex stdout from its durable JSONL transcript. Stderr
-/// continues to use the existing separate diagnostics spool. Older and
-/// generic agents have no transcript file and retain the original spool-only
-/// behavior.
-fn agent_logs_json(
+/// Read agent logs from the ordered diagnostics spool. API-created agents now
+/// tee stdout into that spool as well as their durable transcript, so live
+/// tails have one cursor across both streams. Agents created before that tee
+/// was introduced retain a transcript-only stdout fallback.
+pub(crate) fn agent_logs_json(
     registry: &relay_core::AgentRegistry,
     id: &str,
     stream: &str,
@@ -390,6 +391,9 @@ fn agent_logs_json(
     tail: Option<usize>,
 ) -> Option<Json> {
     let agent = registry.get(id)?;
+    if agent.stdout_next > 0 {
+        return registry.logs_json(id, stream, after, tail);
+    }
     let transcript = agent_transcript_path(id).and_then(|path| std::fs::read_to_string(path).ok());
     let Some(transcript) = transcript else {
         return registry.logs_json(id, stream, after, tail);
@@ -397,21 +401,24 @@ fn agent_logs_json(
 
     let stderr_logs = registry.logs_json(id, "stderr", after, tail)?;
     let mut records = Vec::new();
-    if matches!(stream, "stdout" | "both") && after == 0 {
-        let data = match tail {
-            Some(limit) if transcript.len() > limit => {
-                let mut start = transcript.len() - limit;
-                while !transcript.is_char_boundary(start) {
-                    start += 1;
-                }
-                transcript[start..].to_owned()
+    if matches!(stream, "stdout" | "both") && after < transcript.len() as u64 {
+        let mut start = usize::try_from(after)
+            .unwrap_or(usize::MAX)
+            .min(transcript.len());
+        if after == 0
+            && let Some(limit) = tail
+            && transcript.len() > limit
+        {
+            start = transcript.len() - limit;
+            while !transcript.is_char_boundary(start) {
+                start += 1;
             }
-            _ => transcript,
-        };
+        }
+        let data = transcript[start..].to_owned();
         if !data.is_empty() {
             records.push(Json::Object(vec![
                 ("stream".to_owned(), Json::String("stdout".to_owned())),
-                ("cursor".to_owned(), Json::number(0)),
+                ("cursor".to_owned(), Json::number(start as u64)),
                 ("data".to_owned(), Json::String(data)),
             ]));
         }
@@ -461,6 +468,7 @@ pub(crate) struct AgentCreateRequest {
     pub(crate) model: Option<String>,
     pub(crate) approval_mode: Option<String>,
     pub(crate) timeout_secs: Option<u64>,
+    pub(crate) auto_pr: bool,
 }
 
 pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateRequest, &'static str> {
@@ -478,6 +486,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
                 | "model"
                 | "approval_mode"
                 | "timeout_secs"
+                | "no_auto_pr"
         )
     }) {
         return Err("invalid_agent_create_request");
@@ -498,6 +507,11 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         None => None,
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_create_request")?),
     };
+    let auto_pr = match fields.iter().find(|(key, _)| key == "no_auto_pr") {
+        None => true,
+        Some((_, Json::Bool(no_auto_pr))) => !no_auto_pr,
+        Some(_) => return Err("invalid_agent_create_request"),
+    };
     Ok(AgentCreateRequest {
         prompt: string_field("prompt", true)?.expect("required field"),
         project_dir: string_field("project_dir", true)?.expect("required field"),
@@ -506,6 +520,7 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         model: string_field("model", false)?,
         approval_mode: string_field("approval_mode", false)?,
         timeout_secs,
+        auto_pr,
     })
 }
 
@@ -532,6 +547,7 @@ pub(crate) fn agent_create_worktree(
     repo: &Path,
     path: &Path,
     branch: &str,
+    agents: &[AgentRecord],
 ) -> Result<(), AgentWorktreeFailure> {
     let validation = AgentWorktreeFailure::Validation;
     if !git_output(repo, &["rev-parse", "--git-dir"])
@@ -544,11 +560,33 @@ pub(crate) fn agent_create_worktree(
             message: "worktree_repo_not_a_git_repo",
         }));
     }
-    if worktree_branch_checked_out(repo, branch).map_err(validation)? {
-        return Err(validation(WorktreeError {
-            code: 400,
-            message: "worktree_branch_already_checked_out",
-        }));
+    if let Some(checked_out_path) =
+        worktree_branch_checkout_path(repo, branch).map_err(validation)?
+    {
+        let same_path = std::fs::canonicalize(&checked_out_path)
+            .ok()
+            .zip(std::fs::canonicalize(path).ok())
+            .is_some_and(|(checked_out, requested)| checked_out == requested);
+        let active_agent_uses_worktree = agents.iter().any(|agent| {
+            matches!(agent.state.as_str(), "running" | "paused")
+                && agent.worktree_path.as_deref().is_some_and(|agent_path| {
+                    std::fs::canonicalize(agent_path)
+                        .ok()
+                        .zip(std::fs::canonicalize(&checked_out_path).ok())
+                        .is_some_and(|(agent_path, checkout_path)| agent_path == checkout_path)
+                })
+        });
+        if !same_path || active_agent_uses_worktree {
+            return Err(validation(WorktreeError {
+                code: 400,
+                message: "worktree_branch_already_checked_out",
+            }));
+        }
+        log::info!(
+            "agent_create reusing worktree path={} branch={branch}",
+            path.display()
+        );
+        return Ok(());
     }
     let path_str = path.to_str().ok_or(validation(WorktreeError {
         code: 400,
@@ -657,12 +695,11 @@ fn agent_create_request(
         approval_flag.to_owned(),
         "--skip-git-repo-check".to_owned(),
     ];
-    if let Some(model) = &request.model {
-        if !valid_agent_model(model) {
-            return reply(stream, 400, error("invalid_model"));
-        }
-        codex_args.extend(["-m".to_owned(), model.clone()]);
+    let model = request.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
+    if !valid_agent_model(model) {
+        return reply(stream, 400, error("invalid_model"));
     }
+    codex_args.extend(["-m".to_owned(), model.to_owned()]);
     let worktree_str = worktree_path.to_string_lossy().into_owned();
     codex_args.extend([
         "-C".to_owned(),
@@ -670,7 +707,8 @@ fn agent_create_request(
         "-o".to_owned(),
         format!("{worktree_str}/last-message.txt"),
     ]);
-    match agent_create_worktree(&repo, &worktree_path, &request.branch) {
+    let agents = state.supervisor.registry.list(None, None);
+    match agent_create_worktree(&repo, &worktree_path, &request.branch, &agents) {
         Ok(()) => {}
         Err(AgentWorktreeFailure::Validation(failure)) => {
             return reply(stream, failure.code, error(failure.message));
@@ -811,6 +849,7 @@ pub(crate) fn persisted_agent_config(
             Json::String(request.project_dir.clone()),
         ),
         ("branch".to_owned(), Json::String(request.branch.clone())),
+        ("auto_pr".to_owned(), Json::Bool(request.auto_pr)),
         ("worktree".to_owned(), Json::String(worktree.to_owned())),
         (
             "model".to_owned(),
@@ -953,12 +992,11 @@ pub(crate) fn restart_argv(
         approval.to_owned(),
         "--skip-git-repo-check".to_owned(),
     ];
-    if let Some(model) = &config.model {
-        if !valid_agent_model(model) {
-            return Err("invalid_model");
-        }
-        args.extend(["-m".to_owned(), model.clone()]);
+    let model = config.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
+    if !valid_agent_model(model) {
+        return Err("invalid_model");
     }
+    args.extend(["-m".to_owned(), model.to_owned()]);
     match mode {
         RestartMode::Fresh => args.extend([
             "-C".to_owned(),

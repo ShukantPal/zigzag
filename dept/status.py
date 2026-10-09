@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 import shlex
+import socket
 import sys
 import urllib.parse
 import urllib.request
@@ -37,6 +38,87 @@ INTERNAL_TASK_IDS = frozenset({"relay-update"})
 # server's retention already bounds the bootstrap window; this only stops
 # unbounded growth while streaming.
 MAX_STREAM_EVENTS = 10_000
+SOCKET_PORT = 8766
+MAX_SOCKET_FRAME_BYTES = 4 * 1024 * 1024
+
+
+def socket_address(url: str) -> tuple[str, int]:
+    """Map the relay HTTP URL to its adjacent TCP socket endpoint."""
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname:
+        raise ValueError("relay URL has no hostname")
+    configured = os.environ.get("ZIGZAG_SOCKET_PORT")
+    try:
+        port = int(configured) if configured else SOCKET_PORT
+    except ValueError as error:
+        raise ValueError("ZIGZAG_SOCKET_PORT must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("ZIGZAG_SOCKET_PORT must be between 1 and 65535")
+    return parsed.hostname, port
+
+
+def socket_frame(payload: dict[str, Any]) -> bytes:
+    """Encode one relay socket frame (four-byte BE length plus JSON)."""
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if not data or len(data) > MAX_SOCKET_FRAME_BYTES:
+        raise ValueError("invalid relay socket frame size")
+    return len(data).to_bytes(4, "big") + data
+
+
+def read_socket_frame(connection: socket.socket) -> dict[str, Any]:
+    def exact(size: int) -> bytes:
+        result = bytearray()
+        while len(result) < size:
+            chunk = connection.recv(size - len(result))
+            if not chunk:
+                raise OSError("relay socket closed")
+            result.extend(chunk)
+        return bytes(result)
+
+    size = int.from_bytes(exact(4), "big")
+    if not 0 < size <= MAX_SOCKET_FRAME_BYTES:
+        raise ValueError("invalid relay socket frame size")
+    decoded = json.loads(exact(size))
+    if not isinstance(decoded, dict):
+        raise ValueError("relay socket returned a non-object frame")
+    return decoded
+
+
+class RelaySocket:
+    """Small blocking client for the relay's subscription socket."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+
+    @classmethod
+    def connect(cls, url: str, token: str, *, after: int, epoch: str) -> "RelaySocket":
+        connection = socket.create_connection(socket_address(url), timeout=3)
+        try:
+            connection.sendall(socket_frame({"type": "auth", "authorization": f"Bearer {token}"}))
+            reply = read_socket_frame(connection)
+            if reply.get("type") != "authenticated":
+                raise OSError("relay socket authentication failed")
+            connection.sendall(socket_frame({"type": "subscribe", "topic": "agents"}))
+            # Resume from the HTTP bootstrap cursor.  This closes the gap
+            # between bootstrap and socket admission without making the TCP
+            # protocol retain a second event window.
+            connection.sendall(socket_frame({
+                "type": "subscribe", "topic": "events", "after": after, "epoch": epoch,
+            }))
+            return cls(connection)
+        except BaseException:
+            connection.close()
+            raise
+
+    def receive(self, timeout: float) -> dict[str, Any] | None:
+        self.connection.settimeout(timeout)
+        try:
+            return read_socket_frame(self.connection)
+        except socket.timeout:
+            return None
+
+    def close(self) -> None:
+        self.connection.close()
 
 
 def dept_task_id(task_id: str) -> str:
@@ -352,7 +434,7 @@ def get_json(url: str, token: str) -> dict[str, Any]:
 
 
 class EventStream:
-    """Subscribe to the relay's /v1/events long-poll endpoint.
+    """Subscribe to relay changes, preferring TCP and falling back to HTTP.
 
     Bootstrap once (full retained window + agent table), then poll() blocks
     up to ``timeout`` seconds for newly pushed events and folds them into the
@@ -369,6 +451,7 @@ class EventStream:
         self.agents: dict[str, dict[str, Any]] = {}
         self.lost = False
         self.poll_warnings: list[str] = []
+        self.socket: RelaySocket | None = None
 
     def _get(self, path: str, timeout: float) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -398,6 +481,12 @@ class EventStream:
         """One full-window fetch plus the agent table; the only heavy requests."""
         self._ingest(self._get("/v1/events?after=0&timeout=0", 10))
         self._seed_agents()
+        try:
+            self.socket = RelaySocket.connect(self.url, self.token, after=self.after, epoch=self.epoch)
+        except (OSError, ValueError, json.JSONDecodeError):
+            # Older relays and relays behind an HTTP-only proxy retain exactly
+            # the established long-poll behavior.
+            self.socket = None
 
     def _apply_agent_event(self, event: dict[str, Any]) -> None:
         kind = event.get("kind")
@@ -471,6 +560,43 @@ class EventStream:
 
     def poll(self, timeout: float) -> bool:
         """Block up to ``timeout`` seconds for pushed events; True if changed."""
+        if self.socket is not None:
+            try:
+                frame = self.socket.receive(timeout)
+                if frame is None:
+                    return False
+                topic = frame.get("topic")
+                if topic == "agents":
+                    agents = frame.get("agents")
+                    if isinstance(agents, list):
+                        updated = {
+                            agent["id"]: agent for agent in agents
+                            if isinstance(agent, dict) and isinstance(agent.get("id"), str)
+                        }
+                        changed = updated != self.agents
+                        self.agents = updated
+                        return changed
+                    return False
+                if topic == "events" and frame.get("dropped"):
+                    # The bounded socket queue overflowed. HTTP has the durable
+                    # cursor/epoch recovery semantics, so use it to resync.
+                    self.socket.close()
+                    self.socket = None
+                    return self.poll(timeout)
+                if topic == "events" and isinstance(frame.get("event"), dict):
+                    event = frame["event"]
+                    return self._ingest({
+                        "epoch": self.epoch,
+                        "reset": False,
+                        "lost": False,
+                        "next": event.get("sequence", self.after),
+                        "events": [event],
+                    })
+                return False
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                self.socket.close()
+                self.socket = None
+                self.poll_warnings = [f"relay socket unavailable; using HTTP fallback: {error}"]
         try:
             message = self._get(
                 f"/v1/events?after={self.after}"
@@ -514,9 +640,10 @@ def task_workdir(task_id: str, root: Path | None = None) -> str:
         return ""
 
 
-def transcript_command(task_id: str, root: Path | None = None) -> str:
+def transcript_command(task_id: str | Path, root: Path | None = None) -> str:
     # BSD tail exits when a path has not been created yet; -F retries it.
-    return f"tail -F {shlex.quote(str(transcript_path(task_id, root)))}"
+    path = task_id if isinstance(task_id, Path) else transcript_path(task_id, root)
+    return f"tail -F {shlex.quote(str(path))}"
 
 
 def relay_output(
@@ -594,7 +721,7 @@ def transcript_lines(
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
         f"Source: {path}",
-        f"Command: tail -F {shlex.quote(str(path))}",
+        f"Command: {transcript_command(path)}",
     ]
     if execution.agent_id is None:
         lines.append("Relay output unavailable: no retained supervised agent matches this execution.")

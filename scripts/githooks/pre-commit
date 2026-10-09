@@ -1,29 +1,25 @@
 #!/bin/sh
-# Convenience only: CI enforces that the materialized config is up to date.
+# Run the fast CI gates before accepting a commit. The heavier Clippy gate runs
+# from pre-push so ordinary commits stay reasonably quick.
+
+set -eu
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 
-if ! git diff --cached --name-only --diff-filter=ACMRD | grep -qx 'dept/config.py'; then
-    exit 0
-fi
+"$repo_root/scripts/githooks/materialize-config"
 
-artifact="$repo_root/dept/config.materialized.json"
-temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/zigzag-config.XXXXXX") || {
-    echo "warning: unable to create a materialization workspace; CI will check it" >&2
-    exit 0
-}
-trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
-source="$temporary_dir/config.py"
-temporary="$temporary_dir/config.materialized.json"
+cd "$repo_root"
 
-if ! git show :dept/config.py >"$source" || ! python3 "$source" --materialize >"$temporary"; then
-    echo "warning: unable to materialize dept/config.materialized.json; CI will check it" >&2
-    exit 0
-fi
+# Hooks inherit Git's repository environment. The Python suite creates its own
+# temporary repositories, which must not accidentally use this worktree's
+# index or hooks directory.
+unset $(git rev-parse --local-env-vars)
 
-if ! mv "$temporary" "$artifact" || ! git add "$artifact"; then
-    echo "warning: unable to stage dept/config.materialized.json; CI will check it" >&2
-    rm -f "$temporary"
-fi
+echo 'pre-commit: cargo fmt --all --check'
+cargo fmt --all --check
 
-exit 0
+echo 'pre-commit: Python checks'
+python3 dept/config.py --check
+python3 -c "import pathlib; [compile(p.read_text(), str(p), 'exec') for p in pathlib.Path('dept').glob('*.py')]"
+python3 -m unittest discover -s dept -p 'test_*.py'
+python3 scripts/test_opencode_launch.py

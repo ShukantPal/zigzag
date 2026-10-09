@@ -58,7 +58,6 @@ while [ $# -gt 0 ]; do
 done
 
 command -v gh >/dev/null || { echo "gh CLI is required" >&2; exit 2; }
-command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
 [ "$(uname)" = "Darwin" ] || { echo "codesign checks require macOS" >&2; exit 2; }
 if [ -n "$TRUST_ROOT" ]; then
   [ -f "$TRUST_ROOT" ] || { echo "trust root not found: $TRUST_ROOT" >&2; exit 2; }
@@ -71,21 +70,51 @@ else
   mkdir -p "$WORKDIR"
 fi
 
+# Do not use unauthenticated curl for GitHub API or release-asset requests.
+# GitHub-hosted runners share the unauthenticated REST API rate limit, which
+# can turn an otherwise valid release lookup into a 403. `gh` automatically
+# uses GH_TOKEN (or the user's authenticated gh session), including in
+# `gh release download` below.
+github_api() { # $1 = endpoint relative to https://api.github.com/
+  local endpoint="$1"
+  shift
+  gh api --method GET "$endpoint" "$@"
+}
+
 if [ -z "$TAG" ]; then
-  TAG="$(curl --fail --silent --show-error --location \
-    "https://api.github.com/repos/$REPO/releases/latest" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+  if ! TAG="$(github_api "repos/$REPO/releases/latest" --jq '.tag_name')"; then
+    echo "could not retrieve the latest release; check GH_TOKEN authentication and contents: read permission" >&2
+    exit 1
+  fi
 fi
 echo "verifying $REPO release $TAG"
 
-api="https://api.github.com/repos/$REPO/releases/tags/$TAG"
-asset_url() { # $1 = asset name -> browser_download_url
-  curl --fail --silent --show-error --location "$api" | python3 -c "
-import json,sys
+if ! RELEASE_JSON="$(github_api "repos/$REPO/releases/tags/$TAG")"; then
+  # The release action can return before the API has made the new release
+  # visible.  This is deliberately a retryable failure for the CI wrapper.
+  echo "release $TAG is not available through the GitHub API yet; it may still be publishing, or GH_TOKEN lacks contents: read permission" >&2
+  exit 1
+fi
+
+require_asset() { # $1 = asset name; return nonzero until it is attached
+  printf '%s' "$RELEASE_JSON" | python3 -c '
+import json, sys
 name = sys.argv[1]
-assets = json.load(sys.stdin)['assets']
-print(next(a['browser_download_url'] for a in assets if a['name'] == name))
-" "$1"
+assets = json.load(sys.stdin).get("assets", [])
+if not any(asset.get("name") == name for asset in assets):
+    raise SystemExit(f"release asset not available yet: {name}")
+' "$1"
+}
+
+download_asset() { # $1 = asset name
+  local name="$1"
+  if ! require_asset "$name"; then
+    echo "release $TAG is visible but $name is not attached yet" >&2
+    return 1
+  fi
+  # This preserves authentication for private repositories and avoids a
+  # second unauthenticated API request for browser_download_url.
+  gh release download "$TAG" --repo "$REPO" --pattern "$name" --dir "$WORKDIR" --clobber
 }
 
 gh_verify() { # $1 = file, rest = extra gh attestation args
@@ -102,8 +131,7 @@ gh_verify() { # $1 = file, rest = extra gh attestation args
 step() { echo "==> $*"; }
 
 step "1/5 manifest attestation (SLSA provenance, Sigstore, Rekor)"
-curl --fail --silent --show-error --location \
-  -o "$WORKDIR/$MANIFEST_NAME" "$(asset_url "$MANIFEST_NAME")"
+download_asset "$MANIFEST_NAME"
 # No --source-digest here: the manifest is authenticated before its claimed
 # commit is trusted (mirrors the updater).
 gh_verify "$WORKDIR/$MANIFEST_NAME"
@@ -119,8 +147,7 @@ COMMIT="$(printf '%s' "$MANIFEST_JSON" | python3 -c 'import json,sys; print(json
 echo "version=$VERSION target=$MTARGET commit=$COMMIT"
 
 step "3/5 binary digest"
-curl --fail --silent --show-error --location \
-  -o "$WORKDIR/$BINARY_NAME" "$(asset_url "$BINARY_NAME")"
+download_asset "$BINARY_NAME"
 ACTUAL="$(shasum -a 256 "$WORKDIR/$BINARY_NAME" | awk '{print $1}')"
 [ "$ACTUAL" = "$DIGEST" ] || { echo "digest mismatch: $ACTUAL != $DIGEST" >&2; exit 1; }
 

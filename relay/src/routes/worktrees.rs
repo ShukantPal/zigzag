@@ -185,12 +185,11 @@ pub(crate) fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, 
         }),
     }
 }
-/// True when the branch is already checked out in some worktree, which `git
-/// worktree add` would refuse.
-pub(crate) fn worktree_branch_checked_out(
+/// Return the worktree path where the branch is checked out, if any.
+pub(crate) fn worktree_branch_checkout_path(
     repo: &Path,
     branch: &str,
-) -> Result<bool, WorktreeError> {
+) -> Result<Option<PathBuf>, WorktreeError> {
     let output = git_output(repo, &["worktree", "list", "--porcelain"])?;
     if !output.status.success() {
         return Err(WorktreeError {
@@ -198,10 +197,25 @@ pub(crate) fn worktree_branch_checked_out(
             message: "worktree_git_failed",
         });
     }
-    let wanted = format!("branch refs/heads/{branch}");
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line == wanted))
+    let mut path = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(worktree_path) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(worktree_path));
+        } else if line == format!("branch refs/heads/{branch}") {
+            return Ok(path);
+        } else if line.is_empty() {
+            path = None;
+        }
+    }
+    Ok(None)
+}
+/// True when the branch is already checked out in some worktree, which `git
+/// worktree add` would refuse.
+pub(crate) fn worktree_branch_checked_out(
+    repo: &Path,
+    branch: &str,
+) -> Result<bool, WorktreeError> {
+    Ok(worktree_branch_checkout_path(repo, branch)?.is_some())
 }
 /// Core of `POST /v1/worktrees`: validate, then run `git worktree add`,
 /// creating the branch when it does not exist yet. Returns the 200 body.

@@ -12,6 +12,7 @@ mod review_loop;
 mod routes;
 mod server;
 mod session;
+mod socket;
 mod update;
 
 #[cfg(test)]
@@ -55,8 +56,9 @@ fn run() -> Result<(), String> {
     }
     let config = server_config(arguments.clone())?;
     log::info!(
-        "loaded server config: port={} state_file={} agent_registry_file={} max_events={}",
+        "loaded server config: port={} socket_port={} state_file={} agent_registry_file={} max_events={}",
         config.port,
+        config.socket_port,
         config.state_file.display(),
         config.agent_registry_file.display(),
         config.max_events
@@ -198,6 +200,18 @@ fn run() -> Result<(), String> {
         let limiter = Arc::clone(&limiter);
         log::info!("listening on http://{address}");
         thread::spawn(move || serve(listener, state, limiter));
+    }
+    let socket_addresses = [
+        SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.socket_port),
+        SocketAddr::new(tailnet, config.socket_port),
+    ];
+    for address in socket_addresses {
+        let listener = TcpListener::bind(address)
+            .map_err(|error| format!("could not bind socket {address}: {error}"))?;
+        let state = Arc::clone(&state);
+        let limiter = Arc::clone(&limiter);
+        log::info!("listening for relay socket clients on tcp://{address}");
+        thread::spawn(move || socket::serve(listener, state, limiter));
     }
     // The replacement only signals readiness after it has opened durable state
     // and rebound both listeners. The watchdog rolls back if this does not

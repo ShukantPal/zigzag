@@ -11,7 +11,9 @@ from dept import dept
 from dept.status import (
     EventStream,
     Execution,
+    MAX_SOCKET_FRAME_BYTES,
     RELAY_OUTPUT_TAIL_BYTES,
+    RelaySocket,
     StatusScreen,
     agent_worktrees,
     build_executions,
@@ -25,6 +27,8 @@ from dept.status import (
     observed_duration,
     read_audit_events,
     relay_output,
+    socket_address,
+    socket_frame,
     main as status_main,
     task_workdir,
     transcript_command,
@@ -185,6 +189,70 @@ class SnapshotIngestionTests(unittest.TestCase):
                 agent_worktrees(state_file),
                 {"agent-4c4d2e1a": "/private/tmp/fix-pr69-ci"},
             )
+    def test_socket_helpers_use_a_fixed_adjacent_port_and_big_endian_frame(self):
+        self.assertEqual(socket_address("http://relay:8765/path"), ("relay", 8766))
+        encoded = socket_frame({"type": "ping"})
+        self.assertEqual(int.from_bytes(encoded[:4], "big"), len(encoded) - 4)
+        self.assertEqual(json.loads(encoded[4:]), {"type": "ping"})
+        self.assertEqual(MAX_SOCKET_FRAME_BYTES, 4 * 1024 * 1024)
+
+    def test_socket_push_updates_agents_and_events_after_http_bootstrap(self):
+        stream = EventStream("http://relay", "token")
+        pushed_event = event("process_spawned", "2026-01-01T00:00:00.000Z", sequence=2)
+        pushed_event["payload"] = {"agent_id": "agent-1"}
+        socket = unittest.mock.Mock()
+        with patch.object(
+            EventStream,
+            "_get",
+            side_effect=[
+                {"epoch": "e1", "reset": False, "lost": False, "next": 1, "events": []},
+                {"agents": []},
+            ],
+        ), patch.object(RelaySocket, "connect", return_value=socket):
+            stream.bootstrap()
+            socket.receive.side_effect = [
+                {"topic": "agents", "snapshot": True, "agents": [{"id": "agent-1", "state": "running"}]},
+                {"topic": "events", "event": pushed_event},
+            ]
+            self.assertTrue(stream.poll(1))
+            self.assertEqual(stream.agents["agent-1"]["state"], "running")
+            self.assertTrue(stream.poll(1))
+        self.assertEqual([item["id"] for item in stream.events], [pushed_event["id"]])
+        self.assertEqual(stream.after, 2)
+
+    def test_socket_drop_marker_resynchronizes_through_the_http_cursor(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "e1", 7
+        socket = unittest.mock.Mock()
+        socket.receive.return_value = {"topic": "events", "dropped": True}
+        stream.socket = socket
+        recovered = event("process_completed", "2026-01-01T00:00:01.000Z", sequence=8)
+        with patch.object(
+            EventStream,
+            "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 8, "events": [recovered]},
+        ) as get:
+            self.assertTrue(stream.poll(1))
+        socket.close.assert_called_once()
+        self.assertIsNone(stream.socket)
+        self.assertEqual(get.call_args.args[0], "/v1/events?after=7&epoch=e1&timeout=1")
+        self.assertEqual([item["id"] for item in stream.events], [recovered["id"]])
+
+    def test_socket_failure_falls_back_to_the_existing_http_cursor(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "e1", 7
+        socket = unittest.mock.Mock()
+        socket.receive.side_effect = OSError("closed")
+        stream.socket = socket
+        with patch.object(
+            EventStream,
+            "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 7, "events": []},
+        ) as get:
+            self.assertFalse(stream.poll(1))
+        socket.close.assert_called_once()
+        self.assertIsNone(stream.socket)
+        self.assertEqual(get.call_args.args[0], "/v1/events?after=7&epoch=e1&timeout=1")
 
     def test_partial_audit_line_retains_other_events(self):
         with tempfile.TemporaryDirectory() as directory:

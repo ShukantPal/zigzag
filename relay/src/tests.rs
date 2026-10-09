@@ -30,6 +30,7 @@ use crate::proc::{
     process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
     spawn_proc, unique_handle,
 };
+use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_create_worktree, agent_route, default_agent_worktree,
@@ -541,6 +542,7 @@ fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
         ]
     };
     let config = server_config(base_arguments()).unwrap();
+    assert_eq!(config.socket_port, 8766);
     assert_eq!(
         config.review_state_file,
         PathBuf::from("/state").with_extension("reviews.json")
@@ -556,6 +558,9 @@ fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
     let config = server_config(arguments).unwrap();
     assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
     assert_eq!(config.github_watch_interval, Duration::from_secs(60));
+    let mut socket_arguments = base_arguments();
+    socket_arguments.extend(["--socket-port".to_owned(), "9876".to_owned()]);
+    assert_eq!(server_config(socket_arguments).unwrap().socket_port, 9876);
     let shadow_authoritative = review_loop::authoritative_mode(true);
     assert!(!shadow_authoritative);
     assert!(should_start_legacy_watch(
@@ -1439,21 +1444,33 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
 #[test]
 fn agent_create_request_parsing_and_helpers() {
     let request = parse_agent_create_request(
-        br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-5","approval_mode":"full-auto","timeout_secs":3600}"#,
+        br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-6-luna","approval_mode":"full-auto","timeout_secs":3600}"#,
     )
     .unwrap();
     assert_eq!(request.prompt, "do it");
     assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
     assert_eq!(request.branch, "codex/x");
-    assert_eq!(request.model.as_deref(), Some("gpt-5"));
+    assert_eq!(request.model.as_deref(), Some(DEFAULT_CODEX_MODEL));
     assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
     assert_eq!(request.timeout_secs, Some(3600));
+    assert!(request.auto_pr);
     assert!(request.worktree.is_none());
     assert!(
         parse_agent_create_request(br#"{"prompt":"x","project_dir":"y","branch":"z","nope":1}"#)
             .is_err()
     );
     assert!(parse_agent_create_request(br#"{"project_dir":"y","branch":"z"}"#).is_err());
+    let no_auto_pr = parse_agent_create_request(
+        br#"{"prompt":"x","project_dir":"y","branch":"z","no_auto_pr":true}"#,
+    )
+    .unwrap();
+    assert!(!no_auto_pr.auto_pr);
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","no_auto_pr":"yes"}"#
+        )
+        .is_err()
+    );
     assert!(
         parse_agent_create_request(
             br#"{"prompt":"x","project_dir":"y","branch":"z","timeout_secs":"3600"}"#
@@ -1475,6 +1492,7 @@ fn restart_config_replays_prompt_contents_timeout_and_argv() {
     )
     .unwrap();
     let persisted = persisted_agent_config(&request, "/tmp/worktree", "original prompt contents");
+    assert!(persisted.contains("\"auto_pr\":true"));
     let config = restart_config(&persisted).unwrap();
     assert_eq!(config.prompt, "original prompt contents");
     assert_eq!(config.timeout_secs, Some(42));
@@ -1510,6 +1528,28 @@ fn restart_config_replays_prompt_contents_timeout_and_argv() {
             .any(|args| args == ["resume", "thread-123"])
     );
     assert!(resumed.iter().any(|arg| arg == "continue from override"));
+}
+
+#[test]
+fn restart_argv_uses_luna_when_the_original_request_omitted_a_model() {
+    let request = parse_agent_create_request(
+        br#"{"prompt":"continue","project_dir":"/repo","branch":"codex/restart"}"#,
+    )
+    .unwrap();
+    let persisted = persisted_agent_config(&request, "/tmp/worktree", "continue");
+    let config = restart_config(&persisted).unwrap();
+
+    let argv = restart_argv(
+        &config,
+        super::routes::agents::RestartMode::Fresh,
+        &config.prompt,
+        None,
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|args| args == ["-m", DEFAULT_CODEX_MODEL])
+    );
 }
 
 #[test]
@@ -1549,9 +1589,31 @@ fn agent_create_worktree_roundtrip() {
     std::fs::create_dir_all(&root).unwrap();
     let repo = worktree_test_repo(&base);
     let worktree = root.join("codex-feature");
-    agent_create_worktree(&repo, &worktree, "codex/feature").unwrap();
+    agent_create_worktree(&repo, &worktree, "codex/feature", &[]).unwrap();
     assert!(worktree.join(".git").exists());
-    let error = agent_create_worktree(&repo, &root.join("second"), "codex/feature").unwrap_err();
+    // A completed agent leaves its worktree available to the next agent.
+    let mut completed = agent_record("completed-agent");
+    completed.state = "succeeded".to_owned();
+    completed.worktree_path = Some(worktree.to_string_lossy().into_owned());
+    agent_create_worktree(&repo, &worktree, "codex/feature", &[completed]).unwrap();
+
+    // Running and paused agents retain exclusive use of the worktree.
+    for state in ["running", "paused"] {
+        let mut active = agent_record("active-agent");
+        active.state = state.to_owned();
+        active.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        let error =
+            agent_create_worktree(&repo, &worktree, "codex/feature", &[active]).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentWorktreeFailure::Validation(failure)
+                if failure.message == "worktree_branch_already_checked_out"
+        ));
+    }
+
+    // A different path still cannot check out the same branch twice.
+    let error =
+        agent_create_worktree(&repo, &root.join("second"), "codex/feature", &[]).unwrap_err();
     assert!(matches!(
         error,
         AgentWorktreeFailure::Validation(failure)

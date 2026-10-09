@@ -8,7 +8,7 @@ use crate::session::CappedOutput;
 use relay_core::{AgentRecord, AgentRegistry, Json, Store};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -112,19 +112,13 @@ pub(crate) fn spawn_proc(
     } else {
         None
     };
-    let stdout_stdio = transcript
-        .as_ref()
-        .map(File::try_clone)
-        .transpose()
-        .map_err(|_| "could not open agent transcript".to_owned())?
-        .map(Stdio::from)
-        .unwrap_or_else(Stdio::piped);
     let mut child = Command::new(path)
         .args(&request.args)
         .stdin(Stdio::null())
-        .stdout(stdout_stdio)
-        // Stderr remains in the existing diagnostics spool so callers can
-        // request it independently from Codex's JSONL stdout transcript.
+        // Keep stdout piped even for API-created agents so every live output
+        // chunk enters the registry's ordered log spool. The drain below also
+        // writes the same raw bytes to the durable transcript.
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // A dedicated process group makes kill requests cover the command's
         // descendants without involving the relay itself.
@@ -202,6 +196,7 @@ pub(crate) fn spawn_proc(
             Arc::clone(&store),
             handle.clone(),
             "stdout",
+            transcript,
         );
     } else {
         stdout
@@ -216,6 +211,7 @@ pub(crate) fn spawn_proc(
         store,
         handle.clone(),
         "stderr",
+        None,
     );
     table.insert(
         handle.clone(),
@@ -245,6 +241,7 @@ pub(crate) fn drain_to_capture(
     store: Arc<Store>,
     agent_id: String,
     stream: &'static str,
+    mut transcript: Option<File>,
 ) {
     thread::spawn(move || {
         let mut chunk = [0u8; 8192];
@@ -252,6 +249,13 @@ pub(crate) fn drain_to_capture(
             match pipe.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if let Some(writer) = transcript.as_mut()
+                        && writer.write_all(&chunk[..n]).is_err()
+                    {
+                        // Continue serving the live spool if the optional
+                        // durable transcript becomes unavailable.
+                        transcript = None;
+                    }
                     if let Ok(mut output) = capture.lock() {
                         output.append(&chunk[..n]);
                     } else {

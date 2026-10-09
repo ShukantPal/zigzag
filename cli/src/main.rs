@@ -18,13 +18,16 @@
 //!   zzapi agents transcript <id> --tail 4000
 //!   zzapi exec --bin gh --args pr list --repo ShukantPal/zigzag
 //!   zzapi events --follow
+//!   zzapi events stream
 
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::time::Duration;
 
 const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
+const DEFAULT_SOCKET_PORT: u16 = 8766;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
 /// The relay permits synchronous executions for up to five minutes. Leave a
 /// little room for the response to cross the network after that deadline.
@@ -140,6 +143,8 @@ enum Commands {
         /// Keep long-polling for new events
         #[arg(long)]
         follow: bool,
+        #[command(subcommand)]
+        command: Option<EventsCmd>,
     },
     /// Review-gate report for a PR
     #[command(name = "review-gate")]
@@ -269,6 +274,16 @@ enum ProcCmd {
     Get {
         /// Proc handle from spawn
         id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EventsCmd {
+    /// Stream newly persisted events over the relay's bidirectional socket
+    Stream {
+        /// Relay socket port (default 8766)
+        #[arg(long, env = "ZIGZAG_SOCKET_PORT", default_value_t = DEFAULT_SOCKET_PORT)]
+        socket_port: u16,
     },
 }
 
@@ -1141,6 +1156,122 @@ fn cmd_events(
     Ok(())
 }
 
+const MAX_SOCKET_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Stream the `events` topic from the relay's authenticated TCP protocol.
+/// Unlike HTTP follow, the relay pushes each newly persisted event immediately.
+fn cmd_events_stream(client: &Client, socket_port: u16) -> Result<(), Fail> {
+    let host = socket_host(&client.base).map_err(|error| {
+        eprintln!("error: {error}");
+        Fail::Command
+    })?;
+    let mut stream = TcpStream::connect((host, socket_port)).map_err(|error| {
+        eprintln!("error: cannot reach relay socket at {host}:{socket_port}: {error}");
+        Fail::Command
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| {
+            eprintln!("error: could not configure relay socket: {error}");
+            Fail::Command
+        })?;
+    write_socket_frame(
+        &mut stream,
+        &serde_json::json!({"type":"auth","authorization":format!("Bearer {}", client.token)}),
+    )
+    .map_err(|error| {
+        eprintln!("error: relay socket authentication failed: {error}");
+        Fail::Command
+    })?;
+    let authentication = read_socket_frame(&mut stream).map_err(|error| {
+        eprintln!("error: relay socket authentication failed: {error}");
+        Fail::Command
+    })?;
+    if authentication.get("type").and_then(|value| value.as_str()) != Some("authenticated") {
+        eprintln!("error: relay socket rejected authentication");
+        return Err(Fail::Command);
+    }
+    write_socket_frame(
+        &mut stream,
+        &serde_json::json!({"type":"subscribe","topic":"events"}),
+    )
+    .map_err(|error| {
+        eprintln!("error: could not subscribe to relay events: {error}");
+        Fail::Command
+    })?;
+    stream.set_read_timeout(None).map_err(|error| {
+        eprintln!("error: could not configure relay socket: {error}");
+        Fail::Command
+    })?;
+
+    loop {
+        let frame = read_socket_frame(&mut stream).map_err(|error| {
+            eprintln!("error: relay event stream ended: {error}");
+            Fail::Command
+        })?;
+        if client.json {
+            println!("{}", serde_json::to_string(&frame).unwrap());
+            continue;
+        }
+        if frame.get("topic").and_then(|value| value.as_str()) == Some("events") {
+            if frame.get("dropped").and_then(|value| value.as_bool()) == Some(true) {
+                eprintln!(
+                    "warning: relay socket dropped events; resynchronize with `zzapi events`"
+                );
+            } else if let Some(event) = frame.get("event") {
+                let at = s(event, "occurred_at")
+                    .chars()
+                    .take(19)
+                    .collect::<String>()
+                    .replace('T', " ");
+                println!("{at} {:<22} task={}", s(event, "kind"), s(event, "task_id"));
+            }
+        } else if frame.get("type").and_then(|value| value.as_str()) == Some("error") {
+            eprintln!("warning: relay socket: {}", s(&frame, "error"));
+        }
+    }
+}
+
+fn socket_host(base: &str) -> Result<&str, String> {
+    let authority = base
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("invalid relay URL {base:?}"))?;
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("relay URL has no port: {base:?}"))?;
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return Err(format!("invalid relay URL {base:?}"));
+    }
+    Ok(host)
+}
+
+fn write_socket_frame(stream: &mut TcpStream, value: &serde_json::Value) -> Result<(), String> {
+    let body = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if body.is_empty() || body.len() > MAX_SOCKET_FRAME_BYTES {
+        return Err("invalid outbound frame length".to_owned());
+    }
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|error| error.to_string())
+}
+
+fn read_socket_frame(stream: &mut TcpStream) -> Result<serde_json::Value, String> {
+    let mut prefix = [0u8; 4];
+    stream
+        .read_exact(&mut prefix)
+        .map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_SOCKET_FRAME_BYTES {
+        return Err("invalid frame length".to_owned());
+    }
+    let mut body = vec![0; length];
+    stream
+        .read_exact(&mut body)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|_| "invalid JSON frame".to_owned())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct EventProgress {
     after: u64,
@@ -1292,7 +1423,11 @@ fn run(cli: Cli) -> Result<(), Fail> {
             timeout,
             epoch,
             follow,
-        } => cmd_events(&client, after, timeout, &epoch, follow),
+            command,
+        } => match command {
+            Some(EventsCmd::Stream { socket_port }) => cmd_events_stream(&client, socket_port),
+            None => cmd_events(&client, after, timeout, &epoch, follow),
+        },
         Commands::ReviewGate { repo, pr } => cmd_review_gate(&client, &repo, pr),
     }
 }
@@ -1382,6 +1517,16 @@ mod tests {
     fn relay_base_accepts_an_explicit_port_for_local_or_proxied_relays() {
         assert_eq!(relay_base("relay.example"), "http://relay.example:8765");
         assert_eq!(relay_base("127.0.0.1:19876"), "http://127.0.0.1:19876");
+    }
+
+    #[test]
+    fn socket_host_uses_the_relay_host_not_its_http_port() {
+        assert_eq!(
+            socket_host("http://relay.example:8765"),
+            Ok("relay.example")
+        );
+        assert_eq!(socket_host("http://127.0.0.1:19876"), Ok("127.0.0.1"));
+        assert!(socket_host("https://relay.example:8765").is_err());
     }
 
     #[test]
