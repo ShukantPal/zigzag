@@ -40,7 +40,7 @@ struct RequestInfo {
 }
 
 thread_local! {
-    static CURRENT_REQUEST: RefCell<Option<RequestInfo>> = RefCell::new(None);
+    static CURRENT_REQUEST: RefCell<Option<RequestInfo>> = const { RefCell::new(None) };
 }
 
 /// RAII guard that clears the thread-local request info when dropped.
