@@ -112,7 +112,13 @@ impl AgentRegistry {
             let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
         }
         let records = match fs::read_to_string(&path) {
-            Ok(text) => decode_agents(&text)?,
+            Ok(text) => {
+                let (records, skipped) = decode_agents(&text);
+                for warning in skipped {
+                    eprintln!("zigzag: skipping agent registry record: {}", warning);
+                }
+                records
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(_) => return Err("could not read agent registry".to_owned()),
         };
@@ -443,7 +449,7 @@ impl AgentRegistry {
 }
 
 fn agent_json(entry: &AgentRecord) -> Json {
-    Json::Object(vec![
+    let fields: Vec<(String, Json)> = vec![
         ("id".to_owned(), Json::String(entry.id.clone())),
         ("task_id".to_owned(), Json::String(entry.task_id.clone())),
         (
@@ -531,98 +537,124 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .map(Json::number)
                 .unwrap_or(Json::Null),
         ),
-    ])
+    ];
+    // Omit null fields instead of writing explicit nulls.
+    // The reader handles both forms, but omitting avoids round-trip
+    // issues with parsers that do not expect explicit nulls.
+    Json::Object(
+        fields
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, Json::Null))
+            .collect(),
+    )
 }
-fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentRecord>, String> {
+
+fn decode_agents(text: &str) -> (std::collections::BTreeMap<String, AgentRecord>, Vec<String>) {
+    let mut skipped: Vec<String> = Vec::new();
     let values = match parse_json(text)
         .ok()
         .and_then(|v| v.object("agents").cloned())
     {
         Some(Json::Array(values)) => values,
-        _ => return Err("invalid agent registry".to_owned()),
+        _ => {
+            skipped.push("registry root: missing or invalid 'agents' array".to_owned());
+            return (std::collections::BTreeMap::new(), skipped);
+        }
     };
     let mut entries = std::collections::BTreeMap::new();
-    for value in values {
-        let get = |key: &str| value.object(key);
-        let text = |key| {
-            get(key)
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| "invalid agent registry".to_owned())
-        };
-        // Registries written by older daemons encode some numeric fields as
-        // strings.  Accept either form.
-        let integer = |value: Option<&Json>| {
-            value.and_then(|value| match value {
-                Json::Number(_) => value.as_u64(),
-                Json::String(text) => text.parse::<u64>().ok(),
-                _ => None,
-            })
-        };
-        let required_integer =
-            |key| integer(get(key)).ok_or_else(|| "invalid agent registry".to_owned());
-        let optional_integer = |key| match get(key) {
-            Some(Json::Null) | None => Ok(None),
-            value => integer(value)
-                .map(Some)
-                .ok_or_else(|| "invalid agent registry".to_owned()),
-        };
-        let record = AgentRecord {
-            id: text("id")?,
-            task_id: text("task_id")?,
-            // Registry files written before audit trails had no execution
-            // identifier.  The agent handle is a safe one-to-one fallback.
-            execution_id: get("execution_id")
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| text("id").unwrap_or_default()),
-            leader_pid: required_integer("leader_pid")? as i32,
-            process_group: required_integer("process_group")? as i32,
-            process_identity: match get("process_identity") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            started_at: match get("started_at") {
-                Some(Json::String(value)) => value.clone(),
-                Some(Json::Number(value)) => value.clone(),
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            deadline_at: match get("deadline_at") {
-                Some(Json::String(v)) => Some(v.clone()),
-                Some(Json::Null) => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            command: text("command")?,
-            state: text("state")?,
-            exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
-            log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
-            audit_degraded: get("audit_degraded")
-                .and_then(Json::as_bool)
-                .unwrap_or(false),
-            redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
-            stdout_next: required_integer("stdout_next")?,
-            stderr_next: required_integer("stderr_next")?,
-            stdout_dropped_before: required_integer("stdout_dropped_before")?,
-            stderr_dropped_before: required_integer("stderr_dropped_before")?,
-            log_next: required_integer("log_next")?,
-            log_dropped_before: required_integer("log_dropped_before")?,
-            first_output_at: match get("first_output_at") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            first_output_stream: match get("first_output_stream") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            first_output_bytes: optional_integer("first_output_bytes")?,
-        };
-        entries.insert(record.id.clone(), record);
+    for (idx, value) in values.iter().enumerate() {
+        // Extract agent ID for error messages (best effort)
+        let agent_id = value
+            .object("id")
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("<unknown id at index {}>", idx));
+        match decode_agent_record(value, &agent_id) {
+            Ok(record) => {
+                entries.insert(record.id.clone(), record);
+            }
+            Err(reason) => {
+                skipped.push(format!("agent '{}': {}", agent_id, reason));
+            }
+        }
     }
-    Ok(entries)
+    (entries, skipped)
 }
+
+fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, String> {
+    let get = |key: &str| value.object(key);
+    let err = |field: &str, reason: &str| -> String {
+        format!("field '{}': {} (agent '{}')", field, reason, agent_id)
+    };
+    let text = |key: &str| {
+        get(key)
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| err(key, "expected string, got null/missing/wrong type"))
+    };
+    // Registries written by older daemons encode some numeric fields as
+    // strings.  Accept either form.
+    let integer = |value: Option<&Json>| {
+        value.and_then(|value| match value {
+            Json::Number(_) => value.as_u64(),
+            Json::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        })
+    };
+    let required_integer = |key: &str| {
+        integer(get(key)).ok_or_else(|| err(key, "expected integer, got null/missing/wrong type"))
+    };
+    let optional_integer = |key: &str| match get(key) {
+        Some(Json::Null) | None => Ok(None),
+        value => integer(value)
+            .map(Some)
+            .ok_or_else(|| err(key, "expected integer or null")),
+    };
+    // Helper for optional string fields: accepts string, null, or missing
+    let optional_string = |key: &str| match get(key) {
+        Some(Json::String(value)) => Ok(Some(value.clone())),
+        Some(Json::Null) | None => Ok(None),
+        _ => Err(err(key, "expected string or null")),
+    };
+    let record = AgentRecord {
+        id: text("id")?,
+        task_id: text("task_id")?,
+        // Registry files written before audit trails had no execution
+        // identifier.  The agent handle is a safe one-to-one fallback.
+        execution_id: get("execution_id")
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text("id").unwrap_or_default()),
+        leader_pid: required_integer("leader_pid")? as i32,
+        process_group: required_integer("process_group")? as i32,
+        process_identity: optional_string("process_identity")?,
+        started_at: match get("started_at") {
+            Some(Json::String(value)) => value.clone(),
+            Some(Json::Number(value)) => value.clone(),
+            _ => return Err(err("started_at", "expected string or number")),
+        },
+        deadline_at: optional_string("deadline_at")?,
+        command: text("command")?,
+        state: text("state")?,
+        exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
+        log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
+        audit_degraded: get("audit_degraded")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+        redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
+        stdout_next: required_integer("stdout_next")?,
+        stderr_next: required_integer("stderr_next")?,
+        stdout_dropped_before: required_integer("stdout_dropped_before")?,
+        stderr_dropped_before: required_integer("stderr_dropped_before")?,
+        log_next: required_integer("log_next")?,
+        log_dropped_before: required_integer("log_dropped_before")?,
+        first_output_at: optional_string("first_output_at")?,
+        first_output_stream: optional_string("first_output_stream")?,
+        first_output_bytes: optional_integer("first_output_bytes")?,
+    };
+    Ok(record)
+}
+
 fn redact(text: &mut String) -> bool {
     let original = text.clone();
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
@@ -1736,8 +1768,13 @@ mod tests {
 
     #[test]
     fn decode_agents_accepts_legacy_string_counters() {
-        let agents =
-            decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json")).unwrap();
+        let (agents, skipped) =
+            decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json"));
+        assert!(
+            skipped.is_empty(),
+            "unexpected skipped records: {:?}",
+            skipped
+        );
         let record = agents.get("legacy-0003").unwrap();
         assert_eq!(record.stdout_next, 0);
         assert_eq!(record.stderr_next, 64);
@@ -1746,6 +1783,100 @@ mod tests {
         assert_eq!(record.log_next, 0);
         assert_eq!(record.log_dropped_before, 0);
         assert_eq!(record.first_output_bytes, Some(7));
+    }
+
+    #[test]
+    fn decode_agents_handles_nulls_and_skips_bad_records() {
+        // Registry with explicit nulls for optional fields (as written by
+        // older versions) must parse successfully.
+        let json_with_nulls = r#"{
+            "agents": [
+                {
+                    "id": "agent-1",
+                    "task_id": "task-1",
+                    "execution_id": "exec-1",
+                    "leader_pid": 123,
+                    "process_group": 456,
+                    "process_identity": null,
+                    "started_at": "2026-10-08T00:00:00Z",
+                    "deadline_at": null,
+                    "command": "echo hi",
+                    "state": "running",
+                    "exit_code": null,
+                    "log_degraded": false,
+                    "audit_degraded": false,
+                    "redacted": false,
+                    "stdout_next": 0,
+                    "stderr_next": 0,
+                    "stdout_dropped_before": 0,
+                    "stderr_dropped_before": 0,
+                    "log_next": 0,
+                    "log_dropped_before": 0,
+                    "first_output_at": null,
+                    "first_output_stream": null,
+                    "first_output_bytes": null
+                },
+                {
+                    "id": "bad-agent",
+                    "task_id": "task-bad"
+                }
+            ]
+        }"#;
+        let (agents, skipped) = decode_agents(json_with_nulls);
+        // The good record with nulls must parse
+        assert_eq!(agents.len(), 1);
+        let record = agents.get("agent-1").expect("agent-1 should parse");
+        assert_eq!(record.id, "agent-1");
+        assert_eq!(record.deadline_at, None);
+        assert_eq!(record.process_identity, None);
+        assert_eq!(record.exit_code, None);
+        // The bad record must be skipped (not crash the whole registry)
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("bad-agent"),
+            "skip message should identify the agent: {}",
+            skipped[0]
+        );
+    }
+
+    #[test]
+    fn agent_json_omits_null_fields() {
+        // The writer must omit null fields instead of writing explicit nulls.
+        let record = AgentRecord {
+            id: "test-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            leader_pid: 123,
+            process_group: 456,
+            process_identity: None,
+            started_at: "2026-10-08T00:00:00Z".to_owned(),
+            deadline_at: None,
+            command: "echo".to_owned(),
+            state: "running".to_owned(),
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: false,
+            redacted: false,
+            stdout_next: 0,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
+        };
+        let json = agent_json(&record);
+        let text = json.to_json();
+        // None of the optional fields should appear as explicit nulls
+        assert!(
+            !text.contains("null"),
+            "writer should omit nulls, got: {}",
+            text
+        );
+        // Required fields must still be present
+        assert!(text.contains("test-1"));
     }
 
     #[test]
