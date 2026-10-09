@@ -12,6 +12,7 @@
 //! Examples:
 //!   zzapi health
 //!   zzapi update
+//!   zzapi admin check-update
 //!   zzapi agents list
 //!   zzapi agents create --prompt "Fix the flaky test" \
 //!       --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
@@ -92,6 +93,11 @@ enum Commands {
     Update,
     /// Liveness probe
     Health,
+    /// Administrative relay operations
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
     /// Manage agents
     Agents {
         #[command(subcommand)]
@@ -161,6 +167,12 @@ enum Commands {
         #[arg(long)]
         pr: u64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// Check for and apply an available relay update
+    CheckUpdate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1468,6 +1480,33 @@ fn cmd_health(client: &Client) -> Result<(), Fail> {
     Ok(())
 }
 
+fn cmd_admin_check_update(client: &Client) -> Result<(), Fail> {
+    let resp = client.post(
+        "/v1/update/check",
+        &serde_json::Value::Object(Default::default()),
+    )?;
+    emit(client, &resp, || {
+        let current = display_version(resp.get("current_version"), "unknown");
+        let latest = display_version(resp.get("latest_available_version"), "none");
+        let applied = resp
+            .get("update_applied")
+            .and_then(serde_json::Value::as_bool)
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("unknown");
+        println!("current version: {current}");
+        println!("latest version:  {latest}");
+        println!("update applied:  {applied}");
+    });
+    Ok(())
+}
+
+fn display_version(value: Option<&serde_json::Value>, missing: &str) -> String {
+    value
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(missing)
+        .to_owned()
+}
+
 fn cmd_review_gate(client: &Client, repo: &str, pr: u64) -> Result<(), Fail> {
     let q: Vec<(&str, String)> = vec![
         ("repository", repo.to_string()),
@@ -1524,6 +1563,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
     match cli.command {
         Commands::Update => unreachable!("update command handled before relay client setup"),
         Commands::Health => cmd_health(&client),
+        Commands::Admin { cmd } => match cmd {
+            AdminCmd::CheckUpdate => cmd_admin_check_update(&client),
+        },
         Commands::Agents { cmd } => match cmd {
             AgentsCmd::List { state, task_id } => {
                 cmd_agents_list(&client, state.as_deref(), task_id.as_deref())

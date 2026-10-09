@@ -39,6 +39,9 @@ zzapi update
 # health
 zzapi health
 
+# check for and apply a relay update
+zzapi admin check-update
+
 # agents
 zzapi agents list
 zzapi agents list --state running

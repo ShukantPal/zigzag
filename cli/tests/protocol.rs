@@ -15,14 +15,28 @@ fn transcript_server(
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
             let mut buffer = [0; 1024];
+            let mut expected_len = None;
             loop {
                 let read = stream.read(&mut buffer).unwrap();
                 if read == 0 {
                     break;
                 }
                 request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header_end = header_end + 4;
+                    if expected_len.is_none() {
+                        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                        expected_len = headers.lines().find_map(|line| {
+                            line.strip_prefix("Content-Length: ")?.parse::<usize>().ok()
+                        });
+                    }
+                    if expected_len.is_some_and(|length| request.len() >= header_end + length)
+                        || expected_len.is_none()
+                    {
+                        break;
+                    }
                 }
             }
             stream
@@ -61,6 +75,72 @@ fn update_is_listed_in_help_and_needs_no_agent_flags() {
             .unwrap()
             .contains("Download and install")
     );
+}
+
+#[test]
+fn admin_check_update_posts_authenticated_request_and_displays_update_result() {
+    let (port, server) = transcript_server([
+        r#"{"current_version":"1.2.3","latest_available_version":"1.2.4","update_applied":true}"#,
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "admin",
+            "check-update",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+
+    let requests = server.join().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(requests[0].starts_with("POST /v1/update/check HTTP/1.1\r\n"));
+    assert!(requests[0].contains("Authorization: Bearer test-token\r\n"));
+    assert!(requests[0].ends_with("{}"));
+    assert!(stdout.contains("current version: 1.2.3"));
+    assert!(stdout.contains("latest version:  1.2.4"));
+    assert!(stdout.contains("update applied:  yes"));
+}
+
+#[test]
+fn admin_check_update_displays_no_available_release_and_no_update_applied() {
+    let (port, server) = transcript_server([
+        r#"{"current_version":"1.2.3","latest_available_version":null,"update_applied":false}"#,
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "admin",
+            "check-update",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("current version: 1.2.3"));
+    assert!(stdout.contains("latest version:  none"));
+    assert!(stdout.contains("update applied:  no"));
+}
+
+#[test]
+fn admin_check_update_is_listed_in_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args(["admin", "--help"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("check-update"));
+    assert!(stdout.contains("Check for and apply an available relay update"));
 }
 
 fn read_socket_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
