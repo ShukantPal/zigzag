@@ -13,7 +13,9 @@ from unittest.mock import patch
 DEPT_DIR = pathlib.Path(__file__).parent
 CONFIG_SOURCE = DEPT_DIR / "config.py"
 ARTIFACT_PATH = DEPT_DIR / "config.materialized.json"
-HOOK_SOURCE = DEPT_DIR.parent / "scripts" / "githooks" / "pre-commit"
+MATERIALIZE_CONFIG_SOURCE = DEPT_DIR.parent / "scripts" / "githooks" / "materialize-config"
+PRE_COMMIT_SOURCE = DEPT_DIR.parent / "scripts" / "githooks" / "pre-commit"
+PRE_PUSH_SOURCE = DEPT_DIR.parent / "scripts" / "githooks" / "pre-push"
 INSTALLER_SOURCE = DEPT_DIR.parent / "scripts" / "install-hooks.sh"
 sys.path.insert(0, str(DEPT_DIR))
 config = importlib.import_module("config")
@@ -106,7 +108,9 @@ class HookTest(unittest.TestCase):
         (self.repo / "dept").mkdir()
         (self.repo / "scripts" / "githooks").mkdir(parents=True)
         shutil.copy2(CONFIG_SOURCE, self.repo / "dept" / "config.py")
-        shutil.copy2(HOOK_SOURCE, self.repo / "scripts" / "githooks" / "pre-commit")
+        shutil.copy2(MATERIALIZE_CONFIG_SOURCE, self.repo / "scripts" / "githooks" / "materialize-config")
+        shutil.copy2(PRE_COMMIT_SOURCE, self.repo / "scripts" / "githooks" / "pre-commit")
+        shutil.copy2(PRE_PUSH_SOURCE, self.repo / "scripts" / "githooks" / "pre-push")
         shutil.copy2(INSTALLER_SOURCE, self.repo / "scripts" / "install-hooks.sh")
         rendered = self.command([sys.executable, "dept/config.py", "--materialize"]).stdout
         (self.repo / "dept" / "config.materialized.json").write_text(rendered)
@@ -135,7 +139,7 @@ class HookTest(unittest.TestCase):
         self.git(["add", "dept/config.py"])
         config_path.write_text(staged_source.replace('"start": "21:00"', '"start": "20:00"'))
 
-        self.command([str(self.repo / "scripts" / "githooks" / "pre-commit")])
+        self.command([str(self.repo / "scripts" / "githooks" / "materialize-config")])
 
         artifact = json.loads(self.git(["show", ":dept/config.materialized.json"]).stdout)
         self.assertEqual(artifact["quiet_hours"]["start"], "21:00")
@@ -145,7 +149,7 @@ class HookTest(unittest.TestCase):
         (self.repo / "README.md").write_text("unrelated\n")
         self.git(["add", "README.md"])
 
-        self.command([str(self.repo / "scripts" / "githooks" / "pre-commit")])
+        self.command([str(self.repo / "scripts" / "githooks" / "materialize-config")])
 
         self.assertEqual(self.staged_names(), ["README.md"])
 
@@ -157,7 +161,7 @@ class HookTest(unittest.TestCase):
         ))
         self.git(["add", "dept/config.py"])
 
-        result = self.command([str(self.repo / "scripts" / "githooks" / "pre-commit")])
+        result = self.command([str(self.repo / "scripts" / "githooks" / "materialize-config")])
 
         self.assertIn("warning: unable to materialize", result.stderr)
         self.assertEqual(self.staged_names(), ["dept/config.py"])
@@ -166,12 +170,13 @@ class HookTest(unittest.TestCase):
         self.git(["config", "core.hooksPath", "custom-hooks"])
         self.command(["sh", "scripts/install-hooks.sh"])
 
-        hook_path = pathlib.Path(self.git(["rev-parse", "--git-path", "hooks/pre-commit"]).stdout.strip())
-        if not hook_path.is_absolute():
-            hook_path = self.repo / hook_path
-        self.assertTrue(hook_path.is_file())
-        self.assertTrue(os.access(hook_path, os.X_OK))
-        self.assertEqual(hook_path.read_text(), HOOK_SOURCE.read_text())
+        for hook, source in (("pre-commit", PRE_COMMIT_SOURCE), ("pre-push", PRE_PUSH_SOURCE)):
+            hook_path = pathlib.Path(self.git(["rev-parse", "--git-path", f"hooks/{hook}"]).stdout.strip())
+            if not hook_path.is_absolute():
+                hook_path = self.repo / hook_path
+            self.assertTrue(hook_path.is_file())
+            self.assertTrue(os.access(hook_path, os.X_OK))
+            self.assertEqual(hook_path.read_text(), source.read_text())
 
 
 if __name__ == "__main__":

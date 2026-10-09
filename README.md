@@ -201,6 +201,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+## Local CI hooks
+
+Install the repository hooks once per worktree:
+
+```sh
+./scripts/install-hooks.sh
+```
+
+The pre-commit hook runs the CI formatting and Python checks, and retains the
+existing automatic regeneration of `dept/config.materialized.json` when
+`dept/config.py` is staged. The pre-push hook runs the CI Clippy gate. They
+run `cargo fmt --all --check`, the Python commands from `.github/workflows/ci.yml`,
+and `cargo clippy --locked --workspace --all-targets -- -D warnings`,
+respectively. CI remains the required enforcement point.
+
 ## Verified relay updates
 
 On every successful `main` build, CI produces a signed ARM64 relay binary, a
