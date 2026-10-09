@@ -1580,10 +1580,10 @@ fn run_allowed(bin: &str, args: Vec<String>, id: String) -> Result<String, Strin
     super::require_gui_login_session()?;
     let policy = exec::load_policy()?;
     let path = policy
-        .allowed_path(bin, &args)
-        .ok_or_else(|| format!("execution policy does not allow {bin}"))?;
+        .verified_path(bin, &args)
+        .map_err(|error| format!("execution policy does not allow {bin}: {error}"))?;
     let result = exec::run(
-        path,
+        &path,
         exec::ExecRequest {
             id,
             bin: bin.to_owned(),
@@ -1925,7 +1925,7 @@ fn post_verdict_comment(
     write_private(body_path.clone(), &payload)?;
     super::require_gui_login_session()?;
     let response = exec::run(
-        path,
+        &path,
         exec::ExecRequest {
             id: format!("publish-{task_id}"),
             bin: "gh".to_owned(),
@@ -1963,7 +1963,7 @@ fn delete_verdict_comment(
         .trusted_gh_path_for_repo(&policy.repository)
         .ok_or_else(|| "execution policy does not authorize review comment deletion".to_owned())?;
     let lookup = exec::run(
-        path,
+        &path,
         exec::ExecRequest {
             id: format!("locate-invalidation-{task_id}"),
             bin: "gh".to_owned(),
@@ -1987,7 +1987,7 @@ fn delete_verdict_comment(
     }
     super::require_gui_login_session()?;
     let deleted = exec::run(
-        path,
+        &path,
         exec::ExecRequest {
             id: format!("invalidate-{task_id}"),
             bin: "gh".to_owned(),
@@ -2318,8 +2318,8 @@ fn spawn_codex_task(
     ];
     let policy = exec::load_policy()?;
     let path = policy
-        .allowed_path(bin, &args)
-        .ok_or_else(|| format!("execution policy does not allow {bin}"))?;
+        .verified_path(bin, &args)
+        .map_err(|error| format!("execution policy does not allow {bin}: {error}"))?;
     let execution_id = new_execution_id()?;
     server.store.add(relay_event(
         "relay_request_started",
@@ -2340,7 +2340,7 @@ fn spawn_codex_task(
     let spawned = spawn_proc(
         &server.supervisor,
         Arc::clone(&server.store),
-        path,
+        &path,
         exec::ExecRequest {
             id: task_id.to_owned(),
             bin: bin.to_owned(),

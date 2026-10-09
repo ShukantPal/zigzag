@@ -7,7 +7,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -584,9 +584,9 @@ pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> 
         ],
     };
     let path = policy
-        .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| "the gh policy does not allow the PR scan".to_owned())?;
-    let result = exec::run(path, request);
+        .verified_path(&request.bin, &request.args)
+        .map_err(|error| format!("the gh policy does not allow the PR scan: {error}"))?;
+    let result = exec::run(&path, request);
     if result.timed_out || result.truncated || result.exit_code != Some(0) {
         return Err("GitHub PR discovery did not complete successfully".to_owned());
     }
@@ -1122,11 +1122,27 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
             return reply(stream, 500, error("could_not_read_execution_policy"));
         }
     };
-    let path = match policy_path_or_denial(&policy, &request) {
+    let path = match policy.verified_path(&request.bin, &request.args) {
         Ok(path) => path,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(exec::VerifyError::Denied) => {
+            return reply(stream, 200, denial_json(&request.id));
+        }
+        Err(exec::VerifyError::Unverifiable(error)) => {
+            eprintln!("exec binary verification failed: {error}");
+            // Mirror the spawn-failure shape: 200 with a result whose stderr
+            // explains the failure without naming the path.
+            let result = exec::ExecResult {
+                id: request.id.clone(),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "could not verify configured binary".to_owned(),
+                truncated: false,
+                timed_out: false,
+            };
+            return reply(stream, 200, result.to_json());
+        }
     };
-    let result = exec::run(path, request);
+    let result = exec::run(&path, request);
     reply(stream, 200, result.to_json())
 }
 
@@ -1179,9 +1195,32 @@ fn spawn_request(
             return reply(stream, 500, error("could_not_read_execution_policy"));
         }
     };
-    let path = match policy_path_or_denial(&policy, &request.command) {
+    let path = match policy.verified_path(&request.command.bin, &request.command.args) {
         Ok(path) => path,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(exec::VerifyError::Denied) => {
+            return reply(stream, 200, denial_json(&request.command.id));
+        }
+        Err(exec::VerifyError::Unverifiable(reason)) => {
+            eprintln!("spawn binary verification failed: {reason}");
+            // A failed spawn is a failed spawn, whether the binary was
+            // missing or failed integrity verification: keep the audit event.
+            if state
+                .store
+                .add(relay_event(
+                    "process_failed",
+                    &request.command.id,
+                    &execution_id,
+                    Json::Object(vec![(
+                        "reason".to_owned(),
+                        Json::String("binary_verification_failed".to_owned()),
+                    )]),
+                ))
+                .is_err()
+            {
+                eprintln!("could not persist spawn failure audit event");
+            }
+            return reply(stream, 500, error("could_not_verify_binary"));
+        }
     };
     // The updater takes the same gate while setting `draining`, so a child
     // cannot appear between the drain check and its durable registry record.
@@ -1209,7 +1248,7 @@ fn spawn_request(
     match spawn_proc(
         &state.supervisor,
         Arc::clone(&state.store),
-        path,
+        &path,
         request.command,
         execution_id.clone(),
     ) {
@@ -1251,7 +1290,7 @@ struct SpawnedProc {
 fn spawn_proc(
     supervisor: &Supervisor,
     store: Arc<Store>,
-    path: &str,
+    path: &Path,
     request: exec::ExecRequest,
     execution_id: String,
 ) -> Result<SpawnedProc, String> {
@@ -1902,15 +1941,6 @@ fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
     reply(stream, status, body)
 }
 
-fn policy_path_or_denial<'a>(
-    policy: &'a exec::Policy,
-    request: &exec::ExecRequest,
-) -> Result<&'a str, Json> {
-    policy
-        .allowed_path(&request.bin, &request.args)
-        .ok_or_else(|| denial_json(&request.id))
-}
-
 fn denial_response(id: &str) -> (u16, Json) {
     (200, denial_json(id))
 }
@@ -2454,11 +2484,12 @@ mod tests {
             br#"{"id":"request-1","bin":"jules","args":["login"]}"#.as_slice(),
         ] {
             let request = parse_exec_request(body).unwrap();
-            let denial = policy_path_or_denial(&policy, &request)
-                .unwrap_err()
-                .to_json();
-            assert_eq!(denial, expected);
-            assert!(!denial.contains("configured-binary"));
+            let denial = match policy.verified_path(&request.bin, &request.args) {
+                Err(exec::VerifyError::Denied) => denial_json(&request.id),
+                other => panic!("expected an opaque denial, got {other:?}"),
+            };
+            assert_eq!(denial.to_json(), expected);
+            assert!(!denial.to_json().contains("configured-binary"));
             let (status, response) = denial_response(&request.id);
             assert_eq!(status, 200);
             assert_eq!(response.to_json(), expected);
@@ -2886,7 +2917,7 @@ mod tests {
         let handle = spawn_proc(
             &supervisor,
             Arc::new(Store::open(&event_path, 10).unwrap()),
-            "/bin/sh",
+            Path::new("/bin/sh"),
             request,
             "execution-old".to_owned(),
         )
