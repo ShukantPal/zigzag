@@ -624,6 +624,45 @@ fn spawn_is_rejected_while_update_drain_is_active() {
 }
 
 #[test]
+fn update_check_endpoint_is_authenticated_and_reports_manual_check() {
+    let (mut state, state_path) = test_server();
+    {
+        let server = Arc::get_mut(&mut state).unwrap();
+        server.updater = Arc::new(update::Manager::new(update::Config {
+            directory: state_path.with_extension("updates"),
+            interval: Duration::ZERO,
+            policy: update::Policy::Paused,
+            ready_file: None,
+        }));
+        Arc::clone(&server.updater).start(
+            Arc::new(|| false),
+            Arc::new(|_, _| {}),
+            Vec::new(),
+            PathBuf::from("secret"),
+            8765,
+        );
+    }
+    let policy = test_policy();
+    let unauthorized = request_once_with_gate_token(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/update/check",
+        "",
+        "wrong",
+        review_loop::gate_report,
+    );
+    assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+    let response = request_once(Arc::clone(&state), &policy, "POST", "/v1/update/check", "");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"current_version\""));
+    assert!(response.contains("\"latest_available_version\":null"));
+    assert!(response.ends_with("\"update_applied\":false}"));
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+}
+
+#[test]
 fn captured_output_stops_at_the_exec_output_cap() {
     let mut output = CappedOutput::default();
     output.append(&vec![b'x'; COMPAT_OUTPUT_CAP]);
