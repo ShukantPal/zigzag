@@ -13,6 +13,8 @@ mod session;
 mod update;
 
 #[cfg(test)]
+mod e2e;
+#[cfg(test)]
 mod tests;
 
 use crate::config::{run_config, server_config};

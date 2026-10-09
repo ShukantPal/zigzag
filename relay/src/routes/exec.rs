@@ -4,7 +4,6 @@ use crate::http::{denial_json, error, reply};
 use crate::logging;
 use crate::proc::spawn_proc;
 use crate::server::Server;
-use crate::session::require_gui_login_session;
 use relay_core::{Json, parse_json};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -14,7 +13,11 @@ pub(crate) struct SpawnRequest {
     pub(crate) command: exec::ExecRequest,
     pub(crate) execution_id: Option<String>,
 }
-pub(crate) fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
+pub(crate) fn exec_request(
+    stream: &mut TcpStream,
+    body: Vec<u8>,
+    policy: Result<exec::Policy, String>,
+) -> Result<(), String> {
     let request = match parse_exec_request(&body) {
         Ok(request) => request,
         Err(denial) => return reply(stream, 200, denial),
@@ -26,7 +29,7 @@ pub(crate) fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), 
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
     log::info!("exec id={} {exec_route} source={exec_source}", request.id);
-    let policy = match require_gui_login_session().and_then(|_| exec::load_policy()) {
+    let policy = match policy {
         Ok(policy) => policy,
         Err(message) => {
             log::error!("exec policy read failed: {message}");

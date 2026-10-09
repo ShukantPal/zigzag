@@ -8,6 +8,12 @@ pub(crate) fn test_updater() -> Arc<update::Manager> {
     }))
 }
 
+/// A minimal exec policy for e2e tests: only `/bin/sh -c "<cmd>"` is allowed.
+pub(crate) fn test_policy() -> exec::Policy {
+    exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#)
+        .expect("test policy must parse")
+}
+
 use crate::auth::authorized;
 use crate::config::{allowlist_file, is_get_allowlist, server_config, valid_github_repo};
 use crate::events::{relay_event_at, replay_recovered_lifecycle};
@@ -957,7 +963,7 @@ fn detached_process_endpoints_authenticate_and_manage_process_trees() {
     let _ = std::fs::remove_file(state_path);
 }
 
-fn test_server() -> (Arc<Server>, PathBuf) {
+pub(crate) fn test_server() -> (Arc<Server>, PathBuf) {
     let path = std::env::temp_dir().join(format!(
         "zigzag-proc-test-{}",
         unique_handle(&HashMap::new()).unwrap()
@@ -1027,7 +1033,7 @@ fn completed_entry() -> ProcEntry {
     }
 }
 
-fn request_once(
+pub(crate) fn request_once(
     state: Arc<Server>,
     policy: &exec::Policy,
     method: &str,
@@ -1072,7 +1078,7 @@ where
     )
 }
 
-fn request_once_with_gate_token<G>(
+pub(crate) fn request_once_with_gate_token<G>(
     state: Arc<Server>,
     policy: &exec::Policy,
     method: &str,
@@ -1109,11 +1115,16 @@ where
     client.join().unwrap()
 }
 
-fn response_json(response: String) -> Json {
+pub(crate) fn response_json(response: String) -> Json {
     parse_json(response.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
-fn spawn_for_test(state: &Arc<Server>, policy: &exec::Policy, id: &str, command: &str) -> String {
+pub(crate) fn spawn_for_test(
+    state: &Arc<Server>,
+    policy: &exec::Policy,
+    id: &str,
+    command: &str,
+) -> String {
     let response = response_json(request_once(
         Arc::clone(state),
         policy,
@@ -1128,7 +1139,11 @@ fn spawn_for_test(state: &Arc<Server>, policy: &exec::Policy, id: &str, command:
         .to_owned()
 }
 
-fn poll_until_complete(state: &Arc<Server>, policy: &exec::Policy, handle: &str) -> Json {
+pub(crate) fn poll_until_complete(
+    state: &Arc<Server>,
+    policy: &exec::Policy,
+    handle: &str,
+) -> Json {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let response = response_json(request_once(
@@ -1145,7 +1160,7 @@ fn poll_until_complete(state: &Arc<Server>, policy: &exec::Policy, handle: &str)
     }
     panic!("process did not finish in time");
 }
-fn worktree_test_base(prefix: &str) -> PathBuf {
+pub(crate) fn worktree_test_base(prefix: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!(
         "zigzag-{prefix}-{}-{}",
         std::process::id(),
@@ -1155,14 +1170,14 @@ fn worktree_test_base(prefix: &str) -> PathBuf {
     base
 }
 
-fn worktree_test_roots(base: &Path) -> Vec<PathBuf> {
+pub(crate) fn worktree_test_roots(base: &Path) -> Vec<PathBuf> {
     let allowed = base.join("allowed");
     std::fs::create_dir_all(&allowed).unwrap();
     std::fs::create_dir_all(base.join("other")).unwrap();
     vec![allowed.canonicalize().unwrap()]
 }
 
-fn worktree_test_repo(base: &Path) -> PathBuf {
+pub(crate) fn worktree_test_repo(base: &Path) -> PathBuf {
     let repo = base.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
