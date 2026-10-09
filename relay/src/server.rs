@@ -8,6 +8,7 @@ use crate::review_loop;
 use crate::routes::agents::{agent_request, agent_route};
 use crate::routes::exec::{exec_request, spawn_request};
 use crate::routes::procs::{ProcRoute, kill_proc, poll_proc, proc_route};
+use crate::routes::providers::providers_request;
 use crate::routes::worktrees::{worktree_create, worktree_delete};
 use crate::session::require_gui_login_session;
 use crate::update;
@@ -204,6 +205,7 @@ where
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
         ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
         ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
+        ("GET", "/v1/providers") => providers_request(&mut stream),
         ("GET", "/v1/review-gate") => {
             review_gate_request(&mut stream, &state, &request.target, gate_report)
         }

@@ -6,6 +6,7 @@ mod github;
 mod http;
 mod logging;
 mod proc;
+mod provider;
 mod review_loop;
 mod routes;
 mod server;
