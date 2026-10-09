@@ -26,11 +26,20 @@ use crate::http::{
     denial_response, error, get_query, percent_decode, query, read_request, reply,
 };
 use crate::proc::{
+<<<<<<< HEAD
     COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
     process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
     spawn_proc, unique_handle,
+=======
+    AgentSpawnDetails, COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
+    prune_procs, recovered_agent_identity_matches, spawn_proc, unique_handle,
+>>>>>>> 5643798 (Port agent-create endpoint to modular relay structure)
 };
 use crate::review_loop;
+use crate::routes::agents::{
+    AgentWorktreeFailure, agent_create_worktree, default_agent_worktree,
+    parse_agent_create_request, valid_agent_model,
+};
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
@@ -690,6 +699,7 @@ fn recovery_replays_a_persisted_first_output_fact() {
         command: "sh -c".to_owned(),
         state: "orphaned".to_owned(),
         paused_at: None,
+        worktree_path: None,
         exit_code: None,
         log_degraded: false,
         audit_degraded: true,
@@ -759,6 +769,7 @@ fn prune_drops_finished_entries_past_the_retention_window() {
         Path::new("/bin/sh"),
         request,
         "execution-old".to_owned(),
+        AgentSpawnDetails::default(),
     )
     .unwrap()
     .handle;
@@ -987,6 +998,7 @@ pub(crate) fn test_server() -> (Arc<Server>, PathBuf) {
                 policy: update::Policy::Enabled,
                 ready_file: None,
             })),
+            max_agents: 16,
             review_state_file: path.with_extension("review-state"),
             review_loop_shadow: false,
             review_config: Mutex::new(Some(Arc::new(test_review_config()))),
@@ -1428,6 +1440,7 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
     let _ = std::fs::remove_file(state_path);
 }
 
+<<<<<<< HEAD
 fn agent_record(id: &str) -> AgentRecord {
     AgentRecord {
         id: id.to_owned(),
@@ -1440,6 +1453,103 @@ fn agent_record(id: &str) -> AgentRecord {
         started_at: "2026-10-09T00:00:00Z".to_owned(),
         deadline_at: None,
         command: "sleep 300".to_owned(),
+=======
+#[test]
+fn agent_worktree_default_path_derives_branch_slug() {
+    assert_eq!(
+        default_agent_worktree("codex/my-feature"),
+        "/private/tmp/codex-my-feature/"
+    );
+    assert_eq!(
+        default_agent_worktree("codex/a/b"),
+        "/private/tmp/codex-a-b/"
+    );
+    assert_eq!(default_agent_worktree("main"), "/private/tmp/main/");
+}
+
+#[test]
+fn agent_model_validation_mirrors_dept() {
+    for valid in ["gpt-5", "gpt-5.1", "o3-mini", "org/model:1.0", "a"] {
+        assert!(valid_agent_model(valid), "{valid}");
+    }
+    for invalid in ["", "-m", "--json", "model name", "model;rm", "a b"] {
+        assert!(!valid_agent_model(invalid), "{invalid:?}");
+    }
+}
+
+#[test]
+fn agent_create_request_parsing() {
+    let body = br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-5","approval_mode":"full-auto","timeout_secs":3600}"#;
+    let request = parse_agent_create_request(body).unwrap();
+    assert_eq!(request.prompt, "do it");
+    assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
+    assert_eq!(request.branch, "codex/x");
+    assert_eq!(request.model.as_deref(), Some("gpt-5"));
+    assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
+    assert_eq!(request.timeout_secs, Some(3600));
+    assert!(request.worktree.is_none());
+    // Unknown fields are rejected.
+    assert!(
+        parse_agent_create_request(br#"{"prompt":"x","project_dir":"y","branch":"z","nope":1}"#)
+            .is_err()
+    );
+    // Missing required fields are rejected.
+    assert!(parse_agent_create_request(br#"{"project_dir":"y","branch":"z"}"#).is_err());
+    // timeout_secs must be a number.
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","timeout_secs":"3600"}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn agent_create_worktree_roundtrip() {
+    let base = worktree_test_base("agent-wt");
+    let wt_root = base.join("worktrees");
+    std::fs::create_dir_all(&wt_root).unwrap();
+    let repo = worktree_test_repo(&base);
+
+    let wt = wt_root.join("codex-feature");
+    agent_create_worktree(&repo, &wt, "codex/feature").unwrap();
+    assert!(wt.join(".git").exists());
+
+    // The same branch cannot back a second worktree.
+    let err = agent_create_worktree(&repo, &wt_root.join("other"), "codex/feature").unwrap_err();
+    assert!(
+        matches!(err, AgentWorktreeFailure::Validation(f) if f.message == "worktree_branch_already_checked_out"),
+        "{err:?}"
+    );
+
+    // A genuine git failure surfaces as worktree_failed with the stderr detail.
+    let occupied = wt_root.join("occupied");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("file.txt"), "x").unwrap();
+    let err = agent_create_worktree(&repo, &occupied, "codex/occupied").unwrap_err();
+    match err {
+        AgentWorktreeFailure::GitFailed(detail) => {
+            assert!(detail.contains("already exists"), "{detail}")
+        }
+        other => panic!("expected GitFailed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+fn running_test_agent(id: &str) -> AgentRecord {
+    AgentRecord {
+        id: id.to_owned(),
+        task_id: format!("task-{id}"),
+        execution_id: format!("execution-{id}"),
+        leader_pid: 1,
+        process_group: 1,
+        process_identity: None,
+        started_at: "1".to_owned(),
+        deadline_at: None,
+        command: "codex exec".to_owned(),
+        worktree_path: None,
+        paused_at: None,
+>>>>>>> 5643798 (Port agent-create endpoint to modular relay structure)
         state: "running".to_owned(),
         exit_code: None,
         log_degraded: false,
@@ -1454,11 +1564,15 @@ fn agent_record(id: &str) -> AgentRecord {
         first_output_at: None,
         first_output_stream: None,
         first_output_bytes: None,
+<<<<<<< HEAD
         paused_at: None,
+=======
+>>>>>>> 5643798 (Port agent-create endpoint to modular relay structure)
     }
 }
 
 #[test]
+<<<<<<< HEAD
 fn agent_delete_unknown_agent_is_404() {
     let (state, _state_path) = test_server();
     let policy =
@@ -1613,4 +1727,57 @@ fn agent_delete_terminates_process_group_and_keeps_worktree() {
         "",
     );
     assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+=======
+fn agent_create_enforces_max_agents_over_http() {
+    let (state, state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    for index in 0..16 {
+        state
+            .supervisor
+            .registry
+            .register(running_test_agent(&format!("agent-{index}")))
+            .unwrap();
+    }
+    let body = r#"{"prompt":"hi","project_dir":"/Users/shukant/Workspace/does-not-exist","branch":"codex/t"}"#;
+    let response = request_once(Arc::clone(&state), &policy, "POST", "/v1/agents", body);
+    assert!(
+        response.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(r#"{"error":"too_many_agents","max":16}"#),
+        "{response}"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+}
+
+#[test]
+fn agent_create_below_limit_reaches_worktree_validation_over_http() {
+    let (state, state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    // Fifteen running agents: under the limit of 16, so the request gets
+    // past the limit check and fails later on the bad project_dir.
+    for index in 0..15 {
+        state
+            .supervisor
+            .registry
+            .register(running_test_agent(&format!("agent-{index}")))
+            .unwrap();
+    }
+    let body = r#"{"prompt":"hi","project_dir":"/Users/shukant/Workspace/does-not-exist","branch":"codex/t"}"#;
+    let response = request_once(Arc::clone(&state), &policy, "POST", "/v1/agents", body);
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(r#"{"error":"worktree_repo_not_found"}"#),
+        "{response}"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+>>>>>>> 5643798 (Port agent-create endpoint to modular relay structure)
 }
