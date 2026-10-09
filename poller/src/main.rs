@@ -25,8 +25,14 @@ struct ZigzagUrl {
 }
 
 fn main() {
+    // Timestamps on every line, like the relay daemon. stdout stays reserved
+    // for the JSON event stream.
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs()
+        .try_init();
     if let Err(error) = run() {
-        eprintln!("poller: {error}");
+        log::error!("{error}");
         std::process::exit(1);
     }
 }
@@ -50,10 +56,10 @@ fn run() -> Result<(), String> {
                 let lost = required_bool(&message, "lost")?;
                 let next = required_number(&message, "next")?;
                 if reset {
-                    eprintln!("Zigzag epoch changed; resetting cursor");
+                    log::info!("Zigzag epoch changed; resetting cursor");
                 }
                 if lost {
-                    eprintln!("WARNING: Zigzag retention was exceeded; some events were lost");
+                    log::warn!("Zigzag retention was exceeded; some events were lost");
                 }
                 let events = match message.object("events") {
                     Some(Json::Array(events)) => events,
@@ -76,7 +82,7 @@ fn run() -> Result<(), String> {
                 }
             }
             Err(error) => {
-                eprintln!("poll failed: {error}; retrying in 2s");
+                log::warn!("poll failed: {error}; retrying in 2s");
                 if config.once {
                     return Err(error);
                 }

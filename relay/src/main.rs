@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod exec;
+mod logging;
 mod review_loop;
 mod update;
 
@@ -137,8 +138,9 @@ enum ReadRequestError {
 }
 
 fn main() {
+    logging::init();
     if let Err(error) = run() {
-        eprintln!("zigzag: {error}");
+        log::error!("startup failed: {error}");
         std::process::exit(1);
     }
 }
@@ -158,12 +160,23 @@ fn run() -> Result<(), String> {
         return update::run_watchdog(&arguments[1..]);
     }
     let config = server_config(arguments.clone())?;
+    log::info!(
+        "loaded server config: port={} state_file={} agent_registry_file={} max_events={}",
+        config.port,
+        config.state_file.display(),
+        config.agent_registry_file.display(),
+        config.max_events
+    );
     let secret = read_secret_file(&config.secret_file)?;
+    log::info!("loaded daemon secret from {}", config.secret_file.display());
     let control_secret = config
         .control_secret_file
         .as_deref()
         .map(read_secret_file)
         .transpose()?;
+    if let Some(path) = config.control_secret_file.as_deref() {
+        log::info!("loaded control secret from {}", path.display());
+    }
     let updater = Arc::new(update::Manager::new(update::Config {
         directory: config.update_directory.clone(),
         interval: config.update_interval,
@@ -171,12 +184,26 @@ fn run() -> Result<(), String> {
         ready_file: config.update_ready_file.clone(),
     }));
     let review_loop_shadow = env::var("ZIGZAG_REVIEW_LOOP_SHADOW").as_deref() == Ok("1");
+    let state_file = config.state_file.clone();
+    let store = Arc::new(Store::open(state_file.clone(), config.max_events)?);
+    log::info!(
+        "opened event store {} (max_events={})",
+        state_file.display(),
+        config.max_events
+    );
+    let agent_registry_file = config.agent_registry_file.clone();
+    let registry = Arc::new(AgentRegistry::open(agent_registry_file.clone())?);
+    let agent_records = registry.list(None, None).len();
+    log::info!(
+        "opened agent registry {} with {agent_records} records",
+        agent_registry_file.display()
+    );
     let state = Arc::new(Server {
         secret,
         control_secret,
-        store: Arc::new(Store::open(config.state_file, config.max_events)?),
+        store,
         supervisor: Supervisor {
-            registry: Arc::new(AgentRegistry::open(config.agent_registry_file)?),
+            registry,
             procs: Mutex::new(HashMap::new()),
         },
         updater: Arc::clone(&updater),
@@ -184,11 +211,12 @@ fn run() -> Result<(), String> {
         review_loop_shadow,
         review_config: Mutex::new(None),
     });
-    for agent in state
+    let recovered = state
         .supervisor
         .registry
-        .recover(recovered_agent_identity_matches)?
-    {
+        .recover(recovered_agent_identity_matches)?;
+    log::info!("recovered {} agent records from registry", recovered.len());
+    for agent in recovered {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
     start_reaper(Arc::clone(&state));
@@ -211,24 +239,29 @@ fn run() -> Result<(), String> {
                             Some(review_config);
                         review_loop_authoritative = !review_loop_shadow;
                     }
-                    Err(error) => eprintln!("review loop disabled: {error}"),
+                    Err(error) => log::warn!("review loop disabled: {error}"),
                 }
             }
-            Ok(_) => eprintln!("review loop disabled by ~/.zigzag/config.yaml"),
+            Ok(_) => log::info!("review loop disabled by ~/.zigzag/config.yaml"),
             Err(violations) => {
-                eprintln!("review loop disabled: invalid ~/.zigzag/config.yaml");
+                log::warn!("review loop disabled: invalid ~/.zigzag/config.yaml");
                 for violation in violations {
-                    eprintln!("review loop config: {violation}");
+                    log::warn!("review loop config: {violation}");
                 }
             }
         },
-        Err(violation) => eprintln!("review loop disabled: {violation}"),
+        Err(violation) => log::warn!("review loop disabled: {violation}"),
     }
     if should_start_legacy_watch(review_loop_authoritative, &config.github_watch_repos) {
         let state = Arc::clone(&state);
         let repos = config.github_watch_repos.clone();
         let interval = config.github_watch_interval;
         thread::spawn(move || github_watch_loop(state, repos, interval));
+        log::info!(
+            "started GitHub PR watch loop for {} repositories (interval={:?})",
+            config.github_watch_repos.len(),
+            config.github_watch_interval
+        );
     }
     let tailnet = config.tailscale_ip.unwrap_or(resolve_tailscale_ip()?);
     let addresses = [
@@ -243,7 +276,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("could not bind {address}: {error}"))?;
         let state = Arc::clone(&state);
         let limiter = Arc::clone(&limiter);
-        println!("zigzag listening on http://{address}");
+        log::info!("listening on http://{address}");
         thread::spawn(move || serve(listener, state, limiter));
     }
     // The replacement only signals readiness after it has opened durable state
@@ -251,6 +284,7 @@ fn run() -> Result<(), String> {
     // happen; no launchctl restart is involved.
     let replacement_version = env::var("ZIGZAG_UPDATE_VERSION").ok();
     updater.acknowledge_ready(replacement_version.as_deref())?;
+    log::info!("signaled readiness to update watchdog");
     if let Some(version) = replacement_version {
         let execution_id = new_execution_id()?;
         state.store.add(relay_event(
@@ -292,6 +326,12 @@ fn run() -> Result<(), String> {
         config.secret_file.clone(),
         config.port,
     );
+    log::info!(
+        "started update manager (directory={}, interval={:?})",
+        config.update_directory.display(),
+        config.update_interval
+    );
+    log::info!("zigzag startup complete");
     loop {
         thread::park();
     }
@@ -555,16 +595,16 @@ fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval: Duration)
                         ]);
                         match state.store.add(payload) {
                             Ok((_, false)) => {
-                                eprintln!("queued GitHub PR watchdog event for {repo}#{number}")
+                                log::debug!("queued GitHub PR watchdog event for {repo}#{number}")
                             }
                             Ok((_, true)) => {}
-                            Err(_) => eprintln!(
+                            Err(_) => log::warn!(
                                 "could not persist GitHub PR watchdog event for {repo}#{number}"
                             ),
                         }
                     }
                 }
-                Err(error) => eprintln!("GitHub PR watch for {repo} failed: {error}"),
+                Err(error) => log::warn!("GitHub PR watch for {repo} failed: {error}"),
             }
         }
         thread::sleep(interval);
@@ -763,11 +803,11 @@ fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimit
                     });
                 }
                 None => {
-                    eprintln!("zigzag connection shed: already at {MAX_CONNECTIONS} connections");
+                    log::warn!("connection shed: already at {MAX_CONNECTIONS} connections");
                     let _ = reply(&mut stream, 503, error("too_many_connections"));
                 }
             },
-            Err(error) => eprintln!("zigzag accept error: {error}"),
+            Err(error) => log::warn!("accept error: {error}"),
         }
     }
 }
@@ -929,7 +969,7 @@ where
             reply(stream, 200, response)
         }
         Err(error_message) => {
-            eprintln!("review gate failed for {repository}#{number}: {error_message}");
+            log::warn!("review gate failed for {repository}#{number}: {error_message}");
             reply(stream, 500, error("review_gate_failed"))
         }
     }
@@ -1108,17 +1148,13 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
         Ok(request) => request,
         Err(denial) => return reply(stream, 200, denial),
     };
-    // Prompts can be sensitive, so logs contain only this minimal routing data.
-    eprintln!(
-        "exec id={} bin={} subcommand={}",
-        request.id,
-        request.bin,
-        request.args.first().map(String::as_str).unwrap_or("")
-    );
+    // Prompts can be sensitive, so logs contain only the redacted routing data.
+    let exec_route = logging::exec_route(&request.bin, &request.args);
+    log::info!("exec id={} {exec_route}", request.id);
     let policy = match require_gui_login_session().and_then(|_| exec::load_policy()) {
         Ok(policy) => policy,
         Err(message) => {
-            eprintln!("exec policy read failed: {message}");
+            log::error!("exec policy read failed: {message}");
             return reply(stream, 500, error("could_not_read_execution_policy"));
         }
     };
@@ -1142,7 +1178,15 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
             return reply(stream, 200, result.to_json());
         }
     };
+    let started = Instant::now();
     let result = exec::run(&path, request);
+    log::info!(
+        "exec id={} {exec_route} finished in {:?} exit_code={:?} timed_out={}",
+        result.id,
+        started.elapsed(),
+        result.exit_code,
+        result.timed_out
+    );
     reply(stream, 200, result.to_json())
 }
 
@@ -1159,16 +1203,10 @@ fn spawn_request(
         Ok(request) => request,
         Err(denial) => return reply(stream, 200, denial),
     };
-    eprintln!(
-        "spawn id={} bin={} subcommand={}",
+    log::info!(
+        "spawn id={} {}",
         request.command.id,
-        request.command.bin,
-        request
-            .command
-            .args
-            .first()
-            .map(String::as_str)
-            .unwrap_or("")
+        logging::exec_route(&request.command.bin, &request.command.args)
     );
     let execution_id = match request.execution_id.clone() {
         Some(execution_id) => execution_id,
@@ -1191,7 +1229,7 @@ fn spawn_request(
     let policy = match policy {
         Ok(policy) => policy,
         Err(message) => {
-            eprintln!("spawn policy read failed: {message}");
+            log::error!("spawn policy read failed: {message}");
             return reply(stream, 500, error("could_not_read_execution_policy"));
         }
     };
@@ -1228,7 +1266,7 @@ fn spawn_request(
         Ok(Some(guard)) => guard,
         Ok(None) => return reply(stream, 503, error("updates_draining")),
         Err(message) => {
-            eprintln!("spawn admission failed: {message}");
+            log::error!("spawn admission failed: {message}");
             return reply(stream, 500, error("could_not_admit_process"));
         }
     };
@@ -1252,14 +1290,17 @@ fn spawn_request(
         request.command,
         execution_id.clone(),
     ) {
-        Ok(handle) => reply(
-            stream,
-            200,
-            Json::Object(vec![
-                ("id".to_owned(), Json::String(handle.id)),
-                ("proc".to_owned(), Json::String(handle.handle)),
-            ]),
-        ),
+        Ok(handle) => {
+            log::info!("spawn id={} handle={}", handle.id, handle.handle);
+            reply(
+                stream,
+                200,
+                Json::Object(vec![
+                    ("id".to_owned(), Json::String(handle.id)),
+                    ("proc".to_owned(), Json::String(handle.handle)),
+                ]),
+            )
+        }
         Err(_) => {
             if state
                 .store
@@ -1274,9 +1315,9 @@ fn spawn_request(
                 ))
                 .is_err()
             {
-                eprintln!("could not persist spawn failure audit event");
+                log::error!("could not persist spawn failure audit event");
             }
-            eprintln!("spawn failed");
+            log::error!("spawn failed for id={task_id}");
             reply(stream, 500, error("could_not_spawn_process"))
         }
     }
@@ -1456,9 +1497,11 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             return reply(stream, 404, error("unknown_proc"));
         };
         update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
-        eprintln!(
+        log::debug!(
             "poll id={} bin={} subcommand={}",
-            entry.id, entry.bin, entry.subcommand
+            entry.id,
+            entry.bin,
+            entry.subcommand
         );
         proc_json(entry)
     };
@@ -1490,9 +1533,11 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             // poll, but do not block an HTTP request waiting for cleanup.
             update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         }
-        eprintln!(
-            "kill id={} bin={} subcommand={}",
-            entry.id, entry.bin, entry.subcommand
+        log::info!(
+            "kill id={} bin={} subcommand={} killed={killed}",
+            entry.id,
+            entry.bin,
+            entry.subcommand
         );
         Json::Object(vec![
             ("id".to_owned(), Json::String(entry.id.clone())),
