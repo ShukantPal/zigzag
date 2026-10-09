@@ -14,6 +14,7 @@ pub(crate) struct Config {
     pub(crate) port: u16,
     pub(crate) tailscale_ip: Option<IpAddr>,
     pub(crate) max_events: usize,
+    pub(crate) max_agents: usize,
     pub(crate) github_watch_repos: Vec<String>,
     pub(crate) github_watch_interval: Duration,
     pub(crate) update_directory: PathBuf,
@@ -29,6 +30,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut port = 8765;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
+    let mut max_agents = 16;
     let mut github_watch_repos = Vec::new();
     let mut github_watch_interval = Duration::from_secs(30);
     let mut update_directory = env::var_os("ZIGZAG_UPDATE_DIR").map(PathBuf::from);
@@ -66,6 +68,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 tailscale_ip = Some(address);
             }
             "--max-events" => max_events = value(&mut values, "--max-events")?.parse().map_err(|_| "--max-events must be a positive integer".to_owned())?,
+            "--max-agents" => max_agents = value(&mut values, "--max-agents")?.parse().map_err(|_| "--max-agents must be a positive integer".to_owned())?,
             "--watch-repo" => {
                 let repo = value(&mut values, "--watch-repo")?;
                 if !valid_github_repo(&repo) {
@@ -104,6 +107,9 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     if max_events == 0 {
         return Err("--max-events must be greater than zero".to_owned());
     }
+    if max_agents == 0 {
+        return Err("--max-agents must be greater than zero".to_owned());
+    }
     let agent_registry_file = state_file.with_extension("agents.json");
     let update_directory = update_directory.unwrap_or_else(|| {
         state_file
@@ -120,6 +126,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         port,
         tailscale_ip,
         max_events,
+        max_agents,
         github_watch_repos,
         github_watch_interval,
         update_directory,

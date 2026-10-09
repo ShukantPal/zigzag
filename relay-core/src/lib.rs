@@ -32,6 +32,7 @@ pub struct AgentRecord {
     /// RFC 3339 timestamp of the most recent pause; `None` when the agent is
     /// not paused.  A paused agent's process group is stopped with SIGSTOP.
     pub paused_at: Option<String>,
+    pub worktree_path: Option<String>,
     pub exit_code: Option<i32>,
     pub log_degraded: bool,
     pub audit_degraded: bool,
@@ -60,6 +61,13 @@ impl AgentRecord {
             (
                 "paused_at".to_owned(),
                 self.paused_at
+                    .clone()
+                    .map(Json::String)
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "worktree_path".to_owned(),
+                self.worktree_path
                     .clone()
                     .map(Json::String)
                     .unwrap_or(Json::Null),
@@ -688,6 +696,7 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         command: text("command")?,
         state: text("state")?,
         paused_at: optional_string("paused_at")?,
+        worktree_path: optional_string("worktree_path")?,
         exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
         log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
         audit_degraded: get("audit_degraded")
@@ -1608,6 +1617,7 @@ mod tests {
             command: "codex exec".to_owned(),
             state: "running".to_owned(),
             paused_at: None,
+            worktree_path: None,
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,
@@ -1743,6 +1753,7 @@ mod tests {
             command: "echo".to_owned(),
             state: "running".to_owned(),
             paused_at: None,
+            worktree_path: None,
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,

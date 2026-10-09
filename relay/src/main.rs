@@ -100,6 +100,7 @@ fn run() -> Result<(), String> {
             procs: Mutex::new(HashMap::new()),
         },
         updater: Arc::clone(&updater),
+        max_agents: config.max_agents,
         review_state_file: config.review_state_file.clone(),
         review_loop_shadow,
         review_config: Mutex::new(None),

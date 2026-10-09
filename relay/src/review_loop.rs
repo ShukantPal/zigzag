@@ -2,7 +2,8 @@ use crate::events::{new_execution_id, relay_event};
 use crate::exec;
 use crate::github::github_open_pull_requests;
 use crate::proc::{
-    force_kill_process_group, managed_agent_running, recovered_agent_identity_matches, spawn_proc,
+    AgentSpawnDetails, force_kill_process_group, managed_agent_running,
+    recovered_agent_identity_matches, spawn_proc,
 };
 use crate::server::Server;
 use crate::session::require_gui_login_session;
@@ -2353,6 +2354,7 @@ fn spawn_codex_task(
             args,
         },
         execution_id,
+        AgentSpawnDetails::default(),
     )?;
     Ok(spawned.handle)
 }
@@ -2816,11 +2818,6 @@ fn stable_identifier(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::random_hex_128;
-    use crate::proc::{ProcEntry, managed_agent_running_with, process_identity};
-    use crate::server::Supervisor;
-    use crate::session::CappedOutput;
-    use crate::tests::test_updater;
 
     fn valid_yaml(enabled: bool) -> String {
         format!(
@@ -2851,8 +2848,10 @@ review_loop:
     }
 
     fn load_text(text: &str) -> Result<PersonalConfig, Vec<ConfigViolation>> {
-        let path =
-            std::env::temp_dir().join(format!("zigzag-config-{}.yaml", random_hex_128().unwrap()));
+        let path = std::env::temp_dir().join(format!(
+            "zigzag-config-{}.yaml",
+            crate::events::random_hex_128().unwrap()
+        ));
         fs::write(&path, text).unwrap();
         let result = load_config(&path);
         let _ = fs::remove_file(path);
@@ -2902,8 +2901,9 @@ review_loop:
             started_at: format!("2026-01-01T00:00:{process_group:02}Z"),
             deadline_at: None,
             command: "codex exec".to_owned(),
-            state: state.to_owned(),
             paused_at: None,
+            worktree_path: None,
+            state: state.to_owned(),
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,
@@ -2964,7 +2964,7 @@ review_loop:
     fn shadow_discovery_supersedes_durably_without_dispatch_or_cleanup() {
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-shadow-discovery-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry_path = state_path.with_extension("agents");
         let event_path = state_path.with_extension("events");
@@ -2979,11 +2979,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: true,
             review_config: std::sync::Mutex::new(None),
@@ -3426,7 +3427,7 @@ review_loop:
             .collect();
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-production-gate-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let key = round_key("owner/repo", 7, &head);
         let mut store = StateStore::open(state_path.clone()).unwrap();
@@ -3514,7 +3515,7 @@ review_loop:
     fn owner_task_reattachment_revalidates_the_spawn_fence() {
         let registry_path = std::env::temp_dir().join(format!(
             "zigzag-owner-reattach-registry-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry = AgentRegistry::open(&registry_path).unwrap();
         let head = "a".repeat(40);
@@ -3564,7 +3565,7 @@ review_loop:
     fn durable_restart_reattaches_the_planned_attempt_by_stable_task_id() {
         let path = std::env::temp_dir().join(format!(
             "zigzag-review-state-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let head = "a".repeat(40);
         let key = round_key("owner/repo", 7, &head);
@@ -3587,11 +3588,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -3656,7 +3658,7 @@ review_loop:
         let key = round_key("owner/repo", 7, &head);
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-owner-retry-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry_path = state_path.with_extension("agents");
         let event_path = state_path.with_extension("events");
@@ -3676,11 +3678,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -3776,7 +3779,7 @@ review_loop:
         let key = round_key("owner/repo", 7, &head);
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-owner-rediscovery-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry_path = state_path.with_extension("agents");
         let event_path = state_path.with_extension("events");
@@ -3784,11 +3787,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -3984,7 +3988,7 @@ review_loop:
         );
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-terminal-state-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
@@ -3998,11 +4002,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4055,7 +4060,7 @@ review_loop:
         let key = round_key("owner/repo", 7, &head);
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-unwritable-transition-{}",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         fs::create_dir(&state_path).unwrap();
         let mut store = StateStore {
@@ -4088,7 +4093,7 @@ review_loop:
         let second_key = round_key("owner/repo", 8, &second_head);
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-isolated-merge-poll-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry_path = state_path.with_extension("agents");
         let event_path = state_path.with_extension("events");
@@ -4097,11 +4102,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4159,7 +4165,7 @@ review_loop:
         round.owner_agent_id = Some("owner".to_owned());
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-closed-state-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
@@ -4188,14 +4194,18 @@ review_loop:
     fn cleanup_never_signals_unverified_orphaned_process_groups() {
         let path = std::env::temp_dir().join(format!(
             "zigzag-review-agents-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry = AgentRegistry::open(&path).unwrap();
         let orphan = agent("liveness", "task", 40, "orphaned");
-        assert!(managed_agent_running_with(&orphan, |_| true));
-        assert!(!managed_agent_running_with(&orphan, |_| { false }));
+        assert!(crate::proc::managed_agent_running_with(&orphan, |_| true));
+        assert!(!crate::proc::managed_agent_running_with(&orphan, |_| {
+            false
+        }));
         let finished = agent("terminal", "task", 40, "finished");
-        assert!(!managed_agent_running_with(&finished, |_| { true }));
+        assert!(!crate::proc::managed_agent_running_with(&finished, |_| {
+            true
+        }));
         registry
             .register(agent("running", "task", 41, "running"))
             .unwrap();
@@ -4233,11 +4243,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::new(registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: path.with_extension("review-state"),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4265,10 +4276,10 @@ review_loop:
             .spawn()
             .unwrap();
         let process_group = child.id() as i32;
-        let identity = process_identity(process_group).unwrap();
+        let identity = crate::proc::process_identity(process_group).unwrap();
         let registry_path = std::env::temp_dir().join(format!(
             "zigzag-review-recovery-agents-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry = AgentRegistry::open(&registry_path).unwrap();
         let mut current = agent("current", "owner-task", process_group, "running");
@@ -4290,7 +4301,9 @@ review_loop:
         drop(registry);
 
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
-        registry.recover(recovered_agent_identity_matches).unwrap();
+        registry
+            .recover(super::recovered_agent_identity_matches)
+            .unwrap();
         assert_eq!(registry.get("current").unwrap().state, "orphaned");
         assert_eq!(registry.get("reused").unwrap().state, "lost_after_restart");
         assert_eq!(registry.get("legacy").unwrap().state, "orphaned");
@@ -4301,11 +4314,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: review_state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4352,11 +4366,11 @@ review_loop:
         let process_group = child.id() as i32;
         let registry_path = std::env::temp_dir().join(format!(
             "zigzag-cleanup-debt-agents-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
         let mut recovered = agent("recovered-owner", "owner-task", process_group, "orphaned");
-        recovered.process_identity = process_identity(process_group);
+        recovered.process_identity = crate::proc::process_identity(process_group);
         registry.register(recovered).unwrap();
         let state_path = registry_path.with_extension("events");
         let review_state_path = registry_path.with_extension("review-state");
@@ -4364,11 +4378,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: review_state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4429,20 +4444,20 @@ review_loop:
 
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-review-force-kill-{}",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry_path = state_path.with_extension("agents");
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
         let mut reviewer = agent("reviewer", "review-task", process_group, "running");
-        reviewer.process_identity = process_identity(process_group);
+        reviewer.process_identity = crate::proc::process_identity(process_group);
         registry.register(reviewer).unwrap();
         let complete_output = || {
-            Arc::new(Mutex::new(CappedOutput {
+            Arc::new(Mutex::new(crate::session::CappedOutput {
                 complete: true,
-                ..CappedOutput::default()
+                ..crate::session::CappedOutput::default()
             }))
         };
-        let entry = ProcEntry {
+        let entry = crate::proc::ProcEntry {
             child,
             process_group,
             id: "review-task".to_owned(),
@@ -4461,14 +4476,15 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry,
                 procs: Mutex::new(std::collections::HashMap::from([(
                     "reviewer".to_owned(),
                     entry,
                 )])),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.with_extension("review-state"),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4501,14 +4517,14 @@ review_loop:
         round.owner_agent_id = Some("owner".to_owned());
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-stale-state-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
         store.save().unwrap();
         let registry_path = std::env::temp_dir().join(format!(
             "zigzag-stale-agents-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
         let event_path = state_path.with_extension("events");
@@ -4516,11 +4532,12 @@ review_loop:
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
             store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
-            supervisor: Supervisor {
+            supervisor: super::super::Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
             },
-            updater: test_updater(),
+            updater: crate::tests::test_updater(),
+            max_agents: 16,
             review_state_file: state_path.clone(),
             review_loop_shadow: false,
             review_config: std::sync::Mutex::new(None),
@@ -4592,7 +4609,7 @@ review_loop:
         };
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-comment-cleanup-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(key.clone(), round);
@@ -4679,7 +4696,7 @@ review_loop:
         let key = round_key("owner/repo", 7, &head);
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-publication-race-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(
@@ -4751,7 +4768,7 @@ review_loop:
         };
         let state_path = std::env::temp_dir().join(format!(
             "zigzag-base-retarget-{}.json",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let mut store = StateStore::open(state_path.clone()).unwrap();
         store.state.rounds.insert(
@@ -4816,7 +4833,7 @@ review_loop:
 
         let directory = std::env::temp_dir().join(format!(
             "zigzag-owner-checkout-{}",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         fs::create_dir(&directory).unwrap();
         let git = |args: &[&str]| {
@@ -4866,7 +4883,7 @@ review_loop:
 
         let department = std::env::temp_dir().join(format!(
             "zigzag-owner-department-{}",
-            random_hex_128().unwrap()
+            crate::events::random_hex_128().unwrap()
         ));
         let task_dir = department.join("t-owner");
         fs::create_dir_all(&task_dir).unwrap();
