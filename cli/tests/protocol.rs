@@ -41,6 +41,20 @@ fn transcript_server(
     (port, server)
 }
 
+fn read_socket_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+    stream.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn write_socket_frame(stream: &mut std::net::TcpStream, value: &serde_json::Value) {
+    let body = serde_json::to_vec(value).unwrap();
+    stream.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+}
+
 #[test]
 fn exec_null_exit_code_returns_one_after_posting_the_authenticated_protocol_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -238,5 +252,56 @@ fn transcript_json_once_is_pretty_json() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["stdout"],
         "done\n"
+    );
+}
+
+#[test]
+fn events_stream_authenticates_and_subscribes_to_the_bidi_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_socket_frame(&mut stream),
+            serde_json::json!({"type":"auth","authorization":"Bearer test-token"})
+        );
+        write_socket_frame(&mut stream, &serde_json::json!({"type":"authenticated"}));
+        assert_eq!(
+            read_socket_frame(&mut stream),
+            serde_json::json!({"type":"subscribe","topic":"events"})
+        );
+        write_socket_frame(
+            &mut stream,
+            &serde_json::json!({
+                "topic":"events",
+                "event":{"id":"pushed-event","kind":"test","task_id":"task-1"}
+            }),
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            "127.0.0.1:8765",
+            "--json",
+            "events",
+            "stream",
+            "--socket-port",
+            &port.to_string(),
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+
+    server.join().unwrap();
+    // The test server closes after one frame, while production streams remain
+    // open. The client should print the frame before reporting the closure.
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "topic":"events",
+            "event":{"id":"pushed-event","kind":"test","task_id":"task-1"}
+        })
     );
 }

@@ -115,6 +115,10 @@ unchanged HTTP events endpoint. `dept/status.py` prefers this socket after its
 HTTP bootstrap and automatically falls back to HTTP long-polling when the
 socket is unavailable.
 
+`zzapi events stream` is the command-line client for the event topic. It
+authenticates to the bidi socket and prints pushed event frames; pass
+`--socket-port` (or set `ZIGZAG_SOCKET_PORT`) when the relay does not use 8766.
+
 ## Network security: Tailscale ACLs
 
 The relay never binds to a public interface. On startup it listens on
