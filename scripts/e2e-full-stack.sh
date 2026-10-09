@@ -136,6 +136,38 @@ assert row is not None, f"TUI did not display task {task_id!r}"
 assert row[4] != "not observed", f"TUI did not observe agent state: {row}"
 ' "$task_id" <<<"$tui"
 
+# Exercise the TUI model's real TCP receive path after bootstrap.  Its HTTP
+# accessor is deliberately disabled before polling: the injected event must
+# arrive through the authenticated socket subscription, not a fallback poll.
+PYTHONPATH="$repo_root" python3 - "$port" "$token_file" <<'PY'
+import json
+import sys
+import urllib.request
+
+from dept.status import EventStream
+
+port, token_path = sys.argv[1:]
+token = open(token_path).read().strip()
+url = f"http://127.0.0.1:{port}"
+stream = EventStream(url, token)
+stream.bootstrap()
+stream._get = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected HTTP fallback"))
+request = urllib.request.Request(
+    url + "/v1/events",
+    data=json.dumps({"id": "socket-full-stack", "kind": "socket_test"}).encode(),
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    assert response.status == 201
+for _ in range(20):
+    stream.poll(1)
+    if any(item.get("id") == "socket-full-stack" for item in stream.events):
+        break
+else:
+    raise AssertionError("TUI model did not receive the pushed socket event")
+PY
+
 "${api[@]}" agents pause "$agent_id" >/dev/null
 for _ in $(seq 1 50); do
   state=$(ps -o stat= -p "$leader_pid" 2>/dev/null | tr -d ' ' || true)

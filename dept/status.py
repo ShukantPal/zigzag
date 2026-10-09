@@ -39,6 +39,7 @@ INTERNAL_TASK_IDS = frozenset({"relay-update"})
 # unbounded growth while streaming.
 MAX_STREAM_EVENTS = 10_000
 SOCKET_PORT = 8766
+MAX_SOCKET_FRAME_BYTES = 4 * 1024 * 1024
 
 
 def socket_address(url: str) -> tuple[str, int]:
@@ -59,7 +60,7 @@ def socket_address(url: str) -> tuple[str, int]:
 def socket_frame(payload: dict[str, Any]) -> bytes:
     """Encode one relay socket frame (four-byte BE length plus JSON)."""
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    if not data or len(data) > 4 * 1024 * 1024:
+    if not data or len(data) > MAX_SOCKET_FRAME_BYTES:
         raise ValueError("invalid relay socket frame size")
     return len(data).to_bytes(4, "big") + data
 
@@ -75,7 +76,7 @@ def read_socket_frame(connection: socket.socket) -> dict[str, Any]:
         return bytes(result)
 
     size = int.from_bytes(exact(4), "big")
-    if not 0 < size <= 4 * 1024 * 1024:
+    if not 0 < size <= MAX_SOCKET_FRAME_BYTES:
         raise ValueError("invalid relay socket frame size")
     decoded = json.loads(exact(size))
     if not isinstance(decoded, dict):
@@ -90,15 +91,20 @@ class RelaySocket:
         self.connection = connection
 
     @classmethod
-    def connect(cls, url: str, token: str) -> "RelaySocket":
+    def connect(cls, url: str, token: str, *, after: int, epoch: str) -> "RelaySocket":
         connection = socket.create_connection(socket_address(url), timeout=3)
         try:
             connection.sendall(socket_frame({"type": "auth", "authorization": f"Bearer {token}"}))
             reply = read_socket_frame(connection)
             if reply.get("type") != "authenticated":
                 raise OSError("relay socket authentication failed")
-            for topic in ("agents", "events"):
-                connection.sendall(socket_frame({"type": "subscribe", "topic": topic}))
+            connection.sendall(socket_frame({"type": "subscribe", "topic": "agents"}))
+            # Resume from the HTTP bootstrap cursor.  This closes the gap
+            # between bootstrap and socket admission without making the TCP
+            # protocol retain a second event window.
+            connection.sendall(socket_frame({
+                "type": "subscribe", "topic": "events", "after": after, "epoch": epoch,
+            }))
             return cls(connection)
         except BaseException:
             connection.close()
@@ -476,7 +482,7 @@ class EventStream:
         self._ingest(self._get("/v1/events?after=0&timeout=0", 10))
         self._seed_agents()
         try:
-            self.socket = RelaySocket.connect(self.url, self.token)
+            self.socket = RelaySocket.connect(self.url, self.token, after=self.after, epoch=self.epoch)
         except (OSError, ValueError, json.JSONDecodeError):
             # Older relays and relays behind an HTTP-only proxy retain exactly
             # the established long-poll behavior.
@@ -634,9 +640,10 @@ def task_workdir(task_id: str, root: Path | None = None) -> str:
         return ""
 
 
-def transcript_command(task_id: str, root: Path | None = None) -> str:
+def transcript_command(task_id: str | Path, root: Path | None = None) -> str:
     # BSD tail exits when a path has not been created yet; -F retries it.
-    return f"tail -F {shlex.quote(str(transcript_path(task_id, root)))}"
+    path = task_id if isinstance(task_id, Path) else transcript_path(task_id, root)
+    return f"tail -F {shlex.quote(str(path))}"
 
 
 def relay_output(
@@ -714,7 +721,7 @@ def transcript_lines(
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
         f"Source: {path}",
-        f"Command: tail -F {shlex.quote(str(path))}",
+        f"Command: {transcript_command(path)}",
     ]
     if execution.agent_id is None:
         lines.append("Relay output unavailable: no retained supervised agent matches this execution.")

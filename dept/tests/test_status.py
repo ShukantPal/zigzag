@@ -11,6 +11,7 @@ from dept import dept
 from dept.status import (
     EventStream,
     Execution,
+    MAX_SOCKET_FRAME_BYTES,
     RELAY_OUTPUT_TAIL_BYTES,
     RelaySocket,
     StatusScreen,
@@ -193,6 +194,7 @@ class SnapshotIngestionTests(unittest.TestCase):
         encoded = socket_frame({"type": "ping"})
         self.assertEqual(int.from_bytes(encoded[:4], "big"), len(encoded) - 4)
         self.assertEqual(json.loads(encoded[4:]), {"type": "ping"})
+        self.assertEqual(MAX_SOCKET_FRAME_BYTES, 4 * 1024 * 1024)
 
     def test_socket_push_updates_agents_and_events_after_http_bootstrap(self):
         stream = EventStream("http://relay", "token")
@@ -217,6 +219,24 @@ class SnapshotIngestionTests(unittest.TestCase):
             self.assertTrue(stream.poll(1))
         self.assertEqual([item["id"] for item in stream.events], [pushed_event["id"]])
         self.assertEqual(stream.after, 2)
+
+    def test_socket_drop_marker_resynchronizes_through_the_http_cursor(self):
+        stream = EventStream("http://relay", "token")
+        stream.epoch, stream.after = "e1", 7
+        socket = unittest.mock.Mock()
+        socket.receive.return_value = {"topic": "events", "dropped": True}
+        stream.socket = socket
+        recovered = event("process_completed", "2026-01-01T00:00:01.000Z", sequence=8)
+        with patch.object(
+            EventStream,
+            "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 8, "events": [recovered]},
+        ) as get:
+            self.assertTrue(stream.poll(1))
+        socket.close.assert_called_once()
+        self.assertIsNone(stream.socket)
+        self.assertEqual(get.call_args.args[0], "/v1/events?after=7&epoch=e1&timeout=1")
+        self.assertEqual([item["id"] for item in stream.events], [recovered["id"]])
 
     def test_socket_failure_falls_back_to_the_existing_http_cursor(self):
         stream = EventStream("http://relay", "token")

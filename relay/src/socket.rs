@@ -98,6 +98,32 @@ pub(crate) fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), St
                     );
                     continue;
                 }
+                // Snapshot the event cursor before this topic becomes visible
+                // to publishers.  A client normally supplies its HTTP cursor
+                // and epoch; clients without one start at this exact snapshot.
+                // Either way, an event cannot land between admission and the
+                // cursor from which the publisher reads.
+                let event_cursor = if topic == "events" {
+                    match event_cursor(&frame, &state) {
+                        Ok(cursor) => Some(cursor),
+                        Err(()) => {
+                            let _ = enqueue(
+                                &sender,
+                                json!({"type":"error","error":"invalid_cursor","topic":"events"}),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let log_after = topic.strip_prefix("logs.").map(|id| {
+                    state
+                        .supervisor
+                        .registry
+                        .get(id)
+                        .map_or(0, |agent| agent.log_next)
+                });
                 let added = subscriptions
                     .lock()
                     .map_err(|_| "socket subscriptions lock poisoned".to_owned())?
@@ -111,6 +137,8 @@ pub(crate) fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), St
                         Arc::clone(&alive),
                         Arc::clone(&events_dropped),
                         Arc::clone(&subscriptions),
+                        event_cursor,
+                        log_after,
                     );
                 }
             }
@@ -138,6 +166,23 @@ pub(crate) fn handle(mut stream: TcpStream, state: Arc<Server>) -> Result<(), St
     Ok(())
 }
 
+fn event_cursor(frame: &Value, state: &Server) -> Result<(u64, String), ()> {
+    let after = frame.get("after");
+    let epoch = frame.get("epoch");
+    match (after, epoch) {
+        (Some(after), Some(epoch)) => Ok((
+            after.as_u64().ok_or(())?,
+            epoch.as_str().ok_or(())?.to_owned(),
+        )),
+        (None, None) => state
+            .store
+            .read(u64::MAX, "", Duration::ZERO)
+            .map(|read| (read.next, read.epoch))
+            .map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
 fn valid_topic(topic: &str) -> bool {
     topic == "agents"
         || topic == "events"
@@ -153,16 +198,9 @@ fn start_topic(
     alive: Arc<AtomicBool>,
     events_dropped: Arc<AtomicBool>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
+    event_cursor: Option<(u64, String)>,
+    log_after: Option<u64>,
 ) {
-    // Capture the event cursor synchronously with subscription admission. The
-    // worker may start a moment later, but it will still read every event that
-    // arrives after this subscribe request rather than skipping that gap.
-    let event_after = (topic == "events").then(|| {
-        state
-            .store
-            .read(u64::MAX, "", Duration::ZERO)
-            .map_or(0, |read| read.next)
-    });
     thread::spawn(move || match topic.as_str() {
         "agents" => publish_agents(state, sender, alive, subscriptions, topic),
         "events" => publish_events(
@@ -172,7 +210,7 @@ fn start_topic(
             events_dropped,
             subscriptions,
             topic,
-            event_after.expect("event cursor captured"),
+            event_cursor.expect("event cursor captured"),
         ),
         _ => publish_logs(
             topic
@@ -184,6 +222,7 @@ fn start_topic(
             alive,
             subscriptions,
             topic,
+            log_after.expect("log cursor captured"),
         ),
     });
 }
@@ -220,10 +259,10 @@ fn publish_events(
     dropped: Arc<AtomicBool>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     topic: String,
-    mut after: u64,
+    (mut after, mut epoch): (u64, String),
 ) {
     while active(&alive, &subscriptions, &topic) {
-        let Ok(read) = store.read(after, "", Duration::from_secs(1)) else {
+        let Ok(read) = store.read(after, &epoch, Duration::from_secs(1)) else {
             dropped.store(true, Ordering::Release);
             continue;
         };
@@ -237,6 +276,7 @@ fn publish_events(
             }
         }
         after = read.next;
+        epoch = read.epoch;
     }
 }
 
@@ -247,12 +287,8 @@ fn publish_logs(
     alive: Arc<AtomicBool>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     topic: String,
+    mut after: u64,
 ) {
-    let mut after = state
-        .supervisor
-        .registry
-        .get(&id)
-        .map_or(0, |agent| agent.log_next);
     while active(&alive, &subscriptions, &topic) {
         let Some(logs) = agent_logs_json(&state.supervisor.registry, &id, "both", after, None)
         else {
@@ -363,7 +399,7 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relay_core::Json;
+    use relay_core::{AgentRecord, Json};
     use std::net::TcpListener;
 
     #[test]
@@ -460,6 +496,190 @@ mod tests {
         );
         drop(client);
         server.join().unwrap();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn socket_replays_events_from_the_http_handoff_cursor() {
+        let (state, state_path) = crate::tests::test_server();
+        let epoch = state.store.read(0, "", Duration::ZERO).unwrap().epoch;
+        state
+            .store
+            .add(Json::Object(vec![(
+                "id".to_owned(),
+                Json::String("handoff-event".to_owned()),
+            )]))
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handler_state = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, handler_state).unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &json!({"type":"auth","authorization":format!("Bearer {}", "x".repeat(32))}),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap(),
+            json!({"type":"authenticated"})
+        );
+        write_frame(
+            &mut client,
+            &json!({"type":"subscribe","topic":"events","after":0,"epoch":epoch}),
+        )
+        .unwrap();
+        let replayed = (0..3)
+            .map(|_| read_frame(&mut client).unwrap())
+            .find(|frame| frame.get("event").is_some())
+            .unwrap();
+        assert_eq!(
+            replayed.pointer("/event/id").and_then(Value::as_str),
+            Some("handoff-event")
+        );
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn socket_reports_a_bounded_event_queue_drop_before_the_next_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = sync_channel(EVENT_QUEUE_CAPACITY);
+        for _ in 0..EVENT_QUEUE_CAPACITY {
+            sender
+                .send(json!({"topic":"events","event":{"id":"queued"}}))
+                .unwrap();
+        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicBool::new(true));
+        let writer_alive = Arc::clone(&alive);
+        let writer_dropped = Arc::clone(&dropped);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            write_loop(stream, receiver, writer_alive, writer_dropped);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap(),
+            json!({"topic":"events","dropped":true})
+        );
+        assert_eq!(
+            read_frame(&mut client)
+                .unwrap()
+                .pointer("/event/id")
+                .and_then(Value::as_str),
+            Some("queued")
+        );
+        alive.store(false, Ordering::Release);
+        drop(sender);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn socket_streams_agent_logs_and_rejects_unknown_log_agents() {
+        let (state, state_path) = crate::tests::test_server();
+        state
+            .supervisor
+            .registry
+            .register(AgentRecord {
+                id: "log-agent".to_owned(),
+                task_id: "task".to_owned(),
+                execution_id: "execution".to_owned(),
+                leader_pid: 1,
+                process_group: 1,
+                process_identity: None,
+                worktree_path: None,
+                started_at: "0".to_owned(),
+                deadline_at: None,
+                command: "test".to_owned(),
+                state: "running".to_owned(),
+                paused_at: None,
+                exit_code: None,
+                log_degraded: false,
+                audit_degraded: false,
+                redacted: false,
+                stdout_next: 0,
+                stderr_next: 0,
+                stdout_dropped_before: 0,
+                stderr_dropped_before: 0,
+                log_next: 0,
+                log_dropped_before: 0,
+                first_output_at: None,
+                first_output_stream: None,
+                first_output_bytes: None,
+            })
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handler_state = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, handler_state).unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write_frame(
+            &mut client,
+            &json!({"type":"auth","authorization":format!("Bearer {}", "x".repeat(32))}),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap(),
+            json!({"type":"authenticated"})
+        );
+        write_frame(
+            &mut client,
+            &json!({"type":"subscribe","topic":"logs.log-agent"}),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap(),
+            json!({"type":"subscribed","topic":"logs.log-agent"})
+        );
+        state
+            .supervisor
+            .registry
+            .append_log("log-agent", "stdout", b"socket-log\n")
+            .unwrap();
+        let record = (0..4)
+            .map(|_| read_frame(&mut client).unwrap())
+            .find(|frame| frame.get("record").is_some())
+            .unwrap();
+        assert_eq!(
+            record.pointer("/record/data").and_then(Value::as_str),
+            Some("socket-log\n")
+        );
+        write_frame(
+            &mut client,
+            &json!({"type":"subscribe","topic":"logs.unknown"}),
+        )
+        .unwrap();
+        let unknown = (0..4)
+            .map(|_| read_frame(&mut client).unwrap())
+            .find(|frame| frame.get("error") == Some(&Value::String("unknown_agent".to_owned())))
+            .unwrap();
+        assert_eq!(
+            unknown.get("topic").and_then(Value::as_str),
+            Some("logs.unknown")
+        );
+        drop(client);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(state_path.with_extension("agents"));
+        let _ = std::fs::remove_dir_all(state_path.with_extension("agent-logs"));
         let _ = std::fs::remove_file(state_path);
     }
 
