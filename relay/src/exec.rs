@@ -621,7 +621,7 @@ fn run_with_timeout(path: &Path, request: ExecRequest, timeout: Duration) -> Exe
                 thread::sleep(Duration::from_millis(50));
             }
             Err(error) => {
-                eprintln!("exec child wait failed: {error}");
+                log::warn!("exec id={} child wait failed: {error}", request.id);
                 let _ = child.kill();
                 let _ = child.wait();
                 break true;

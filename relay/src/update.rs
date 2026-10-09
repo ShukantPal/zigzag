@@ -300,7 +300,7 @@ impl Manager {
                     &secret_file,
                     health_port,
                 ) {
-                    eprintln!("relay update check failed: {error}");
+                    log::warn!("relay update check failed: {error}");
                 }
                 std::thread::sleep(self.config.interval);
             }
@@ -605,7 +605,7 @@ fn run_watchdog_with(
         }
         wait();
     }
-    eprintln!("candidate did not become healthy; rolling back");
+    log::error!("candidate did not become healthy; rolling back");
     replace_symlink(&config.rollback, &config.current_link)?;
     let mut status = read_status(&config.status_directory)?;
     status.last_result = Some(format!("health_check_failed:{}", config.candidate_version));

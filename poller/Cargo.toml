@@ -9,3 +9,5 @@ percent-encoding = "2"
 relay-core = { path = "../relay-core" }
 ureq = "2"
 url = "2"
+log = "0.4"
+env_logger = "0.11"

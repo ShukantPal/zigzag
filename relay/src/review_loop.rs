@@ -471,7 +471,7 @@ pub fn start(
         let mut discovery_due = Instant::now();
         let mut review_due = Instant::now();
         let mut merge_due = Instant::now();
-        eprintln!(
+        log::info!(
             "review loop started{} for {} repositories",
             if shadow { " in shadow mode" } else { "" },
             config.repositories.len()
@@ -480,19 +480,19 @@ pub fn start(
             let now = Instant::now();
             if now >= discovery_due {
                 if let Err(error) = discover(&state, &config, &mut store, shadow) {
-                    eprintln!("review discovery failed: {error}");
+                    log::warn!("review discovery failed: {error}");
                 }
                 discovery_due = now + Duration::from_secs(config.intervals.discovery_seconds);
             }
             if now >= review_due {
                 if let Err(error) = poll_reviews(&state, &config, &mut store, shadow) {
-                    eprintln!("review poll failed: {error}");
+                    log::warn!("review poll failed: {error}");
                 }
                 review_due = now + Duration::from_secs(config.intervals.review_seconds);
             }
             if now >= merge_due {
                 if let Err(error) = poll_merges(&state, &config, &mut store, shadow) {
-                    eprintln!("review merge poll failed: {error}");
+                    log::warn!("review merge poll failed: {error}");
                 }
                 merge_due = now + Duration::from_secs(config.intervals.merge_seconds);
             }
@@ -809,7 +809,7 @@ fn discover_with(
         let numbers = match open_pull_requests(&policy.repository) {
             Ok(numbers) => numbers,
             Err(error) => {
-                eprintln!("review discovery failed for {}: {error}", policy.repository);
+                log::warn!("review discovery failed for {}: {error}", policy.repository);
                 continue;
             }
         };
@@ -907,7 +907,7 @@ fn discover_with(
                 Ok(())
             })();
             if let Err(error) = result {
-                eprintln!(
+                log::warn!(
                     "review discovery failed for {}#{number}: {error}",
                     policy.repository
                 );
@@ -1129,7 +1129,7 @@ fn retry_all_pending_comment_deletions(config: &ReviewLoopConfig, store: &mut St
             continue;
         };
         if let Err(error) = retry_pending_comment_deletions(policy, store, &key) {
-            eprintln!("review comment cleanup failed for {key}: {error}");
+            log::warn!("review comment cleanup failed for {key}: {error}");
         }
     }
 }
@@ -1151,7 +1151,7 @@ fn prepare_inactive_comment_cleanup(
     if authoritative_mode(shadow)
         && let Err(error) = retry_pending_comment_deletions(policy, store, key)
     {
-        eprintln!("review comment cleanup failed for {key}: {error}");
+        log::warn!("review comment cleanup failed for {key}: {error}");
     }
     Ok(())
 }
@@ -1370,7 +1370,7 @@ fn poll_reviews_with(
             Ok(())
         })();
         if let Err(error) = result {
-            eprintln!("review poll failed for {key}: {error}");
+            log::warn!("review poll failed for {key}: {error}");
         }
     }
     Ok(())
@@ -1444,7 +1444,7 @@ fn poll_merges_with(
             Ok(())
         })();
         if let Err(error) = result {
-            eprintln!("review merge poll failed for {key}: {error}");
+            log::warn!("review merge poll failed for {key}: {error}");
         }
     }
     Ok(())
@@ -2657,7 +2657,7 @@ fn kill_agents(server: &Server, agent_ids: &[String]) {
                 .registry
                 .transition(&agent_id, "cleanup_skipped_unverified", None)
         {
-            eprintln!("could not persist safe orphan cleanup for {agent_id}: {error}");
+            log::error!("could not persist safe orphan cleanup for {agent_id}: {error}");
         }
     }
     if process_groups.is_empty() {
