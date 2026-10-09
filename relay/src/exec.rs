@@ -612,6 +612,412 @@ mod tests {
         assert_eq!(policy.allowed_path("unknown", &args(&["new"])), None);
     }
 
+    // ------------------------------------------------------------------
+    // gh allowlist parser hardening. `is_read_only_gh_command` /
+    // `is_read_only_gh_api` are the only thing standing between the
+    // allowlisted `gh` binary and a write, so the parser's deny-by-default
+    // behavior is pinned here: edge-case tables plus deterministic
+    // property-style sweeps (a PRNG with a fixed seed — reproducible "fuzz").
+    // ------------------------------------------------------------------
+
+    fn gh_repos() -> BTreeSet<String> {
+        BTreeSet::from(["leveled-inc/leveled".to_owned()])
+    }
+
+    fn gh_argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    fn assert_gh_denied(argv: &[&str]) {
+        assert!(
+            !is_read_only_gh_command(&gh_argv(argv), &gh_repos()),
+            "gh allowlist accepted a non-read-only command: {argv:?}"
+        );
+    }
+
+    fn assert_gh_allowed(argv: &[&str]) {
+        assert!(
+            is_read_only_gh_command(&gh_argv(argv), &gh_repos()),
+            "gh allowlist rejected a read-only command: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn gh_write_attempts_are_denied_despite_matching_prefix() {
+        // The allowlist prefix `[["api"]]` matches, but the read-only parser
+        // is the backstop: a prefix match alone must never authorize.
+        let policy = policy(
+            r#"{"bins":{"gh":{"path":"/bin/echo","commands":[["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &gh_argv(&[
+                        "api",
+                        "--method",
+                        "POST",
+                        "repos/leveled-inc/leveled/pulls/1/comments"
+                    ])
+                )
+                .is_none()
+        );
+        assert!(
+            policy
+                .allowed_path(
+                    "gh",
+                    &gh_argv(&["api", "repos/leveled-inc/leveled/pulls/1/comments"])
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gh_api_rejects_every_write_capable_flag_in_every_position() {
+        let endpoint = "repos/leveled-inc/leveled/pulls/1/comments";
+        // Flags that can turn `gh api` into a write (method/body/headers) or
+        // otherwise escape the read-only contract.
+        let write_flags = [
+            "--method",
+            "-X",
+            "--input",
+            "-F",
+            "--field",
+            "-f",
+            "--raw-field",
+            "--magic-field",
+            "--header",
+            "-H",
+            "--verbose",
+            "-v",
+            "--hostname",
+            "--show-headers",
+            "-i",
+            "--insecure",
+            "--request",
+        ];
+        for flag in write_flags {
+            // Before the endpoint, after it, and behind an allowed flag.
+            assert_gh_denied(&["api", flag, endpoint]);
+            assert_gh_denied(&["api", endpoint, flag]);
+            assert_gh_denied(&["api", "--paginate", flag, endpoint]);
+            // With a plausible value attached.
+            assert_gh_denied(&["api", flag, "GET", endpoint]);
+            assert_gh_denied(&["api", flag, "x=y", endpoint]);
+        }
+        // Combined short flags and the `=` form are not allowlisted either.
+        assert_gh_denied(&["api", "-sX", endpoint]);
+        assert_gh_denied(&["api", "-abc", endpoint]);
+        assert_gh_denied(&["api", "--jq=.foo", endpoint]);
+        assert_gh_denied(&["api", "--silent=false", endpoint]);
+    }
+
+    #[test]
+    fn gh_api_allows_only_the_documented_read_shapes() {
+        let compare = format!(
+            "repos/leveled-inc/leveled/compare/{}...{}",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let endpoints = [
+            "repos/leveled-inc/leveled/pulls/1/comments",
+            "repos/leveled-inc/leveled/issues/42/comments",
+            "repos/leveled-inc/leveled/pulls/7/reviews",
+            "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
+            compare.as_str(),
+        ];
+        for endpoint in endpoints {
+            assert_gh_allowed(&["api", endpoint]);
+            // Allowed flags in any position, alone and combined.
+            assert_gh_allowed(&["api", "--paginate", endpoint]);
+            assert_gh_allowed(&["api", endpoint, "--paginate", "--slurp"]);
+            assert_gh_allowed(&["api", "--silent", "--include", endpoint]);
+            assert_gh_allowed(&["api", "--jq", ".foo", endpoint]);
+            assert_gh_allowed(&["api", "--template", "{{.x}}", endpoint]);
+            assert_gh_allowed(&["api", "--cache", "1h", endpoint]);
+            assert_gh_allowed(&[
+                "api",
+                "--paginate",
+                "--jq",
+                ".",
+                "--slurp",
+                endpoint,
+                "--silent",
+            ]);
+        }
+    }
+
+    #[test]
+    fn gh_api_value_flags_consume_but_never_reinterpret() {
+        let endpoint = "repos/leveled-inc/leveled/pulls/1/comments";
+        // A dangerous-looking token in *value* position is data, not a flag:
+        // the single linear pass never re-parses it, so it cannot smuggle a
+        // write.
+        assert_gh_allowed(&["api", "--jq", "--method", endpoint]);
+        assert_gh_allowed(&["api", "--template", "-X", endpoint]);
+        assert_gh_allowed(&["api", "--cache", "--paginate", endpoint]);
+        // ...but a missing value is a hard deny, not a skip.
+        assert_gh_denied(&["api", "--jq"]);
+        assert_gh_denied(&["api", endpoint, "--template"]);
+        assert_gh_denied(&["api", "--cache"]);
+    }
+
+    #[test]
+    fn gh_api_rejects_separators_empty_and_extra_positionals() {
+        let endpoint = "repos/leveled-inc/leveled/pulls/1/comments";
+        assert_gh_denied(&["api", "--", endpoint]);
+        assert_gh_denied(&["api", "-", endpoint]);
+        assert_gh_denied(&["api", "", endpoint]);
+        assert_gh_denied(&["api", endpoint, endpoint]);
+        assert_gh_denied(&["api", "--paginate", endpoint, "extra"]);
+        assert_gh_denied(&["api"]);
+        assert_gh_denied(&[]);
+    }
+
+    #[test]
+    fn gh_api_rejects_malformed_endpoints() {
+        let bad = [
+            // Wrong resource shapes.
+            "repos/leveled-inc/leveled/issues",
+            "repos/leveled-inc/leveled/pulls",
+            "repos/leveled-inc/leveled/pulls?state=open",
+            "repos/leveled-inc/leveled/pulls?state=open&per_page=100&extra=1",
+            "repos/leveled-inc/leveled/pulls/1",
+            "repos/leveled-inc/leveled/pulls/1/files",
+            "repos/leveled-inc/leveled/actions/runs",
+            // Bad numbers and oids.
+            "repos/leveled-inc/leveled/pulls/0/comments",
+            "repos/leveled-inc/leveled/pulls/abc/comments",
+            "repos/leveled-inc/leveled/pulls/1/comments/",
+            "repos/leveled-inc/leveled/compare/main...head",
+            "repos/leveled-inc/leveled/compare/xyz...abc",
+            // Traversal / encoding tricks.
+            "repos/leveled-inc/leveled/pulls/../pulls/1/comments",
+            "repos/leveled-inc%2Fleveled/pulls/1/comments",
+            "/repos/leveled-inc/leveled/pulls/1/comments",
+            "repos//leveled/pulls/1/comments",
+            // Valid shape, but the repo is not allowlisted (exact match).
+            "repos/other-org/other-repo/pulls/1/comments",
+            "repos/Leveled-Inc/Leveled/pulls/1/comments",
+        ];
+        for endpoint in bad {
+            assert_gh_denied(&["api", endpoint]);
+        }
+        // ...while the exact documented shapes next to them are allowed.
+        assert_gh_allowed(&["api", "repos/leveled-inc/leveled/pulls/1/comments"]);
+        assert_gh_allowed(&[
+            "api",
+            "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
+        ]);
+    }
+
+    #[test]
+    fn gh_pr_branch_edges() {
+        let repo = "leveled-inc/leveled";
+        // Happy paths.
+        assert_gh_allowed(&["pr", "list", "--repo", repo]);
+        assert_gh_allowed(&["pr", "view", "42", "--repo", repo]);
+        assert_gh_allowed(&["pr", "checks", "--repo", repo]);
+        assert_gh_allowed(&["pr", "list", &format!("--repo={repo}")]);
+        // --web opens a browser: never allowlisted.
+        assert_gh_denied(&["pr", "view", "42", "--repo", repo, "--web"]);
+        assert_gh_denied(&["pr", "list", "--repo", repo, "--web=true"]);
+        assert_gh_denied(&["pr", "list", "--repo", repo, "--web=1"]);
+        // Repo scoping is exact and mandatory.
+        assert_gh_denied(&["pr", "list"]);
+        assert_gh_denied(&["pr", "list", "--repo", "other/repo"]);
+        assert_gh_denied(&["pr", "list", "--repo", repo, "--repo", repo]);
+        assert_gh_denied(&["pr", "list", "--repo"]);
+        assert_gh_denied(&["pr", "list", "--repo="]);
+        assert_gh_denied(&["pr", "list", "--repo", "--web"]);
+        assert_gh_denied(&["pr", "list", "--repo", "not a repo"]);
+        assert_gh_denied(&["pr", "list", "--repo", "ownér/repo"]);
+        // Only the three read-only subcommands (case-sensitive).
+        for sub in [
+            "merge", "close", "comment", "edit", "create", "checkout", "diff", "status", "LIST",
+        ] {
+            assert_gh_denied(&["pr", sub, "--repo", repo]);
+        }
+        assert_gh_denied(&["pr"]);
+        assert_gh_denied(&["issue", "list", "--repo", repo]);
+        assert_gh_denied(&["repo", "view", "--repo", repo]);
+    }
+
+    #[test]
+    fn gh_parser_handles_unicode_safely() {
+        // Unicode never validates as a repo/endpoint name...
+        assert_gh_denied(&["api", "repos/leveled-inc/leveled/pulls/1/cómments"]);
+        assert_gh_denied(&["pr", "list", "--repo", "leveled-inc/levéléd"]);
+        // ...but is harmless as a --jq/--template value (output formatting).
+        assert_gh_allowed(&[
+            "api",
+            "--jq",
+            ".títle",
+            "repos/leveled-inc/leveled/pulls/1/comments",
+        ]);
+    }
+
+    /// Deterministic PRNG so the sweep below is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// Positions the parser treats as flags (not values swallowed by
+    /// --jq/--template/--cache), per the documented grammar.
+    fn flag_positions(argv: &[String]) -> Vec<usize> {
+        let mut positions = Vec::new();
+        let mut index = 0;
+        while index < argv.len() {
+            match argv[index].as_str() {
+                "--jq" | "--template" | "--cache" => index += 2,
+                _ => {
+                    if argv[index].starts_with('-') {
+                        positions.push(index);
+                    }
+                    index += 1;
+                }
+            }
+        }
+        positions
+    }
+
+    #[test]
+    fn gh_api_fuzz_no_smuggled_flags_are_ever_accepted() {
+        // The allowlisted flag set, spelled out. If the parser ever learns a
+        // new flag, this test fails until the flag is justified here: flag
+        // expansion on this parser is a security decision.
+        const KNOWN_GOOD_FLAGS: &[&str] = &[
+            "--paginate",
+            "--slurp",
+            "--silent",
+            "--include",
+            "--jq",
+            "--template",
+            "--cache",
+        ];
+        let tokens = [
+            "--method",
+            "-X",
+            "--input",
+            "-F",
+            "--field",
+            "-f",
+            "--raw-field",
+            "--header",
+            "-H",
+            "--verbose",
+            "--paginate",
+            "--slurp",
+            "--silent",
+            "--include",
+            "--jq",
+            "--template",
+            "--cache",
+            "--",
+            "-",
+            "",
+            "--web",
+            "GET",
+            "POST",
+            "-sX",
+            "--jq=",
+            "repos/leveled-inc/leveled/pulls/1/comments",
+            "repos/leveled-inc/leveled/issues/9/comments",
+            "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
+            "repos/other/repo/pulls/1/comments",
+            "not-an-endpoint",
+            "--repo",
+            "o/r",
+        ];
+        let mut rng = Lcg(0x9E3779B97F4A7C15);
+        for _ in 0..20_000 {
+            let len = 1 + (rng.next() % 5) as usize;
+            let argv: Vec<String> = (0..len)
+                .map(|_| tokens[(rng.next() as usize) % tokens.len()].to_string())
+                .collect();
+            let mut full = vec!["api".to_string()];
+            full.extend(argv.iter().cloned());
+            if is_read_only_gh_command(&full, &gh_repos()) {
+                // Anything the parser took as a flag must be a known-good one.
+                for position in flag_positions(&argv) {
+                    assert!(
+                        KNOWN_GOOD_FLAGS.contains(&argv[position].as_str()),
+                        "smuggled flag accepted: {argv:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gh_api_fuzz_valid_shapes_are_always_accepted() {
+        // Guards against over-blocking regressions: every grammar-valid
+        // combination of allowed flags must stay accepted.
+        let endpoints = [
+            "repos/leveled-inc/leveled/pulls/1/comments",
+            "repos/leveled-inc/leveled/issues/2/comments",
+            "repos/leveled-inc/leveled/pulls/3/reviews",
+            "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
+        ];
+        let bare = ["--paginate", "--slurp", "--silent", "--include"];
+        let valued = ["--jq", "--template", "--cache"];
+        let values = ["x", ".foo", "--method", "-X", ""];
+        let mut rng = Lcg(0xC2B280121);
+        for _ in 0..5_000 {
+            // Shuffle (flag, value) pairs as units: shuffling bare tokens
+            // would divorce values from their flags and generate shapes the
+            // grammar itself rejects.
+            let mut items: Vec<Vec<String>> = Vec::new();
+            for flag in bare {
+                if rng.next().is_multiple_of(2) {
+                    items.push(vec![flag.to_string()]);
+                }
+            }
+            for flag in valued {
+                if rng.next().is_multiple_of(3) {
+                    items.push(vec![
+                        flag.to_string(),
+                        values[(rng.next() as usize) % values.len()].to_string(),
+                    ]);
+                }
+            }
+            // Fisher-Yates shuffle with the LCG.
+            for i in (1..items.len()).rev() {
+                let j = (rng.next() as usize) % (i + 1);
+                items.swap(i, j);
+            }
+            let mut argv: Vec<String> = items.into_iter().flatten().collect();
+            argv.push(endpoints[(rng.next() as usize) % endpoints.len()].to_string());
+            // The endpoint may also lead, but never as a swallowed value.
+            if rng.next().is_multiple_of(2) && argv.len() > 1 {
+                let endpoint = argv.pop().unwrap();
+                let mut position = (rng.next() as usize) % (argv.len() + 1);
+                if position > 0
+                    && matches!(
+                        argv[position - 1].as_str(),
+                        "--jq" | "--template" | "--cache"
+                    )
+                {
+                    position = argv.len();
+                }
+                argv.insert(position, endpoint);
+            }
+            let mut full = vec!["api".to_string()];
+            full.extend(argv.iter().cloned());
+            assert!(
+                is_read_only_gh_command(&full, &gh_repos()),
+                "valid read-only shape rejected: {argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
         let policy = policy(
