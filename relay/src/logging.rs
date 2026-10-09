@@ -11,6 +11,9 @@
 //! - INFO: lifecycle events (startup steps, exec/spawn requests, shutdown)
 //! - DEBUG: detailed flow (request handling steps, per-PR watchdog ticks)
 
+use std::cell::RefCell;
+use std::time::Instant;
+
 /// Initialize process-wide logging. Idempotent: safe to call from tests.
 pub fn init() {
     let _ = env_logger::Builder::from_default_env()
@@ -25,4 +28,61 @@ pub fn init() {
 pub fn exec_route(bin: &str, args: &[String]) -> String {
     let subcommand = args.first().map(String::as_str).unwrap_or("");
     format!("bin={bin} subcommand={subcommand}")
+}
+
+/// Per-request tracking info, stored in a thread-local for the duration of
+/// request handling. The relay uses a thread-per-connection model, so a
+/// thread-local is safe and avoids threading request context through every
+/// handler function signature.
+struct RequestInfo {
+    path: String,
+    start: Instant,
+}
+
+thread_local! {
+    static CURRENT_REQUEST: RefCell<Option<RequestInfo>> = RefCell::new(None);
+}
+
+/// RAII guard that clears the thread-local request info when dropped.
+/// Create one at the start of request handling; all early returns will
+/// clean up automatically.
+pub struct RequestGuard;
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        CURRENT_REQUEST.with(|r| {
+            *r.borrow_mut() = None;
+        });
+    }
+}
+
+/// Log an incoming request and start tracking it for response logging.
+/// Returns a guard that clears the tracking state when dropped.
+pub fn begin_request(method: &str, path: &str, source: &str) -> RequestGuard {
+    log::info!("request method={method} path={path} source={source}");
+    CURRENT_REQUEST.with(|r| {
+        *r.borrow_mut() = Some(RequestInfo {
+            path: path.to_owned(),
+            start: Instant::now(),
+        });
+    });
+    RequestGuard
+}
+
+/// Log a completed response with status code and duration. Called from
+/// `reply()` so every response is logged exactly once. If no request is
+/// being tracked (e.g. in tests), this is a no-op.
+pub fn log_response(status: u16, source: &str) {
+    CURRENT_REQUEST.with(|r| {
+        if let Some(info) = r.borrow().as_ref() {
+            let duration_ms = info.start.elapsed().as_millis();
+            log::info!(
+                "response path={} status={} duration_ms={} source={}",
+                info.path,
+                status,
+                duration_ms,
+                source
+            );
+        }
+    });
 }

@@ -875,6 +875,12 @@ where
         }
     };
     let request_path = request.target.split('?').next().unwrap_or("");
+    // Log the incoming request with source IP for observability.
+    let source = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let _request_guard = logging::begin_request(&request.method, request_path, &source);
     let control_route =
         request.method == "POST" && matches!(proc_route(request_path), Some(ProcRoute::Kill(_)));
     let Some(required_secret) = (if control_route {
@@ -892,6 +898,7 @@ where
             .unwrap_or(""),
         required_secret,
     ) {
+        log::warn!("auth_failed path={request_path} source={source}");
         reply(&mut stream, 401, error("unauthorized"))?;
         return Ok(());
     }
@@ -1150,7 +1157,11 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     };
     // Prompts can be sensitive, so logs contain only the redacted routing data.
     let exec_route = logging::exec_route(&request.bin, &request.args);
-    log::info!("exec id={} {exec_route}", request.id);
+    let exec_source = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    log::info!("exec id={} {exec_route} source={exec_source}", request.id);
     let policy = match require_gui_login_session().and_then(|_| exec::load_policy()) {
         Ok(policy) => policy,
         Err(message) => {
@@ -1180,13 +1191,25 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
     };
     let started = Instant::now();
     let result = exec::run(&path, request);
-    log::info!(
-        "exec id={} {exec_route} finished in {:?} exit_code={:?} timed_out={}",
-        result.id,
-        started.elapsed(),
-        result.exit_code,
-        result.timed_out
-    );
+    let duration_ms = started.elapsed().as_millis();
+    // Log failures at ERROR level, successes at INFO.
+    let failed = result.timed_out || matches!(result.exit_code, Some(code) if code != 0);
+    if failed {
+        log::error!(
+            "exec_failed id={} {exec_route} exit_code={:?} timed_out={} duration_ms={} source={exec_source}",
+            result.id,
+            result.exit_code,
+            result.timed_out,
+            duration_ms,
+        );
+    } else {
+        log::info!(
+            "exec id={} {exec_route} finished duration_ms={} exit_code={:?} source={exec_source}",
+            result.id,
+            duration_ms,
+            result.exit_code,
+        );
+    }
     reply(stream, 200, result.to_json())
 }
 
@@ -2230,6 +2253,12 @@ fn error(message: &str) -> Json {
     Json::Object(vec![("error".to_owned(), Json::String(message.to_owned()))])
 }
 fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
+    // Log response completion with status code and duration.
+    let log_source = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    logging::log_response(code, &log_source);
     let body = value.to_json();
     let reason = match code {
         200 => "OK",
