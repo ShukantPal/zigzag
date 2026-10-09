@@ -59,6 +59,18 @@ def parse_time(value: object) -> dt.datetime | None:
         return None
 
 
+def parse_started_at(value: object) -> dt.datetime | None:
+    """Parse the RFC 3339 or Unix-second timestamp returned by `/v1/agents`."""
+    parsed = parse_time(value)
+    if parsed is not None:
+        return parsed
+    try:
+        seconds = float(value) if isinstance(value, (str, int, float)) else None
+        return dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc) if seconds is not None else None
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
 def event_time(event: dict[str, Any]) -> dt.datetime | None:
     return parse_time(event.get("occurred_at"))
 
@@ -132,12 +144,18 @@ class Execution:
     events: list[dict[str, Any]] = field(default_factory=list)
     agent_state: str = "not observed"
     agent_id: str | None = None
+    agent_started_at: dt.datetime | None = None
+    worktree_path: str | None = None
     degraded: list[str] = field(default_factory=list)
     relay_lost: bool = False
 
     @property
     def phase(self) -> str:
-        return str(self.events[-1].get("kind", "not observed")) if self.events else "not observed"
+        if self.events:
+            return str(self.events[-1].get("kind", "not observed"))
+        if self.agent_state != "not observed":
+            return f"agent {self.agent_state}"
+        return "not observed"
 
     @property
     def latest_event(self) -> str:
@@ -145,12 +163,35 @@ class Execution:
             return "not observed"
         return str(self.events[-1].get("occurred_at") or self.events[-1].get("received_at") or "not observed")
 
-    def current_elapsed(self) -> dt.timedelta | None:
+    def running_started_at(self) -> dt.datetime | None:
+        if self.agent_started_at is not None:
+            return self.agent_started_at
+        return next(
+            (
+                event_time(event)
+                for event in self.events
+                if event.get("kind") == "process_spawned" and event_time(event) is not None
+            ),
+            None,
+        )
+
+    def current_elapsed(self, now: dt.datetime | None = None) -> dt.timedelta | None:
+        if self.agent_state == "running":
+            started_at = self.running_started_at()
+            if started_at is not None:
+                now = now or dt.datetime.now(dt.timezone.utc)
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=dt.timezone.utc)
+                return max(now - started_at, dt.timedelta())
         if len(self.events) < 2:
             return None
         return duration_between(self.events[-2], self.events[-1])
 
-    def total_elapsed(self) -> tuple[dt.timedelta | None, bool]:
+    def total_elapsed(self, now: dt.datetime | None = None) -> tuple[dt.timedelta | None, bool]:
+        if self.agent_state == "running":
+            elapsed = self.current_elapsed(now)
+            if elapsed is not None:
+                return elapsed, False
         return observed_duration(self.events)
 
 
@@ -171,14 +212,30 @@ def build_executions(
     for agent in agents:
         if not include_internal and str(agent.get("task_id") or "") in INTERNAL_TASK_IDS:
             continue
+        task_id = str(agent.get("task_id") or "?")
         execution_id = agent.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:
-            continue
-        execution = grouped.setdefault(execution_id, Execution(execution_id, str(agent.get("task_id") or "?")))
+            if not task_id.startswith("agent-"):
+                continue
+            # Agents created through POST /v1/agents use relay-owned
+            # `agent-*` task ids.  Older retained rows can lack an execution
+            # id, so attach by that unique task id before using a stable
+            # synthetic key.  This still renders their live agent status.
+            matches = [item for item in grouped.values() if item.task_id == task_id]
+            execution_id = matches[0].execution_id if len(matches) == 1 else f"agent-task:{task_id}"
+        execution = grouped.setdefault(execution_id, Execution(execution_id, task_id))
+        if task_id.startswith("agent-"):
+            execution.task_id = task_id
         execution.agent_state = str(agent.get("state") or "not observed")
         agent_id = agent.get("id")
         if isinstance(agent_id, str) and agent_id:
             execution.agent_id = agent_id
+        started_at = parse_started_at(agent.get("started_at"))
+        if started_at is not None:
+            execution.agent_started_at = started_at
+        worktree_path = agent.get("worktree_path")
+        if isinstance(worktree_path, str) and worktree_path:
+            execution.worktree_path = worktree_path
         if agent.get("audit_degraded"):
             execution.degraded.append("audit degraded")
         if agent.get("log_degraded"):
@@ -313,6 +370,7 @@ class EventStream:
                 "task_id": event.get("task_id"),
                 "execution_id": event.get("execution_id"),
                 "state": "running",
+                "started_at": event.get("occurred_at"),
             }
         elif kind in ("process_completed", "process_failed"):
             agent = self.agents.get(agent_id)
@@ -395,6 +453,13 @@ def mac_dept_root() -> Path:
 def transcript_path(task_id: str, root: Path | None = None) -> Path:
     """Return the Mac-local final-message path created for every dept task."""
     return (root or mac_dept_root()) / dept_task_id(task_id) / "last-message.txt"
+
+
+def execution_transcript_path(execution: Execution, root: Path | None = None) -> Path:
+    """Use an API-created agent's worktree before falling back to dept layout."""
+    if execution.worktree_path:
+        return Path(execution.worktree_path) / "last-message.txt"
+    return transcript_path(execution.task_id, root)
 
 
 def task_workdir(task_id: str, root: Path | None = None) -> str:
@@ -482,11 +547,11 @@ def detail_lines(execution: Execution, limit: int = 12) -> list[str]:
 def transcript_lines(
     execution: Execution, output: list[str], error: str | None, root: Path | None = None,
 ) -> list[str]:
-    path = transcript_path(execution.task_id, root)
+    path = execution_transcript_path(execution, root)
     lines = [
         f"Transcript for {execution.task_id} / {execution.execution_id}",
         f"Source: {path}",
-        f"Command: {transcript_command(execution.task_id, root)}",
+        f"Command: tail -F {shlex.quote(str(path))}",
     ]
     if execution.agent_id is None:
         lines.append("Relay output unavailable: no retained supervised agent matches this execution.")
@@ -622,8 +687,11 @@ class StatusScreen:
             # The long-poll inside update() blocks up to `interval` seconds
             # for pushed events, so the UI wakes the moment work happens and
             # issues no request at all while idle.
-            if self.update():
-                self.draw(screen)
+            self.update()
+            # A long-poll expiry is also a render tick.  Running-agent
+            # elapsed time is computed from started_at during each render,
+            # so it advances even when no new lifecycle event arrives.
+            self.draw(screen)
             key = screen.getch()
             if key == -1:
                 continue
@@ -653,14 +721,15 @@ class StatusScreen:
         if self.show_transcript:
             header = "dept status — transcript (read-only)  q/Esc back"
         screen.addnstr(0, 0, header, width - 1, curses.A_BOLD)
-        columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  AGENT       DIR                            LAST EVENT"
+        columns = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  STATE       AGENT ID             DIR                            LAST EVENT"
         screen.addnstr(1, 0, columns[self.h_offset:self.h_offset + width - 1], width - 1, curses.A_UNDERLINE)
         rows = self.visible_rows(height)
+        now = dt.datetime.now(dt.timezone.utc)
         for row, execution in enumerate(self.executions[self.offset:self.offset + rows], start=2):
-            total, boundary = execution.total_elapsed()
+            total, boundary = execution.total_elapsed(now)
             total_text = format_duration(total) + ("*" if boundary else "")
-            workdir = task_workdir(execution.task_id, self.task_root)
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed()):14} {total_text:15} {execution.agent_state[:11]:11} {workdir[:30]:30} {execution.latest_event[:24]}"
+            workdir = execution.worktree_path or task_workdir(execution.task_id, self.task_root)
+            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed(now)):14} {total_text:15} {execution.agent_state[:11]:11} {(execution.agent_id or '-')[:20]:20} {workdir[:30]:30} {execution.latest_event[:24]}"
             screen.addnstr(row, 0, line[self.h_offset:self.h_offset + width - 1], width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
@@ -679,11 +748,13 @@ class StatusScreen:
 
 
 def print_once(executions: list[Execution], warnings: list[str], root = None) -> None:
-    print("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tAGENT\tDIR\tLAST EVENT\tFLAGS")
+    print("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tSTATE\tAGENT ID\tDIR\tLAST EVENT\tFLAGS")
+    now = dt.datetime.now(dt.timezone.utc)
     for execution in executions:
-        total, boundary = execution.total_elapsed()
+        total, boundary = execution.total_elapsed(now)
         total_text = format_duration(total) + (" (cross-clock)" if boundary else "")
-        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed()), total_text, execution.agent_state, task_workdir(execution.task_id, root), execution.latest_event, flags(execution))))
+        workdir = execution.worktree_path or task_workdir(execution.task_id, root)
+        print("\t".join((execution.task_id, execution.phase, format_duration(execution.current_elapsed(now)), total_text, execution.agent_state, execution.agent_id or "-", workdir, execution.latest_event, flags(execution))))
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 

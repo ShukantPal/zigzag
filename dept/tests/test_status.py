@@ -103,6 +103,46 @@ class PhaseDurationTests(unittest.TestCase):
         self.assertTrue(any("timing not observed" in line for line in lines))
         self.assertFalse(any("cross-clock" in line for line in lines))
 
+    def test_api_agent_task_id_and_status_render_without_lifecycle_events(self):
+        agents = [{
+            "id": "agent-handle-123",
+            "task_id": "agent-4c4d2e1a",
+            # Older retained rows may not have execution_id.  API-created
+            # agent task ids still need a useful live status row.
+            "state": "running",
+            "started_at": "2026-01-01T00:00:00Z",
+            "worktree_path": "/worktrees/api-agent",
+        }]
+        execution = build_executions([], agents)[0]
+        self.assertEqual(execution.task_id, "agent-4c4d2e1a")
+        self.assertEqual(execution.agent_id, "agent-handle-123")
+        self.assertEqual(execution.agent_state, "running")
+        self.assertEqual(execution.phase, "agent running")
+
+        screen = StatusScreen("http://relay", Path("events.json"), Path("token"), 1)
+        screen.executions = [execution]
+        fake = FakeScreen([], width=180)
+        screen.draw(fake)
+        row = "\n".join(fake.frames[-1])
+        self.assertIn("agent-4c4d2e1a", row)
+        self.assertIn("agent-handle-123", row)
+        self.assertIn("/worktrees/api-agent", row)
+
+    def test_running_elapsed_uses_started_at_on_each_render(self):
+        execution = build_executions([], [{
+            "id": "agent-handle-123",
+            "task_id": "agent-4c4d2e1a",
+            "execution_id": "relay-attempt-123",
+            "state": "running",
+            # The live /v1/agents endpoint sends Unix seconds as a string.
+            "started_at": "1767225600",
+        }])[0]
+        first = dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc)
+        second = dt.datetime(2026, 1, 1, 0, 0, 8, tzinfo=dt.timezone.utc)
+        self.assertEqual(execution.current_elapsed(first), dt.timedelta(seconds=5))
+        self.assertEqual(execution.current_elapsed(second), dt.timedelta(seconds=8))
+        self.assertEqual(execution.total_elapsed(second), (dt.timedelta(seconds=8), False))
+
 
 class SnapshotIngestionTests(unittest.TestCase):
     def test_partial_audit_line_retains_other_events(self):
@@ -367,10 +407,10 @@ class TranscriptTests(unittest.TestCase):
                 stream.poll.return_value = False
                 screen.run(fake)
         self.assertEqual([call.args[2] for call in output.call_args_list], ["agent-one", "agent-zero", "agent-zero"])
-        self.assertIn("task-one", "\n".join(fake.frames[1]))
-        self.assertIn("one output", "\n".join(fake.frames[1]))
-        self.assertIn("task-zero", "\n".join(fake.frames[2]))
-        self.assertIn("zero output", "\n".join(fake.frames[2]))
+        one_output = next("\n".join(frame) for frame in fake.frames if "one output" in "\n".join(frame))
+        zero_output = next("\n".join(frame) for frame in fake.frames if "zero output" in "\n".join(frame))
+        self.assertIn("task-one", one_output)
+        self.assertIn("task-zero", zero_output)
         self.assertTrue(any("read-only  \u2191\u2193 select" in "\n".join(frame) for frame in fake.frames[3:]))
         self.assertEqual((screen.selected, screen.offset, screen.show_transcript), (1, 1, False))
 
@@ -444,6 +484,20 @@ class InternalTaskFilterTests(unittest.TestCase):
 
 
 class StreamUpdateTests(unittest.TestCase):
+    def test_idle_long_poll_expiry_redraws_running_elapsed_time(self):
+        screen = StatusScreen("http://relay", Path("events.json"), Path("token"), 1)
+        screen.executions = [Execution(
+            "execution", "agent-task", agent_state="running",
+            agent_started_at=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+        )]
+        screen.bootstrap = lambda: None
+        fake = FakeScreen([ord("q")])
+        with patch("dept.status.curses.curs_set"), patch.object(screen, "update", return_value=False) as update:
+            screen.run(fake)
+        self.assertEqual(update.call_count, 1)
+        # One initial frame plus a frame after the eventless long-poll tick.
+        self.assertEqual(len(fake.frames), 2)
+
     def test_update_rebuilds_only_on_pushed_events(self):
         with tempfile.TemporaryDirectory() as directory:
             token = Path(directory) / "token"
