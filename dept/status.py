@@ -71,6 +71,42 @@ def parse_started_at(value: object) -> dt.datetime | None:
         return None
 
 
+def agent_worktrees(state_file: Path = DEFAULT_STATE_FILE) -> dict[str, str]:
+    """Return persisted API-agent worktrees, keyed by relay task id.
+
+    The relay's status endpoint deliberately omits ``worktree_path`` even
+    though it is durably recorded in its adjacent ``events.agents.json``
+    registry.  This is a best-effort, read-only enrichment for the status UI;
+    unavailable or malformed local state simply leaves DIR empty.
+    """
+    registry_file = state_file.with_suffix(".agents.json")
+    try:
+        decoded = json.loads(registry_file.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("agents"), list):
+        return {}
+    worktrees: dict[str, str] = {}
+    for record in decoded["agents"]:
+        if not isinstance(record, dict):
+            continue
+        task_id, worktree = record.get("task_id"), record.get("worktree_path")
+        if isinstance(task_id, str) and task_id and isinstance(worktree, str) and worktree:
+            worktrees[task_id] = worktree
+    return worktrees
+
+
+def compact_path(path: str, width: int) -> str:
+    """Fit a path in a table cell while preserving its useful right end."""
+    if width <= 0:
+        return ""
+    if len(path) <= width:
+        return path
+    if width <= 3:
+        return "." * width
+    return "..." + path[-(width - 3):]
+
+
 def event_time(event: dict[str, Any]) -> dt.datetime | None:
     return parse_time(event.get("occurred_at"))
 
@@ -197,7 +233,7 @@ class Execution:
 
 def build_executions(
     events: Iterable[dict[str, Any]], agents: Iterable[dict[str, Any]], *, relay_lost: bool = False,
-    include_internal: bool = False,
+    include_internal: bool = False, persisted_agent_worktrees: dict[str, str] | None = None,
 ) -> list[Execution]:
     grouped: dict[str, Execution] = {}
     for event in sort_events(events):
@@ -233,7 +269,12 @@ def build_executions(
         started_at = parse_started_at(agent.get("started_at"))
         if started_at is not None:
             execution.agent_started_at = started_at
-        worktree_path = agent.get("worktree_path")
+        # Newer endpoints may provide either spelling directly.  Current
+        # relay status rows omit both, so enrich them from the local durable
+        # agent registry by handle.
+        worktree_path = agent.get("worktree_path") or agent.get("worktree")
+        if not isinstance(worktree_path, str) or not worktree_path:
+            worktree_path = (persisted_agent_worktrees or {}).get(task_id)
         if isinstance(worktree_path, str) and worktree_path:
             execution.worktree_path = worktree_path
         if agent.get("audit_degraded"):
@@ -241,6 +282,8 @@ def build_executions(
         if agent.get("log_degraded"):
             execution.degraded.append("agent log degraded")
     for execution in grouped.values():
+        if not execution.worktree_path and execution.task_id.startswith("agent-"):
+            execution.worktree_path = (persisted_agent_worktrees or {}).get(execution.task_id)
         execution.relay_lost = relay_lost
     def newest_first(execution: Execution) -> float:
         if not execution.events:
@@ -621,6 +664,7 @@ class StatusScreen:
         self.executions = build_executions(
             merged_events(self.audit_events, recent), agents,
             relay_lost=lost, include_internal=self.include_internal,
+            persisted_agent_worktrees=agent_worktrees(self.state_file),
         )
         self.selected = min(self.selected, max(len(self.executions) - 1, 0))
         self.offset = min(self.offset, self.selected)
@@ -729,7 +773,7 @@ class StatusScreen:
             total, boundary = execution.total_elapsed(now)
             total_text = format_duration(total) + ("*" if boundary else "")
             workdir = execution.worktree_path or task_workdir(execution.task_id, self.task_root)
-            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed(now)):14} {total_text:15} {execution.agent_state[:11]:11} {(execution.agent_id or '-')[:20]:20} {workdir[:30]:30} {execution.latest_event[:24]}"
+            line = f"{execution.task_id[:20]:20} {execution.phase[:24]:24} {format_duration(execution.current_elapsed(now)):14} {total_text:15} {execution.agent_state[:11]:11} {(execution.agent_id or '-')[:20]:20} {compact_path(workdir, 30):30} {execution.latest_event[:24]}"
             screen.addnstr(row, 0, line[self.h_offset:self.h_offset + width - 1], width - 1, curses.A_REVERSE if self.offset + row - 2 == self.selected else 0)
         divider = rows + 2
         screen.hline(divider, 0, "-", width - 1)
