@@ -208,27 +208,31 @@ where
         ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
         ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
         ("GET", "/v1/providers") => providers_request(&mut stream),
-        ("DELETE", path) => match agent_route(path) {
+        ("DELETE", path) => match agent_route("DELETE", path) {
             Some(AgentRoute::Status(id)) => agent_delete(&mut stream, &state, id),
             _ => reply(&mut stream, 404, error("not_found")),
         },
         ("GET", "/v1/review-gate") => {
             review_gate_request(&mut stream, &state, &request.target, gate_report)
         }
-        ("GET", path) if agent_route(path).is_some() => agent_request(
+        ("GET", path) if agent_route("GET", path).is_some() => agent_request(
             &mut stream,
             &state,
             &request.target,
-            agent_route(path).expect("checked"),
+            agent_route("GET", path).expect("checked"),
         ),
         ("GET", path) => match proc_route(path) {
             Some(ProcRoute::Poll(handle)) => poll_proc(&mut stream, &state, handle),
             Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
             None => reply(&mut stream, 404, error("not_found")),
         },
-        ("POST", path) if agent_route(path).is_some() => {
-            agent_post_request(&mut stream, &state, agent_route(path).expect("checked"))
-        }
+        ("POST", path) if agent_route("POST", path).is_some() => agent_post_request(
+            &mut stream,
+            &state,
+            agent_route("POST", path).expect("checked"),
+            request.body,
+            load_policy(),
+        ),
         ("POST", path) => match proc_route(path) {
             Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
             Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),

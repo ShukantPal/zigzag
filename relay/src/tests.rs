@@ -26,11 +26,15 @@ use crate::http::{
     denial_response, error, get_query, percent_decode, query, read_request, reply,
 };
 use crate::proc::{
-    COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
+    AgentSpawnDetails, COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
     process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
     spawn_proc, unique_handle,
 };
 use crate::review_loop;
+use crate::routes::agents::{
+    AgentRoute, AgentWorktreeFailure, agent_create_worktree, agent_route, default_agent_worktree,
+    parse_agent_create_request, valid_agent_model,
+};
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
@@ -759,6 +763,7 @@ fn prune_drops_finished_entries_past_the_retention_window() {
         Path::new("/bin/sh"),
         request,
         "execution-old".to_owned(),
+        AgentSpawnDetails::default(),
     )
     .unwrap()
     .handle;
@@ -1426,6 +1431,86 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
     );
     drop(state);
     let _ = std::fs::remove_file(state_path);
+}
+
+#[test]
+fn agent_create_request_parsing_and_helpers() {
+    let request = parse_agent_create_request(
+        br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-5","approval_mode":"full-auto","timeout_secs":3600}"#,
+    )
+    .unwrap();
+    assert_eq!(request.prompt, "do it");
+    assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
+    assert_eq!(request.branch, "codex/x");
+    assert_eq!(request.model.as_deref(), Some("gpt-5"));
+    assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
+    assert_eq!(request.timeout_secs, Some(3600));
+    assert!(request.worktree.is_none());
+    assert!(
+        parse_agent_create_request(br#"{"prompt":"x","project_dir":"y","branch":"z","nope":1}"#)
+            .is_err()
+    );
+    assert!(parse_agent_create_request(br#"{"project_dir":"y","branch":"z"}"#).is_err());
+    assert!(
+        parse_agent_create_request(
+            br#"{"prompt":"x","project_dir":"y","branch":"z","timeout_secs":"3600"}"#
+        )
+        .is_err()
+    );
+    assert_eq!(
+        default_agent_worktree("codex/a/b"),
+        "/private/tmp/codex-a-b/"
+    );
+    assert!(valid_agent_model("org/model:1.0"));
+    assert!(!valid_agent_model("model name"));
+}
+
+#[test]
+fn agent_route_selects_create_only_for_post_collection() {
+    assert!(matches!(
+        agent_route("GET", "/v1/agents"),
+        Some(AgentRoute::List)
+    ));
+    assert!(matches!(
+        agent_route("POST", "/v1/agents"),
+        Some(AgentRoute::Create)
+    ));
+    assert!(agent_route("DELETE", "/v1/agents").is_none());
+}
+
+#[test]
+fn agent_create_route_passes_the_body_to_request_validation() {
+    let (state, state_path) = test_server();
+    let policy = test_policy();
+    let response = request_once(Arc::clone(&state), &policy, "POST", "/v1/agents", r#"{}"#);
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "{response}"
+    );
+    assert!(
+        response.ends_with(r#"{"error":"invalid_agent_create_request"}"#),
+        "{response}"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+}
+
+#[test]
+fn agent_create_worktree_roundtrip() {
+    let base = worktree_test_base("agent-wt");
+    let root = base.join("worktrees");
+    std::fs::create_dir_all(&root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let worktree = root.join("codex-feature");
+    agent_create_worktree(&repo, &worktree, "codex/feature").unwrap();
+    assert!(worktree.join(".git").exists());
+    let error = agent_create_worktree(&repo, &root.join("second"), "codex/feature").unwrap_err();
+    assert!(matches!(
+        error,
+        AgentWorktreeFailure::Validation(failure)
+            if failure.message == "worktree_branch_already_checked_out"
+    ));
+    let _ = std::fs::remove_dir_all(base);
 }
 
 fn agent_record(id: &str) -> AgentRecord {

@@ -1,9 +1,22 @@
-use crate::events::relay_timestamp;
-use crate::http::{error, query, reply};
-use crate::proc::{kill_process_group, process_group_running, recovered_agent_identity_matches};
+use crate::events::{
+    new_execution_id, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
+};
+use crate::exec;
+use crate::http::{denial_json, error, query, reply};
+use crate::proc::{
+    AgentSpawnDetails, kill_process_group, process_group_running, recovered_agent_identity_matches,
+    spawn_proc,
+};
+use crate::routes::worktrees::{
+    WORKTREE_REPO_ROOT, WorktreeError, canonical_worktree_roots, git_output,
+    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
+    worktree_branch_checked_out, worktree_branch_exists,
+};
 use crate::server::Server;
-use relay_core::{AgentRecord, Json};
+use relay_core::{AgentRecord, Json, parse_json};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,15 +27,20 @@ const AGENT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) enum AgentRoute<'a> {
     List,
+    Create,
     Status(&'a str),
     Logs(&'a str),
     Transcript(&'a str),
     Pause(&'a str),
     Resume(&'a str),
 }
-pub(crate) fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
+pub(crate) fn agent_route<'a>(method: &'a str, path: &'a str) -> Option<AgentRoute<'a>> {
     if path == "/v1/agents" {
-        return Some(AgentRoute::List);
+        return match method {
+            "GET" => Some(AgentRoute::List),
+            "POST" => Some(AgentRoute::Create),
+            _ => None,
+        };
     }
     let rest = path.strip_prefix("/v1/agents/")?;
     if let Some(id) = rest.strip_suffix("/logs") {
@@ -139,18 +157,23 @@ pub(crate) fn agent_request(
                 None => reply(stream, 404, error("unknown_agent")),
             }
         }
-        // Pause and resume are POST-only routes.
-        AgentRoute::Pause(_) | AgentRoute::Resume(_) => reply(stream, 404, error("not_found")),
+        // Pause, resume, and create are POST-only routes.
+        AgentRoute::Pause(_) | AgentRoute::Resume(_) | AgentRoute::Create => {
+            reply(stream, 404, error("not_found"))
+        }
     }
 }
 
-/// Handle POST requests to agent routes (pause/resume).
+/// Handle POST requests to agent routes (create/pause/resume).
 pub(crate) fn agent_post_request(
     stream: &mut TcpStream,
     state: &Server,
     route: AgentRoute<'_>,
+    body: Vec<u8>,
+    policy: Result<exec::Policy, String>,
 ) -> Result<(), String> {
     match route {
+        AgentRoute::Create => agent_create_request(stream, state, body, policy),
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
         _ => reply(stream, 404, error("not_found")),
@@ -291,6 +314,345 @@ fn dept_task_dir(task_id: &str) -> Option<std::path::PathBuf> {
     let dir_name = task_id.strip_prefix("codex-").unwrap_or(task_id);
     let dir = home.join(".codex/dept").join(dir_name);
     dir.is_dir().then_some(dir)
+}
+
+/// Request body for `POST /v1/agents`: launch a supervised Codex agent in a
+/// fresh worktree.
+pub(crate) struct AgentCreateRequest {
+    pub(crate) prompt: String,
+    pub(crate) project_dir: String,
+    pub(crate) branch: String,
+    pub(crate) worktree: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) approval_mode: Option<String>,
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateRequest, &'static str> {
+    let text = std::str::from_utf8(body).map_err(|_| "invalid_agent_create_request")?;
+    let Json::Object(fields) = parse_json(text).map_err(|_| "invalid_agent_create_request")? else {
+        return Err("invalid_agent_create_request");
+    };
+    if fields.iter().any(|(name, _)| {
+        !matches!(
+            name.as_str(),
+            "prompt"
+                | "project_dir"
+                | "branch"
+                | "worktree"
+                | "model"
+                | "approval_mode"
+                | "timeout_secs"
+        )
+    }) {
+        return Err("invalid_agent_create_request");
+    }
+    let string_field = |name: &str, required: bool| -> Result<Option<String>, &'static str> {
+        match fields.iter().find(|(key, _)| key == name) {
+            None if required => Err("invalid_agent_create_request"),
+            None => Ok(None),
+            Some((_, value)) => value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .map(Some)
+                .ok_or("invalid_agent_create_request"),
+        }
+    };
+    let timeout_secs = match fields.iter().find(|(key, _)| key == "timeout_secs") {
+        None => None,
+        Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_create_request")?),
+    };
+    Ok(AgentCreateRequest {
+        prompt: string_field("prompt", true)?.expect("required field"),
+        project_dir: string_field("project_dir", true)?.expect("required field"),
+        branch: string_field("branch", true)?.expect("required field"),
+        worktree: string_field("worktree", false)?,
+        model: string_field("model", false)?,
+        approval_mode: string_field("approval_mode", false)?,
+        timeout_secs,
+    })
+}
+
+/// Derive the default worktree directory from a branch name.
+pub(crate) fn default_agent_worktree(branch: &str) -> String {
+    format!("/private/tmp/{}/", branch.replace('/', "-"))
+}
+
+/// Model identifier validation, mirroring dept.py's MODEL_RE.
+pub(crate) fn valid_agent_model(model: &str) -> bool {
+    let mut chars = model.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+}
+
+/// Worktree creation errors distinguish validation from a failed git command.
+#[derive(Debug)]
+pub(crate) enum AgentWorktreeFailure {
+    Validation(WorktreeError),
+    GitFailed(String),
+}
+
+pub(crate) fn agent_create_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+) -> Result<(), AgentWorktreeFailure> {
+    let validation = AgentWorktreeFailure::Validation;
+    if !git_output(repo, &["rev-parse", "--git-dir"])
+        .map_err(validation)?
+        .status
+        .success()
+    {
+        return Err(validation(WorktreeError {
+            code: 400,
+            message: "worktree_repo_not_a_git_repo",
+        }));
+    }
+    if worktree_branch_checked_out(repo, branch).map_err(validation)? {
+        return Err(validation(WorktreeError {
+            code: 400,
+            message: "worktree_branch_already_checked_out",
+        }));
+    }
+    let path_str = path.to_str().ok_or(validation(WorktreeError {
+        code: 400,
+        message: "worktree_path_not_unicode",
+    }))?;
+    let output = if worktree_branch_exists(repo, branch).map_err(validation)? {
+        git_output(repo, &["worktree", "add", path_str, branch]).map_err(validation)?
+    } else {
+        git_output(repo, &["worktree", "add", "-b", branch, path_str]).map_err(validation)?
+    };
+    if !output.status.success() {
+        return Err(AgentWorktreeFailure::GitFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    log::info!(
+        "agent_create worktree path={} branch={branch}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `POST /v1/agents`: create a worktree and launch a supervised `codex exec`.
+fn agent_create_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    body: Vec<u8>,
+    policy: Result<exec::Policy, String>,
+) -> Result<(), String> {
+    if state.updater.is_draining() {
+        return reply(stream, 503, error("updates_draining"));
+    }
+    let request = match parse_agent_create_request(&body) {
+        Ok(request) => request,
+        Err(message) => return reply(stream, 400, error(message)),
+    };
+    let execution_id = match new_execution_id() {
+        Ok(id) => id,
+        Err(message) => {
+            log::error!("agent_create could not mint execution id: {message}");
+            return reply(stream, 500, error("could_not_create_agent"));
+        }
+    };
+    let task_id = match random_hex_128() {
+        Ok(hex) => format!("agent-{}", &hex[..12]),
+        Err(message) => {
+            log::error!("agent_create could not mint task id: {message}");
+            return reply(stream, 500, error("could_not_create_agent"));
+        }
+    };
+    if state
+        .store
+        .add(relay_event(
+            "relay_request_started",
+            &task_id,
+            &execution_id,
+            Json::Object(vec![]),
+        ))
+        .is_err()
+    {
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
+    if !valid_worktree_branch(&request.branch) {
+        return reply(stream, 400, error("worktree_invalid_branch"));
+    }
+    let roots = canonical_worktree_roots();
+    let repo_root = std::fs::canonicalize(WORKTREE_REPO_ROOT)
+        .unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT));
+    let worktree_raw = request
+        .worktree
+        .clone()
+        .unwrap_or_else(|| default_agent_worktree(&request.branch));
+    let worktree_path = match resolve_new_worktree_path(&worktree_raw, &roots) {
+        Ok(path) => path,
+        Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let repo = match resolve_worktree_repo(&request.project_dir, &repo_root) {
+        Ok(repo) => repo,
+        Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let file_prompt = if Path::new(&request.prompt).is_file() {
+        match std::fs::read_to_string(&request.prompt) {
+            Ok(text) => Some(text),
+            Err(message) => {
+                log::error!(
+                    "agent_create could not read prompt file {}: {message}",
+                    request.prompt
+                );
+                return reply(stream, 500, error("could_not_read_prompt"));
+            }
+        }
+    } else {
+        None
+    };
+    let approval_flag = match request.approval_mode.as_deref() {
+        None => "--approve-for-me",
+        Some("suggest") => "--suggest",
+        Some("auto-edit") => "--auto-edit",
+        Some("full-auto") => "--full-auto",
+        Some(other) => {
+            log::warn!("agent_create refused: unknown approval_mode={other}");
+            return reply(stream, 400, error("invalid_approval_mode"));
+        }
+    };
+    let mut codex_args = vec![
+        "exec".to_owned(),
+        "--json".to_owned(),
+        approval_flag.to_owned(),
+        "--skip-git-repo-check".to_owned(),
+    ];
+    if let Some(model) = &request.model {
+        if !valid_agent_model(model) {
+            return reply(stream, 400, error("invalid_model"));
+        }
+        codex_args.extend(["-m".to_owned(), model.clone()]);
+    }
+    let worktree_str = worktree_path.to_string_lossy().into_owned();
+    codex_args.extend([
+        "-C".to_owned(),
+        worktree_str.clone(),
+        "-o".to_owned(),
+        format!("{worktree_str}/last-message.txt"),
+    ]);
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(message) => {
+            log::error!("agent_create policy read failed: {message}");
+            return reply(stream, 500, error("could_not_read_execution_policy"));
+        }
+    };
+    let codex_path = match policy.verified_path("codex", &codex_args) {
+        Ok(path) => path,
+        Err(exec::VerifyError::Denied) => return reply(stream, 200, denial_json(&task_id)),
+        Err(exec::VerifyError::Unverifiable(reason)) => {
+            log::error!("agent_create binary verification failed: {reason}");
+            return reply(stream, 500, error("could_not_verify_binary"));
+        }
+    };
+    match agent_create_worktree(&repo, &worktree_path, &request.branch) {
+        Ok(()) => {}
+        Err(AgentWorktreeFailure::Validation(failure)) => {
+            return reply(stream, failure.code, error(failure.message));
+        }
+        Err(AgentWorktreeFailure::GitFailed(detail)) => {
+            log::error!(
+                "agent_create worktree add failed for branch={}: {detail}",
+                request.branch
+            );
+            return reply(
+                stream,
+                500,
+                Json::Object(vec![
+                    (
+                        "error".to_owned(),
+                        Json::String("worktree_failed".to_owned()),
+                    ),
+                    ("detail".to_owned(), Json::String(detail)),
+                ]),
+            );
+        }
+    }
+    let prompt_text = match file_prompt {
+        Some(text) => text,
+        None => {
+            if let Err(message) =
+                std::fs::write(worktree_path.join(".codex-prompt.md"), &request.prompt)
+            {
+                log::error!("agent_create could not write prompt file: {message}");
+                return reply(stream, 500, error("could_not_write_prompt"));
+            }
+            request.prompt.clone()
+        }
+    };
+    codex_args.push(prompt_text);
+    let _spawn_admission = match state.updater.spawn_admission() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 503, error("updates_draining")),
+        Err(message) => {
+            log::error!("agent_create admission failed: {message}");
+            return reply(stream, 500, error("could_not_admit_process"));
+        }
+    };
+    if state
+        .store
+        .add(relay_event(
+            "relay_accepted",
+            &task_id,
+            &execution_id,
+            Json::Object(vec![]),
+        ))
+        .is_err()
+    {
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
+    let deadline_at = request.timeout_secs.map(|secs| {
+        unix_timestamp()
+            .parse::<u64>()
+            .unwrap_or(0)
+            .saturating_add(secs)
+            .to_string()
+    });
+    let command = exec::ExecRequest {
+        id: task_id.clone(),
+        bin: "codex".to_owned(),
+        args: codex_args,
+    };
+    match spawn_proc(
+        &state.supervisor,
+        Arc::clone(&state.store),
+        &codex_path,
+        command,
+        execution_id.clone(),
+        AgentSpawnDetails {
+            worktree_path: Some(worktree_str.clone()),
+            deadline_at,
+        },
+    ) {
+        Ok(handle) => reply(
+            stream,
+            200,
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(handle.handle)),
+                ("worktree".to_owned(), Json::String(worktree_str)),
+            ]),
+        ),
+        Err(message) => {
+            let _ = state.store.add(relay_event(
+                "process_failed",
+                &task_id,
+                &execution_id,
+                Json::Object(vec![(
+                    "reason".to_owned(),
+                    Json::String("spawn_failed".to_owned()),
+                )]),
+            ));
+            log::error!("agent_create spawn failed for id={task_id}: {message}");
+            reply(stream, 500, error("could_not_spawn_process"))
+        }
+    }
 }
 
 /// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
