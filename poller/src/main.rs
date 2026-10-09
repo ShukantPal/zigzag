@@ -1,11 +1,12 @@
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use relay_core::{Json, parse_json, read_secret_file};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use url::Url;
 
 struct Config {
     zigzag_url: String,
@@ -20,10 +21,7 @@ struct Cursor {
     after: u64,
 }
 struct ZigzagUrl {
-    authority: String,
-    host: String,
-    port: u16,
-    base_path: String,
+    base: Url,
 }
 
 fn main() {
@@ -126,36 +124,27 @@ fn config(arguments: Vec<String>) -> Result<Config, String> {
 }
 
 fn parse_url(input: &str) -> Result<ZigzagUrl, String> {
-    let rest = input.strip_prefix("http://").ok_or_else(|| {
-        "Zigzag URL must use http:// (the tailnet is the transport boundary)".to_owned()
-    })?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    if authority.is_empty() || authority.contains('@') {
+    let mut url = Url::parse(input).map_err(|_| "invalid Zigzag URL".to_owned())?;
+    if url.scheme() != "http" {
+        return Err(
+            "Zigzag URL must use http:// (the tailnet is the transport boundary)".to_owned(),
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
         return Err("invalid Zigzag URL authority".to_owned());
     }
-    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
-        (
-            host.to_owned(),
-            port.parse()
-                .map_err(|_| "invalid Zigzag URL port".to_owned())?,
-        )
-    } else {
-        (authority.to_owned(), 80)
-    };
-    if host.is_empty() {
+    if url.host_str().is_none_or(str::is_empty) {
         return Err("invalid Zigzag URL host".to_owned());
     }
-    let base_path = if path.is_empty() {
+    // Normalize the base path to directory form so joining "v1/events" is stable.
+    let path = url.path().trim_matches('/').to_owned();
+    let normalized = if path.is_empty() {
         "/".to_owned()
     } else {
-        format!("/{}/", path.trim_matches('/'))
+        format!("/{path}/")
     };
-    Ok(ZigzagUrl {
-        authority: authority.to_owned(),
-        host,
-        port,
-        base_path,
-    })
+    url.set_path(&normalized);
+    Ok(ZigzagUrl { base: url })
 }
 
 fn poll(
@@ -165,89 +154,41 @@ fn poll(
     cursor: &Cursor,
     timeout: u64,
 ) -> Result<Json, String> {
+    let events = zigzag
+        .base
+        .join("v1/events")
+        .map_err(|error| format!("invalid Zigzag URL: {error}"))?;
     let target = format!(
-        "{}v1/events?after={}&epoch={}&timeout={timeout}",
-        zigzag.base_path,
+        "{events}?after={}&epoch={}&timeout={timeout}",
         cursor.after,
         encode(&cursor.epoch)
     );
-    let (connection, request_target) = if let Some(proxy) = proxy {
-        let proxy = parse_url(proxy)?;
-        (
-            TcpStream::connect((proxy.host.as_str(), proxy.port))
-                .map_err(|error| format!("could not connect to proxy: {error}"))?,
-            format!("http://{}{}", zigzag.authority, target),
-        )
-    } else {
-        (
-            TcpStream::connect((zigzag.host.as_str(), zigzag.port))
-                .map_err(|error| format!("could not connect to Zigzag: {error}"))?,
-            target,
-        )
-    };
-    connection
-        .set_read_timeout(Some(Duration::from_secs(timeout + 15)))
-        .map_err(|error| error.to_string())?;
-    connection
-        .set_write_timeout(Some(Duration::from_secs(15)))
-        .map_err(|error| error.to_string())?;
-    let mut connection = connection;
-    connection.write_all(format!("GET {request_target} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {secret}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", zigzag.authority).as_bytes()).map_err(|error| format!("could not write poll: {error}"))?;
-    read_response(&mut connection)
-}
-
-fn read_response(stream: &mut TcpStream) -> Result<Json, String> {
-    let mut reader = BufReader::new(stream);
-    let mut status = String::new();
-    reader
-        .read_line(&mut status)
-        .map_err(|_| "could not read HTTP status".to_owned())?;
-    let code = status
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "malformed HTTP status".to_owned())?
-        .parse::<u16>()
-        .map_err(|_| "malformed HTTP status".to_owned())?;
-    let mut length = None;
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|_| "could not read response headers".to_owned())?;
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let (name, value) = line
-            .trim_end()
-            .split_once(':')
-            .ok_or_else(|| "malformed HTTP response header".to_owned())?;
-        if name.eq_ignore_ascii_case("content-length") {
-            length = Some(
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "invalid response content length".to_owned())?,
-            );
-        }
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout + 15))
+        // The old raw-socket client never followed redirects; a 3xx is an error.
+        .redirects(0);
+    if let Some(proxy) = proxy {
+        let proxy =
+            ureq::Proxy::new(proxy).map_err(|error| format!("invalid proxy URL: {error}"))?;
+        builder = builder.proxy(proxy);
     }
-    let mut body = Vec::new();
-    match length {
-        Some(length) => {
-            body.resize(length, 0);
-            reader
-                .read_exact(&mut body)
-                .map_err(|_| "short HTTP response body".to_owned())?;
+    let authorization = format!("Bearer {secret}");
+    match builder
+        .build()
+        .get(&target)
+        .set("Accept", "application/json")
+        .set("Authorization", &authorization)
+        .call()
+    {
+        Ok(response) => {
+            let body = response
+                .into_string()
+                .map_err(|error| format!("could not read Zigzag response: {error}"))?;
+            parse_json(&body)
         }
-        None => {
-            reader
-                .read_to_end(&mut body)
-                .map_err(|_| "could not read HTTP response body".to_owned())?;
-        }
+        Err(ureq::Error::Status(code, _)) => Err(format!("Zigzag returned HTTP {code}")),
+        Err(error) => Err(format!("poll failed: {error}")),
     }
-    if code != 200 {
-        return Err(format!("Zigzag returned HTTP {code}"));
-    }
-    parse_json(std::str::from_utf8(&body).map_err(|_| "Zigzag response was not UTF-8".to_owned())?)
 }
 
 fn load_cursor(path: &Path) -> Result<Cursor, String> {
@@ -337,21 +278,25 @@ fn required_bool(value: &Json, field: &str) -> Result<bool, String> {
         .and_then(Json::as_bool)
         .ok_or_else(|| format!("Zigzag response missing boolean {field}"))
 }
+
+/// Percent-encode set matching exactly the RFC 3986 unreserved characters,
+/// the only characters [`encode`] leaves unescaped.
+const ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 fn encode(input: &str) -> String {
-    input
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
+    utf8_percent_encode(input, ENCODE_SET).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn path(name: &str) -> PathBuf {
@@ -408,6 +353,143 @@ mod tests {
                 "56".to_owned(),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_url_accepts_http_and_normalizes_the_base_path() {
+        let bare = parse_url("http://127.0.0.1:8765").unwrap();
+        assert_eq!(bare.base.as_str(), "http://127.0.0.1:8765/");
+        let nested = parse_url("http://relay.example/zigzag").unwrap();
+        assert_eq!(nested.base.as_str(), "http://relay.example/zigzag/");
+        assert_eq!(
+            nested.base.join("v1/events").unwrap().as_str(),
+            "http://relay.example/zigzag/v1/events"
+        );
+        let trailing = parse_url("http://relay.example/zigzag/").unwrap();
+        assert_eq!(trailing.base.as_str(), "http://relay.example/zigzag/");
+    }
+
+    #[test]
+    fn parse_url_rejects_non_http_authorities() {
+        assert!(parse_url("https://relay.example").is_err());
+        assert!(parse_url("http://user@relay.example").is_err());
+        assert!(parse_url("http://user:pass@relay.example").is_err());
+        assert!(parse_url("http://relay.example:notaport").is_err());
+        assert!(parse_url("not a url").is_err());
+    }
+
+    #[test]
+    fn encode_escapes_everything_outside_the_unreserved_set() {
+        assert_eq!(encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+        assert_eq!(encode(""), "");
+        assert_eq!(encode("a b"), "a%20b");
+        assert_eq!(encode("ep+och/1="), "ep%2Boch%2F1%3D");
+        assert_eq!(encode("caf\u{e9}"), "caf%C3%A9");
+    }
+
+    /// Serve a single canned HTTP response on 127.0.0.1, capturing the raw
+    /// request text. Returns the capture, the bound port, and the server thread.
+    fn serve_once(status: u16, body: &str) -> (Arc<Mutex<String>>, u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&seen);
+        let body = body.to_owned();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                request.push_str(&line);
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            *captured.lock().unwrap() = request;
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = reader.into_inner();
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (seen, port, handle)
+    }
+
+    fn test_zigzag(port: u16) -> ZigzagUrl {
+        parse_url(&format!("http://127.0.0.1:{port}")).unwrap()
+    }
+
+    #[test]
+    fn poll_sends_an_authorized_request_and_parses_the_response() {
+        let body = r#"{"epoch":"epoch-9","reset":false,"lost":false,"next":7,"events":[]}"#;
+        let (seen, port, handle) = serve_once(200, body);
+        let cursor = Cursor {
+            epoch: "ep+och/1".to_owned(),
+            after: 3,
+        };
+        let message = poll(&test_zigzag(port), None, "test-secret", &cursor, 5).unwrap();
+        handle.join().unwrap();
+        assert_eq!(required_string(&message, "epoch").unwrap(), "epoch-9");
+        assert_eq!(required_number(&message, "next").unwrap(), 7);
+        let request = seen.lock().unwrap();
+        assert!(
+            request.starts_with("GET /v1/events?after=3&epoch=ep%2Boch%2F1&timeout=5 HTTP/1.1\r\n"),
+            "unexpected request: {request}"
+        );
+        assert!(
+            request.contains("\r\nAuthorization: Bearer test-secret\r\n"),
+            "missing authorization header: {request}"
+        );
+        assert!(
+            request.contains("\r\nAccept: application/json\r\n"),
+            "missing accept header: {request}"
+        );
+    }
+
+    #[test]
+    fn poll_reports_non_200_statuses() {
+        let (seen, port, handle) = serve_once(503, "try again later");
+        let cursor = Cursor {
+            epoch: String::new(),
+            after: 0,
+        };
+        let error = poll(&test_zigzag(port), None, "test-secret", &cursor, 5).unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(error, "Zigzag returned HTTP 503");
+        assert!(
+            seen.lock()
+                .unwrap()
+                .starts_with("GET /v1/events?after=0&epoch=&timeout=5 "),
+            "unexpected request target"
+        );
+    }
+
+    #[test]
+    fn poll_sends_absolute_form_targets_through_a_proxy() {
+        let body = r#"{"epoch":"e","reset":false,"lost":false,"next":1,"events":[]}"#;
+        let (seen, proxy_port, handle) = serve_once(200, body);
+        // With a proxy configured the client never resolves the origin host.
+        let zigzag = parse_url("http://relay.internal:9999").unwrap();
+        let cursor = Cursor {
+            epoch: "e1".to_owned(),
+            after: 0,
+        };
+        let proxy = format!("http://127.0.0.1:{proxy_port}");
+        let message = poll(&zigzag, Some(&proxy), "proxy-secret", &cursor, 5).unwrap();
+        handle.join().unwrap();
+        assert_eq!(required_string(&message, "epoch").unwrap(), "e");
+        let request = seen.lock().unwrap();
+        assert!(
+            request.starts_with(
+                "GET http://relay.internal:9999/v1/events?after=0&epoch=e1&timeout=5 HTTP/1.1\r\n"
+            ),
+            "unexpected proxied request: {request}"
         );
     }
 }
