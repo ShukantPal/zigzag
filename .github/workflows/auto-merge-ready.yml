@@ -59,39 +59,41 @@ jobs:
               continue
             fi
 
-            # Exit code 8 means checks are pending. Capture JSON in either case
-            # so failures can remove the label while pending checks keep it.
+            # Read every check run attached to the PR's current head commit.
+            # `gh pr checks --required` only reports branch-protection checks,
+            # which can be empty when the repository has no required checks.
+            head_sha="$(gh pr view "$pr_number" --json headRefOid --jq '.headRefOid')"
             set +e
-            checks="$(gh pr checks "$pr_number" --required --json bucket,name 2>&1)"
-            checks_status=$?
+            checks="$(gh api --paginate --slurp "repos/${GH_REPO}/commits/${head_sha}/check-runs" 2>&1)"
+            api_status=$?
             set -e
-            if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks"; then
-              echo "Could not read required checks for PR #${pr_number}: ${checks}" >&2
+            if [[ "$api_status" -ne 0 ]] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$checks"; then
+              echo "Could not read check runs for PR #${pr_number}: ${checks}" >&2
               exit 1
             fi
 
-            check_count="$(jq 'length' <<<"$checks")"
+            check_count="$(jq '[.[] | .check_runs[]?] | length' <<<"$checks")"
             if (( check_count == 0 )); then
-              echo "No required checks were reported for PR #${pr_number}; leaving the label in place."
+              echo "No check runs have been reported for PR #${pr_number} yet; waiting."
               continue
             fi
 
-            has_failure="$(jq '[.[].bucket] | any(. == "fail" or . == "cancel")' <<<"$checks")"
+            has_failure="$(jq '[.[] | .check_runs[]?] | any(.status == "completed" and (.conclusion as $conclusion | ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"] | index($conclusion) != null))' <<<"$checks")"
             if [[ "$has_failure" == "true" ]]; then
               gh pr edit "$pr_number" --remove-label ready
               continue
             fi
 
-            has_pending="$(jq '[.[].bucket] | any(. == "pending")' <<<"$checks")"
-            if [[ "$has_pending" == "true" || "$checks_status" -eq 8 ]]; then
-              echo "Required checks are still pending for PR #${pr_number}."
+            has_pending="$(jq '[.[] | .check_runs[]?] | any(.status != "completed" or .conclusion == null)' <<<"$checks")"
+            if [[ "$has_pending" == "true" ]]; then
+              echo "Check runs are still pending for PR #${pr_number}."
               continue
             fi
 
-            all_green="$(jq 'all(.[]; .bucket == "pass" or .bucket == "skipping")' <<<"$checks")"
+            all_green="$(jq '[.[] | .check_runs[]?] | all(.status == "completed" and (.conclusion as $conclusion | ["success", "neutral", "skipped"] | index($conclusion) != null))' <<<"$checks")"
             if [[ "$all_green" == "true" ]]; then
               gh pr merge "$pr_number" --merge
             else
-              echo "Required checks are not all green for PR #${pr_number}; leaving the label in place."
+              echo "Check runs are not all complete for PR #${pr_number}; leaving the label in place."
             fi
           done <<<"$pr_numbers"
