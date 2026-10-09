@@ -1,7 +1,9 @@
 import datetime as dt
 import io
 import json
+import socket
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -196,6 +198,17 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual(json.loads(encoded[4:]), {"type": "ping"})
         self.assertEqual(MAX_SOCKET_FRAME_BYTES, 4 * 1024 * 1024)
 
+    def test_socket_receive_preserves_a_partial_frame_across_timeout(self):
+        client, server = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+        relay = RelaySocket(client)
+        encoded = socket_frame({"topic": "agents", "agents": []})
+        server.sendall(encoded[:2])
+        self.assertIsNone(relay.receive(0.01))
+        server.sendall(encoded[2:])
+        self.assertEqual(relay.receive(1), {"topic": "agents", "agents": []})
+
     def test_socket_push_updates_agents_and_events_after_http_bootstrap(self):
         stream = EventStream("http://relay", "token")
         pushed_event = event("process_spawned", "2026-01-01T00:00:00.000Z", sequence=2)
@@ -253,6 +266,38 @@ class SnapshotIngestionTests(unittest.TestCase):
         socket.close.assert_called_once()
         self.assertIsNone(stream.socket)
         self.assertEqual(get.call_args.args[0], "/v1/events?after=7&epoch=e1&timeout=1")
+
+    def test_periodic_agent_reconciliation_observes_api_stop_without_event(self):
+        stream = EventStream("http://relay", "token")
+        stream.agents = {"agent-1": {"id": "agent-1", "state": "running"}}
+        stream.next_agent_refresh = 0
+        stream.next_socket_retry = time.monotonic() + 60
+        with patch.object(
+            EventStream,
+            "_get",
+            side_effect=[
+                {"epoch": "e1", "reset": False, "lost": False, "next": 0, "events": []},
+                {"agents": [{"id": "agent-1", "state": "stopped"}]},
+            ],
+        ) as get:
+            self.assertTrue(stream.poll(1))
+        self.assertEqual(stream.agents["agent-1"]["state"], "stopped")
+        self.assertEqual([call.args[0] for call in get.call_args_list], [
+            "/v1/events?after=0&epoch=&timeout=1", "/v1/agents",
+        ])
+
+    def test_lost_socket_is_retried_after_http_fallback(self):
+        stream = EventStream("http://relay", "token")
+        stream.next_agent_refresh = time.monotonic() + 60
+        stream.next_socket_retry = 0
+        with patch.object(
+            EventStream,
+            "_get",
+            return_value={"epoch": "e1", "reset": False, "lost": False, "next": 0, "events": []},
+        ), patch.object(RelaySocket, "connect", return_value=unittest.mock.Mock()) as connect:
+            self.assertFalse(stream.poll(1))
+        self.assertIsNotNone(stream.socket)
+        connect.assert_called_once_with("http://relay", "token", after=0, epoch="e1")
 
     def test_partial_audit_line_retains_other_events(self):
         with tempfile.TemporaryDirectory() as directory:

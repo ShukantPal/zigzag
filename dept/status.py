@@ -10,6 +10,7 @@ import os
 import shlex
 import socket
 import sys
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -40,6 +41,11 @@ INTERNAL_TASK_IDS = frozenset({"relay-update"})
 MAX_STREAM_EVENTS = 10_000
 SOCKET_PORT = 8766
 MAX_SOCKET_FRAME_BYTES = 4 * 1024 * 1024
+# Agent lifecycle changes made through the management API (notably DELETE)
+# are not necessarily represented by a durable event. Reconcile from the
+# authoritative agents endpoint regularly, even while the socket is healthy.
+AGENT_REFRESH_INTERVAL = 5.0
+SOCKET_RETRY_INTERVAL = 5.0
 
 
 def socket_address(url: str) -> tuple[str, int]:
@@ -89,6 +95,7 @@ class RelaySocket:
 
     def __init__(self, connection: socket.socket) -> None:
         self.connection = connection
+        self.buffer = bytearray()
 
     @classmethod
     def connect(cls, url: str, token: str, *, after: int, epoch: str) -> "RelaySocket":
@@ -113,7 +120,26 @@ class RelaySocket:
     def receive(self, timeout: float) -> dict[str, Any] | None:
         self.connection.settimeout(timeout)
         try:
-            return read_socket_frame(self.connection)
+            while len(self.buffer) < 4:
+                chunk = self.connection.recv(4096)
+                if not chunk:
+                    raise OSError("relay socket closed")
+                self.buffer.extend(chunk)
+            size = int.from_bytes(self.buffer[:4], "big")
+            if not 0 < size <= MAX_SOCKET_FRAME_BYTES:
+                raise ValueError("invalid relay socket frame size")
+            frame_size = size + 4
+            while len(self.buffer) < frame_size:
+                chunk = self.connection.recv(min(4096, frame_size - len(self.buffer)))
+                if not chunk:
+                    raise OSError("relay socket closed")
+                self.buffer.extend(chunk)
+            body = bytes(self.buffer[4:frame_size])
+            del self.buffer[:frame_size]
+            decoded = json.loads(body)
+            if not isinstance(decoded, dict):
+                raise ValueError("relay socket returned a non-object frame")
+            return decoded
         except socket.timeout:
             return None
 
@@ -437,9 +463,8 @@ class EventStream:
     """Subscribe to relay changes, preferring TCP and falling back to HTTP.
 
     Bootstrap once (full retained window + agent table), then poll() blocks
-    up to ``timeout`` seconds for newly pushed events and folds them into the
-    in-memory model.  The agent table is patched from process lifecycle
-    events, so the steady state issues no repeated /v1/agents fetches either.
+    up to ``timeout`` seconds for pushes. Agent snapshots are reconciled from
+    /v1/agents periodically because some API state transitions have no event.
     """
 
     def __init__(self, url: str, token: str) -> None:
@@ -452,6 +477,9 @@ class EventStream:
         self.lost = False
         self.poll_warnings: list[str] = []
         self.socket: RelaySocket | None = None
+        now = time.monotonic()
+        self.next_agent_refresh = now + AGENT_REFRESH_INTERVAL
+        self.next_socket_retry = now + SOCKET_RETRY_INTERVAL
 
     def _get(self, path: str, timeout: float) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -464,29 +492,55 @@ class EventStream:
             raise ValueError("relay returned a non-object JSON response")
         return decoded
 
-    def _seed_agents(self) -> None:
+    def _seed_agents(self) -> bool:
+        """Replace the cached agent table from the authoritative API."""
         try:
             values = self._get("/v1/agents", 10).get("agents", [])
         except (OSError, ValueError, json.JSONDecodeError) as error:
             self.poll_warnings.append(f"relay agents unavailable: {error}")
-            return
+            return False
         if not isinstance(values, list):
             self.poll_warnings.append("relay agents unavailable: agents is not an array")
-            return
-        for agent in values:
-            if isinstance(agent, dict) and isinstance(agent.get("id"), str):
-                self.agents[agent["id"]] = agent
+            return False
+        updated = {
+            agent["id"]: agent
+            for agent in values
+            if isinstance(agent, dict) and isinstance(agent.get("id"), str)
+        }
+        changed = updated != self.agents
+        self.agents = updated
+        return changed
+
+    def _connect_socket(self) -> bool:
+        try:
+            self.socket = RelaySocket.connect(
+                self.url, self.token, after=self.after, epoch=self.epoch,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.socket = None
+            return False
+        return True
+
+    def _maintain(self) -> bool:
+        """Refresh agent state and retry a lost socket on bounded intervals."""
+        now = time.monotonic()
+        changed = False
+        if now >= self.next_agent_refresh:
+            changed = self._seed_agents() or changed
+            self.next_agent_refresh = now + AGENT_REFRESH_INTERVAL
+        if self.socket is None and now >= self.next_socket_retry:
+            self._connect_socket()
+            self.next_socket_retry = now + SOCKET_RETRY_INTERVAL
+        return changed
 
     def bootstrap(self) -> None:
         """One full-window fetch plus the agent table; the only heavy requests."""
         self._ingest(self._get("/v1/events?after=0&timeout=0", 10))
         self._seed_agents()
-        try:
-            self.socket = RelaySocket.connect(self.url, self.token, after=self.after, epoch=self.epoch)
-        except (OSError, ValueError, json.JSONDecodeError):
-            # Older relays and relays behind an HTTP-only proxy retain exactly
-            # the established long-poll behavior.
-            self.socket = None
+        now = time.monotonic()
+        self.next_agent_refresh = now + AGENT_REFRESH_INTERVAL
+        self._connect_socket()
+        self.next_socket_retry = now + SOCKET_RETRY_INTERVAL
 
     def _apply_agent_event(self, event: dict[str, Any]) -> None:
         kind = event.get("kind")
@@ -559,14 +613,17 @@ class EventStream:
         return changed
 
     def poll(self, timeout: float) -> bool:
-        """Block up to ``timeout`` seconds for pushed events; True if changed."""
+        """Wait for pushed changes, while reconciling agent state periodically."""
+        self.poll_warnings = []
+        changed = False
+        socket_warning: str | None = None
         if self.socket is not None:
             try:
                 frame = self.socket.receive(timeout)
                 if frame is None:
-                    return False
-                topic = frame.get("topic")
-                if topic == "agents":
+                    changed = self._maintain()
+                    return changed
+                elif frame.get("topic") == "agents":
                     agents = frame.get("agents")
                     if isinstance(agents, list):
                         updated = {
@@ -575,28 +632,32 @@ class EventStream:
                         }
                         changed = updated != self.agents
                         self.agents = updated
-                        return changed
-                    return False
-                if topic == "events" and frame.get("dropped"):
+                    changed = self._maintain() or changed
+                    return changed
+                elif frame.get("topic") == "events" and frame.get("dropped"):
                     # The bounded socket queue overflowed. HTTP has the durable
-                    # cursor/epoch recovery semantics, so use it to resync.
+                    # cursor/epoch recovery semantics for events. Agent state
+                    # is independently reconciled below from /v1/agents.
                     self.socket.close()
                     self.socket = None
-                    return self.poll(timeout)
-                if topic == "events" and isinstance(frame.get("event"), dict):
+                elif frame.get("topic") == "events" and isinstance(frame.get("event"), dict):
                     event = frame["event"]
-                    return self._ingest({
+                    changed = self._ingest({
                         "epoch": self.epoch,
                         "reset": False,
                         "lost": False,
                         "next": event.get("sequence", self.after),
                         "events": [event],
                     })
-                return False
+                    changed = self._maintain() or changed
+                    return changed
+                else:
+                    changed = self._maintain()
+                    return changed
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 self.socket.close()
                 self.socket = None
-                self.poll_warnings = [f"relay socket unavailable; using HTTP fallback: {error}"]
+                socket_warning = f"relay socket unavailable; using HTTP fallback: {error}"
         try:
             message = self._get(
                 f"/v1/events?after={self.after}"
@@ -605,9 +666,14 @@ class EventStream:
                 timeout,
             )
         except (OSError, ValueError, json.JSONDecodeError) as error:
-            self.poll_warnings = [f"relay events unavailable: {error}"]
-            return False
-        return self._ingest(message)
+            self.poll_warnings.append(f"relay events unavailable: {error}")
+            changed = False
+        else:
+            changed = self._ingest(message)
+        changed = self._maintain() or changed
+        if socket_warning:
+            self.poll_warnings.append(socket_warning)
+        return changed
 
 
 def mac_dept_root() -> Path:
