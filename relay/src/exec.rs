@@ -416,6 +416,13 @@ fn pr_watchdog_read_endpoint_repo(endpoint: &str) -> Option<String> {
         {
             Some(format!("{owner}/{repo}"))
         }
+        ["repos", owner, repo, "pulls", number]
+            if valid_github_name(owner)
+                && valid_github_name(repo)
+                && number.parse::<u64>().is_ok_and(|number| number > 0) =>
+        {
+            Some(format!("{owner}/{repo}"))
+        }
         ["repos", owner, repo, "pulls"]
             if valid_github_name(owner)
                 && valid_github_name(repo)
@@ -840,6 +847,7 @@ mod tests {
             "repos/leveled-inc/leveled/pulls/1/comments",
             "repos/leveled-inc/leveled/issues/42/comments",
             "repos/leveled-inc/leveled/pulls/7/reviews",
+            "repos/leveled-inc/leveled/pulls/7",
             "repos/leveled-inc/leveled/pulls?state=open&per_page=100",
             compare.as_str(),
         ];
@@ -899,7 +907,6 @@ mod tests {
             "repos/leveled-inc/leveled/pulls",
             "repos/leveled-inc/leveled/pulls?state=open",
             "repos/leveled-inc/leveled/pulls?state=open&per_page=100&extra=1",
-            "repos/leveled-inc/leveled/pulls/1",
             "repos/leveled-inc/leveled/pulls/1/files",
             "repos/leveled-inc/leveled/actions/runs",
             // Bad numbers and oids.
@@ -922,6 +929,7 @@ mod tests {
         }
         // ...while the exact documented shapes next to them are allowed.
         assert_gh_allowed(&["api", "repos/leveled-inc/leveled/pulls/1/comments"]);
+        assert_gh_allowed(&["api", "repos/leveled-inc/leveled/pulls/1"]);
         assert_gh_allowed(&[
             "api",
             "repos/leveled-inc/leveled/pulls?state=open&per_page=100",

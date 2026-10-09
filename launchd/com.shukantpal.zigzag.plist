@@ -13,6 +13,8 @@
     <string>/Users/REPLACE/.codex/zigzag/events.json</string>
     <string>--watch-repo</string>
     <string>leveled-inc/leveled</string>
+    <string>--watch-repo</string>
+    <string>ShukantPal/zigzag</string>
     <string>--watch-interval</string>
     <string>30</string>
     <string>--watch-pr-state</string>
