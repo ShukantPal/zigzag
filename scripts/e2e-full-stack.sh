@@ -61,6 +61,9 @@ git -C "$project_dir" init -b main -q
 git -C "$project_dir" config user.email zigzag-e2e@example.invalid
 git -C "$project_dir" config user.name 'Zigzag E2E'
 git -C "$project_dir" commit --allow-empty -qm init
+git init --bare --initial-branch=main -q "$tmp_dir/project-origin.git"
+git -C "$project_dir" remote add origin "$tmp_dir/project-origin.git"
+git -C "$project_dir" push --set-upstream origin main -q
 
 port=$(python3 - <<'PY'
 import socket
