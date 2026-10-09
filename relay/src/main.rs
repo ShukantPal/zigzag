@@ -5,8 +5,8 @@ use relay_core::{
 };
 use std::collections::HashMap;
 use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -378,12 +378,12 @@ fn run() -> Result<(), String> {
     // not threads per socket.
     let limiter = Arc::new(ConnectionLimiter::new(MAX_CONNECTIONS));
     for address in addresses {
-        let listener = TcpListener::bind(address)
+        let server = tiny_http::Server::http(address)
             .map_err(|error| format!("could not bind {address}: {error}"))?;
         let state = Arc::clone(&state);
         let limiter = Arc::clone(&limiter);
         println!("zigzag listening on http://{address}");
-        thread::spawn(move || serve(listener, state, limiter));
+        thread::spawn(move || serve(server, state, limiter));
     }
     // The replacement only signals readiness after it has opened durable state
     // and rebound both listeners. The watchdog rolls back if this does not
@@ -837,46 +837,47 @@ impl Drop for ConnectionPermit {
     }
 }
 
-fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimiter>) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => match limiter.try_acquire() {
-                Some(permit) => {
-                    let state = Arc::clone(&state);
-                    thread::spawn(move || {
-                        let _permit = permit;
-                        let _ = handle(stream, state);
-                    });
-                }
-                None => {
-                    eprintln!("zigzag connection shed: already at {MAX_CONNECTIONS} connections");
-                    let _ = reply(&mut stream, 503, error("too_many_connections"));
-                }
-            },
-            Err(error) => eprintln!("zigzag accept error: {error}"),
+fn serve(server: tiny_http::Server, state: Arc<Server>, limiter: Arc<ConnectionLimiter>) {
+    for request in server.incoming_requests() {
+        match limiter.try_acquire() {
+            Some(permit) => {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    let _permit = permit;
+                    let _ = handle(request, state);
+                });
+            }
+            None => {
+                eprintln!("zigzag connection shed: already at {MAX_CONNECTIONS} connections");
+                let body = error("too_many_connections").to_json();
+                let _ = request.respond(
+                    tiny_http::Response::from_data(body.as_bytes())
+                        .with_status_code(tiny_http::StatusCode::from(503u16)),
+                );
+            }
         }
     }
 }
 
-fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
-    handle_with_policy(stream, state, || {
+fn handle(request: tiny_http::Request, state: Arc<Server>) -> Result<(), String> {
+    handle_with_policy(request, state, || {
         require_gui_login_session().and_then(|_| exec::load_policy())
     })
 }
 
 fn handle_with_policy<F>(
-    stream: TcpStream,
+    request: tiny_http::Request,
     state: Arc<Server>,
     load_policy: F,
 ) -> Result<(), String>
 where
     F: Fn() -> Result<exec::Policy, String>,
 {
-    handle_with_services(stream, state, load_policy, review_loop::gate_report)
+    handle_with_services(request, state, load_policy, review_loop::gate_report)
 }
 
 fn handle_with_services<F, G>(
-    mut stream: TcpStream,
+    http_request: tiny_http::Request,
     state: Arc<Server>,
     load_policy: F,
     gate_report: G,
@@ -891,18 +892,17 @@ where
         &review_loop::ReviewLoopConfig,
     ) -> Result<serde_json::Value, String>,
 {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| error.to_string())?;
-    let request = match read_request(&mut stream) {
+    let incoming = receive(http_request);
+    let mut responder = incoming.responder;
+    let request = match incoming.parsed {
         Ok(request) => request,
         Err(ReadRequestError::ExecutionDenied) => {
-            denied(&mut stream, "")?;
+            denied(&mut responder, "")?;
             return Ok(());
         }
         Err(ReadRequestError::HeadersTooLarge) => {
             reply(
-                &mut stream,
+                &mut responder,
                 431,
                 Json::Object(vec![(
                     "error".to_owned(),
@@ -913,7 +913,7 @@ where
         }
         Err(ReadRequestError::Message(error)) => {
             reply(
-                &mut stream,
+                &mut responder,
                 400,
                 Json::Object(vec![("error".to_owned(), Json::String(error))]),
             )?;
@@ -928,7 +928,7 @@ where
     } else {
         Some(state.secret.as_str())
     }) else {
-        return reply(&mut stream, 404, error("not_found"));
+        return reply(&mut responder, 404, error("not_found"));
     };
     if !authorized(
         request
@@ -938,44 +938,44 @@ where
             .unwrap_or(""),
         required_secret,
     ) {
-        reply(&mut stream, 401, error("unauthorized"))?;
+        reply(&mut responder, 401, error("unauthorized"))?;
         return Ok(());
     }
     match (request.method.as_str(), request_path) {
         ("GET", "/v1/health") => reply(
-            &mut stream,
+            &mut responder,
             200,
             Json::Object(vec![("status".to_owned(), Json::String("ok".to_owned()))]),
         ),
-        ("POST", "/v1/events") => post(&mut stream, &state, request.body),
-        ("GET", "/v1/events") => get(&mut stream, &state, &request.target),
-        ("POST", "/v1/exec") => exec_request(&mut stream, request.body),
-        ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
+        ("POST", "/v1/events") => post(&mut responder, &state, request.body),
+        ("GET", "/v1/events") => get(&mut responder, &state, &request.target),
+        ("POST", "/v1/exec") => exec_request(&mut responder, request.body),
+        ("POST", "/v1/spawn") => spawn_request(&mut responder, &state, request.body, load_policy()),
         ("GET", "/v1/review-gate") => {
-            review_gate_request(&mut stream, &state, &request.target, gate_report)
+            review_gate_request(&mut responder, &state, &request.target, gate_report)
         }
         ("GET", path) if agent_route(path).is_some() => agent_request(
-            &mut stream,
+            &mut responder,
             &state,
             &request.target,
             agent_route(path).expect("checked"),
         ),
         ("GET", path) => match proc_route(path) {
-            Some(ProcRoute::Poll(handle)) => poll_proc(&mut stream, &state, handle),
-            Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
-            None => reply(&mut stream, 404, error("not_found")),
+            Some(ProcRoute::Poll(handle)) => poll_proc(&mut responder, &state, handle),
+            Some(ProcRoute::Kill(_)) => reply(&mut responder, 404, error("not_found")),
+            None => reply(&mut responder, 404, error("not_found")),
         },
         ("POST", path) => match proc_route(path) {
-            Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
-            Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),
-            None => reply(&mut stream, 404, error("not_found")),
+            Some(ProcRoute::Kill(handle)) => kill_proc(&mut responder, &state, handle),
+            Some(ProcRoute::Poll(_)) => reply(&mut responder, 404, error("not_found")),
+            None => reply(&mut responder, 404, error("not_found")),
         },
-        _ => reply(&mut stream, 404, error("not_found")),
+        _ => reply(&mut responder, 404, error("not_found")),
     }
 }
 
 fn review_gate_request<G>(
-    stream: &mut TcpStream,
+    responder: &mut HttpResponder,
     state: &Server,
     target: &str,
     gate_report: G,
@@ -991,14 +991,14 @@ where
 {
     let (repository, number) = match review_gate_parameters(target) {
         Ok(parameters) => parameters,
-        Err(()) => return reply(stream, 400, error("invalid_review_gate_query")),
+        Err(()) => return reply(responder, 400, error("invalid_review_gate_query")),
     };
     let config = match state.review_config.lock() {
         Ok(config) => config.clone(),
-        Err(_) => return reply(stream, 500, error("review_gate_failed")),
+        Err(_) => return reply(responder, 500, error("review_gate_failed")),
     };
     let Some(config) = config else {
-        return reply(stream, 500, error("review_gate_failed"));
+        return reply(responder, 500, error("review_gate_failed"));
     };
     match gate_report(
         &repository,
@@ -1012,11 +1012,11 @@ where
                 .map_err(|error| format!("could not encode review gate report: {error}"))?;
             let response = parse_json(&encoded)
                 .map_err(|_| "could not convert review gate report".to_owned())?;
-            reply(stream, 200, response)
+            reply(responder, 200, response)
         }
         Err(error_message) => {
             eprintln!("review gate failed for {repository}#{number}: {error_message}");
-            reply(stream, 500, error("review_gate_failed"))
+            reply(responder, 500, error("review_gate_failed"))
         }
     }
 }
@@ -1052,27 +1052,27 @@ fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
 }
 
 fn agent_request(
-    stream: &mut TcpStream,
+    responder: &mut HttpResponder,
     state: &Server,
     target: &str,
     route: AgentRoute<'_>,
 ) -> Result<(), String> {
     let values = match query(target) {
         Ok(values) => values,
-        Err(_) => return reply(stream, 400, error("invalid_agent_query")),
+        Err(_) => return reply(responder, 400, error("invalid_agent_query")),
     };
     match route {
         AgentRoute::List => {
             let allowed = ["state", "task_id"];
             if values.keys().any(|key| !allowed.contains(&key.as_str())) {
-                return reply(stream, 400, error("invalid_agent_query"));
+                return reply(responder, 400, error("invalid_agent_query"));
             }
             let agents = state.supervisor.registry.list(
                 values.get("state").map(String::as_str),
                 values.get("task_id").map(String::as_str),
             );
             reply(
-                stream,
+                responder,
                 200,
                 Json::Object(vec![(
                     "agents".to_owned(),
@@ -1081,24 +1081,24 @@ fn agent_request(
             )
         }
         AgentRoute::Status(id) => match state.supervisor.registry.get(id) {
-            Some(agent) => reply(stream, 200, agent.status_json()),
-            None => reply(stream, 404, error("unknown_agent")),
+            Some(agent) => reply(responder, 200, agent.status_json()),
+            None => reply(responder, 404, error("unknown_agent")),
         },
         AgentRoute::Logs(id) => {
             let allowed = ["stream", "after", "tail", "follow"];
             if values.keys().any(|key| !allowed.contains(&key.as_str())) {
-                return reply(stream, 400, error("invalid_log_query"));
+                return reply(responder, 400, error("invalid_log_query"));
             }
             let stream_name = values.get("stream").map(String::as_str).unwrap_or("both");
             if !matches!(stream_name, "stdout" | "stderr" | "both") {
-                return reply(stream, 400, error("invalid_log_query"));
+                return reply(responder, 400, error("invalid_log_query"));
             }
             let after = match values
                 .get("after")
                 .map_or(Ok(0), |value| value.parse::<u64>())
             {
                 Ok(value) => value,
-                Err(_) => return reply(stream, 400, error("invalid_log_query")),
+                Err(_) => return reply(responder, 400, error("invalid_log_query")),
             };
             let tail = match values
                 .get("tail")
@@ -1106,7 +1106,7 @@ fn agent_request(
                 .transpose()
             {
                 Ok(value) => value,
-                Err(_) => return reply(stream, 400, error("invalid_log_query")),
+                Err(_) => return reply(responder, 400, error("invalid_log_query")),
             };
             let follow =
                 match values
@@ -1117,7 +1117,7 @@ fn agent_request(
                         _ => Err(()),
                     }) {
                     Ok(value) => value,
-                    Err(_) => return reply(stream, 400, error("invalid_log_query")),
+                    Err(_) => return reply(responder, 400, error("invalid_log_query")),
                 };
             let deadline = Instant::now() + Duration::from_secs(50);
             loop {
@@ -1126,13 +1126,13 @@ fn agent_request(
                     .registry
                     .logs_json(id, stream_name, after, tail)
                 else {
-                    return reply(stream, 404, error("unknown_agent"));
+                    return reply(responder, 404, error("unknown_agent"));
                 };
                 let has_records = logs.object("records").is_some_and(
                     |records| matches!(records, Json::Array(records) if !records.is_empty()),
                 );
                 if !follow || has_records || Instant::now() >= deadline {
-                    return reply(stream, 200, logs);
+                    return reply(responder, 200, logs);
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -1140,12 +1140,12 @@ fn agent_request(
     }
 }
 
-fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), String> {
+fn post(responder: &mut HttpResponder, state: &Server, body: Vec<u8>) -> Result<(), String> {
     let body = match String::from_utf8(body) {
         Ok(body) => body,
         Err(_) => {
             reply(
-                stream,
+                responder,
                 400,
                 error("body_must_be_an_object_with_nonempty_id"),
             )?;
@@ -1156,7 +1156,7 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
         Ok(Json::Object(fields)) => Json::Object(fields),
         _ => {
             reply(
-                stream,
+                responder,
                 400,
                 error("body_must_be_an_object_with_nonempty_id"),
             )?;
@@ -1170,7 +1170,7 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
         .is_none()
     {
         reply(
-            stream,
+            responder,
             400,
             error("body_must_be_an_object_with_nonempty_id"),
         )?;
@@ -1178,21 +1178,21 @@ fn post(stream: &mut TcpStream, state: &Server, body: Vec<u8>) -> Result<(), Str
     }
     match state.store.add(payload) {
         Ok((event, duplicate)) => reply(
-            stream,
+            responder,
             if duplicate { 200 } else { 201 },
             Json::Object(vec![
                 ("duplicate".to_owned(), Json::Bool(duplicate)),
                 ("event".to_owned(), event.response_json()),
             ]),
         ),
-        Err(_) => reply(stream, 500, error("could_not_persist_event")),
+        Err(_) => reply(responder, 500, error("could_not_persist_event")),
     }
 }
 
-fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
+fn exec_request(responder: &mut HttpResponder, body: Vec<u8>) -> Result<(), String> {
     let request = match parse_exec_request(&body) {
         Ok(request) => request,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(denial) => return reply(responder, 200, denial),
     };
     // Prompts can be sensitive, so logs contain only this minimal routing data.
     eprintln!(
@@ -1205,29 +1205,29 @@ fn exec_request(stream: &mut TcpStream, body: Vec<u8>) -> Result<(), String> {
         Ok(policy) => policy,
         Err(message) => {
             eprintln!("exec policy read failed: {message}");
-            return reply(stream, 500, error("could_not_read_execution_policy"));
+            return reply(responder, 500, error("could_not_read_execution_policy"));
         }
     };
     let path = match policy_path_or_denial(&policy, &request) {
         Ok(path) => path,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(denial) => return reply(responder, 200, denial),
     };
     let result = exec::run(path, request);
-    reply(stream, 200, result.to_json())
+    reply(responder, 200, result.to_json())
 }
 
 fn spawn_request(
-    stream: &mut TcpStream,
+    responder: &mut HttpResponder,
     state: &Server,
     body: Vec<u8>,
     policy: Result<exec::Policy, String>,
 ) -> Result<(), String> {
     if state.updater.is_draining() {
-        return reply(stream, 503, error("updates_draining"));
+        return reply(responder, 503, error("updates_draining"));
     }
     let request = match parse_spawn_request(&body) {
         Ok(request) => request,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(denial) => return reply(responder, 200, denial),
     };
     eprintln!(
         "spawn id={} bin={} subcommand={}",
@@ -1256,27 +1256,27 @@ fn spawn_request(
         ))
         .is_err()
     {
-        return reply(stream, 500, error("could_not_persist_event"));
+        return reply(responder, 500, error("could_not_persist_event"));
     }
     let policy = match policy {
         Ok(policy) => policy,
         Err(message) => {
             eprintln!("spawn policy read failed: {message}");
-            return reply(stream, 500, error("could_not_read_execution_policy"));
+            return reply(responder, 500, error("could_not_read_execution_policy"));
         }
     };
     let path = match policy_path_or_denial(&policy, &request.command) {
         Ok(path) => path,
-        Err(denial) => return reply(stream, 200, denial),
+        Err(denial) => return reply(responder, 200, denial),
     };
     // The updater takes the same gate while setting `draining`, so a child
     // cannot appear between the drain check and its durable registry record.
     let _spawn_admission = match state.updater.spawn_admission() {
         Ok(Some(guard)) => guard,
-        Ok(None) => return reply(stream, 503, error("updates_draining")),
+        Ok(None) => return reply(responder, 503, error("updates_draining")),
         Err(message) => {
             eprintln!("spawn admission failed: {message}");
-            return reply(stream, 500, error("could_not_admit_process"));
+            return reply(responder, 500, error("could_not_admit_process"));
         }
     };
     if state
@@ -1289,7 +1289,7 @@ fn spawn_request(
         ))
         .is_err()
     {
-        return reply(stream, 500, error("could_not_persist_event"));
+        return reply(responder, 500, error("could_not_persist_event"));
     }
     let task_id = request.command.id.clone();
     match spawn_proc(
@@ -1300,7 +1300,7 @@ fn spawn_request(
         execution_id.clone(),
     ) {
         Ok(handle) => reply(
-            stream,
+            responder,
             200,
             Json::Object(vec![
                 ("id".to_owned(), Json::String(handle.id)),
@@ -1324,7 +1324,7 @@ fn spawn_request(
                 eprintln!("could not persist spawn failure audit event");
             }
             eprintln!("spawn failed");
-            reply(stream, 500, error("could_not_spawn_process"))
+            reply(responder, 500, error("could_not_spawn_process"))
         }
     }
 }
@@ -1491,7 +1491,7 @@ fn drain_to_capture(
     });
 }
 
-fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
+fn poll_proc(responder: &mut HttpResponder, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
             .supervisor
@@ -1500,7 +1500,7 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             .map_err(|_| "process table lock poisoned".to_owned())?;
         prune_procs(&mut table, Instant::now());
         let Some(entry) = table.get_mut(handle) else {
-            return reply(stream, 404, error("unknown_proc"));
+            return reply(responder, 404, error("unknown_proc"));
         };
         update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         eprintln!(
@@ -1509,10 +1509,10 @@ fn poll_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
         );
         proc_json(entry)
     };
-    reply(stream, 200, result)
+    reply(responder, 200, result)
 }
 
-fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(), String> {
+fn kill_proc(responder: &mut HttpResponder, state: &Server, handle: &str) -> Result<(), String> {
     let result = {
         let mut table = state
             .supervisor
@@ -1521,7 +1521,7 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             .map_err(|_| "process table lock poisoned".to_owned())?;
         prune_procs(&mut table, Instant::now());
         let Some(entry) = table.get_mut(handle) else {
-            return reply(stream, 404, error("unknown_proc"));
+            return reply(responder, 404, error("unknown_proc"));
         };
         update_proc_status_with_handle(entry, handle, &state.supervisor.registry, &state.store);
         let killed = if entry.finished_at.is_none() {
@@ -1546,7 +1546,7 @@ fn kill_proc(stream: &mut TcpStream, state: &Server, handle: &str) -> Result<(),
             ("killed".to_owned(), Json::Bool(killed)),
         ])
     };
-    reply(stream, 200, result)
+    reply(responder, 200, result)
 }
 
 fn output_is_complete(entry: &ProcEntry) -> bool {
@@ -1983,9 +1983,9 @@ fn parse_spawn_request(body: &[u8]) -> Result<SpawnRequest, Json> {
     })
 }
 
-fn denied(stream: &mut TcpStream, id: &str) -> Result<(), String> {
+fn denied(responder: &mut HttpResponder, id: &str) -> Result<(), String> {
     let (status, body) = denial_response(id);
-    reply(stream, status, body)
+    reply(responder, status, body)
 }
 
 fn policy_path_or_denial<'a>(
@@ -2008,11 +2008,11 @@ fn denial_json(id: &str) -> Json {
     ])
 }
 
-fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), String> {
+fn get(responder: &mut HttpResponder, state: &Server, target: &str) -> Result<(), String> {
     let (after, timeout, epoch) = match get_query(target) {
         Ok(query) => query,
         Err(message) => {
-            reply(stream, 400, error(&message))?;
+            reply(responder, 400, error(&message))?;
             return Ok(());
         }
     };
@@ -2022,11 +2022,11 @@ fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Result<(), Strin
     let result = match result {
         Ok(result) => result,
         Err(_) => {
-            reply(stream, 500, error("could_not_read_events"))?;
+            reply(responder, 500, error("could_not_read_events"))?;
             return Ok(());
         }
     };
-    reply(stream, 200, read_json(result))
+    reply(responder, 200, read_json(result))
 }
 
 fn get_query(target: &str) -> Result<(u64, u64, String), String> {
@@ -2070,78 +2070,103 @@ fn read_json(result: ReadResult) -> Json {
     ])
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
-    let mut reader = BufReader::new(stream);
-    // The budget covers the request line too: an unbounded request line is
-    // the same allocation attack as unbounded headers.
-    let mut budget = MAX_HEADER_BLOCK_BYTES;
-    let first = read_header_line(&mut reader, &mut budget)?
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?;
-    let mut parts = first.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
-        .to_owned();
-    let target = parts
-        .next()
-        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?
-        .to_owned();
-    if parts.next().is_none() {
-        return Err(ReadRequestError::Message(
-            "malformed request line".to_owned(),
-        ));
+/// Owns the tiny_http request while the handler runs. `respond` takes the
+/// request out, so a handler can only ever send one response: a second reply
+/// is a loud internal error, never a second write on the wire.
+struct HttpResponder {
+    request: Option<tiny_http::Request>,
+}
+
+struct Incoming {
+    parsed: Result<Request, ReadRequestError>,
+    responder: HttpResponder,
+}
+
+fn receive(mut http_request: tiny_http::Request) -> Incoming {
+    let parsed = parse_request(&mut http_request);
+    Incoming {
+        parsed,
+        responder: HttpResponder {
+            request: Some(http_request),
+        },
     }
+}
+
+fn parse_request(http: &mut tiny_http::Request) -> Result<Request, ReadRequestError> {
+    let method = http.method().as_str().to_owned();
+    let target = http.url().to_owned();
     let mut headers = HashMap::new();
-    let mut header_count = 0;
-    loop {
-        let line = read_header_line(&mut reader, &mut budget)?
-            .ok_or_else(|| ReadRequestError::Message("could not read headers".to_owned()))?;
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        // Count lines, not map entries: duplicate header names collapse in
-        // the map, but each line still costs the peer nothing to send.
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    // DoS hardening (#36): tiny_http parses headers with no caps of its own,
+    // so enforce the merged header-block budget (request line included) and
+    // header-count cap here. Violations fail closed with 431, as before.
+    let mut header_block_bytes = method.len() + target.len();
+    let mut header_count = 0usize;
+    for header in http.headers() {
         header_count += 1;
         if header_count > MAX_HEADER_COUNT {
             return Err(ReadRequestError::HeadersTooLarge);
         }
-        let (name, value) = line
-            .trim_end()
-            .split_once(':')
-            .ok_or_else(|| ReadRequestError::Message("malformed header".to_owned()))?;
-        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-    }
-    let length = headers.get("content-length").map_or(Ok(0), |value| {
-        value
-            .parse::<usize>()
-            .map_err(|_| ReadRequestError::Message("invalid content length".to_owned()))
-    })?;
-    if length > MAX_BODY {
-        if method == "POST"
-            && matches!(
-                target.split('?').next(),
-                Some("/v1/exec") | Some("/v1/spawn")
-            )
-        {
-            return Err(ReadRequestError::ExecutionDenied);
+        header_block_bytes += header.field.as_str().as_str().len() + header.value.as_str().len();
+        if header_block_bytes > MAX_HEADER_BLOCK_BYTES {
+            return Err(ReadRequestError::HeadersTooLarge);
         }
-        return Err(ReadRequestError::Message(
-            "request body too large".to_owned(),
-        ));
+        if header.field.equiv("content-length") {
+            let length = header
+                .value
+                .as_str()
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ReadRequestError::Message("invalid content length".to_owned()))?;
+            if content_length.is_some_and(|previous| previous != length) {
+                // Conflicting duplicate Content-Length values are a classic
+                // request-smuggling vector; fail closed instead of picking one.
+                return Err(ReadRequestError::Message(
+                    "invalid content length".to_owned(),
+                ));
+            }
+            content_length = Some(length);
+        } else if header.field.equiv("transfer-encoding") {
+            chunked = true;
+        }
+        headers.insert(
+            header.field.as_str().as_str().to_ascii_lowercase(),
+            header.value.as_str().trim().to_owned(),
+        );
     }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).map_err(|_| {
-        if method == "POST"
-            && matches!(
-                target.split('?').next(),
-                Some("/v1/exec") | Some("/v1/spawn")
-            )
-        {
+    // POST /v1/exec and /v1/spawn evaluate the execution policy; any body
+    // framing anomaly there stays an opaque denial, never a descriptive error.
+    let exec_or_spawn = method == "POST"
+        && matches!(
+            target.split('?').next(),
+            Some("/v1/exec") | Some("/v1/spawn")
+        );
+    let framing_error = |message: &str| {
+        if exec_or_spawn {
             ReadRequestError::ExecutionDenied
         } else {
-            ReadRequestError::Message("short request body".to_owned())
+            ReadRequestError::Message(message.to_owned())
         }
-    })?;
+    };
+    if chunked {
+        // The old server ignored Transfer-Encoding and therefore never
+        // understood chunked bodies; reject the framing outright instead of
+        // reinterpreting it behind the caller's back.
+        return Err(framing_error("transfer encoding not supported"));
+    }
+    let length = content_length.unwrap_or(0);
+    if length > MAX_BODY {
+        // Drain the framed body with a fixed-size buffer so the connection
+        // stays in sync for keep-alive. The denial itself never allocates
+        // for the body, preserving the old "before body allocation" property.
+        drain_body(http.as_reader(), length);
+        return Err(framing_error("request body too large"));
+    }
+    let mut body = vec![0u8; length];
+    if http.as_reader().read_exact(&mut body).is_err() {
+        return Err(framing_error("short request body"));
+    }
     Ok(Request {
         method,
         target,
@@ -2150,39 +2175,16 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
     })
 }
 
-/// Read one header line, deducting its bytes from `budget`.
-///
-/// The budget caps the whole header block (request line included). Reads go
-/// through `take(budget)`, so a peer can never make the block larger than the
-/// cap no matter how long a single line is: `read_until` returns as soon as
-/// the budget is consumed, even without a line terminator. `None` is a clean
-/// EOF before any byte of the line.
-fn read_header_line(
-    reader: &mut BufReader<&mut TcpStream>,
-    budget: &mut usize,
-) -> Result<Option<String>, ReadRequestError> {
-    if *budget == 0 {
-        return Err(ReadRequestError::HeadersTooLarge);
+fn drain_body(reader: &mut dyn Read, mut remaining: usize) {
+    let mut chunk = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => remaining -= n,
+            Err(_) => break,
+        }
     }
-    let mut line = Vec::new();
-    let consumed = reader
-        .by_ref()
-        .take(*budget as u64)
-        .read_until(b'\n', &mut line)
-        .map_err(|_| ReadRequestError::Message("could not read headers".to_owned()))?;
-    *budget -= consumed;
-    if consumed == 0 {
-        return Ok(None);
-    }
-    if !line.ends_with(b"\n") {
-        // Budget exhausted before the terminator: the header block is over
-        // the cap. (A peer that disconnects mid-header lands here too; it is
-        // still a client error, as before.)
-        return Err(ReadRequestError::HeadersTooLarge);
-    }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|_| ReadRequestError::Message("malformed header".to_owned()))
 }
 
 fn query(target: &str) -> Result<HashMap<String, String>, String> {
@@ -2240,19 +2242,32 @@ fn authorized(supplied: &str, secret: &str) -> bool {
 fn error(message: &str) -> Json {
     Json::Object(vec![("error".to_owned(), Json::String(message.to_owned()))])
 }
-fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
-    let body = value.to_json();
-    let reason = match code {
-        200 => "OK",
-        201 => "Created",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        431 => "Request Header Fields Too Large",
-        503 => "Service Unavailable",
-        _ => "Internal Server Error",
-    };
-    stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
+fn reply(responder: &mut HttpResponder, code: u16, value: Json) -> Result<(), String> {
+    responder.respond(code, value)
+}
+
+impl HttpResponder {
+    fn respond(&mut self, code: u16, value: Json) -> Result<(), String> {
+        let request = self
+            .request
+            .take()
+            .ok_or_else(|| "response already sent".to_owned())?;
+        let body = value.to_json();
+        // tiny_http's default reason phrases match the old server's table
+        // exactly for every status code this relay emits.
+        let response = tiny_http::Response::from_data(body.as_bytes())
+            .with_status_code(tiny_http::StatusCode::from(code))
+            .with_header(response_header("Content-Type", "application/json")?)
+            .with_header(response_header("Content-Length", &body.len().to_string())?)
+            .with_header(response_header("Cache-Control", "no-store")?)
+            .with_header(response_header("Connection", "close")?);
+        request.respond(response).map_err(|error| error.to_string())
+    }
+}
+
+fn response_header(name: &str, value: &str) -> Result<tiny_http::Header, String> {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .map_err(|_| "could not build response header".to_owned())
 }
 
 #[cfg(test)]
@@ -2268,6 +2283,8 @@ pub(crate) fn test_updater() -> Arc<update::Manager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpStream;
 
     #[test]
     fn malformed_get_query_is_a_bad_request() {
@@ -2728,43 +2745,101 @@ mod tests {
 
     #[test]
     fn oversized_exec_request_is_an_opaque_denial_before_body_allocation() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(
                 stream,
-                "POST /v1/exec HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                "POST /v1/exec HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 MAX_BODY + 1
             )
             .unwrap();
+            // No body follows; close the write side so the server's drain
+            // observes EOF instead of blocking.
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
         });
-        let (mut server, _) = listener.accept().unwrap();
-        client.join().unwrap();
+        let mut http_request = server.recv().expect("test server received the request");
+        // The size gate fires before any body-sized allocation is made.
         assert!(matches!(
-            read_request(&mut server),
+            parse_request(&mut http_request),
             Err(ReadRequestError::ExecutionDenied)
         ));
+        let mut responder = HttpResponder {
+            request: Some(http_request),
+        };
+        denied(&mut responder, "").unwrap();
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with(r#"{"id":"","error":"denied"}"#));
     }
 
     #[test]
-    fn truncated_exec_request_is_an_opaque_denial() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+    fn truncated_small_body_resets_the_connection() {
+        // tiny_http eagerly buffers bodies up to 1024 bytes while parsing,
+        // so a truncated small body aborts the connection before any request
+        // reaches the handler. Fail-closed: no response, no execution.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(
                 stream,
-                "POST /v1/exec HTTP/1.1\r\nContent-Length: 1\r\n\r\n"
+                "POST /v1/exec HTTP/1.1\r\nContent-Length: 32\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
         });
-        let (mut server, _) = listener.accept().unwrap();
-        client.join().unwrap();
+        let arrived = server
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recv did not error");
+        assert!(
+            arrived.is_none(),
+            "truncated body must not reach the handler"
+        );
+        assert!(
+            client.join().unwrap().is_empty(),
+            "no response on truncated body"
+        );
+    }
+
+    #[test]
+    fn truncated_large_exec_body_is_an_opaque_denial() {
+        // Bodies larger than tiny_http's 1024-byte eager buffer stay lazy,
+        // so a truncated read surfaces in the handler as an opaque denial,
+        // exactly like the old server.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(
+                stream,
+                "POST /v1/exec HTTP/1.1\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let mut http_request = server.recv().expect("test server received the request");
         assert!(matches!(
-            read_request(&mut server),
+            parse_request(&mut http_request),
             Err(ReadRequestError::ExecutionDenied)
         ));
+        let mut responder = HttpResponder {
+            request: Some(http_request),
+        };
+        denied(&mut responder, "").unwrap();
+        let response = client.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with(r#"{"id":"","error":"denied"}"#));
     }
 
     #[test]
@@ -2805,8 +2880,8 @@ mod tests {
 
     #[test]
     fn more_than_one_hundred_headers_are_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(stream, "GET /v1/health HTTP/1.1\r\n").unwrap();
@@ -2814,19 +2889,20 @@ mod tests {
                 write!(stream, "X-Flood-{index}: value\r\n").unwrap();
             }
             write!(stream, "\r\n").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
-        let (mut server, _) = listener.accept().unwrap();
+        let mut http_request = server.recv().expect("test server received the request");
         client.join().unwrap();
         assert!(matches!(
-            read_request(&mut server),
+            parse_request(&mut http_request),
             Err(ReadRequestError::HeadersTooLarge)
         ));
     }
 
     #[test]
     fn exactly_one_hundred_headers_still_parse() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(stream, "GET /v1/health HTTP/1.1\r\n").unwrap();
@@ -2834,17 +2910,18 @@ mod tests {
                 write!(stream, "X-Ok-{index}: value\r\n").unwrap();
             }
             write!(stream, "\r\n").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
-        let (mut server, _) = listener.accept().unwrap();
+        let mut http_request = server.recv().expect("test server received the request");
         client.join().unwrap();
-        let request = read_request(&mut server).unwrap();
+        let request = parse_request(&mut http_request).unwrap();
         assert_eq!(request.headers.len(), MAX_HEADER_COUNT);
     }
 
     #[test]
     fn header_block_over_eight_kib_is_rejected() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(stream, "GET /v1/health HTTP/1.1\r\nX-Big: ").unwrap();
@@ -2852,57 +2929,73 @@ mod tests {
                 .write_all(&vec![b'a'; MAX_HEADER_BLOCK_BYTES])
                 .unwrap();
             write!(stream, "\r\n\r\n").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
-        let (mut server, _) = listener.accept().unwrap();
+        let mut http_request = server.recv().expect("test server received the request");
         client.join().unwrap();
         assert!(matches!(
-            read_request(&mut server),
+            parse_request(&mut http_request),
             Err(ReadRequestError::HeadersTooLarge)
         ));
     }
 
     #[test]
-    fn unterminated_header_line_cannot_outgrow_the_budget() {
-        // The client never sends a line terminator; the server must stop at
-        // the budget instead of buffering the line without bound.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+    fn oversized_header_block_is_rejected_promptly() {
+        // tiny_http parses the header block before we see the request, so the
+        // old "never wait for a line terminator" property now lives in
+        // tiny_http; what this guards is that an over-budget block is still
+        // rejected instead of being processed.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             write!(stream, "GET /v1/health HTTP/1.1\r\nX-Big: ").unwrap();
             stream
                 .write_all(&vec![b'a'; 2 * MAX_HEADER_BLOCK_BYTES])
                 .unwrap();
+            write!(stream, "\r\n\r\n").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
-        let (mut server, _) = listener.accept().unwrap();
         let started = Instant::now();
-        let result = read_request(&mut server);
+        let mut http_request = server.recv().expect("test server received the request");
+        let result = parse_request(&mut http_request);
         assert!(matches!(result, Err(ReadRequestError::HeadersTooLarge)));
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "server waited for a terminator instead of enforcing the budget"
+            "over-budget header block was not rejected promptly"
         );
         client.join().unwrap();
     }
 
     #[test]
     fn reply_reports_431_as_request_header_fields_too_large() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).unwrap();
-            let response = String::from_utf8(response).unwrap();
-            assert!(
-                response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
-                "unexpected status line: {response}"
-            );
+            write!(stream, "GET /v1/health HTTP/1.1\r\n\r\n").unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).unwrap();
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            let line = String::from_utf8(line).unwrap();
+            assert_eq!(line, "HTTP/1.1 431 Request Header Fields Too Large\r\n");
         });
-        let (mut server, _) = listener.accept().unwrap();
-        reply(&mut server, 431, error("request header fields too large")).unwrap();
-        // Close so the client's read_to_end sees EOF.
-        drop(server);
+        let http_request = server.recv().expect("test server received the request");
+        let mut responder = HttpResponder {
+            request: Some(http_request),
+        };
+        reply(
+            &mut responder,
+            431,
+            error("request header fields too large"),
+        )
+        .unwrap();
         client.join().unwrap();
     }
 
@@ -3494,11 +3587,12 @@ mod tests {
             &review_loop::ReviewLoopConfig,
         ) -> Result<serde_json::Value, String>,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        // `Connection: close` keeps the one-request-per-connection shape the
+        // old server had, so the client can read the response to EOF.
         let request = format!(
-            "{method} {target} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
-            token,
+            "{method} {target} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let client = thread::spawn(move || {
@@ -3508,9 +3602,260 @@ mod tests {
             stream.read_to_string(&mut response).unwrap();
             response
         });
-        let (server, _) = listener.accept().unwrap();
-        handle_with_services(server, state, || Ok(policy.clone()), gate_report).unwrap();
+        let http_request = server.recv().expect("test server received the request");
+        handle_with_services(http_request, state, || Ok(policy.clone()), gate_report).unwrap();
         client.join().unwrap()
+    }
+
+    /// Sends a fully raw request (no Authorization or Content-Length added)
+    /// at a real tiny_http server and returns the raw response. Used for
+    /// HTTP-layer integration tests: auth ordering, framing anomalies, and
+    /// malformed input.
+    fn raw_request_once(state: Arc<Server>, policy: &exec::Policy, raw: &str) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let raw = raw.to_owned();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        // tiny_http itself answers malformed request lines/headers with an
+        // empty 400 and closes; those never reach the handler.
+        if let Some(http_request) = server
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recv did not error")
+        {
+            handle_with_policy(http_request, state, || Ok(policy.clone())).unwrap();
+        }
+        client.join().unwrap()
+    }
+
+    fn test_policy() -> exec::Policy {
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap()
+    }
+
+    fn test_token() -> String {
+        "x".repeat(32)
+    }
+
+    #[test]
+    fn http_layer_rejects_malformed_input_with_400() {
+        let (state, state_path) = test_server();
+        let policy = test_policy();
+        for raw in [
+            "GARBAGE\r\n\r\n",
+            "GET\r\n\r\n",
+            "GET /v1/health\r\n\r\n",
+            "GET /v1/health HTTP/1.1\r\nNo-Colon-Here\r\n\r\n",
+        ] {
+            let response = raw_request_once(Arc::clone(&state), &policy, raw);
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{raw:?} -> {response:?}"
+            );
+        }
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn http_layer_enforces_auth_before_routing() {
+        let (state, state_path) = test_server();
+        let policy = test_policy();
+        let token = test_token();
+        // No credentials on a real route: 401, not 404.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            "GET /v1/health HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"unauthorized"}"#));
+        // Wrong token: 401.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            "GET /v1/health HTTP/1.1\r\nAuthorization: Bearer wrong\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response:?}"
+        );
+        // Authenticated unknown route: 404. Auth runs before routing.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "GET /nope HTTP/1.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"not_found"}"#));
+        // Wrong method on a real route: 404, like the old server.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "DELETE /v1/health HTTP/1.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "{response:?}"
+        );
+        // Health check works end to end.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "GET /v1/health HTTP/1.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+        assert!(response.ends_with(r#"{"status":"ok"}"#));
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn http_layer_rejects_framing_anomalies() {
+        let (state, state_path) = test_server();
+        let policy = test_policy();
+        let token = test_token();
+        // Conflicting duplicate Content-Length values: fail closed, never pick one.
+        // (The 5-byte body lets tiny_http's eager small-body read complete so
+        // the request reaches the conflict check; without it the truncated
+        // body aborts the connection first, which is equally fail-closed.)
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "POST /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 5\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"invalid content length"}"#));
+        // Unparseable Content-Length: 400.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "POST /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: bogus\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"invalid content length"}"#));
+        // Transfer-Encoding was never understood by the old server; reject it.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "POST /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"transfer encoding not supported"}"#));
+        // On the exec boundary the same anomaly stays an opaque denial.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "POST /v1/exec HTTP/1.1\r\nAuthorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response:?}");
+        assert!(response.ends_with(r#"{"id":"","error":"denied"}"#));
+        // Oversized non-exec body: 400, like the old server.
+        let response = raw_request_once(
+            Arc::clone(&state),
+            &policy,
+            &format!(
+                "POST /v1/events HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_BODY + 1
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response:?}"
+        );
+        assert!(response.ends_with(r#"{"error":"request body too large"}"#));
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn http_layer_supports_keep_alive_across_requests() {
+        let (state, state_path) = test_server();
+        let policy = test_policy();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let token = test_token();
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(address).unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut results = Vec::new();
+            for _ in 0..2 {
+                (&stream)
+                    .write_all(
+                        format!(
+                            "GET /v1/health HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                let mut status = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut status).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                results.push((status, body));
+            }
+            results
+        });
+        for _ in 0..2 {
+            let http_request = server
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recv did not error")
+                .expect("request arrived");
+            let state = Arc::clone(&state);
+            let policy = policy.clone();
+            handle_with_policy(http_request, state, move || Ok(policy.clone())).unwrap();
+        }
+        for (status, body) in client.join().unwrap() {
+            assert!(status.starts_with("HTTP/1.1 200 OK"), "{status:?}");
+            assert_eq!(body, br#"{"status":"ok"}"#.as_slice());
+        }
+        drop(state);
+        let _ = std::fs::remove_file(state_path);
     }
 
     fn response_json(response: String) -> Json {
