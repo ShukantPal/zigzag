@@ -2,7 +2,8 @@ use crate::events::{new_execution_id, relay_event};
 use crate::exec;
 use crate::github::github_open_pull_requests;
 use crate::proc::{
-    force_kill_process_group, managed_agent_running, recovered_agent_identity_matches, spawn_proc,
+    AgentSpawnDetails, force_kill_process_group, managed_agent_running,
+    recovered_agent_identity_matches, spawn_proc,
 };
 use crate::server::Server;
 use crate::session::require_gui_login_session;
@@ -2353,6 +2354,7 @@ fn spawn_codex_task(
             args,
         },
         execution_id,
+        AgentSpawnDetails::default(),
     )?;
     Ok(spawned.handle)
 }

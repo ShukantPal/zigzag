@@ -2,7 +2,7 @@ use crate::events::{new_execution_id, relay_event};
 use crate::exec;
 use crate::http::{denial_json, error, reply};
 use crate::logging;
-use crate::proc::spawn_proc;
+use crate::proc::{AgentSpawnDetails, spawn_proc};
 use crate::server::Server;
 use relay_core::{Json, parse_json};
 use std::net::TcpStream;
@@ -178,6 +178,7 @@ pub(crate) fn spawn_request(
         &path,
         request.command,
         execution_id.clone(),
+        AgentSpawnDetails::default(),
     ) {
         Ok(handle) => {
             log::info!("spawn id={} handle={}", handle.id, handle.handle);
