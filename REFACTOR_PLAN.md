@@ -3,16 +3,18 @@
 Status: research only. This document proposes a file move and the follow-up
 reference updates; no source files or directories were moved for this plan.
 
+The `poller/` component is omitted from this plan because the `zzapi` events
+stream provides the same event-streaming functionality.
+
 ## 1. Current top-level layout
 
-The tracked top-level project folders and their roles are:
+The top-level project folders covered by this refactor and their roles are:
 
 | Path | Contents and role |
 | --- | --- |
 | `relay/` | The `zigzag` daemon crate: HTTP/API routes, server, process and agent supervision, event/socket handling, provider and review-loop code, config schemas, prompts, integration tests, and the pinned Sigstore trust root. |
 | `relay-core/` | The `relay-core` library crate: shared JSON, durable store, agent registry, parsing, and secret-file helpers. |
 | `cli/` | The `zzapi` CLI crate and protocol integration tests. |
-| `poller/` | The `poller` event long-poll consumer crate. |
 | `dept/` | Python department/task tooling, relay status TUI, configuration, fixtures, tests, and department documentation/design notes. |
 | `docs/` | User and developer documentation, including architecture, daemon, CLI, configuration, operations, and review-system guides. |
 | `launchd/` | The macOS LaunchAgent plist template and installation instructions. |
@@ -27,15 +29,13 @@ be included in a source reorganization.
 
 ## 2. Cargo packages and dependency direction
 
-The root workspace currently declares `members = ["relay-core", "relay",
-"poller", "cli"]` with resolver 2 and shares version, edition, and license
-metadata.
+The refactored root workspace will declare `members = ["relay-core", "relay",
+"cli"]` with resolver 2 and share version, edition, and license metadata.
 
 | Package | Manifest path | Targets | Workspace dependencies |
 | --- | --- | --- | --- |
 | `relay-core` | `relay-core/Cargo.toml` | Library crate `relay_core` | None on other workspace packages |
 | `zigzag` | `relay/Cargo.toml` | Daemon binary `zigzag`, plus `e2e_binary` integration test | `relay-core` via `../relay-core` |
-| `poller` | `poller/Cargo.toml` | Poller binary | `relay-core` via `../relay-core` |
 | `zzapi` | `cli/Cargo.toml` | CLI binary `zzapi`, plus `protocol` integration test | None on other workspace packages |
 
 Dependency graph:
@@ -43,13 +43,12 @@ Dependency graph:
 ```text
              ┌───────────┐
              │ relay-core│
-             └─────▲─▲───┘
-                   │ │
-          ┌────────┘ └────────┐
-          │                   │
-     ┌────┴────┐         ┌────┴────┐
-     │ zigzag  │         │ poller  │
-     └─────────┘         └─────────┘
+             └─────▲─────┘
+                   │
+                   │
+              ┌────┴────┐
+              │ zigzag  │
+              └─────────┘
 
      ┌─────────┐
      │  zzapi  │  (no workspace-crate dependency)
@@ -69,7 +68,6 @@ deployment, and general repository tooling at their current top-level paths.
 | `relay-core/` | `zz/` | Rename package/crate `relay-core` / `relay_core` to `zz` / `zz` |
 | `cli/` | `zzapi/` | Keep package and executable `zzapi` |
 | `relay/` | `zzd/` | Keep package `zigzag` and executable `zigzag`; `zzd` is the source folder name |
-| `poller/` | `poller/` | Keep package and executable `poller` |
 
 Resulting top-level shape:
 
@@ -77,7 +75,6 @@ Resulting top-level shape:
 zz/          shared core library
 zzapi/       HTTP API client CLI
 zzd/         daemon implementation and its trust/config assets
-poller/      event poller
 dept/        Python tooling and status view
 docs/        repository documentation
 launchd/     macOS LaunchAgent material
@@ -94,25 +91,25 @@ name `relay-core`; that reduces source edits but leaves a path/name mismatch.
 
 ### Cargo changes
 
-1. Set workspace members to `zz`, `zzd`, `poller`, and `zzapi` (ordering is
+1. Set workspace members to `zz`, `zzd`, and `zzapi` (ordering is
    cosmetic); retain resolver 2 and shared workspace package metadata.
 2. Move each crate's manifest with its source/tests/assets.
-3. In `zzd/Cargo.toml` and `poller/Cargo.toml`, change the core dependency to
+3. In `zzd/Cargo.toml`, change the core dependency to
    `zz = { path = "../zz" }`.
 4. In the moved core manifest, set `[package].name = "zz"`; source references
    become `use zz::...` and qualified `zz::...` names.
 5. Regenerate/update `Cargo.lock` so its package and dependency entries use
    `zz` instead of `relay-core`. Registry dependency versions should not
    change as part of this move.
-6. Keep the daemon package `zigzag`, binary name `zigzag`, CLI package/binary
-   `zzapi`, and poller package/binary `poller`. Existing `cargo -p zigzag` and
-   `cargo -p zzapi` release/build invocations then remain valid.
+6. Keep the daemon package `zigzag`, binary name `zigzag`, and CLI
+   package/binary `zzapi`. Existing `cargo -p zigzag` and `cargo -p zzapi`
+   release/build invocations then remain valid.
 
 ### Source imports and path references
 
 Update all Rust imports and qualified names from `relay_core::` to `zz::` in
-the daemon and poller. Update comments referring to the crate name. The
-`zzapi` crate has no source dependency on the core.
+the daemon. Update comments referring to the crate name. The `zzapi` crate
+has no source dependency on the core.
 
 Update literal repository paths wherever they identify moved files. Known
 references include:
