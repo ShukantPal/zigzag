@@ -707,6 +707,8 @@ fn recovery_replays_a_persisted_first_output_fact() {
         first_output_at: Some("2026-01-02T03:04:05.006Z".to_owned()),
         first_output_stream: Some("stdout".to_owned()),
         first_output_bytes: Some(3),
+        restarted_from: None,
+        agent_config: None,
     };
     replay_recovered_lifecycle(&store, &agent).unwrap();
     let events = store.timeline("task").unwrap();
@@ -1540,6 +1542,8 @@ fn agent_record(id: &str) -> AgentRecord {
         first_output_stream: None,
         first_output_bytes: None,
         paused_at: None,
+        restarted_from: None,
+        agent_config: None,
     }
 }
 
@@ -1698,4 +1702,95 @@ fn agent_delete_terminates_process_group_and_keeps_worktree() {
         "",
     );
     assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+}
+
+#[test]
+fn agent_restart_endpoint_covers_success_and_guards() {
+    let (state, state_path) = test_server();
+    let policy = test_policy();
+    let worktree = std::env::temp_dir().to_string_lossy().into_owned();
+    let config = format!(
+        r#"{{"prompt":"continue","project_dir":"/repo","branch":"codex/restart","worktree":"{worktree}","model":null,"approval_mode":null,"timeout_secs":null}}"#
+    );
+    let mut stopped = agent_record("restartable");
+    stopped.state = "succeeded".to_owned();
+    state.supervisor.registry.register(stopped).unwrap();
+    state
+        .supervisor
+        .registry
+        .set_agent_config("restartable", &config)
+        .unwrap();
+
+    let resumed = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/restartable/restart",
+        r#"{"mode":"resume"}"#,
+    );
+    assert!(
+        resumed.ends_with(r#"{"error":"no_resumable_session"}"#),
+        "{resumed}"
+    );
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/restartable/restart",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response_json(response);
+    let restarted = body.object("id").and_then(Json::as_str).unwrap().to_owned();
+    assert_eq!(
+        body.object("restarted_from").and_then(Json::as_str),
+        Some("restartable")
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get(&restarted)
+            .unwrap()
+            .restarted_from
+            .as_deref(),
+        Some("restartable")
+    );
+
+    let mut paused = agent_record("paused-restart");
+    paused.state = "paused".to_owned();
+    paused.agent_config = Some(config.clone());
+    state.supervisor.registry.register(paused).unwrap();
+    let paused_response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/paused-restart/restart",
+        "",
+    );
+    assert!(paused_response.ends_with(r#"{"error":"agent_not_stopped"}"#));
+
+    let mut missing = agent_record("missing-worktree");
+    missing.state = "succeeded".to_owned();
+    missing.agent_config = Some(config.replace(&worktree, "/definitely/missing-worktree"));
+    state.supervisor.registry.register(missing).unwrap();
+    let missing_response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "POST",
+        "/v1/agents/missing-worktree/restart",
+        "",
+    );
+    assert!(missing_response.ends_with(r#"{"error":"worktree_missing"}"#));
+
+    let _ = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{restarted}"),
+        "",
+    );
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
 }

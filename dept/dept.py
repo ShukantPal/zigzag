@@ -301,19 +301,24 @@ def setup_task_dir(tid, project_dir, prompt, session_id=None, model=None, read_o
 
 
 def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
-                  read_only=False, task_id=None):
-    """Launch start/resume through one preparation, transport, and ledger path."""
+                  read_only=False, task_id=None, restarted_from=None):
+    """Launch start/resume/restart through one preparation, transport, and ledger path."""
     validate_model(model)
     tid = task_id or "t-" + uuid.uuid4().hex[:6]
     if not TASK_ID_RE.fullmatch(tid):
         sys.exit("invalid task id")
     relay_path = asset_path("relay-announce.md")
-    if not read_only and os.path.exists(relay_path):
+    # A restarted task reuses the stored prompt byte-for-byte; it already
+    # carries the SOP decoration and the relay announce block.
+    if not read_only and not restarted_from and os.path.exists(relay_path):
         with open(relay_path, "rb") as f:
             relay = f.read().replace(b"{{TASK_ID}}", tid.encode())
         prompt = prompt + b"\n\n---\n\n" + relay
     rdir = setup_task_dir(tid, project_dir, prompt, session_id, model, read_only)
-    action = "resumed" if session_id else "started"
+    if restarted_from:
+        action = "restarted"
+    else:
+        action = "resumed" if session_id else "started"
     if use_ssh:
         command = (f'resume "$(cat {shq(f"{rdir}/resume.txt")})" '
                    f'"$(cat {shq(f"{rdir}/prompt.txt")})" '
@@ -343,9 +348,12 @@ def dispatch_task(project_dir, prompt, use_ssh, session_id=None, model=None,
         transport = {"via": "relay", "proc": proc}
         detail = f"proc={proc[:12]}..."
     prefix = f"[resume {session_id[:8]}] " if session_id else ""
-    ledger_append({"id": tid, "project": project_dir, **transport, "status": "running",
-                   "read_only": read_only, "prompt_head": prefix + prompt.decode(errors="replace")[:200],
-                   "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
+    ledger_entry = {"id": tid, "project": project_dir, **transport, "status": "running",
+                    "read_only": read_only, "prompt_head": prefix + prompt.decode(errors="replace")[:200],
+                    "started_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if restarted_from:
+        ledger_entry["restarted_from"] = restarted_from
+    ledger_append(ledger_entry)
     session = f" session={session_id[:8]}" if session_id else ""
     # Keep this field present for both explicit overrides and the configured
     # default so cron callers have a stable, observable confirmation format.
@@ -374,6 +382,35 @@ def session_meta_cwd(lines):
             cwd = (record.get("payload") or {}).get("cwd")
             if isinstance(cwd, str) and cwd:
                 return cwd
+    return None
+
+
+def session_id_from_events(lines):
+    """Return a Codex thread/session id from structured JSONL event output."""
+    def find_id(value):
+        if isinstance(value, dict):
+            for key in ("thread_id", "session_id", "threadId", "sessionId"):
+                session_id = value.get(key)
+                if isinstance(session_id, str) and session_id:
+                    return session_id
+            for child in value.values():
+                found = find_id(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find_id(child)
+                if found:
+                    return found
+        return None
+
+    for line in lines:
+        try:
+            session_id = find_id(json.loads(line))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if session_id:
+            return session_id
     return None
 
 
@@ -452,6 +489,88 @@ def remote_status_detail(entry):
 
 def remote_status(entry):
     return remote_status_detail(entry)[0]
+
+
+def cmd_restart(args):
+    """Restart a stopped task: fresh Codex session (same worktree/prompt) or
+    resume the previous Codex session with full context. The restarted task
+    gets a new id linked via restarted_from; the old task's dir and logs are
+    preserved."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="dept.py restart")
+    ap.add_argument("task_id", help="id of the stopped task to restart")
+    ap.add_argument("--mode", choices=["fresh", "resume"], default="fresh",
+                    help="fresh: new Codex session with the original prompt "
+                         "(default); resume: continue the previous Codex session")
+    ap.add_argument("--ssh", action="store_true",
+                    help="launch over SSH+nohup instead of the relay")
+    ap.add_argument("--model", help="override the Codex model for the restarted task")
+    ns = ap.parse_args(args)
+
+    tid = ns.task_id
+    if not TASK_ID_RE.fullmatch(tid):
+        sys.exit("invalid task id")
+    matches = [e for e in ledger_read() if e["id"] == tid]
+    if not matches:
+        sys.exit(f"unknown task {tid}")
+    entry = matches[-1]
+
+    live = remote_status(entry) if entry.get("status") == "running" else entry.get("status")
+    if live == "RUNNING" or live == "running":
+        sys.exit(f"task {tid} is still running; kill it before restarting")
+
+    rdir = f"{REMOTE_DEPT}/{tid}"
+    # The stored prompt is already decorated (SOP + relay announce); reuse it
+    # as-is so the restarted task is byte-identical to the original launch.
+    r = ssh(f"cat {rdir}/prompt.txt", timeout=60)
+    if r.returncode != 0 or not r.stdout.strip():
+        sys.exit(f"task {tid} has no stored prompt; cannot restart")
+    prompt = r.stdout
+    r = ssh(f"cat {rdir}/dir.txt 2>/dev/null; echo ---; cat {rdir}/model.txt 2>/dev/null",
+            timeout=60)
+    parts = r.stdout.decode(errors="replace").split("---\n")
+    project_dir = parts[0].strip() if parts else ""
+    stored_model = parts[1].strip() if len(parts) > 1 else ""
+    if not project_dir:
+        sys.exit(f"task {tid} has no stored project dir; cannot restart")
+    if not remote_isdir(project_dir):
+        sys.exit(f"task {tid} worktree no longer exists: {project_dir}")
+    model = ns.model or stored_model or None
+    read_only = entry.get("read_only", False)
+
+    session_id = None
+    if ns.mode == "resume":
+        # The Codex session id is emitted in the task's --json event stream;
+        # scan the captured stdout for the thread/session identifier.
+        extractor = (
+            "import json\n"
+            f"path = {rdir!r} + '/events.jsonl'\n"
+            "def find_id(value):\n"
+            "    if isinstance(value, dict):\n"
+            "        for key in ('thread_id', 'session_id', 'threadId', 'sessionId'):\n"
+            "            if isinstance(value.get(key), str) and value[key]: return value[key]\n"
+            "        for child in value.values():\n"
+            "            found = find_id(child)\n"
+            "            if found: return found\n"
+            "    elif isinstance(value, list):\n"
+            "        for child in value:\n"
+            "            found = find_id(child)\n"
+            "            if found: return found\n"
+            "for line in open(path, errors='replace'):\n"
+            "    try: found = find_id(json.loads(line))\n"
+            "    except (TypeError, json.JSONDecodeError): continue\n"
+            "    if found:\n"
+            "        print(found)\n"
+            "        break\n"
+        )
+        r = ssh("python3", "-", stdin_data=extractor.encode(), timeout=60)
+        session_id = r.stdout.decode().strip()
+        if not session_id:
+            sys.exit(f"task {tid} has no resumable Codex session in its logs; "
+                     "use --mode fresh instead")
+
+    dispatch_task(project_dir, prompt, ns.ssh, session_id=session_id or None,
+                  model=model, read_only=read_only, restarted_from=tid)
 
 
 def cmd_kill(args):
@@ -595,11 +714,11 @@ def cmd_check(args):
 def management_main(argv):
     """Run department manager commands, including ``status TASK_ID``."""
     if not argv:
-        sys.exit("usage: dept.py <start|status|list|result|tokens|check|resume|kill> ...")
+        sys.exit("usage: dept.py <start|status|list|result|tokens|check|resume|kill|restart> ...")
     cmd, rest = argv[0], argv[1:]
     commands = {"start": cmd_start, "status": cmd_status, "list": cmd_list,
      "result": cmd_result, "tokens": cmd_tokens, "check": cmd_check,
-     "resume": cmd_resume, "kill": cmd_kill}
+     "resume": cmd_resume, "kill": cmd_kill, "restart": cmd_restart}
     handler = commands.get(cmd)
     if handler is None:
         print(f"unknown command: {cmd}", file=sys.stderr)

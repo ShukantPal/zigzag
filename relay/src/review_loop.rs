@@ -2919,6 +2919,8 @@ review_loop:
             first_output_at: None,
             first_output_stream: None,
             first_output_bytes: None,
+            restarted_from: None,
+            agent_config: None,
         }
     }
 

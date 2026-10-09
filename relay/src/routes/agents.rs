@@ -4,8 +4,8 @@ use crate::events::{
 use crate::exec;
 use crate::http::{error, query, reply};
 use crate::proc::{
-    AgentSpawnDetails, agent_transcript_path, kill_process_group, process_group_running,
-    recovered_agent_identity_matches, spawn_proc,
+    AgentSpawnDetails, agent_transcript_path, force_kill_process_group, kill_process_group,
+    managed_agent_running, process_group_running, recovered_agent_identity_matches, spawn_proc,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{WORKTREE_REPO_ROOT, canonical_worktree_roots};
@@ -88,6 +88,13 @@ pub(crate) enum AgentRoute<'a> {
     Transcript(&'a str),
     Pause(&'a str),
     Resume(&'a str),
+}
+
+/// POST-only route: `/v1/agents/{id}/restart`.
+pub(crate) fn agent_restart_route(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1/agents/")?;
+    let id = rest.strip_suffix("/restart")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 pub(crate) fn agent_route<'a>(method: &'a str, path: &'a str) -> Option<AgentRoute<'a>> {
     if path == "/v1/agents" {
@@ -731,14 +738,36 @@ fn agent_create_request(
             persist_transcript: true,
         },
     ) {
-        Ok(handle) => reply(
-            stream,
-            200,
-            Json::Object(vec![
-                ("id".to_owned(), Json::String(handle.handle)),
-                ("worktree".to_owned(), Json::String(worktree_str)),
-            ]),
-        ),
+        Ok(handle) => {
+            let config = persisted_agent_config(&request, &worktree_str);
+            if !matches!(
+                state
+                    .supervisor
+                    .registry
+                    .set_agent_config(&handle.handle, &config),
+                Ok(Some(_))
+            ) {
+                // A restartable API agent must not run before its durable
+                // launch metadata has been committed.
+                if let Some(agent) = state.supervisor.registry.get(&handle.handle) {
+                    let _ = force_kill_process_group(agent.process_group);
+                }
+                let _ = state.supervisor.registry.transition(
+                    &handle.handle,
+                    "agent_config_persist_failed",
+                    None,
+                );
+                return reply(stream, 500, error("could_not_persist_agent_config"));
+            }
+            reply(
+                stream,
+                200,
+                Json::Object(vec![
+                    ("id".to_owned(), Json::String(handle.handle)),
+                    ("worktree".to_owned(), Json::String(worktree_str)),
+                ]),
+            )
+        }
         Err(message) => {
             let _ = state.store.add(relay_event(
                 "process_failed",
@@ -753,6 +782,328 @@ fn agent_create_request(
             reply(stream, 500, error("could_not_spawn_process"))
         }
     }
+}
+
+fn persisted_agent_config(request: &AgentCreateRequest, worktree: &str) -> String {
+    Json::Object(vec![
+        ("prompt".to_owned(), Json::String(request.prompt.clone())),
+        (
+            "project_dir".to_owned(),
+            Json::String(request.project_dir.clone()),
+        ),
+        ("branch".to_owned(), Json::String(request.branch.clone())),
+        ("worktree".to_owned(), Json::String(worktree.to_owned())),
+        (
+            "model".to_owned(),
+            request
+                .model
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "approval_mode".to_owned(),
+            request
+                .approval_mode
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "timeout_secs".to_owned(),
+            request.timeout_secs.map(Json::number).unwrap_or(Json::Null),
+        ),
+    ])
+    .to_json()
+}
+
+struct AgentRestartConfig {
+    prompt: String,
+    worktree: String,
+    model: Option<String>,
+    approval_mode: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RestartMode {
+    Fresh,
+    Resume,
+}
+
+struct RestartRequest {
+    mode: RestartMode,
+    prompt: Option<String>,
+}
+
+fn parse_restart_request(body: &[u8]) -> Result<RestartRequest, &'static str> {
+    if body.is_empty() {
+        return Ok(RestartRequest {
+            mode: RestartMode::Fresh,
+            prompt: None,
+        });
+    }
+    let text = std::str::from_utf8(body).map_err(|_| "invalid_restart_request")?;
+    let Json::Object(fields) = parse_json(text).map_err(|_| "invalid_restart_request")? else {
+        return Err("invalid_restart_request");
+    };
+    if fields
+        .iter()
+        .any(|(name, _)| !matches!(name.as_str(), "mode" | "prompt"))
+    {
+        return Err("invalid_restart_request");
+    }
+    let mode = match fields.iter().find(|(key, _)| key == "mode") {
+        None => RestartMode::Fresh,
+        Some((_, value)) => match value.as_str() {
+            Some("fresh") => RestartMode::Fresh,
+            Some("resume") => RestartMode::Resume,
+            _ => return Err("invalid_restart_request"),
+        },
+    };
+    let prompt = match fields.iter().find(|(key, _)| key == "prompt") {
+        None => None,
+        Some((_, value)) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or("invalid_restart_request")?,
+        ),
+    };
+    Ok(RestartRequest { mode, prompt })
+}
+
+fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static str> {
+    let Json::Object(fields) = parse_json(text).map_err(|_| "invalid_agent_config")? else {
+        return Err("invalid_agent_config");
+    };
+    let required = |name: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or("invalid_agent_config")
+    };
+    let optional = |name: &str| -> Result<Option<String>, &'static str> {
+        match fields.iter().find(|(key, _)| key == name) {
+            None | Some((_, Json::Null)) => Ok(None),
+            Some((_, value)) => value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .map(Some)
+                .ok_or("invalid_agent_config"),
+        }
+    };
+    // Validate the complete creation schema; only launch-relevant fields are
+    // retained here, avoiding dead duplicate state.
+    required("project_dir")?;
+    required("branch")?;
+    if let Some((_, value)) = fields.iter().find(|(key, _)| key == "timeout_secs")
+        && !matches!(value, Json::Null)
+        && value.as_u64().is_none()
+    {
+        return Err("invalid_agent_config");
+    }
+    Ok(AgentRestartConfig {
+        prompt: required("prompt")?,
+        worktree: required("worktree")?,
+        model: optional("model")?,
+        approval_mode: optional("approval_mode")?,
+    })
+}
+
+fn restart_argv(
+    config: &AgentRestartConfig,
+    mode: RestartMode,
+    prompt: &str,
+    session: Option<&str>,
+) -> Result<Vec<String>, &'static str> {
+    let approval = match config.approval_mode.as_deref() {
+        None => "--approve-for-me",
+        Some("suggest") => "--suggest",
+        Some("auto-edit") => "--auto-edit",
+        Some("full-auto") => "--full-auto",
+        Some(_) => return Err("invalid_approval_mode"),
+    };
+    let mut args = vec![
+        "exec".to_owned(),
+        "--json".to_owned(),
+        approval.to_owned(),
+        "--skip-git-repo-check".to_owned(),
+    ];
+    if let Some(model) = &config.model {
+        if !valid_agent_model(model) {
+            return Err("invalid_model");
+        }
+        args.extend(["-m".to_owned(), model.clone()]);
+    }
+    match mode {
+        RestartMode::Fresh => args.extend([
+            "-C".to_owned(),
+            config.worktree.clone(),
+            "-o".to_owned(),
+            format!("{}/last-message.txt", config.worktree),
+            prompt.to_owned(),
+        ]),
+        RestartMode::Resume => args.extend([
+            "resume".to_owned(),
+            session.expect("resume session").to_owned(),
+            prompt.to_owned(),
+            "-o".to_owned(),
+            format!("{}/last-message.txt", config.worktree),
+        ]),
+    }
+    Ok(args)
+}
+
+fn extract_codex_session_id(registry: &relay_core::AgentRegistry, id: &str) -> Option<String> {
+    let logs = agent_logs_json(registry, id, "stdout", 0, None)?;
+    let Json::Array(records) = logs.object("records")? else {
+        return None;
+    };
+    let mut output = String::new();
+    for record in records {
+        if let Some(data) = record.object("data").and_then(Json::as_str) {
+            output.push_str(data);
+        }
+    }
+    serde_json::Deserializer::from_str(&output)
+        .into_iter::<serde_json::Value>()
+        .filter_map(Result::ok)
+        .find_map(|record| session_id_in_json(&record).map(str::to_owned))
+}
+
+fn session_id_in_json(value: &serde_json::Value) -> Option<&str> {
+    let object = value.as_object()?;
+    for key in ["thread_id", "session_id", "threadId", "sessionId"] {
+        if let Some(id) = object.get(key).and_then(serde_json::Value::as_str)
+            && !id.is_empty()
+            && id.len() < 128
+        {
+            return Some(id);
+        }
+    }
+    object.values().find_map(session_id_in_json)
+}
+
+pub(crate) fn agent_restart_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    id: &str,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    let request = match parse_restart_request(&body) {
+        Ok(request) => request,
+        Err(code) => return reply(stream, 400, error(code)),
+    };
+    let Some(agent) = state.supervisor.registry.get(id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if managed_agent_running(&agent) || agent.state == "paused" {
+        return reply(stream, 409, error("agent_not_stopped"));
+    }
+    let Some(config_text) = agent.agent_config.as_deref() else {
+        return reply(stream, 400, error("restart_config_missing"));
+    };
+    let config = match restart_config(config_text) {
+        Ok(config) => config,
+        Err(code) => return reply(stream, 500, error(code)),
+    };
+    if !Path::new(&config.worktree).is_absolute() || !Path::new(&config.worktree).is_dir() {
+        return reply(stream, 400, error("worktree_missing"));
+    }
+    let session = if request.mode == RestartMode::Resume {
+        match extract_codex_session_id(&state.supervisor.registry, id) {
+            Some(session) => Some(session),
+            None => return reply(stream, 400, error("no_resumable_session")),
+        }
+    } else {
+        None
+    };
+    let prompt = request.prompt.unwrap_or_else(|| match request.mode {
+        RestartMode::Fresh => config.prompt.clone(),
+        RestartMode::Resume => "Continue where you left off. Review the current worktree and proceed with the original task.".to_owned(),
+    });
+    let args = match restart_argv(&config, request.mode, &prompt, session.as_deref()) {
+        Ok(args) => args,
+        Err(code) => return reply(stream, 400, error(code)),
+    };
+    let _admission = match state.updater.spawn_admission() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 503, error("updates_draining")),
+        Err(_) => return reply(stream, 503, error("could_not_admit_process")),
+    };
+    let execution_id = new_execution_id().map_err(|_| "could_not_create_execution".to_owned())?;
+    if state
+        .store
+        .add(relay_event(
+            "relay_accepted",
+            &agent.task_id,
+            &execution_id,
+            Json::Object(vec![]),
+        ))
+        .is_err()
+    {
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
+    let spawned = match spawn_proc(
+        &state.supervisor,
+        Arc::clone(&state.store),
+        agent_codex_path(),
+        exec::ExecRequest {
+            id: agent.task_id.clone(),
+            bin: "codex".to_owned(),
+            args,
+        },
+        execution_id,
+        AgentSpawnDetails {
+            worktree_path: Some(config.worktree.clone()),
+            deadline_at: None,
+            persist_transcript: true,
+        },
+    ) {
+        Ok(spawned) => spawned,
+        Err(_) => return reply(stream, 500, error("restart_spawn_failed")),
+    };
+    if !matches!(
+        state
+            .supervisor
+            .registry
+            .set_restart_metadata(&spawned.handle, id, Some(config_text)),
+        Ok(Some(_))
+    ) {
+        if let Some(spawned_agent) = state.supervisor.registry.get(&spawned.handle) {
+            let _ = force_kill_process_group(spawned_agent.process_group);
+        }
+        let _ =
+            state
+                .supervisor
+                .registry
+                .transition(&spawned.handle, "restart_metadata_failed", None);
+        return reply(stream, 500, error("could_not_persist_restart_metadata"));
+    }
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(spawned.handle)),
+            ("restarted_from".to_owned(), Json::String(id.to_owned())),
+            ("worktree".to_owned(), Json::String(config.worktree)),
+            (
+                "mode".to_owned(),
+                Json::String(
+                    match request.mode {
+                        RestartMode::Fresh => "fresh",
+                        RestartMode::Resume => "resume",
+                    }
+                    .to_owned(),
+                ),
+            ),
+        ]),
+    )
 }
 
 /// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
