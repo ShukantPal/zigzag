@@ -12,6 +12,7 @@ pub(crate) struct Config {
     pub(crate) state_file: PathBuf,
     pub(crate) agent_registry_file: PathBuf,
     pub(crate) port: u16,
+    pub(crate) socket_port: u16,
     pub(crate) tailscale_ip: Option<IpAddr>,
     pub(crate) max_events: usize,
     pub(crate) github_watch_repos: Vec<String>,
@@ -28,6 +29,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
     let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
     let mut control_secret_file = env::var_os("ZIGZAG_CONTROL_SECRET_FILE").map(PathBuf::from);
     let mut port = 8765;
+    let mut socket_port = 8766;
     let mut tailscale_ip = None;
     let mut max_events = 1000;
     let mut github_watch_repos = Vec::new();
@@ -62,6 +64,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
             "--control-secret-file" => control_secret_file = Some(PathBuf::from(value(&mut values, "--control-secret-file")?)),
             "--state-file" => state_file = Some(PathBuf::from(value(&mut values, "--state-file")?)),
             "--port" => port = value(&mut values, "--port")?.parse().map_err(|_| "--port must be a valid u16".to_owned())?,
+            "--socket-port" => socket_port = value(&mut values, "--socket-port")?.parse().map_err(|_| "--socket-port must be a valid u16".to_owned())?,
             "--tailscale-ip" => {
                 let address = value(&mut values, "--tailscale-ip")?
                     .parse()
@@ -102,7 +105,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
             }
             "--update-policy" => update_policy = update::Policy::parse(&value(&mut values, "--update-policy")?)?,
             "--update-ready-file" => update_ready_file = Some(PathBuf::from(value(&mut values, "--update-ready-file")?)),
-            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--watch-pr-state PATH] [--watch-pr OWNER/REPO#NUMBER:SESSION] [--comment-router-live] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
+            "--help" | "-h" => return Err("usage: zigzag --secret-file PATH --state-file PATH [--control-secret-file PATH] [--port 8765] [--socket-port 8766] [--max-events 1000] [--watch-repo OWNER/REPO] [--watch-interval 30] [--watch-pr-state PATH] [--watch-pr OWNER/REPO#NUMBER:SESSION] [--comment-router-live] [--update-dir PATH] [--update-interval 3600] [--update-policy enabled|paused|pin:VERSION]".to_owned()),
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
@@ -134,6 +137,7 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         state_file,
         agent_registry_file,
         port,
+        socket_port,
         tailscale_ip,
         max_events,
         github_watch_repos,

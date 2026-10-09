@@ -382,7 +382,7 @@ fn transcript_json(
 /// continues to use the existing separate diagnostics spool. Older and
 /// generic agents have no transcript file and retain the original spool-only
 /// behavior.
-fn agent_logs_json(
+pub(crate) fn agent_logs_json(
     registry: &relay_core::AgentRegistry,
     id: &str,
     stream: &str,
