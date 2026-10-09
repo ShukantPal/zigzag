@@ -379,11 +379,11 @@ fn transcript_json(
     ]))
 }
 
-/// Read API-created Codex stdout from its durable JSONL transcript. Stderr
-/// continues to use the existing separate diagnostics spool. Older and
-/// generic agents have no transcript file and retain the original spool-only
-/// behavior.
-fn agent_logs_json(
+/// Read agent logs from the ordered diagnostics spool. API-created agents now
+/// tee stdout into that spool as well as their durable transcript, so live
+/// tails have one cursor across both streams. Agents created before that tee
+/// was introduced retain a transcript-only stdout fallback.
+pub(crate) fn agent_logs_json(
     registry: &relay_core::AgentRegistry,
     id: &str,
     stream: &str,
@@ -391,6 +391,9 @@ fn agent_logs_json(
     tail: Option<usize>,
 ) -> Option<Json> {
     let agent = registry.get(id)?;
+    if agent.stdout_next > 0 {
+        return registry.logs_json(id, stream, after, tail);
+    }
     let transcript = agent_transcript_path(id).and_then(|path| std::fs::read_to_string(path).ok());
     let Some(transcript) = transcript else {
         return registry.logs_json(id, stream, after, tail);
@@ -398,21 +401,24 @@ fn agent_logs_json(
 
     let stderr_logs = registry.logs_json(id, "stderr", after, tail)?;
     let mut records = Vec::new();
-    if matches!(stream, "stdout" | "both") && after == 0 {
-        let data = match tail {
-            Some(limit) if transcript.len() > limit => {
-                let mut start = transcript.len() - limit;
-                while !transcript.is_char_boundary(start) {
-                    start += 1;
-                }
-                transcript[start..].to_owned()
+    if matches!(stream, "stdout" | "both") && after < transcript.len() as u64 {
+        let mut start = usize::try_from(after)
+            .unwrap_or(usize::MAX)
+            .min(transcript.len());
+        if after == 0
+            && let Some(limit) = tail
+            && transcript.len() > limit
+        {
+            start = transcript.len() - limit;
+            while !transcript.is_char_boundary(start) {
+                start += 1;
             }
-            _ => transcript,
-        };
+        }
+        let data = transcript[start..].to_owned();
         if !data.is_empty() {
             records.push(Json::Object(vec![
                 ("stream".to_owned(), Json::String("stdout".to_owned())),
-                ("cursor".to_owned(), Json::number(0)),
+                ("cursor".to_owned(), Json::number(start as u64)),
                 ("data".to_owned(), Json::String(data)),
             ]));
         }

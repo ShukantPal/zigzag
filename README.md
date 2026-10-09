@@ -88,27 +88,53 @@ token as granting log access and rotate it after suspected exposure.
 After a relay restart, live process groups become `orphaned` (their former
 pipes cannot be reattached); dead groups become `lost_after_restart`. Terminal
 registry records and their bounded spool metadata are pruned after seven days.
-The relay remains HTTP only on loopback/Tailscale; the approved forwarding
-proxy terminates TLS for orchestrator-facing HTTPS. The bearer token and
+The relay keeps its HTTP API on loopback/Tailscale and also exposes a native
+TCP subscription port for interactive status clients. The bearer token and
 GUI-session Keychain allowlist are unchanged. The legacy kill route is only
 enabled when a distinct `--control-secret-file` (or
 `ZIGZAG_CONTROL_SECRET_FILE`) is configured.
+
+## Interactive socket protocol
+
+The relay listens on TCP port 8766 by default (`--socket-port` overrides it).
+Each frame is a four-byte big-endian length followed by one UTF-8 JSON object;
+there are no WebSocket, TLS, or new dependency requirements. The first frame
+must arrive within ten seconds and be:
+
+```json
+{"type":"auth","authorization":"Bearer <relay-token>"}
+```
+
+After `{"type":"authenticated"}`, clients send
+`{"type":"subscribe","topic":"…"}`. Topics are `agents` (a coalesced
+full snapshot on change), `events` (one frame per newly persisted event), and
+`logs.<agent-id>` (an opt-in live tail). Event delivery has a bounded
+256-frame queue; if a client falls behind it receives
+`{"topic":"events","dropped":true}` and must resynchronize through the
+unchanged HTTP events endpoint. `dept/status.py` prefers this socket after its
+HTTP bootstrap and automatically falls back to HTTP long-polling when the
+socket is unavailable.
+
+`zzapi events stream` is the command-line client for the event topic. It
+authenticates to the bidi socket and prints pushed event frames; pass
+`--socket-port` (or set `ZIGZAG_SOCKET_PORT`) when the relay does not use 8766.
 
 ## Network security: Tailscale ACLs
 
 The relay never binds to a public interface. On startup it listens on
 `127.0.0.1` and on the Mac's Tailscale IPv4 address (`100.64.0.0/10`,
 resolved via `tailscale ip -4`; `--tailscale-ip` overrides it for testing and
-is rejected unless it is a Tailscale IPv4 address). The default port is 8765.
+is rejected unless it is a Tailscale IPv4 address). The default HTTP port is
+8765 and the default interactive socket port is 8766.
 
 Binding to the tailnet is necessary but not sufficient: **Tailscale ACLs are
-the relay's network-level access control.** The relay speaks plain HTTP on the
-tailnet and every route requires the bearer token — but any tailnet device
-that can reach the port can attempt authentication indefinitely, probe for
-weaknesses, and burn relay resources. The ACL is what keeps that set to
-exactly the orchestrator. Tailscale's default ACL allows all tailnet traffic
-(`*` to `*:*`), so if you have never edited your ACLs, every device on your
-tailnet can already reach the relay's port.
+the relay's network-level access control.** The relay speaks plain HTTP and
+the authenticated subscription protocol on the tailnet — but any tailnet
+device that can reach either port can attempt authentication indefinitely,
+probe for weaknesses, and burn relay resources. The ACL is what keeps that
+set to exactly the orchestrator. Tailscale's default ACL allows all tailnet
+traffic (`*` to `*:*`), so if you have never edited your ACLs, every device on
+your tailnet can already reach the relay's ports.
 
 ### Recommended policy
 

@@ -542,6 +542,7 @@ fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
         ]
     };
     let config = server_config(base_arguments()).unwrap();
+    assert_eq!(config.socket_port, 8766);
     assert_eq!(
         config.review_state_file,
         PathBuf::from("/state").with_extension("reviews.json")
@@ -557,6 +558,9 @@ fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
     let config = server_config(arguments).unwrap();
     assert_eq!(config.github_watch_repos, ["leveled-inc/leveled"]);
     assert_eq!(config.github_watch_interval, Duration::from_secs(60));
+    let mut socket_arguments = base_arguments();
+    socket_arguments.extend(["--socket-port".to_owned(), "9876".to_owned()]);
+    assert_eq!(server_config(socket_arguments).unwrap().socket_port, 9876);
     let shadow_authoritative = review_loop::authoritative_mode(true);
     assert!(!shadow_authoritative);
     assert!(should_start_legacy_watch(

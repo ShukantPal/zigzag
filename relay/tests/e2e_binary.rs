@@ -83,6 +83,14 @@ impl TestRelay {
             .local_addr()
             .unwrap()
             .port();
+        // The relay now owns a second listener.  Give each concurrently run
+        // binary test its own socket port too; using the production default
+        // would make all but one daemon fail during startup.
+        let socket_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("could not find a free relay socket port")
+            .local_addr()
+            .unwrap()
+            .port();
         let mut child = Command::new(env!("CARGO_BIN_EXE_zigzag"))
             .arg("--secret-file")
             .arg(&secret_file)
@@ -90,6 +98,8 @@ impl TestRelay {
             .arg(&state_file)
             .arg("--port")
             .arg(port.to_string())
+            .arg("--socket-port")
+            .arg(socket_port.to_string())
             .env("PATH", path)
             .env("HOME", &dir)
             .env("ZIGZAG_UPDATE_POLICY", "paused")

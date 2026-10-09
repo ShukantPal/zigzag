@@ -64,6 +64,10 @@ zzapi proc get <proc-handle>
 # event stream (like the poller, but interactive)
 zzapi events --follow
 zzapi events --after 2800 --timeout 30
+# low-latency event push over the relay's authenticated bidi socket
+zzapi events stream
+# use a non-default relay socket port when needed
+zzapi events stream --socket-port 9876
 
 # review gate for a PR
 zzapi review-gate --repo leveled-inc/leveled --pr 1031
