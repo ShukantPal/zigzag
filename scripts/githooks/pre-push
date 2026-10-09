@@ -1,0 +1,10 @@
+#!/bin/sh
+# Keep the expensive Rust lint gate at push time while matching CI exactly.
+
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo 'pre-push: cargo clippy --locked --workspace --all-targets -- -D warnings'
+cargo clippy --locked --workspace --all-targets -- -D warnings
