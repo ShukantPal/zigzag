@@ -1589,13 +1589,17 @@ fn agent_create_worktree_roundtrip() {
     std::fs::create_dir_all(&root).unwrap();
     let repo = worktree_test_repo(&base);
     let worktree = root.join("codex-feature");
-    agent_create_worktree(&repo, &worktree, "codex/feature", &[]).unwrap();
+    let selected = agent_create_worktree(&repo, &worktree, "codex/feature", &[]).unwrap();
+    assert_eq!(selected, worktree);
     assert!(worktree.join(".git").exists());
     // A completed agent leaves its worktree available to the next agent.
     let mut completed = agent_record("completed-agent");
     completed.state = "succeeded".to_owned();
     completed.worktree_path = Some(worktree.to_string_lossy().into_owned());
-    agent_create_worktree(&repo, &worktree, "codex/feature", &[completed]).unwrap();
+    assert_eq!(
+        agent_create_worktree(&repo, &worktree, "codex/feature", &[completed]).unwrap(),
+        worktree.canonicalize().unwrap()
+    );
 
     // Running and paused agents retain exclusive use of the worktree.
     for state in ["running", "paused"] {
@@ -1611,14 +1615,30 @@ fn agent_create_worktree_roundtrip() {
         ));
     }
 
-    // A different path still cannot check out the same branch twice.
-    let error =
-        agent_create_worktree(&repo, &root.join("second"), "codex/feature", &[]).unwrap_err();
-    assert!(matches!(
-        error,
-        AgentWorktreeFailure::Validation(failure)
-            if failure.message == "worktree_branch_already_checked_out"
-    ));
+    // The standard path is reused even when the caller proposes another path.
+    assert_eq!(
+        agent_create_worktree(&repo, &root.join("second"), "codex/feature", &[]).unwrap(),
+        worktree.canonicalize().unwrap()
+    );
+
+    // A manually created checkout at a non-standard path is also reused.
+    let branch = "codex/task-survive-restart";
+    let manual_path = root.join("zigzag-task-survival");
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", branch])
+        .arg(&manual_path)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reused =
+        agent_create_worktree(&repo, &root.join("codex-task-survive-restart"), branch, &[])
+            .unwrap();
+    assert_eq!(reused, manual_path.canonicalize().unwrap());
     let _ = std::fs::remove_dir_all(base);
 }
 
