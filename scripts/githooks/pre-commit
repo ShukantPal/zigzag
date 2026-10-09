@@ -15,8 +15,9 @@ cd "$repo_root"
 # index or hooks directory.
 unset $(git rev-parse --local-env-vars)
 
-echo 'pre-commit: cargo fmt --all --check'
-cargo fmt --all --check
+echo 'pre-commit: cargo fmt --all'
+cargo fmt --all
+git add -u -- '*.rs'
 
 echo 'pre-commit: Python checks'
 python3 dept/config.py --check
