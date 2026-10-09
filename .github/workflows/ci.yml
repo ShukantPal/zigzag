@@ -33,6 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --locked --workspace --all-targets
       - run: cargo test --locked --workspace
       - name: Smoke-test daemon startup against legacy agent registry
@@ -71,6 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: bash -n scripts/codex-review-launch.sh
       - name: Smoke release signing policy
         # A release without Developer ID credentials must fail rather than
@@ -130,6 +132,18 @@ jobs:
           grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
           grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
+  full-stack-e2e:
+    # Drive the released binaries together: a real relay, zzapi, and the
+    # status TUI's live-relay view.  The script uses a fake long-lived Codex
+    # executable, so it verifies lifecycle side effects without credentials.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked -p zigzag -p zzapi
+      - run: bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi
+
   zzapi:
     # Build the zzapi CLI for macOS (Shukant's Mac) and Linux (Muse's VM).
     # Runs on every PR and main push; binaries are uploaded as artifacts
@@ -150,6 +164,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release --locked -p zzapi --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/zzapi ${{ matrix.artifact }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -174,6 +189,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
         with:
           toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Require Developer ID release signing credentials
         # Release candidates must satisfy the updater's Apple Team ID
         # requirement; never publish an ad-hoc update artifact.
