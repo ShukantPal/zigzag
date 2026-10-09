@@ -1,5 +1,6 @@
 //! Shared durable queue and JSON support for Zigzag.
 
+use chrono::{NaiveDate, SecondsFormat, Utc};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -1249,78 +1250,23 @@ pub fn parse_rfc3339_millis(value: &str) -> Option<u64> {
             .parse::<u64>()
             .ok()
     };
-    let year = number(0, 4)? as i64;
-    let month = number(5, 7)? as i64;
-    let day = number(8, 10)? as i64;
-    let hour = number(11, 13)?;
-    let minute = number(14, 16)?;
-    let second = number(17, 19)?;
-    let millis = number(20, 23)?;
-    if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let adjusted_year = year - i64::from(month <= 2);
-    let adjusted_month = month + if month <= 2 { 9 } else { -3 };
-    let era = if adjusted_year >= 0 {
-        adjusted_year
-    } else {
-        adjusted_year - 399
-    } / 400;
-    let yoe = adjusted_year - era * 400;
-    let doy = (153 * adjusted_month + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days)
-        .ok()?
-        .checked_mul(86_400_000)?
-        .checked_add((hour * 3_600 + minute * 60 + second) * 1_000)?
-        .checked_add(millis)
+    let year = number(0, 4)? as i32;
+    let month = number(5, 7)? as u32;
+    let day = number(8, 10)? as u32;
+    let hour = number(11, 13)? as u32;
+    let minute = number(14, 16)? as u32;
+    let second = number(17, 19)? as u32;
+    let millis = number(20, 23)? as u32;
+    let timestamp = NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_milli_opt(hour, minute, second, millis)?
+        .and_utc()
+        .timestamp_millis();
+    u64::try_from(timestamp).ok()
 }
 
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-/// RFC 3339 UTC with millisecond precision, without a time-formatting crate.
+/// RFC 3339 UTC with millisecond precision.
 pub fn rfc3339_timestamp() -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let (year, month, day) = civil_date(elapsed.as_secs() / 86_400);
-    let second_of_day = elapsed.as_secs() % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        second_of_day / 3_600,
-        (second_of_day % 3_600) / 60,
-        second_of_day % 60,
-        elapsed.subsec_millis()
-    )
-}
-
-// Howard Hinnant's civil-from-days algorithm, with 1970-01-01 as day zero.
-fn civil_date(days_since_epoch: u64) -> (i64, u32, u32) {
-    let z = days_since_epoch as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let day_of_year = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year, month as u32, day as u32)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 fn new_epoch() -> String {
     let now = SystemTime::now()
@@ -1812,6 +1758,47 @@ mod tests {
         assert!(parse_rfc3339_millis("2023-02-29T23:59:59.999Z").is_none());
         let generated = rfc3339_timestamp();
         assert!(parse_rfc3339_millis(&generated).is_some());
+    }
+
+    #[test]
+    fn rfc3339_millis_parsing_is_strict_and_handles_calendar_boundaries() {
+        for value in [
+            "2024-02-29T00:00:00.000Z",
+            "2000-02-29T00:00:00.000Z",
+            "2026-01-31T00:00:00.000Z",
+            "2026-12-31T00:00:00.000Z",
+            "2026-12-31T23:59:59.999Z",
+        ] {
+            assert!(parse_rfc3339_millis(value).is_some(), "{value}");
+        }
+        for value in [
+            "2023-02-29T00:00:00.000Z",
+            "1900-02-29T00:00:00.000Z",
+            "2026-04-31T00:00:00.000Z",
+            "2026-12-31T24:00:00.000Z",
+            "2026-12-31T12:60:00.000Z",
+            "2026-12-31T12:00:60.000Z",
+            "2026-12-31T12:00:00.000+00:00",
+            "2026-12-31T12:00:00Z",
+            "2026-12-31t12:00:00.000Z",
+            "2026-12-31T12:00:00.000z",
+            "2026-12-31T12:00:00.000Z trailing",
+        ] {
+            assert!(parse_rfc3339_millis(value).is_none(), "{value}");
+        }
+        assert_eq!(parse_rfc3339_millis("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_millis("2000-01-01T00:00:00.000Z"),
+            Some(946_684_800_000)
+        );
+    }
+
+    #[test]
+    fn generated_rfc3339_timestamp_is_current_and_parseable() {
+        let timestamp = rfc3339_timestamp();
+        let parsed = parse_rfc3339_millis(&timestamp).unwrap();
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap();
+        assert!(parsed.abs_diff(now) <= 5_000, "{timestamp}");
     }
 
     #[test]
