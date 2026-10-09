@@ -54,6 +54,16 @@ not be group/world readable and its content must be at least 32 bytes. For
 testing only, `--tailscale-ip` can set a specific Tailscale IPv4 address;
 ordinary operation discovers it using `tailscale ip -4`.
 
+## Native PR comment routing
+
+The native router polls conversation comments, inline review comments, and
+review bodies, then resumes the Codex session recorded for each watched PR.
+Its Mac-local session file defaults to `events.pr_sessions.json` beside the
+relay state file and is reloaded while the daemon runs. The router is live by
+default; `--comment-router-live` remains accepted as a compatibility flag and
+has no effect. Live resumes use the relay supervisor and shared
+session-operation gate.
+
 ## Mac-owned review loop
 
 Zigzag reads `~/.zigzag/config.yaml` once at daemon startup. The file is

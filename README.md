@@ -10,7 +10,7 @@ Zigzag is a Mac-hosted relay for dispatching and supervising Codex agents throug
 
 The daemon listens on loopback and the Mac's Tailscale address (HTTP on port `8765`; the bidirectional TCP event socket defaults to `8766`). Every API request requires the relay bearer token. Keep network access limited to trusted tailnet clients with a Tailscale ACL. See [architecture](docs/architecture.md) and [operations](docs/operations.md) for deployment details.
 
-The relay can also poll GitHub PR conversation comments, inline review comments, and review bodies, then resume the Codex session associated with that PR. Comment routing runs in shadow mode by default; enable live routing explicitly after reviewing the [LaunchAgent setup guide](launchd/INSTALL.md).
+The relay can poll GitHub PR conversation comments, inline review comments, and review bodies, then resume the Codex session recorded for that PR. Routing runs live by default, keys durable comment events by GitHub's GraphQL `node_id`, skips replies whose first line begins `> 🤖`, and dispatches Codex resumes through the relay supervisor and shared session-operation gate. The `--comment-router-live` flag remains accepted for compatibility and has no effect. See the [native PR comment routing installation guide](launchd/INSTALL.md#native-pr-comment-routing) for the Mac-local reloadable session file and LaunchAgent setup.
 
 ## Quickstart
 
