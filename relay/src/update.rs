@@ -331,6 +331,11 @@ impl Manager {
             return;
         }
         std::thread::spawn(move || {
+            // Check immediately when the relay starts (including after an
+            // update re-exec), then wait one full configured interval after
+            // each completed attempt. A slow check therefore lengthens the
+            // start-to-start cadence by its runtime; network requests below
+            // are bounded so a stalled GitHub connection cannot stop the loop.
             loop {
                 if let Err(error) = self.check_and_apply(
                     active_work.as_ref(),
@@ -443,6 +448,9 @@ impl Manager {
         if !self.begin_drain()? {
             return Ok(());
         }
+        // Discovery and verification above run while agents are active. Only
+        // applying an already verified candidate waits for running work to
+        // finish, and draining prevents new work from extending this wait.
         while active_work() {
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -479,6 +487,10 @@ impl Manager {
                 "--silent",
                 "--show-error",
                 "--location",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
                 "https://api.github.com/repos/ShukantPal/zigzag/releases/latest",
             ],
         )?;
@@ -842,6 +854,10 @@ fn download(runtime: &dyn Runtime, url: &str, output: &Path) -> Result<(), Strin
             "--silent",
             "--show-error",
             "--location",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
             "--output",
             &temporary.to_string_lossy(),
             url,
@@ -1316,6 +1332,17 @@ mod tests {
         assert_eq!(fs::read(candidate).unwrap(), b"binary");
 
         let calls = runtime.calls();
+        let curl_calls = calls
+            .iter()
+            .filter(|call| call.command == "curl")
+            .collect::<Vec<_>>();
+        assert_eq!(curl_calls.len(), 3);
+        assert!(curl_calls.iter().all(|call| {
+            call.args
+                .windows(2)
+                .any(|args| args == ["--connect-timeout", "10"])
+                && call.args.iter().any(|arg| arg == "--max-time")
+        }));
         let attestations = calls
             .iter()
             .filter(|call| call.command == "gh")
