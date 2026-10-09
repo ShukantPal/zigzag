@@ -51,7 +51,9 @@ fn read_socket_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
 
 fn write_socket_frame(stream: &mut std::net::TcpStream, value: &serde_json::Value) {
     let body = serde_json::to_vec(value).unwrap();
-    stream.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .unwrap();
     stream.write_all(&body).unwrap();
 }
 
