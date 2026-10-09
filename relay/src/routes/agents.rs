@@ -7,6 +7,7 @@ use crate::proc::{
     AgentSpawnDetails, agent_transcript_path, force_kill_process_group, kill_process_group,
     managed_agent_running, process_group_running, recovered_agent_identity_matches, spawn_proc,
 };
+use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::{
     WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
     valid_worktree_branch, worktree_branch_checked_out, worktree_branch_exists,
@@ -657,12 +658,11 @@ fn agent_create_request(
         approval_flag.to_owned(),
         "--skip-git-repo-check".to_owned(),
     ];
-    if let Some(model) = &request.model {
-        if !valid_agent_model(model) {
-            return reply(stream, 400, error("invalid_model"));
-        }
-        codex_args.extend(["-m".to_owned(), model.clone()]);
+    let model = request.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
+    if !valid_agent_model(model) {
+        return reply(stream, 400, error("invalid_model"));
     }
+    codex_args.extend(["-m".to_owned(), model.to_owned()]);
     let worktree_str = worktree_path.to_string_lossy().into_owned();
     codex_args.extend([
         "-C".to_owned(),
@@ -953,12 +953,11 @@ pub(crate) fn restart_argv(
         approval.to_owned(),
         "--skip-git-repo-check".to_owned(),
     ];
-    if let Some(model) = &config.model {
-        if !valid_agent_model(model) {
-            return Err("invalid_model");
-        }
-        args.extend(["-m".to_owned(), model.clone()]);
+    let model = config.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
+    if !valid_agent_model(model) {
+        return Err("invalid_model");
     }
+    args.extend(["-m".to_owned(), model.to_owned()]);
     match mode {
         RestartMode::Fresh => args.extend([
             "-C".to_owned(),

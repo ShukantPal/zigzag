@@ -85,6 +85,9 @@ pub(crate) const PROVIDER_NAMES: &[&str] = &["codex", "gemini", "opencode", "gro
 /// Default provider when the API request omits one.
 pub(crate) const DEFAULT_PROVIDER: &str = "codex";
 
+/// Model passed to Codex when an agent request does not specify one.
+pub(crate) const DEFAULT_CODEX_MODEL: &str = "gpt-6-luna";
+
 // --- Codex ---
 
 pub(crate) struct CodexProvider;
@@ -108,10 +111,13 @@ impl Provider for CodexProvider {
             "-C".to_owned(),
             opts.project_dir.clone(),
         ];
-        if let Some(model) = &opts.model {
-            argv.push("--model".to_owned());
-            argv.push(model.clone());
-        }
+        argv.push("--model".to_owned());
+        argv.push(
+            opts.model
+                .as_deref()
+                .unwrap_or(DEFAULT_CODEX_MODEL)
+                .to_owned(),
+        );
         argv.push(opts.prompt.clone());
         Ok(argv)
     }
@@ -245,6 +251,10 @@ mod tests {
         assert!(argv.contains(&"--json".to_owned()));
         assert!(argv.contains(&"-C".to_owned()));
         assert!(argv.contains(&"/tmp/proj".to_owned()));
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--model", DEFAULT_CODEX_MODEL])
+        );
         assert_eq!(argv.last().unwrap(), "hello");
     }
 
@@ -274,9 +284,9 @@ mod tests {
     #[test]
     fn model_flag_propagates() {
         let mut o = opts();
-        o.model = Some("gpt-5".to_owned());
+        o.model = Some("gpt-6-astra".to_owned());
         let argv = CodexProvider.spawn_argv(&o).unwrap();
         let i = argv.iter().position(|a| a == "--model").unwrap();
-        assert_eq!(argv[i + 1], "gpt-5");
+        assert_eq!(argv[i + 1], "gpt-6-astra");
     }
 }

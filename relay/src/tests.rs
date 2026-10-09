@@ -30,6 +30,7 @@ use crate::proc::{
     process_group_running, process_identity, prune_procs, recovered_agent_identity_matches,
     spawn_proc, unique_handle,
 };
+use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_create_worktree, agent_route, default_agent_worktree,
@@ -1439,13 +1440,13 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
 #[test]
 fn agent_create_request_parsing_and_helpers() {
     let request = parse_agent_create_request(
-        br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-5","approval_mode":"full-auto","timeout_secs":3600}"#,
+        br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-6-luna","approval_mode":"full-auto","timeout_secs":3600}"#,
     )
     .unwrap();
     assert_eq!(request.prompt, "do it");
     assert_eq!(request.project_dir, "/Users/shukant/Workspace/repo");
     assert_eq!(request.branch, "codex/x");
-    assert_eq!(request.model.as_deref(), Some("gpt-5"));
+    assert_eq!(request.model.as_deref(), Some(DEFAULT_CODEX_MODEL));
     assert_eq!(request.approval_mode.as_deref(), Some("full-auto"));
     assert_eq!(request.timeout_secs, Some(3600));
     assert!(request.worktree.is_none());
@@ -1510,6 +1511,28 @@ fn restart_config_replays_prompt_contents_timeout_and_argv() {
             .any(|args| args == ["resume", "thread-123"])
     );
     assert!(resumed.iter().any(|arg| arg == "continue from override"));
+}
+
+#[test]
+fn restart_argv_uses_luna_when_the_original_request_omitted_a_model() {
+    let request = parse_agent_create_request(
+        br#"{"prompt":"continue","project_dir":"/repo","branch":"codex/restart"}"#,
+    )
+    .unwrap();
+    let persisted = persisted_agent_config(&request, "/tmp/worktree", "continue");
+    let config = restart_config(&persisted).unwrap();
+
+    let argv = restart_argv(
+        &config,
+        super::routes::agents::RestartMode::Fresh,
+        &config.prompt,
+        None,
+    )
+    .unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|args| args == ["-m", DEFAULT_CODEX_MODEL])
+    );
 }
 
 #[test]
