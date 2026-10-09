@@ -424,33 +424,33 @@ pub(crate) fn agent_logs_json(
             ]));
         }
     }
-    if matches!(stream, "stderr" | "both") {
-        if after == 0 {
-            if let Some(stderr) = durable_stderr.as_deref() {
-                let data = match tail {
-                    Some(limit) if stderr.len() > limit => {
-                        let mut start = stderr.len() - limit;
-                        while !stderr.is_char_boundary(start) {
-                            start += 1;
-                        }
-                        stderr[start..].to_owned()
-                    }
-                    _ => stderr.to_owned(),
-                };
-                if !data.is_empty() {
-                    records.push(Json::Object(vec![
-                        ("stream".to_owned(), Json::String("stderr".to_owned())),
-                        ("cursor".to_owned(), Json::number(0)),
-                        ("data".to_owned(), Json::String(data)),
-                    ]));
+    if matches!(stream, "stderr" | "both")
+        && after == 0
+        && let Some(stderr) = durable_stderr.as_deref()
+    {
+        let data = match tail {
+            Some(limit) if stderr.len() > limit => {
+                let mut start = stderr.len() - limit;
+                while !stderr.is_char_boundary(start) {
+                    start += 1;
                 }
+                stderr[start..].to_owned()
             }
+            _ => stderr.to_owned(),
+        };
+        if !data.is_empty() {
+            records.push(Json::Object(vec![
+                ("stream".to_owned(), Json::String("stderr".to_owned())),
+                ("cursor".to_owned(), Json::number(0)),
+                ("data".to_owned(), Json::String(data)),
+            ]));
         }
-        if durable_stderr.is_none()
-            && let Some(Json::Array(stderr_records)) = stderr_logs.object("records")
-        {
-            records.extend(stderr_records.iter().cloned());
-        }
+    }
+    if matches!(stream, "stderr" | "both")
+        && durable_stderr.is_none()
+        && let Some(Json::Array(stderr_records)) = stderr_logs.object("records")
+    {
+        records.extend(stderr_records.iter().cloned());
     }
     Some(Json::Object(vec![
         ("records".to_owned(), Json::Array(records)),
