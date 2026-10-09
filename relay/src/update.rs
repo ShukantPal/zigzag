@@ -414,7 +414,7 @@ impl Manager {
         }
         let asset_url = release_asset_url(&release, MANIFEST)?;
         let manifest_path = self.config.directory.join("candidate-manifest.json");
-        download(self.runtime.as_ref(), &asset_url, &manifest_path)?;
+        download(&asset_url, &manifest_path)?;
         // The manifest is itself an attested subject. This binds its version to
         // the trusted workflow before release metadata can influence monotonicity.
         verify_attestation(
@@ -438,7 +438,7 @@ impl Manager {
         fs::create_dir_all(&candidate_dir)
             .map_err(|e| format!("could not create update directory: {e}"))?;
         let candidate = candidate_dir.join("zigzag");
-        download(self.runtime.as_ref(), &binary_url, &candidate)?;
+        download(&binary_url, &candidate)?;
         if sha256_file(&candidate)? != manifest.sha256 {
             let _ = fs::remove_file(&candidate);
             return Err("release binary digest does not match manifest".to_owned());
@@ -735,28 +735,36 @@ fn verify_attestation(
     runtime.status("gh", &args)
 }
 
-fn download(runtime: &dyn Runtime, url: &str, output: &Path) -> Result<(), String> {
+fn download(url: &str, output: &Path) -> Result<(), String> {
     let parent = output
         .parent()
         .ok_or_else(|| "download path has no parent".to_owned())?;
     fs::create_dir_all(parent).map_err(|e| format!("could not create update directory: {e}"))?;
     let temporary = output.with_extension("download");
     let _ = fs::remove_file(&temporary);
-    command_status(
-        runtime,
-        "curl",
-        [
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--output",
-            &temporary.to_string_lossy(),
-            url,
-        ],
-    )?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+    // Replaces curl --fail/--silent/--show-error/--location/--output.
+    // Redirects are followed and HTTP error statuses surface as errors.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(300)))
+        .build()
+        .into();
+    let mut response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(format!("download of {url} failed with HTTP status {code}"));
+        }
+        Err(error) => return Err(format!("download of {url} failed: {error}")),
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
+        .map_err(|e| format!("could not create download file: {e}"))?;
+    file.set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
+    std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+        .map_err(|e| format!("download of {url} failed while writing: {e}"))?;
     fs::rename(temporary, output).map_err(|e| e.to_string())
 }
 
@@ -1012,7 +1020,6 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
@@ -1028,7 +1035,6 @@ mod tests {
 
     struct MockRuntime {
         release: String,
-        downloads: Mutex<VecDeque<Vec<u8>>>,
         codesign_detail: String,
         calls: Mutex<Vec<Call>>,
         status_index: AtomicUsize,
@@ -1037,15 +1043,22 @@ mod tests {
     }
 
     impl MockRuntime {
-        fn release(manifest: &str, binary: &[u8]) -> Arc<Self> {
+        fn release(base_url: &str) -> Arc<Self> {
             Arc::new(Self {
-                release: r#"{"tag_name":"v2.0.0","assets":[{"name":"zigzag-macos-aarch64.manifest.json","browser_download_url":"https://example.test/manifest"},{"name":"zigzag-macos-aarch64","browser_download_url":"https://example.test/binary"}]}"#.to_owned(),
-                downloads: Mutex::new(VecDeque::from([
-                    manifest.as_bytes().to_vec(),
-                    binary.to_vec(),
-                ])),
-                codesign_detail:
-                    "Identifier=com.shukantpal.zigzag\nTeamIdentifier=NH5F3PDHQ8\n".to_owned(),
+                release: [
+                    r#"{"tag_name":"v2.0.0","assets":[{"name":""#,
+                    MANIFEST,
+                    r#"","browser_download_url":""#,
+                    base_url,
+                    r#"/manifest"},{"name":""#,
+                    BINARY,
+                    r#"","browser_download_url":""#,
+                    base_url,
+                    r#"/binary"}]}"#,
+                ]
+                .concat(),
+                codesign_detail: "Identifier=com.shukantpal.zigzag\nTeamIdentifier=NH5F3PDHQ8\n"
+                    .to_owned(),
                 calls: Mutex::new(Vec::new()),
                 status_index: AtomicUsize::new(0),
                 fail_status_at: None,
@@ -1092,20 +1105,6 @@ mod tests {
                 command: command.to_owned(),
                 args: args.to_vec(),
             });
-            if command == "curl" {
-                let output_index = args
-                    .iter()
-                    .position(|arg| arg == "--output")
-                    .expect("curl output argument")
-                    + 1;
-                let bytes = self
-                    .downloads
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("queued download");
-                fs::write(&args[output_index], bytes).unwrap();
-            }
             if self.fail_status_at == Some(index) {
                 return Err(if command == "gh" {
                     "attestation verification failed".to_owned()
@@ -1155,6 +1154,43 @@ mod tests {
             });
             Err("exec intercepted".to_owned())
         }
+    }
+
+    /// Serves each `(status, body)` pair over plain HTTP on 127.0.0.1, one
+    /// response per connection, then returns. Join the handle once the
+    /// expected requests have completed.
+    fn serve_responses(responses: Vec<(u16, Vec<u8>)>) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    match status {
+                        200 => "OK",
+                        404 => "Not Found",
+                        _ => "Error",
+                    },
+                    body.len(),
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        (port, handle)
     }
 
     static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1213,7 +1249,11 @@ mod tests {
     fn fetch_candidate_verifies_every_authenticated_boundary() {
         let dir = temp_dir("fetch-ok");
         let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
-        let runtime = MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary");
+        let (port, server) = serve_responses(vec![
+            (200, manifest("v2.0.0", TARGET, &digest).into_bytes()),
+            (200, b"binary".to_vec()),
+        ]);
+        let runtime = MockRuntime::release(&format!("http://127.0.0.1:{port}"));
         let updater = manager(&dir, runtime.clone(), None);
 
         let (verified, candidate) = updater
@@ -1262,6 +1302,7 @@ mod tests {
         }));
         let root = fs::read_to_string(dir.join("sigstore-trusted-root.json")).unwrap();
         assert!(root.contains("fulcio.githubapp.com"));
+        server.join().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1276,6 +1317,7 @@ mod tests {
                 None,
                 None,
                 "version or target",
+                1,
             ),
             (
                 "v2.0.0",
@@ -1284,8 +1326,9 @@ mod tests {
                 None,
                 None,
                 "version or target",
+                1,
             ),
-            ("v2.0.0", TARGET, "b".repeat(64), None, None, "digest"),
+            ("v2.0.0", TARGET, "b".repeat(64), None, None, "digest", 2),
             (
                 "v2.0.0",
                 TARGET,
@@ -1293,20 +1336,27 @@ mod tests {
                 Some("bad identity"),
                 None,
                 "code-signing",
+                2,
             ),
             (
                 "v2.0.0",
                 TARGET,
                 digest.clone(),
                 None,
-                Some(4),
+                Some(2),
                 "attestation",
+                2,
             ),
         ];
-        for (tag, target, manifest_digest, detail, fail_at, expected) in cases {
+        for (tag, target, manifest_digest, detail, fail_at, expected, downloads) in cases {
             let dir = temp_dir(expected);
-            let mut runtime =
-                MockRuntime::release(&manifest(tag, target, &manifest_digest), b"binary");
+            let mut responses = vec![
+                (200, manifest(tag, target, &manifest_digest).into_bytes()),
+                (200, b"binary".to_vec()),
+            ];
+            responses.truncate(downloads);
+            let (port, server) = serve_responses(responses);
+            let mut runtime = MockRuntime::release(&format!("http://127.0.0.1:{port}"));
             let inner = Arc::get_mut(&mut runtime).unwrap();
             if let Some(detail) = detail {
                 inner.codesign_detail = detail.to_owned();
@@ -1315,6 +1365,7 @@ mod tests {
             let updater = manager(&dir, runtime, None);
             let error = updater.fetch_candidate(&empty_status()).unwrap_err();
             assert!(error.contains(expected), "{error}");
+            server.join().unwrap();
             let _ = fs::remove_dir_all(dir);
         }
     }
@@ -1324,7 +1375,6 @@ mod tests {
         let dir = temp_dir("failed-check");
         let runtime = Arc::new(MockRuntime {
             release: "not json".to_owned(),
-            downloads: Mutex::new(VecDeque::new()),
             codesign_detail: String::new(),
             calls: Mutex::new(Vec::new()),
             status_index: AtomicUsize::new(0),
@@ -1356,7 +1406,11 @@ mod tests {
     fn drain_waits_for_admitted_spawn_and_active_work_before_exec() {
         let dir = temp_dir("drain");
         let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
-        let runtime = MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary");
+        let (port, server) = serve_responses(vec![
+            (200, manifest("v2.0.0", TARGET, &digest).into_bytes()),
+            (200, b"binary".to_vec()),
+        ]);
+        let runtime = MockRuntime::release(&format!("http://127.0.0.1:{port}"));
         let updater = Arc::new(manager(&dir, runtime.clone(), None));
         save_status(&dir, &empty_status()).unwrap();
 
@@ -1396,6 +1450,7 @@ mod tests {
         active.store(false, Ordering::Release);
         assert!(check.join().unwrap().is_err());
         assert_eq!(runtime.exec_calls().len(), 1);
+        server.join().unwrap();
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1407,7 +1462,7 @@ mod tests {
         fs::write(&previous, b"old").unwrap();
         fs::write(&candidate, b"new").unwrap();
         replace_symlink(&previous, &dir.join("last-known-good")).unwrap();
-        let mut runtime = MockRuntime::release("", b"");
+        let mut runtime = MockRuntime::release("");
         Arc::get_mut(&mut runtime).unwrap().fail_spawn = true;
         let updater = manager(&dir, runtime, None);
         let result = updater.activate_and_exec(
@@ -1444,7 +1499,7 @@ mod tests {
         replace_symlink(&candidate, &current).unwrap();
         save_status(&dir, &empty_status()).unwrap();
 
-        let runtime = MockRuntime::release("", b"");
+        let runtime = MockRuntime::release("");
         let updater = manager(&dir, runtime.clone(), Some(ready.clone()));
         updater.acknowledge_ready(Some("v2.0.0")).unwrap();
         assert!(ready.exists());
@@ -1573,6 +1628,43 @@ mod tests {
             sha256_file(&empty).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn download_streams_body_to_output_atomically() {
+        let dir = temp_dir("download-ok");
+        let (port, server) = serve_responses(vec![(200, b"payload".to_vec())]);
+        let output = dir.join("zigzag");
+        download(&format!("http://127.0.0.1:{port}/zigzag"), &output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"payload");
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!dir.join("zigzag.download").exists());
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn download_reports_http_and_transport_failures() {
+        let dir = temp_dir("download-err");
+        let (port, server) = serve_responses(vec![(404, b"nope".to_vec())]);
+        let output = dir.join("zigzag");
+        let error = download(&format!("http://127.0.0.1:{port}/zigzag"), &output).unwrap_err();
+        assert!(error.contains("404"), "{error}");
+        assert!(!output.exists());
+        server.join().unwrap();
+
+        // Nothing listening here: a transport failure must error, never
+        // silently succeed.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let error =
+            download(&format!("http://127.0.0.1:{closed_port}/zigzag"), &output).unwrap_err();
+        assert!(!error.is_empty(), "transport failure produced no error");
         let _ = fs::remove_dir_all(dir);
     }
 

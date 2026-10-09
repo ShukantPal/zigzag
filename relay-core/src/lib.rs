@@ -1,4 +1,4 @@
-//! Shared durable queue and deliberately small JSON support for Zigzag.
+//! Shared durable queue and JSON support for Zigzag.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -112,7 +112,13 @@ impl AgentRegistry {
             let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
         }
         let records = match fs::read_to_string(&path) {
-            Ok(text) => decode_agents(&text)?,
+            Ok(text) => {
+                let (records, skipped) = decode_agents(&text);
+                for warning in skipped {
+                    eprintln!("zigzag: skipping agent registry record: {}", warning);
+                }
+                records
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(_) => return Err("could not read agent registry".to_owned()),
         };
@@ -443,7 +449,7 @@ impl AgentRegistry {
 }
 
 fn agent_json(entry: &AgentRecord) -> Json {
-    Json::Object(vec![
+    let fields: Vec<(String, Json)> = vec![
         ("id".to_owned(), Json::String(entry.id.clone())),
         ("task_id".to_owned(), Json::String(entry.task_id.clone())),
         (
@@ -531,98 +537,124 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .map(Json::number)
                 .unwrap_or(Json::Null),
         ),
-    ])
+    ];
+    // Omit null fields instead of writing explicit nulls.
+    // The reader handles both forms, but omitting avoids round-trip
+    // issues with parsers that do not expect explicit nulls.
+    Json::Object(
+        fields
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, Json::Null))
+            .collect(),
+    )
 }
-fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentRecord>, String> {
+
+fn decode_agents(text: &str) -> (std::collections::BTreeMap<String, AgentRecord>, Vec<String>) {
+    let mut skipped: Vec<String> = Vec::new();
     let values = match parse_json(text)
         .ok()
         .and_then(|v| v.object("agents").cloned())
     {
         Some(Json::Array(values)) => values,
-        _ => return Err("invalid agent registry".to_owned()),
+        _ => {
+            skipped.push("registry root: missing or invalid 'agents' array".to_owned());
+            return (std::collections::BTreeMap::new(), skipped);
+        }
     };
     let mut entries = std::collections::BTreeMap::new();
-    for value in values {
-        let get = |key: &str| value.object(key);
-        let text = |key| {
-            get(key)
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| "invalid agent registry".to_owned())
-        };
-        // Registries written by older daemons encode some numeric fields as
-        // strings.  Accept either form.
-        let integer = |value: Option<&Json>| {
-            value.and_then(|value| match value {
-                Json::Number(_) => value.as_u64(),
-                Json::String(text) => text.parse::<u64>().ok(),
-                _ => None,
-            })
-        };
-        let required_integer =
-            |key| integer(get(key)).ok_or_else(|| "invalid agent registry".to_owned());
-        let optional_integer = |key| match get(key) {
-            Some(Json::Null) | None => Ok(None),
-            value => integer(value)
-                .map(Some)
-                .ok_or_else(|| "invalid agent registry".to_owned()),
-        };
-        let record = AgentRecord {
-            id: text("id")?,
-            task_id: text("task_id")?,
-            // Registry files written before audit trails had no execution
-            // identifier.  The agent handle is a safe one-to-one fallback.
-            execution_id: get("execution_id")
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| text("id").unwrap_or_default()),
-            leader_pid: required_integer("leader_pid")? as i32,
-            process_group: required_integer("process_group")? as i32,
-            process_identity: match get("process_identity") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            started_at: match get("started_at") {
-                Some(Json::String(value)) => value.clone(),
-                Some(Json::Number(value)) => value.clone(),
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            deadline_at: match get("deadline_at") {
-                Some(Json::String(v)) => Some(v.clone()),
-                Some(Json::Null) => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            command: text("command")?,
-            state: text("state")?,
-            exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
-            log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
-            audit_degraded: get("audit_degraded")
-                .and_then(Json::as_bool)
-                .unwrap_or(false),
-            redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
-            stdout_next: required_integer("stdout_next")?,
-            stderr_next: required_integer("stderr_next")?,
-            stdout_dropped_before: required_integer("stdout_dropped_before")?,
-            stderr_dropped_before: required_integer("stderr_dropped_before")?,
-            log_next: required_integer("log_next")?,
-            log_dropped_before: required_integer("log_dropped_before")?,
-            first_output_at: match get("first_output_at") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            first_output_stream: match get("first_output_stream") {
-                Some(Json::String(value)) => Some(value.clone()),
-                Some(Json::Null) | None => None,
-                _ => return Err("invalid agent registry".to_owned()),
-            },
-            first_output_bytes: optional_integer("first_output_bytes")?,
-        };
-        entries.insert(record.id.clone(), record);
+    for (idx, value) in values.iter().enumerate() {
+        // Extract agent ID for error messages (best effort)
+        let agent_id = value
+            .object("id")
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("<unknown id at index {}>", idx));
+        match decode_agent_record(value, &agent_id) {
+            Ok(record) => {
+                entries.insert(record.id.clone(), record);
+            }
+            Err(reason) => {
+                skipped.push(format!("agent '{}': {}", agent_id, reason));
+            }
+        }
     }
-    Ok(entries)
+    (entries, skipped)
 }
+
+fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, String> {
+    let get = |key: &str| value.object(key);
+    let err = |field: &str, reason: &str| -> String {
+        format!("field '{}': {} (agent '{}')", field, reason, agent_id)
+    };
+    let text = |key: &str| {
+        get(key)
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| err(key, "expected string, got null/missing/wrong type"))
+    };
+    // Registries written by older daemons encode some numeric fields as
+    // strings.  Accept either form.
+    let integer = |value: Option<&Json>| {
+        value.and_then(|value| match value {
+            Json::Number(_) => value.as_u64(),
+            Json::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        })
+    };
+    let required_integer = |key: &str| {
+        integer(get(key)).ok_or_else(|| err(key, "expected integer, got null/missing/wrong type"))
+    };
+    let optional_integer = |key: &str| match get(key) {
+        Some(Json::Null) | None => Ok(None),
+        value => integer(value)
+            .map(Some)
+            .ok_or_else(|| err(key, "expected integer or null")),
+    };
+    // Helper for optional string fields: accepts string, null, or missing
+    let optional_string = |key: &str| match get(key) {
+        Some(Json::String(value)) => Ok(Some(value.clone())),
+        Some(Json::Null) | None => Ok(None),
+        _ => Err(err(key, "expected string or null")),
+    };
+    let record = AgentRecord {
+        id: text("id")?,
+        task_id: text("task_id")?,
+        // Registry files written before audit trails had no execution
+        // identifier.  The agent handle is a safe one-to-one fallback.
+        execution_id: get("execution_id")
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text("id").unwrap_or_default()),
+        leader_pid: required_integer("leader_pid")? as i32,
+        process_group: required_integer("process_group")? as i32,
+        process_identity: optional_string("process_identity")?,
+        started_at: match get("started_at") {
+            Some(Json::String(value)) => value.clone(),
+            Some(Json::Number(value)) => value.clone(),
+            _ => return Err(err("started_at", "expected string or number")),
+        },
+        deadline_at: optional_string("deadline_at")?,
+        command: text("command")?,
+        state: text("state")?,
+        exit_code: get("exit_code").and_then(Json::as_u64).map(|v| v as i32),
+        log_degraded: get("log_degraded").and_then(Json::as_bool).unwrap_or(false),
+        audit_degraded: get("audit_degraded")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+        redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
+        stdout_next: required_integer("stdout_next")?,
+        stderr_next: required_integer("stderr_next")?,
+        stdout_dropped_before: required_integer("stdout_dropped_before")?,
+        stderr_dropped_before: required_integer("stderr_dropped_before")?,
+        log_next: required_integer("log_next")?,
+        log_dropped_before: required_integer("log_dropped_before")?,
+        first_output_at: optional_string("first_output_at")?,
+        first_output_stream: optional_string("first_output_stream")?,
+        first_output_bytes: optional_integer("first_output_bytes")?,
+    };
+    Ok(record)
+}
+
 fn redact(text: &mut String) -> bool {
     let original = text.clone();
     if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
@@ -697,28 +729,7 @@ impl Json {
     }
 
     pub fn to_json(&self) -> String {
-        match self {
-            Self::Null => "null".to_owned(),
-            Self::Bool(value) => value.to_string(),
-            Self::Number(value) => value.clone(),
-            Self::String(value) => quote(value),
-            Self::Array(values) => format!(
-                "[{}]",
-                values
-                    .iter()
-                    .map(Self::to_json)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            Self::Object(fields) => format!(
-                "{{{}}}",
-                fields
-                    .iter()
-                    .map(|(key, value)| format!("{}:{}", quote(key), value.to_json()))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        }
+        serde_json::to_string(&json_value(self)).expect("Json values are serializable")
     }
 
     pub fn number(value: u64) -> Self {
@@ -727,36 +738,50 @@ impl Json {
 }
 
 pub fn parse_json(input: &str) -> Result<Json, String> {
-    let mut parser = Parser {
-        input: input.as_bytes(),
-        position: 0,
-    };
-    parser.space();
-    let value = parser.value()?;
-    parser.space();
-    if parser.position != parser.input.len() {
-        return Err("trailing data after JSON value".to_owned());
-    }
-    Ok(value)
+    serde_json::from_str(input)
+        .map(json_from_value)
+        .map_err(|error| error.to_string())
 }
 
 pub fn quote(value: &str) -> String {
-    let mut result = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            character if character <= '\u{1f}' => {
-                result.push_str(&format!("\\u{:04x}", character as u32))
-            }
-            character => result.push(character),
-        }
+    serde_json::to_string(value).expect("strings are serializable")
+}
+
+fn json_value(value: &Json) -> serde_json::Value {
+    match value {
+        Json::Null => serde_json::Value::Null,
+        Json::Bool(value) => serde_json::Value::Bool(*value),
+        Json::Number(value) => match serde_json::from_str(value) {
+            Ok(serde_json::Value::Number(number)) => serde_json::Value::Number(number),
+            _ => serde_json::Value::String(value.clone()),
+        },
+        Json::String(value) => serde_json::Value::String(value.clone()),
+        Json::Array(values) => serde_json::Value::Array(values.iter().map(json_value).collect()),
+        Json::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value(value)))
+                .collect(),
+        ),
     }
-    result.push('"');
-    result
+}
+
+fn json_from_value(value: serde_json::Value) -> Json {
+    match value {
+        serde_json::Value::Null => Json::Null,
+        serde_json::Value::Bool(value) => Json::Bool(value),
+        serde_json::Value::Number(value) => Json::Number(value.to_string()),
+        serde_json::Value::String(value) => Json::String(value),
+        serde_json::Value::Array(values) => {
+            Json::Array(values.into_iter().map(json_from_value).collect())
+        }
+        serde_json::Value::Object(fields) => Json::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, json_from_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 /// Reads a shared bearer token without ever putting it in a command line.
@@ -782,239 +807,6 @@ pub fn read_secret_file(path: &Path) -> Result<String, String> {
         return Err("secret must contain at least 32 bytes".to_owned());
     }
     Ok(secret)
-}
-
-struct Parser<'a> {
-    input: &'a [u8],
-    position: usize,
-}
-
-impl Parser<'_> {
-    fn space(&mut self) {
-        while self
-            .input
-            .get(self.position)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            self.position += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Json, String> {
-        self.space();
-        match self.input.get(self.position) {
-            Some(b'n') => {
-                self.word(b"null")?;
-                Ok(Json::Null)
-            }
-            Some(b't') => {
-                self.word(b"true")?;
-                Ok(Json::Bool(true))
-            }
-            Some(b'f') => {
-                self.word(b"false")?;
-                Ok(Json::Bool(false))
-            }
-            Some(b'"') => Ok(Json::String(self.string()?)),
-            Some(b'[') => self.array(),
-            Some(b'{') => self.object_value(),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err("expected JSON value".to_owned()),
-        }
-    }
-
-    fn word(&mut self, word: &[u8]) -> Result<(), String> {
-        if self.input.get(self.position..self.position + word.len()) == Some(word) {
-            self.position += word.len();
-            Ok(())
-        } else {
-            Err("invalid literal".to_owned())
-        }
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.position += 1;
-        self.space();
-        let mut values = Vec::new();
-        if self.take(b']') {
-            return Ok(Json::Array(values));
-        }
-        loop {
-            values.push(self.value()?);
-            self.space();
-            if self.take(b']') {
-                return Ok(Json::Array(values));
-            }
-            self.require(b',')?;
-        }
-    }
-
-    fn object_value(&mut self) -> Result<Json, String> {
-        self.position += 1;
-        self.space();
-        let mut fields = Vec::new();
-        if self.take(b'}') {
-            return Ok(Json::Object(fields));
-        }
-        loop {
-            self.space();
-            if self.input.get(self.position) != Some(&b'"') {
-                return Err("object key must be a string".to_owned());
-            }
-            let key = self.string()?;
-            self.space();
-            self.require(b':')?;
-            fields.push((key, self.value()?));
-            self.space();
-            if self.take(b'}') {
-                return Ok(Json::Object(fields));
-            }
-            self.require(b',')?;
-        }
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.position;
-        self.take(b'-');
-        if self.take(b'0') {
-        } else {
-            self.digits()?;
-        }
-        if self.take(b'.') {
-            self.digits()?;
-        }
-        if self.take(b'e') || self.take(b'E') {
-            self.take(b'+');
-            self.take(b'-');
-            self.digits()?;
-        }
-        Ok(Json::Number(
-            std::str::from_utf8(&self.input[start..self.position])
-                .map_err(|_| "invalid number".to_owned())?
-                .to_owned(),
-        ))
-    }
-
-    fn digits(&mut self) -> Result<(), String> {
-        let start = self.position;
-        while self
-            .input
-            .get(self.position)
-            .is_some_and(u8::is_ascii_digit)
-        {
-            self.position += 1;
-        }
-        if start == self.position {
-            Err("expected digit".to_owned())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.require(b'"')?;
-        let mut value = String::new();
-        loop {
-            let byte = *self
-                .input
-                .get(self.position)
-                .ok_or_else(|| "unterminated string".to_owned())?;
-            self.position += 1;
-            match byte {
-                b'"' => return Ok(value),
-                b'\\' => {
-                    let escaped = *self
-                        .input
-                        .get(self.position)
-                        .ok_or_else(|| "unfinished escape".to_owned())?;
-                    self.position += 1;
-                    match escaped {
-                        b'"' => value.push('"'),
-                        b'\\' => value.push('\\'),
-                        b'/' => value.push('/'),
-                        b'b' => value.push('\u{08}'),
-                        b'f' => value.push('\u{0c}'),
-                        b'n' => value.push('\n'),
-                        b'r' => value.push('\r'),
-                        b't' => value.push('\t'),
-                        b'u' => {
-                            let first = self.hex4()?;
-                            let character = if (0xd800..=0xdbff).contains(&first) {
-                                if !self.take(b'\\') || !self.take(b'u') {
-                                    return Err("high surrogate without low surrogate".to_owned());
-                                }
-                                let second = self.hex4()?;
-                                if !(0xdc00..=0xdfff).contains(&second) {
-                                    return Err("invalid low surrogate".to_owned());
-                                }
-                                char::from_u32(0x10000 + ((first - 0xd800) << 10) + second - 0xdc00)
-                            } else {
-                                char::from_u32(first)
-                            }
-                            .ok_or_else(|| "invalid unicode escape".to_owned())?;
-                            value.push(character);
-                        }
-                        _ => return Err("invalid escape".to_owned()),
-                    }
-                }
-                0..=0x1f => return Err("control character in string".to_owned()),
-                _ => {
-                    let width =
-                        utf8_width(byte).ok_or_else(|| "invalid UTF-8 in string".to_owned())?;
-                    let start = self.position - 1;
-                    let end = start + width;
-                    let text = std::str::from_utf8(
-                        self.input
-                            .get(start..end)
-                            .ok_or_else(|| "truncated UTF-8".to_owned())?,
-                    )
-                    .map_err(|_| "invalid UTF-8 in string".to_owned())?;
-                    value.push_str(text);
-                    self.position = end;
-                }
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let bytes = self
-            .input
-            .get(self.position..self.position + 4)
-            .ok_or_else(|| "short unicode escape".to_owned())?;
-        self.position += 4;
-        std::str::from_utf8(bytes)
-            .map_err(|_| "invalid unicode escape".to_owned())
-            .and_then(|text| {
-                u32::from_str_radix(text, 16).map_err(|_| "invalid unicode escape".to_owned())
-            })
-    }
-
-    fn take(&mut self, expected: u8) -> bool {
-        if self.input.get(self.position) == Some(&expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-    fn require(&mut self, expected: u8) -> Result<(), String> {
-        self.space();
-        if self.take(expected) {
-            Ok(())
-        } else {
-            Err(format!("expected {}", expected as char))
-        }
-    }
-}
-
-fn utf8_width(byte: u8) -> Option<usize> {
-    match byte {
-        0x00..=0x7f => Some(1),
-        0xc2..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf4 => Some(4),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1678,6 +1470,78 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn json_round_trips_through_serde_json() {
+        let value = Json::Object(vec![
+            ("message".to_owned(), Json::String("hello".to_owned())),
+            (
+                "values".to_owned(),
+                Json::Array(vec![Json::Bool(true), Json::number(42), Json::Null]),
+            ),
+        ]);
+
+        assert_eq!(parse_json(&value.to_json()).unwrap(), value);
+    }
+
+    #[test]
+    fn json_null_fields_remain_explicit_nulls() {
+        let value = parse_json(r#"{"a":null,"b":1}"#).unwrap();
+        let optional_a = match value.object("a") {
+            Some(Json::Null) | None => None,
+            Some(value) => value.as_str().map(str::to_owned),
+        };
+
+        assert_eq!(optional_a, None);
+        assert_eq!(value.object("a"), Some(&Json::Null));
+        assert_eq!(
+            parse_json(&value.to_json()).unwrap().object("a"),
+            Some(&Json::Null)
+        );
+    }
+
+    #[test]
+    fn json_decodes_unicode_and_standard_escapes() {
+        let value = parse_json(r#"{"text":"\uD83D\uDE00 \" \\ \b\f\n\r\t"}"#).unwrap();
+
+        assert_eq!(
+            value.object("text").and_then(Json::as_str),
+            Some("😀 \" \\ \u{08}\u{0c}\n\r\t")
+        );
+    }
+
+    #[test]
+    fn json_parses_nested_objects_and_arrays() {
+        let value = parse_json(r#"{"outer":[{"inner":[{"leaf":true}]}]}"#).unwrap();
+        let Json::Array(outer) = value.object("outer").unwrap() else {
+            panic!("outer should be an array");
+        };
+        let Json::Array(inner) = outer[0].object("inner").unwrap() else {
+            panic!("inner should be an array");
+        };
+
+        assert_eq!(inner[0].object("leaf"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn json_handles_u64_numbers_and_rejects_malformed_ones() {
+        assert_eq!(
+            parse_json("18446744073709551615").unwrap().as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_json("0").unwrap().as_u64(), Some(0));
+        for number in ["01", "1.", "1e", "-", "--1", "1e+-2"] {
+            assert!(parse_json(number).is_err(), "{number} should be rejected");
+        }
+    }
+
+    #[test]
+    fn json_rejects_trailing_and_truncated_input_without_panicking() {
+        assert!(parse_json("null true").is_err());
+        for input in ["{", "{\"a\":", "[1,", "\"unterminated", "{\"a\": invalid}"] {
+            assert!(parse_json(input).is_err(), "{input:?} should be rejected");
+        }
+    }
+
     fn agent(id: &str) -> AgentRecord {
         AgentRecord {
             id: id.to_owned(),
@@ -1736,8 +1600,13 @@ mod tests {
 
     #[test]
     fn decode_agents_accepts_legacy_string_counters() {
-        let agents =
-            decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json")).unwrap();
+        let (agents, skipped) =
+            decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json"));
+        assert!(
+            skipped.is_empty(),
+            "unexpected skipped records: {:?}",
+            skipped
+        );
         let record = agents.get("legacy-0003").unwrap();
         assert_eq!(record.stdout_next, 0);
         assert_eq!(record.stderr_next, 64);
@@ -1746,6 +1615,100 @@ mod tests {
         assert_eq!(record.log_next, 0);
         assert_eq!(record.log_dropped_before, 0);
         assert_eq!(record.first_output_bytes, Some(7));
+    }
+
+    #[test]
+    fn decode_agents_handles_nulls_and_skips_bad_records() {
+        // Registry with explicit nulls for optional fields (as written by
+        // older versions) must parse successfully.
+        let json_with_nulls = r#"{
+            "agents": [
+                {
+                    "id": "agent-1",
+                    "task_id": "task-1",
+                    "execution_id": "exec-1",
+                    "leader_pid": 123,
+                    "process_group": 456,
+                    "process_identity": null,
+                    "started_at": "2026-10-08T00:00:00Z",
+                    "deadline_at": null,
+                    "command": "echo hi",
+                    "state": "running",
+                    "exit_code": null,
+                    "log_degraded": false,
+                    "audit_degraded": false,
+                    "redacted": false,
+                    "stdout_next": 0,
+                    "stderr_next": 0,
+                    "stdout_dropped_before": 0,
+                    "stderr_dropped_before": 0,
+                    "log_next": 0,
+                    "log_dropped_before": 0,
+                    "first_output_at": null,
+                    "first_output_stream": null,
+                    "first_output_bytes": null
+                },
+                {
+                    "id": "bad-agent",
+                    "task_id": "task-bad"
+                }
+            ]
+        }"#;
+        let (agents, skipped) = decode_agents(json_with_nulls);
+        // The good record with nulls must parse
+        assert_eq!(agents.len(), 1);
+        let record = agents.get("agent-1").expect("agent-1 should parse");
+        assert_eq!(record.id, "agent-1");
+        assert_eq!(record.deadline_at, None);
+        assert_eq!(record.process_identity, None);
+        assert_eq!(record.exit_code, None);
+        // The bad record must be skipped (not crash the whole registry)
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("bad-agent"),
+            "skip message should identify the agent: {}",
+            skipped[0]
+        );
+    }
+
+    #[test]
+    fn agent_json_omits_null_fields() {
+        // The writer must omit null fields instead of writing explicit nulls.
+        let record = AgentRecord {
+            id: "test-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            leader_pid: 123,
+            process_group: 456,
+            process_identity: None,
+            started_at: "2026-10-08T00:00:00Z".to_owned(),
+            deadline_at: None,
+            command: "echo".to_owned(),
+            state: "running".to_owned(),
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: false,
+            redacted: false,
+            stdout_next: 0,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
+        };
+        let json = agent_json(&record);
+        let text = json.to_json();
+        // None of the optional fields should appear as explicit nulls
+        assert!(
+            !text.contains("null"),
+            "writer should omit nulls, got: {}",
+            text
+        );
+        // Required fields must still be present
+        assert!(text.contains("test-1"));
     }
 
     #[test]
