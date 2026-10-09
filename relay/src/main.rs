@@ -108,6 +108,24 @@ fn run() -> Result<(), String> {
         .supervisor
         .registry
         .recover(recovered_agent_identity_matches)?;
+    // Re-apply SIGSTOP to agents that were paused before the restart: their
+    // process groups may still be alive. Dead groups are left for the recover
+    // pass above, which marks the agents honestly.
+    let mut repaused = 0;
+    for agent in state.supervisor.registry.list(None, None) {
+        if agent.state == "running" && agent.paused_at.is_some() {
+            if unsafe { libc::kill(-agent.process_group, libc::SIGSTOP) } == 0 {
+                repaused += 1;
+            } else {
+                log::warn!(
+                    "could not reapply pause to agent {}: process group {} gone",
+                    agent.id,
+                    agent.process_group
+                );
+            }
+        }
+    }
+    log::info!("reapplied pause to {repaused} agents on startup");
     log::info!("recovered {} agent records from registry", recovered.len());
     for agent in recovered {
         replay_recovered_lifecycle(&state.store, &agent)?;

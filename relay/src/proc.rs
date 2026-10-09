@@ -85,6 +85,7 @@ pub(crate) fn spawn_proc(
             request.args.first().map(String::as_str).unwrap_or("")
         ),
         state: "running".to_owned(),
+        paused_at: None,
         exit_code: None,
         log_degraded: false,
         audit_degraded: false,

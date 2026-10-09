@@ -1,3 +1,4 @@
+use crate::events::relay_timestamp;
 use crate::http::{error, query, reply};
 use crate::server::Server;
 use relay_core::{AgentRecord, Json};
@@ -10,6 +11,8 @@ pub(crate) enum AgentRoute<'a> {
     Status(&'a str),
     Logs(&'a str),
     Transcript(&'a str),
+    Pause(&'a str),
+    Resume(&'a str),
 }
 pub(crate) fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
     if path == "/v1/agents" {
@@ -21,6 +24,12 @@ pub(crate) fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
     }
     if let Some(id) = rest.strip_suffix("/transcript") {
         return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Transcript(id));
+    }
+    if let Some(id) = rest.strip_suffix("/pause") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Pause(id));
+    }
+    if let Some(id) = rest.strip_suffix("/resume") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Resume(id));
     }
     (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
 }
@@ -124,7 +133,81 @@ pub(crate) fn agent_request(
                 None => reply(stream, 404, error("unknown_agent")),
             }
         }
+        // Pause and resume are POST-only routes.
+        AgentRoute::Pause(_) | AgentRoute::Resume(_) => reply(stream, 404, error("not_found")),
     }
+}
+
+/// Handle POST requests to agent routes (pause/resume).
+pub(crate) fn agent_post_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    route: AgentRoute<'_>,
+) -> Result<(), String> {
+    match route {
+        AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
+        AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
+        _ => reply(stream, 404, error("not_found")),
+    }
+}
+
+fn pause_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
+    let agent = match state.supervisor.registry.get(id) {
+        Some(agent) => agent,
+        None => return reply(stream, 404, error("unknown_agent")),
+    };
+    if agent.state != "running" {
+        return reply(stream, 409, error("agent_not_running"));
+    }
+    if agent.paused_at.is_some() {
+        return reply(stream, 409, error("already_paused"));
+    }
+    let process_group = agent.process_group;
+    // Signal the whole process group, matching how agents are spawned and killed.
+    if unsafe { libc::kill(-process_group, libc::SIGSTOP) } != 0 {
+        // The group may already be gone; the reaper's orphan logic marks the
+        // agent honestly, but the pause marker is still recorded.
+        log::warn!("agent_pause id={id} pgid={process_group}: SIGSTOP failed");
+    }
+    let paused_at = relay_timestamp();
+    state
+        .supervisor
+        .registry
+        .set_paused_at(id, Some(paused_at.clone()))?;
+    log::info!("agent_pause id={id} pgid={process_group}");
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id.to_owned())),
+            ("paused".to_owned(), Json::Bool(true)),
+            ("paused_at".to_owned(), Json::String(paused_at)),
+        ]),
+    )
+}
+
+fn resume_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
+    let agent = match state.supervisor.registry.get(id) {
+        Some(agent) => agent,
+        None => return reply(stream, 404, error("unknown_agent")),
+    };
+    if agent.paused_at.is_none() {
+        return reply(stream, 409, error("not_paused"));
+    }
+    let process_group = agent.process_group;
+    if unsafe { libc::kill(-process_group, libc::SIGCONT) } != 0 {
+        log::warn!("agent_resume id={id} pgid={process_group}: SIGCONT failed");
+    }
+    state.supervisor.registry.set_paused_at(id, None)?;
+    log::info!("agent_resume id={id} pgid={process_group}");
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id.to_owned())),
+            ("paused".to_owned(), Json::Bool(false)),
+        ]),
+    )
 }
 
 /// Build the full transcript for an agent: record metadata, prompt,

@@ -686,6 +686,7 @@ fn recovery_replays_a_persisted_first_output_fact() {
         deadline_at: None,
         command: "sh -c".to_owned(),
         state: "orphaned".to_owned(),
+        paused_at: None,
         exit_code: None,
         log_degraded: false,
         audit_degraded: true,
