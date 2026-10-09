@@ -13,7 +13,9 @@ from dept.status import (
     Execution,
     RELAY_OUTPUT_TAIL_BYTES,
     StatusScreen,
+    agent_worktrees,
     build_executions,
+    compact_path,
     detail_lines,
     dept_task_id,
     duration_between,
@@ -128,6 +130,33 @@ class PhaseDurationTests(unittest.TestCase):
         self.assertIn("agent-handle-123", row)
         self.assertIn("/worktrees/api-agent", row)
 
+    def test_api_agent_uses_worktree_from_local_relay_registry(self):
+        agent = {
+            "id": "agent-handle-123",
+            "task_id": "agent-4c4d2e1a",
+            "state": "running",
+        }
+        execution = build_executions(
+            [], [agent],
+            persisted_agent_worktrees={"agent-4c4d2e1a": "/private/tmp/fix-pr69-ci"},
+        )[0]
+        self.assertEqual(execution.worktree_path, "/private/tmp/fix-pr69-ci")
+
+    def test_event_only_api_agent_uses_worktree_from_local_relay_registry(self):
+        api_event = event("process_spawned", "2026-01-01T00:00:00.000Z",
+                          task_id="agent-4c4d2e1a", execution_id="relay-attempt-123")
+        execution = build_executions(
+            [api_event], [],
+            persisted_agent_worktrees={"agent-4c4d2e1a": "/private/tmp/fix-pr69-ci"},
+        )[0]
+        self.assertEqual(execution.worktree_path, "/private/tmp/fix-pr69-ci")
+
+    def test_compact_path_preserves_the_right_end(self):
+        self.assertEqual(
+            compact_path("/Users/shukant/Workspace/ShukantPal/zigzag/fix-pr69-ci", 22),
+            ".../zigzag/fix-pr69-ci",
+        )
+
     def test_running_elapsed_uses_started_at_on_each_render(self):
         execution = build_executions([], [{
             "id": "agent-handle-123",
@@ -145,6 +174,18 @@ class PhaseDurationTests(unittest.TestCase):
 
 
 class SnapshotIngestionTests(unittest.TestCase):
+    def test_agent_worktrees_reads_local_relay_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "events.json"
+            state_file.with_suffix(".agents.json").write_text(json.dumps({"agents": [
+                {"id": "agent-handle-123", "task_id": "agent-4c4d2e1a", "worktree_path": "/private/tmp/fix-pr69-ci"},
+                {"id": "missing-path"},
+            ]}))
+            self.assertEqual(
+                agent_worktrees(state_file),
+                {"agent-4c4d2e1a": "/private/tmp/fix-pr69-ci"},
+            )
+
     def test_partial_audit_line_retains_other_events(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = Path(directory) / "events.json"
