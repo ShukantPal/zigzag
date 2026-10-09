@@ -1,0 +1,1084 @@
+openapi: 3.0.3
+info:
+  title: zigzag relay API
+  version: 1.0.0
+  description: |
+    The zigzag relay is the control plane for the Codex department on Shukant's Mac.
+    It exposes a small HTTP/JSON API for health checks, a durable event store,
+    synchronous execution of allowlisted commands, and supervised background
+    processes (agents) with log streaming, pause/resume/stop control, and git
+    worktree management.
+
+    This spec is the source of truth for future auto-generated CLI clients.
+
+    Authentication: every endpoint requires an `Authorization: Bearer <token>`
+    header carrying the relay daemon secret. The only exception is
+    `POST /v1/proc/{id}/kill`, which instead requires a separate control
+    secret; when the control secret is unset, that route behaves as 404.
+servers:
+  - url: http://localhost:{port}
+    description: Relay daemon on the Mac. The port comes from the relay server config.
+    variables:
+      port:
+        default: '8765'
+        description: TCP port the relay daemon listens on (default from the relay --port CLI flag).
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Relay daemon secret (or the separate control secret for
+        POST /v1/proc/{id}/kill) sent as an Authorization: Bearer header.
+  schemas:
+    Error:
+      type: object
+      description: Standard error envelope. `error` is a stable machine-readable code.
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: unknown_agent
+    Denial:
+      type: object
+      description: >
+        Opaque allowlist denial. Exec and spawn requests that fail request
+        parsing or fail the command allowlist answer with HTTP 200 and this
+        body instead of a detailed error, so invalid input does not leak policy
+        detail.
+      required: [id, error]
+      properties:
+        id:
+          type: string
+          description: Echo of the request id (empty string when the body was unparseable).
+        error:
+          type: string
+          enum: [denied]
+          example: denied
+    ExecRequest:
+      type: object
+      description: >
+        Synchronous execution request. `bin` must match an allowlisted
+        prefix; `args` may hold at most 64 non-empty strings totalling at most
+        8 KiB. Unknown fields are rejected.
+      required: [id, bin, args]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Client-chosen correlation id, echoed in the result.
+        bin:
+          type: string
+          description: Allowlisted binary name/prefix.
+        args:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+          description: Argument vector. Combined length must not exceed 8192 bytes.
+    ExecResult:
+      type: object
+      description: >
+        Synchronous execution result. Also returned (with exit_code null and
+        an explanatory stderr) when the configured binary fails integrity
+        verification; use the Denial schema for allowlist denials.
+      required: [id, exit_code, stdout, stderr, truncated, timed_out]
+      properties:
+        id:
+          type: string
+        exit_code:
+          type: integer
+          nullable: true
+          description: Process exit code; null when the process never ran or timed out.
+        stdout:
+          type: string
+          description: Captured stdout (lossy UTF-8 decode).
+        stderr:
+          type: string
+          description: Captured stderr (lossy UTF-8 decode).
+        truncated:
+          type: boolean
+          description: True when captured output exceeded the server cap.
+        timed_out:
+          type: boolean
+    SpawnRequest:
+      allOf:
+        - $ref: '#/components/schemas/ExecRequest'
+        - type: object
+          properties:
+            execution_id:
+              type: string
+              minLength: 1
+              maxLength: 128
+              pattern: '^[A-Za-z0-9_-]+$'
+              description: >
+                Optional client correlation id for one supervised attempt.
+                Alphanumeric plus dash/underscore, max 128 bytes. When omitted
+                the relay generates one. Unknown fields are rejected.
+    SpawnResponse:
+      type: object
+      description: >
+        The spawn acknowledgement. `id` is the client request id; `proc` is
+        the relay-assigned process handle. Use `proc` with
+        GET /v1/proc/{id} to poll, and with GET /v1/agents/{proc} and
+        GET /v1/agents/{proc}/logs for status and logs.
+      required: [id, proc]
+      properties:
+        id:
+          type: string
+        proc:
+          type: string
+          description: Relay-assigned process/agent handle.
+    AgentRecord:
+      type: object
+      description: Durable record for one supervised agent. Command arguments and prompt text are intentionally not retained.
+      required:
+        - id
+        - task_id
+        - execution_id
+        - state
+        - started_at
+        - deadline_at
+        - command
+        - exit_code
+        - log_degraded
+        - audit_degraded
+        - redacted
+        - stdout_dropped_before
+        - stderr_dropped_before
+        - dropped_before
+      properties:
+        id:
+          type: string
+          description: Agent handle, unique per supervised attempt.
+        task_id:
+          type: string
+          description: Client request id; may be retried, unlike execution_id.
+        execution_id:
+          type: string
+          description: Relay-generated attempt identifier; identifies one concrete supervised process.
+        state:
+          type: string
+          description: Lifecycle state, e.g. running, succeeded, failed.
+          example: running
+        started_at:
+          type: string
+          description: Start timestamp as recorded by the relay.
+        deadline_at:
+          type: string
+          nullable: true
+          description: Optional agent deadline.
+        command:
+          type: string
+          description: Short command summary (bin plus first argument).
+        exit_code:
+          type: integer
+          nullable: true
+          description: Exit code once the process has finished; null while running.
+        log_degraded:
+          type: boolean
+        audit_degraded:
+          type: boolean
+        redacted:
+          type: boolean
+        stdout_dropped_before:
+          type: integer
+          format: int64
+        stderr_dropped_before:
+          type: integer
+          format: int64
+        dropped_before:
+          type: integer
+          format: int64
+          description: Log bytes dropped before the earliest retained cursor.
+    Event:
+      type: object
+      description: >
+        A posted event object (payload) plus relay-assigned `received_at` and
+        `sequence`. The store accepts any JSON object with a non-empty string
+        `id`; relay-emitted events carry schema_version, task_id,
+        execution_id, kind, source, occurred_at, clock, and payload fields.
+      required: [id]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        received_at:
+          type: string
+          description: Relay-assigned receipt timestamp.
+        sequence:
+          type: integer
+          format: int64
+          description: Relay-assigned monotonically increasing sequence number.
+      additionalProperties: true
+    EventPostResponse:
+      type: object
+      required: [duplicate, event]
+      properties:
+        duplicate:
+          type: boolean
+          description: True when an event with this id was already stored.
+        event:
+          $ref: '#/components/schemas/Event'
+    EventReadResponse:
+      type: object
+      required: [epoch, reset, lost, events, next]
+      properties:
+        epoch:
+          type: string
+          description: Store epoch; clients pass it back to detect store resets.
+        reset:
+          type: boolean
+          description: True when the store was reset since the given epoch/after.
+        lost:
+          type: boolean
+          description: True when events were lost between after and the returned window.
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        next:
+          type: integer
+          format: int64
+          description: Sequence number to pass as `after` on the next read.
+    AgentListResponse:
+      type: object
+      required: [agents]
+      properties:
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentRecord'
+    LogRecord:
+      type: object
+      description: One captured log line.
+      properties:
+        stream:
+          type: string
+          enum: [stdout, stderr]
+        cursor:
+          type: integer
+          format: int64
+          description: Monotonic cursor; pass as `after` to resume reading.
+        data:
+          type: string
+          description: Log line content.
+    LogResponse:
+      type: object
+      required: [records, next_cursor, dropped_before, complete, log_degraded]
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogRecord'
+        next_cursor:
+          type: integer
+          format: int64
+        dropped_before:
+          type: integer
+          format: int64
+        complete:
+          type: boolean
+          description: True when the agent is no longer running.
+        log_degraded:
+          type: boolean
+    ProcStatus:
+      type: object
+      required: [id, running, exit_code, stdout, stderr, truncated]
+      properties:
+        id:
+          type: string
+        running:
+          type: boolean
+        exit_code:
+          type: integer
+          nullable: true
+        stdout:
+          type: string
+        stderr:
+          type: string
+        truncated:
+          type: boolean
+    KillResponse:
+      type: object
+      required: [id, killed]
+      properties:
+        id:
+          type: string
+        killed:
+          type: boolean
+          description: Whether a live process was actually signalled.
+    AgentCreateRequest:
+      type: object
+      description: >
+        Request to create and start a Codex agent. Implemented in a parallel
+        PR; this documents the intended contract.
+      required: [prompt, project_dir, branch]
+      properties:
+        prompt:
+          type: string
+          description: Inline prompt text or a path to a prompt file.
+        project_dir:
+          type: string
+          description: Project directory the agent works in.
+        branch:
+          type: string
+          description: Branch for the agent's work.
+        worktree:
+          type: string
+          description: Worktree path; defaults to /private/tmp/<branch-slug>/.
+        model:
+          type: string
+        approval_mode:
+          type: string
+        timeout_secs:
+          type: integer
+          format: int64
+    AgentCreateResponse:
+      type: object
+      required: [id, worktree]
+      properties:
+        id:
+          type: string
+          description: Agent handle for subsequent agent endpoints.
+        worktree:
+          type: string
+          description: Resolved worktree path the agent is using.
+    AgentPauseResponse:
+      type: object
+      required: [id, paused, paused_at]
+      properties:
+        id:
+          type: string
+        paused:
+          type: boolean
+          example: true
+        paused_at:
+          type: string
+          format: date-time
+          description: RFC 3339 timestamp when the process group was stopped.
+    AgentResumeResponse:
+      type: object
+      required: [id, paused]
+      properties:
+        id:
+          type: string
+        paused:
+          type: boolean
+          example: false
+    AgentStopResponse:
+      type: object
+      required: [id, stopped]
+      properties:
+        id:
+          type: string
+        stopped:
+          type: boolean
+          example: true
+    WorktreeCreateRequest:
+      type: object
+      description: >
+        Create a git worktree. Paths are canonicalized: `..` is rejected and
+        only /private/tmp/ and /Users/shukant/.codex/worktrees/ are permitted.
+        Implemented in a parallel PR; this documents the intended contract.
+      required: [path, branch, repo]
+      properties:
+        path:
+          type: string
+        branch:
+          type: string
+        repo:
+          type: string
+    WorktreeCreateResponse:
+      type: object
+      required: [path, branch]
+      properties:
+        path:
+          type: string
+        branch:
+          type: string
+    WorktreeDeleteRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+    WorktreeDeleteResponse:
+      type: object
+      required: [removed, path]
+      properties:
+        removed:
+          type: boolean
+          example: true
+        path:
+          type: string
+paths:
+  /v1/health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      description: 'Liveness probe. Always returns {"status": "ok"} when the relay is up.'
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Relay is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/events:
+    post:
+      operationId: postEvent
+      summary: Post an event
+      description: >
+        Store one event object. The body must be a JSON object with a
+        non-empty string `id`. Returns 201 for a new event, 200 when the id
+        was already stored (duplicate).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  minLength: 1
+              additionalProperties: true
+      responses:
+        '201':
+          description: Event stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPostResponse'
+        '200':
+          description: Event already stored (duplicate id).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPostResponse'
+        '400':
+          description: Body was not a JSON object with a non-empty string id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      operationId: readEvents
+      summary: Long-poll the event store
+      description: >
+        Read events at or after a sequence number, long-polling up to
+        `timeout` seconds for new events. Pass the response's `next` as
+        `after` on the next call and echo `epoch` to detect store resets.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          description: Sequence number to read from. Defaults to 0.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: timeout
+          in: query
+          description: Long-poll timeout in seconds. Defaults to 50, max 55.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 55
+            default: 50
+        - name: epoch
+          in: query
+          description: Epoch from a previous read; used to detect store resets.
+          schema:
+            type: string
+            default: ''
+      responses:
+        '200':
+          description: Event read result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventReadResponse'
+        '400':
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/exec:
+    post:
+      operationId: execCommand
+      summary: Execute an allowlisted command synchronously
+      description: >
+        Run one allowlisted command and wait for it to finish. Denials
+        (unparseable body, bin not allowlisted) answer with HTTP 200 and the
+        Denial body rather than an error status.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecRequest'
+      responses:
+        '200':
+          description: Execution result or opaque allowlist denial.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ExecResult'
+                  - $ref: '#/components/schemas/Denial'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/spawn:
+    post:
+      operationId: spawnProcess
+      summary: Spawn a supervised background process
+      description: >
+        Launch an allowlisted command as a supervised process in its own
+        process group, registered in the agent registry. The returned `proc`
+        handle works with GET /v1/proc/{id}, GET /v1/agents/{id}, and
+        GET /v1/agents/{id}/logs. Denials (unparseable body, bin not
+        allowlisted) answer with HTTP 200 and the Denial body.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SpawnRequest'
+      responses:
+        '200':
+          description: Process spawned or opaque allowlist denial.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SpawnResponse'
+                  - $ref: '#/components/schemas/Denial'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Relay is draining for updates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/review-gate:
+    get:
+      operationId: getReviewGate
+      summary: Review gate report
+      description: >
+        Compute the review-gate report for a pull request. Both query
+        parameters are required and no extra parameters are allowed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: repository
+          in: query
+          required: true
+          description: Repository in "owner/name" form.
+          schema:
+            type: string
+            example: leveled-inc/leveled
+        - name: pull_request
+          in: query
+          required: true
+          description: Pull request number; must be greater than 0.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '200':
+          description: Review gate report (report-shaped JSON object).
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Gate report produced by the review loop.
+        '400':
+          description: Missing, empty, duplicated, or otherwise invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents:
+    get:
+      operationId: listAgents
+      summary: List agents
+      description: >
+        List registered agents. Only the documented filters are accepted;
+        any other query parameter yields 400.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: state
+          in: query
+          description: Optional state filter, e.g. running.
+          schema:
+            type: string
+        - name: task_id
+          in: query
+          description: Optional task id filter.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Registered agents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentListResponse'
+        '400':
+          description: Unknown query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      operationId: createAgent
+      summary: Create and start a Codex agent
+      description: >
+        Create and start a Codex agent in a worktree. Implemented in a
+        parallel PR; this documents the intended contract.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentCreateRequest'
+      responses:
+        '200':
+          description: Agent started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCreateResponse'
+        '400':
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Agent capacity exceeded (max_agents, default 16).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{id}:
+    get:
+      operationId: getAgent
+      summary: Get agent status
+      description: Fetch the durable AgentRecord for one agent handle.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Agent status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRecord'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      operationId: stopAgent
+      summary: Stop an agent gracefully
+      description: >
+        Send SIGTERM to the agent's process group, wait a grace period, then
+        SIGKILL. Deregisters the agent but leaves its worktree in place. Only
+        touches agent-owned processes: the PID is verified against the agent
+        registry. Implemented in a parallel PR; this documents the intended
+        contract.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Agent stopped.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentStopResponse'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{id}/pause:
+    post:
+      operationId: pauseAgent
+      summary: Pause an agent
+      description: >
+        SIGSTOP the agent's process group, freezing it without losing state.
+        Implemented in a parallel PR; this documents the intended contract.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Agent paused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentPauseResponse'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{id}/resume:
+    post:
+      operationId: resumeAgent
+      summary: Resume a paused agent
+      description: >
+        SIGCONT the agent's process group. Implemented in a parallel PR;
+        this documents the intended contract.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Agent resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResumeResponse'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/agents/{id}/logs:
+    get:
+      operationId: getAgentLogs
+      summary: Get agent logs
+      description: >
+        Read captured agent output. `follow=1` long-polls up to 50 seconds
+        for new records. Only the documented query parameters are accepted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+        - name: stream
+          in: query
+          description: Which stream to read. Defaults to both.
+          schema:
+            type: string
+            enum: [stdout, stderr, both]
+            default: both
+        - name: after
+          in: query
+          description: Cursor offset to read from. Defaults to 0.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: tail
+          in: query
+          description: Optional cap, in bytes of record data, on the newest records returned.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: follow
+          in: query
+          description: Set to 1 to long-poll for new records.
+          schema:
+            type: string
+            enum: ['0', '1']
+            default: '0'
+      responses:
+        '200':
+          description: Log records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogResponse'
+        '400':
+          description: Invalid query parameter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/proc/{id}:
+    get:
+      operationId: pollProcess
+      summary: Poll a spawned process
+      description: >
+        Poll the captured output and exit status of a process created by
+        POST /v1/spawn, keyed by its `proc` handle.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Process handle returned by POST /v1/spawn.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Process status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcStatus'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown process handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/proc/{id}/kill:
+    post:
+      operationId: killProcess
+      summary: Kill a spawned process
+      description: >
+        Signal the process group of a spawned process. Requires the separate
+        control secret (not the relay bearer secret); when the control secret
+        is unset this route answers 404. This is a generic process kill and is
+        not agent-aware.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Process handle returned by POST /v1/spawn.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Kill attempted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KillResponse'
+        '401':
+          description: Missing or invalid control secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown process handle, or control secret unset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/worktrees:
+    post:
+      operationId: createWorktree
+      summary: Create a git worktree
+      description: >
+        Create a git worktree. Implemented in a parallel PR; this documents
+        the intended contract.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorktreeCreateRequest'
+      responses:
+        '200':
+          description: Worktree created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorktreeCreateResponse'
+        '400':
+          description: Invalid path (outside allowed roots, uncanonicalizable, or already a worktree).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      operationId: deleteWorktree
+      summary: Remove a git worktree
+      description: >
+        Remove a git worktree. Refuses when a live agent is attached to the
+        worktree. Implemented in a parallel PR; this documents the intended
+        contract.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorktreeDeleteRequest'
+      responses:
+        '200':
+          description: Worktree removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorktreeDeleteResponse'
+        '400':
+          description: Invalid path or a live agent is attached to the worktree.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
