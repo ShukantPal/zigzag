@@ -72,34 +72,6 @@ token as granting log access and rotate it after suspected exposure.
 After a relay restart, live process groups become `orphaned` (their former
 pipes cannot be reattached); dead groups become `lost_after_restart`. Terminal
 registry records and their bounded spool metadata are pruned after seven days.
-
-### Agent creation: `POST /v1/agents`
-
-`POST /v1/agents` launches a supervised Codex agent in a fresh git worktree and
-answers `{"id": "<agent-handle>", "worktree": "<resolved-path>"}`:
-
-```json
-{
-  "prompt": "implement the widget (inline text, or a path to a prompt file)",
-  "project_dir": "/Users/shukant/Workspace/leveled-inc/leveled",
-  "branch": "codex/widget",
-  "worktree": "/private/tmp/codex-widget/ (optional; defaults to /private/tmp/<branch-slug>/)",
-  "model": "gpt-5 (optional, passed to codex exec -m)",
-  "approval_mode": "suggest|auto-edit|full-auto (optional; default --approve-for-me)",
-  "timeout_secs": 3600 (optional, recorded as the agent's deadline)
-}
-```
-
-The relay caps concurrent `running` agents at `--max-agents` (default 16);
-beyond that it answers `503 {"error":"too_many_agents","max":16}`. Worktrees are
-created under `/private/tmp/` or `/Users/shukant/.codex/worktrees/` and the
-repository must live under `/Users/shukant/Workspace/`, reusing the same
-validation as `POST /v1/worktrees`. A failed `git worktree add` answers
-`500 {"error":"worktree_failed","detail":"..."}` and registers nothing. The
-agent's worktree is recorded on its registry record, so `DELETE /v1/worktrees`
-refuses to remove a worktree with a live agent attached. Spawning goes through
-the exec allowlist like `/v1/spawn`: the `codex` binary must be allowlisted,
-and a non-allowlisted codex gets the standard denial.
 The relay remains HTTP only on loopback/Tailscale; the approved forwarding
 proxy terminates TLS for orchestrator-facing HTTPS. The bearer token and
 GUI-session Keychain allowlist are unchanged. The legacy kill route is only

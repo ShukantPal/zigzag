@@ -66,13 +66,6 @@ impl AgentRecord {
                     .unwrap_or(Json::Null),
             ),
             (
-                "worktree_path".to_owned(),
-                self.worktree_path
-                    .clone()
-                    .map(Json::String)
-                    .unwrap_or(Json::Null),
-            ),
-            (
                 "started_at".to_owned(),
                 Json::String(self.started_at.clone()),
             ),
@@ -1617,7 +1610,6 @@ mod tests {
             command: "codex exec".to_owned(),
             state: "running".to_owned(),
             paused_at: None,
-            worktree_path: None,
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,
@@ -1753,7 +1745,6 @@ mod tests {
             command: "echo".to_owned(),
             state: "running".to_owned(),
             paused_at: None,
-            worktree_path: None,
             exit_code: None,
             log_degraded: false,
             audit_degraded: false,

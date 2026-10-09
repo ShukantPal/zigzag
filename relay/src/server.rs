@@ -33,7 +33,6 @@ pub(crate) struct Server {
     pub(crate) store: Arc<Store>,
     pub(crate) supervisor: Supervisor,
     pub(crate) updater: Arc<update::Manager>,
-    pub(crate) max_agents: usize,
     pub(crate) review_state_file: PathBuf,
     pub(crate) review_loop_shadow: bool,
     pub(crate) review_config: Mutex<Option<Arc<review_loop::ReviewLoopConfig>>>,
@@ -216,30 +215,20 @@ where
         ("GET", "/v1/review-gate") => {
             review_gate_request(&mut stream, &state, &request.target, gate_report)
         }
-        ("GET", path) if agent_route("GET", path).is_some() => agent_request(
+        ("GET", path) if agent_route(path).is_some() => agent_request(
             &mut stream,
             &state,
             &request.target,
-            agent_route("GET", path).expect("checked"),
+            agent_route(path).expect("checked"),
         ),
         ("GET", path) => match proc_route(path) {
             Some(ProcRoute::Poll(handle)) => poll_proc(&mut stream, &state, handle),
             Some(ProcRoute::Kill(_)) => reply(&mut stream, 404, error("not_found")),
             None => reply(&mut stream, 404, error("not_found")),
         },
-<<<<<<< HEAD
         ("POST", path) if agent_route(path).is_some() => {
             agent_post_request(&mut stream, &state, agent_route(path).expect("checked"))
         }
-=======
-        ("POST", path) if agent_route("POST", path).is_some() => agent_post_request(
-            &mut stream,
-            &state,
-            agent_route("POST", path).expect("checked"),
-            request.body,
-            load_policy(),
-        ),
->>>>>>> 5643798 (Port agent-create endpoint to modular relay structure)
         ("POST", path) => match proc_route(path) {
             Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
             Some(ProcRoute::Poll(_)) => reply(&mut stream, 404, error("not_found")),

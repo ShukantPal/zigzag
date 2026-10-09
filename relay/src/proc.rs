@@ -37,21 +37,12 @@ pub(crate) struct SpawnedProc {
     pub(crate) id: String,
     pub(crate) handle: String,
 }
-/// Extra fields `spawn_proc` records on the agent registry entry.
-#[derive(Default)]
-pub(crate) struct AgentSpawnDetails {
-    /// Worktree the agent works in, recorded for the worktree endpoints.
-    pub(crate) worktree_path: Option<String>,
-    /// Caller-supplied deadline, informational only.
-    pub(crate) deadline_at: Option<String>,
-}
 pub(crate) fn spawn_proc(
     supervisor: &Supervisor,
     store: Arc<Store>,
     path: &Path,
     request: exec::ExecRequest,
     execution_id: String,
-    details: AgentSpawnDetails,
 ) -> Result<SpawnedProc, String> {
     let stdout = Arc::new(Mutex::new(CappedOutput::default()));
     let stderr = Arc::new(Mutex::new(CappedOutput::default()));
@@ -88,7 +79,7 @@ pub(crate) fn spawn_proc(
         process_identity: Some(process_identity),
         worktree_path: None,
         started_at: unix_timestamp(),
-        deadline_at: details.deadline_at,
+        deadline_at: None,
         command: format!(
             "{} {}",
             request.bin,
@@ -96,7 +87,6 @@ pub(crate) fn spawn_proc(
         ),
         state: "running".to_owned(),
         paused_at: None,
-        worktree_path: details.worktree_path,
         exit_code: None,
         log_degraded: false,
         audit_degraded: false,
