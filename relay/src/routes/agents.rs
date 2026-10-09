@@ -11,7 +11,7 @@ use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::{
     WorktreeError, cleanup_agent_worktree, git_output, resolve_new_worktree_path,
     resolve_worktree_repo, run_worktree_hook, valid_worktree_branch,
-    worktree_branch_checked_out, worktree_branch_checkout_path, worktree_branch_exists,
+    worktree_branch_checkout_path, worktree_branch_exists,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};

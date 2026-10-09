@@ -273,15 +273,9 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
         "agent was not stopped after delete: {stopped:?}"
     );
 
-    let output = Command::new("git")
-        .args(["worktree", "remove", "--force", worktree_text.as_ref()])
-        .current_dir(&repo)
-        .output()
-        .expect("could not clean up agent test worktree");
     assert!(
-        output.status.success(),
-        "could not clean up agent test worktree: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !worktree.exists(),
+        "agent delete did not clean up its worktree"
     );
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
 }

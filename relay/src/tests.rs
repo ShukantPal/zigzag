@@ -1407,7 +1407,7 @@ fn agent_worktree_cleanup_runs_stop_hook_and_deletes_feature_branch() {
     )
     .unwrap();
     let worktree = worktree_root.join("feature-cleanup");
-    agent_create_worktree(&repo, &worktree, "feature-cleanup").unwrap();
+    agent_create_worktree(&repo, &worktree, "feature-cleanup", &[]).unwrap();
 
     let roots = vec![std::env::temp_dir().canonicalize().unwrap()];
     cleanup_agent_worktree(worktree.to_str().unwrap(), &roots).unwrap();
@@ -1819,7 +1819,7 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     )
     .unwrap();
     let worktree = worktree_root.join("codex-delete-me");
-    agent_create_worktree(&repo, &worktree, "codex/delete-me").unwrap();
+    agent_create_worktree(&repo, &worktree, "codex/delete-me", &[]).unwrap();
 
     // A real process in its own process group.
     let mut child = Command::new("/bin/sleep")
