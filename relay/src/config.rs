@@ -82,34 +82,16 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
                 }
             }
             "--watch-interval" => {
-                let seconds = value(&mut values, "--watch-interval")?
-                    .parse::<u64>()
-                    .map_err(|_| "--watch-interval must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--watch-interval must be between 30 and 3600 seconds".to_owned());
-                }
-                github_watch_interval = Duration::from_secs(seconds);
+                github_watch_interval = bounded_duration(&mut values, "--watch-interval")?;
             }
             "--watch-pr-state" => watch_pr_state = Some(PathBuf::from(value(&mut values, "--watch-pr-state")?)),
             "--watch-pr" => watch_prs.push(value(&mut values, "--watch-pr")?),
             "--comment-router-live" => comment_router_shadow = false,
             "--comment-router-quiet-interval" => {
-                let seconds = value(&mut values, "--comment-router-quiet-interval")?
-                    .parse::<u64>()
-                    .map_err(|_| "--comment-router-quiet-interval must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--comment-router-quiet-interval must be between 30 and 3600 seconds".to_owned());
-                }
-                comment_router_quiet_interval = Duration::from_secs(seconds);
+                comment_router_quiet_interval = bounded_duration(&mut values, "--comment-router-quiet-interval")?;
             }
             "--comment-router-burst-window" => {
-                let seconds = value(&mut values, "--comment-router-burst-window")?
-                    .parse::<u64>()
-                    .map_err(|_| "--comment-router-burst-window must be an integer".to_owned())?;
-                if !(30..=3600).contains(&seconds) {
-                    return Err("--comment-router-burst-window must be between 30 and 3600 seconds".to_owned());
-                }
-                comment_router_burst_window = Duration::from_secs(seconds);
+                comment_router_burst_window = bounded_duration(&mut values, "--comment-router-burst-window")?;
             }
             "--update-dir" => update_directory = Some(PathBuf::from(value(&mut values, "--update-dir")?)),
             "--update-interval" => {
@@ -163,6 +145,21 @@ pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
         update_ready_file,
         review_state_file,
     })
+}
+
+fn bounded_duration(
+    values: &mut std::vec::IntoIter<String>,
+    name: &str,
+) -> Result<Duration, String> {
+    let seconds = values
+        .next()
+        .ok_or_else(|| format!("{name} requires a value"))?
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be an integer"))?;
+    if !(30..=3600).contains(&seconds) {
+        return Err(format!("{name} must be between 30 and 3600 seconds"));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 pub(crate) fn valid_github_repo(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {

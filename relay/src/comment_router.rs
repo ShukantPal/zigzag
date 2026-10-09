@@ -26,7 +26,7 @@ const PROMPT: &str = include_str!("../prompts/comment_address.md");
 #[derive(Clone)]
 pub(crate) struct Config {
     state_file: PathBuf,
-    command_entries: Vec<String>,
+    command_entries: Vec<WatchedPr>,
     shadow: bool,
     quiet_interval: Duration,
     burst_window: Duration,
@@ -40,9 +40,10 @@ impl Config {
         quiet_interval: Duration,
         burst_window: Duration,
     ) -> Result<Self, String> {
-        for entry in &command_entries {
-            parse_watch_entry(entry)?;
-        }
+        let command_entries = command_entries
+            .iter()
+            .map(|entry| parse_watch_entry(entry))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             state_file,
             command_entries,
@@ -284,44 +285,25 @@ fn poll_interval(now: Instant, burst_until: Instant, quiet_interval: Duration) -
 fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<bool, String> {
     let comments = github_comments(&watched.repository, watched.number)?;
     let gate = session_gate();
-    let candidates: Vec<_> = comments
-        .iter()
-        .filter(|comment| comment.is_owner_feedback())
-        .filter(|comment| !gate.is_dispatched(&comment.event_id()))
-        .cloned()
-        .collect();
+    let candidates = routable_comments(&comments, &gate);
+
+    if shadow {
+        return shadow_dispatch(&gate, watched, &candidates, |event| {
+            state
+                .store
+                .add(event)
+                .map(|_| ())
+                .map_err(|error| format!("could not persist comment event: {error}"))
+        });
+    }
+
     if candidates.is_empty() || !gate.claim(&watched.session_id) {
         return Ok(false);
     }
 
-    let fresh = candidates;
-    if shadow {
-        let result = (|| {
-            for comment in &fresh {
-                state
-                    .store
-                    .add(comment_event(watched, comment))
-                    .map_err(|error| format!("could not persist comment event: {error}"))?;
-            }
-            gate.mark_dispatched(fresh.iter().map(Comment::event_id))
-        })();
-        if let Err(error) = result {
-            gate.release(&watched.session_id);
-            return Err(error);
-        }
-        eprintln!(
-            "shadow: would resume a session for {}#{} on {} new GitHub comment(s)",
-            watched.repository,
-            watched.number,
-            fresh.len()
-        );
-        gate.release(&watched.session_id);
-        return Ok(true);
-    }
-
     let prompt = comment_prompt(watched, &comments);
     let request = exec::ExecRequest {
-        id: format!("github-comment-{}", fresh[0].node_id),
+        id: format!("github-comment-{}", candidates[0].node_id),
         bin: "codex".to_owned(),
         args: vec![
             "exec".to_owned(),
@@ -361,7 +343,7 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
     };
     // The event must be durable before launching; the dispatch ledger is
     // updated only after a successful spawn, so pre-launch failures retry.
-    for comment in &fresh {
+    for comment in &candidates {
         if let Err(error) = state.store.add(comment_event(watched, comment)) {
             gate.release(&watched.session_id);
             return Err(format!("could not persist comment event: {error}"));
@@ -392,11 +374,49 @@ fn scan_pr(state: &Arc<Server>, watched: &WatchedPr, shadow: bool) -> Result<boo
         gate.release(&watched.session_id);
         return Err(error);
     }
-    if let Err(error) = gate.mark_dispatched(fresh.iter().map(Comment::event_id)) {
+    if let Err(error) = gate.mark_dispatched(candidates.iter().map(Comment::event_id)) {
         // The completion monitor releases the claim; retrying after it exits
         // is safer than stranding this session forever.
         eprintln!("could not mark GitHub comment dispatch complete: {error}");
     }
+    Ok(true)
+}
+
+fn routable_comments(comments: &[Comment], gate: &SessionGate) -> Vec<Comment> {
+    comments
+        .iter()
+        .filter(|comment| comment.is_owner_feedback())
+        .filter(|comment| !gate.is_dispatched(&comment.event_id()))
+        .cloned()
+        .collect()
+}
+
+fn shadow_dispatch(
+    gate: &SessionGate,
+    watched: &WatchedPr,
+    candidates: &[Comment],
+    mut persist: impl FnMut(Json) -> Result<(), String>,
+) -> Result<bool, String> {
+    if candidates.is_empty() || !gate.claim(&watched.session_id) {
+        return Ok(false);
+    }
+    let result = (|| {
+        for comment in candidates {
+            persist(comment_event(watched, comment))?;
+        }
+        gate.mark_dispatched(candidates.iter().map(Comment::event_id))
+    })();
+    if let Err(error) = result {
+        gate.release(&watched.session_id);
+        return Err(error);
+    }
+    eprintln!(
+        "shadow: would resume a session for {}#{} on {} new GitHub comment(s)",
+        watched.repository,
+        watched.number,
+        candidates.len()
+    );
+    gate.release(&watched.session_id);
     Ok(true)
 }
 
@@ -604,7 +624,7 @@ fn truncate_utf8_tail(value: &str, max: usize) -> &str {
 fn load_watched_prs(config: &Config) -> Result<Vec<WatchedPr>, String> {
     let mut watched: HashMap<(String, u64), WatchedPr> = HashMap::new();
     for entry in &config.command_entries {
-        let entry = parse_watch_entry(entry)?;
+        let entry = entry.clone();
         watched.insert((entry.repository.clone(), entry.number), entry);
     }
     match std::fs::read_to_string(&config.state_file) {
@@ -756,6 +776,7 @@ fn parse_watch_entry(value: &str) -> Result<WatchedPr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relay_core::Store;
 
     #[test]
     fn graphql_node_id_is_the_only_comment_identity() {
@@ -903,5 +924,152 @@ mod tests {
             poll_interval(now, now, Duration::from_secs(300)),
             Duration::from_secs(300)
         );
+    }
+
+    fn watched() -> WatchedPr {
+        WatchedPr {
+            repository: "ShukantPal/zigzag".to_owned(),
+            number: 13,
+            session_id: "session".to_owned(),
+        }
+    }
+
+    fn owner_comment(surface: &'static str, node_id: &str) -> Comment {
+        Comment {
+            surface,
+            node_id: node_id.to_owned(),
+            author: ROUTED_OWNER.to_owned(),
+            body: "please fix".to_owned(),
+            url: String::new(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn shadow_failures_release_the_claim_for_retry() {
+        let watched = watched();
+        let comment = owner_comment("issue", "node");
+        let gate = SessionGate::in_memory();
+        assert!(
+            shadow_dispatch(&gate, &watched, std::slice::from_ref(&comment), |_| Err(
+                "disk failed".to_owned()
+            ))
+            .is_err()
+        );
+        assert!(gate.claim(&watched.session_id));
+        gate.release(&watched.session_id);
+
+        // A ledger write failure follows the same release path. The in-memory
+        // state is still removed even though the deliberately invalid ledger
+        // path cannot be replaced.
+        let broken = SessionGate {
+            path: Some(PathBuf::from("/dev/null/comment-router")),
+            inner: Mutex::new(GateState::default()),
+        };
+        assert!(shadow_dispatch(&broken, &watched, &[comment], |_| Ok(())).is_err());
+        assert!(broken.claim(&watched.session_id));
+    }
+
+    #[test]
+    fn durable_dedup_survives_event_eviction_and_router_reopen() {
+        let base = std::env::temp_dir().join(format!(
+            "zigzag-comment-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let event_path = base.join("events.json");
+        let ledger_path = base.join("router.json");
+        let watched = watched();
+        let comment = owner_comment("review_comment", "PRRC_node");
+        let store = Store::open(&event_path, 1).unwrap();
+        let gate = SessionGate::open(ledger_path.clone()).unwrap();
+        assert!(
+            shadow_dispatch(&gate, &watched, std::slice::from_ref(&comment), |event| {
+                store.add(event).map(|_| ())
+            })
+            .unwrap()
+        );
+        // Evict the delivery event; routing identity remains in its own ledger.
+        store
+            .add(Json::Object(vec![(
+                "id".to_owned(),
+                Json::String("noise".to_owned()),
+            )]))
+            .unwrap();
+        drop(store);
+        drop(gate);
+
+        let reopened_store = Store::open(&event_path, 1).unwrap();
+        let reopened_gate = SessionGate::open(ledger_path).unwrap();
+        let candidates = routable_comments(&[comment], &reopened_gate);
+        assert!(candidates.is_empty());
+        assert!(
+            !shadow_dispatch(&reopened_gate, &watched, &candidates, |event| {
+                reopened_store.add(event).map(|_| ())
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            reopened_store
+                .read(0, "", Duration::ZERO)
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn paginated_all_surface_owner_feedback_produces_routable_events() {
+        let issue = parse_comments("issue", r#"[[{"id":1,"node_id":"IC_1","body":"one","user":{"login":"ShukantPal"}}],[{"id":9}]]"#).unwrap();
+        let inline = parse_comments(
+            "review_comment",
+            r#"[[{"id":2,"node_id":"PRRC_2","body":"two","user":{"login":"ShukantPal"}}]]"#,
+        )
+        .unwrap();
+        let review = parse_comments(
+            "review",
+            r#"[[{"id":3,"node_id":"PRR_3","body":"three","user":{"login":"ShukantPal"}}]]"#,
+        )
+        .unwrap();
+        let comments = [issue, inline, review].concat();
+        let gate = SessionGate::in_memory();
+        let candidates = routable_comments(&comments, &gate);
+        assert_eq!(candidates.len(), 3);
+        let watched = watched();
+        let base = std::env::temp_dir().join(format!(
+            "zigzag-comment-surfaces-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(base.join("events.json"), 10).unwrap();
+        assert!(
+            shadow_dispatch(&gate, &watched, &candidates, |event| {
+                store.add(event).map(|_| ())
+            })
+            .unwrap()
+        );
+        let events = store.read(0, "", Duration::ZERO).unwrap();
+        let surfaces: Vec<_> = events
+            .events
+            .iter()
+            .map(|event| {
+                event
+                    .payload
+                    .object("surface")
+                    .and_then(Json::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(surfaces, ["issue", "review_comment", "review"]);
+        let _ = std::fs::remove_dir_all(base);
     }
 }
