@@ -1,6 +1,5 @@
 use crate::exec;
-use crate::is_tailscale_ipv4;
-use crate::require_gui_login_session;
+use crate::session::{is_tailscale_ipv4, require_gui_login_session};
 use crate::update;
 use std::env;
 use std::net::IpAddr;
