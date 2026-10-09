@@ -57,6 +57,33 @@ fn agent_create_test_repo(id: &str) -> PathBuf {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let origin = repo.join(".test-origin.git");
+    let output = Command::new("git")
+        .args(["init", "--bare", "--initial-branch=main", "-q"])
+        .arg(&origin)
+        .current_dir(&repo)
+        .output()
+        .expect("could not initialize agent test origin");
+    assert!(
+        output.status.success(),
+        "agent test origin setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for args in [
+        vec!["remote", "add", "origin", origin.to_str().unwrap()],
+        vec!["push", "--set-upstream", "origin", "main"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("could not configure agent test origin");
+        assert!(
+            output.status.success(),
+            "agent test origin setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     repo
 }
 
