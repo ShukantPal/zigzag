@@ -76,6 +76,75 @@ GUI-session Keychain allowlist are unchanged. The legacy kill route is only
 enabled when a distinct `--control-secret-file` (or
 `ZIGZAG_CONTROL_SECRET_FILE`) is configured.
 
+## Network security: Tailscale ACLs
+
+The relay never binds to a public interface. On startup it listens on
+`127.0.0.1` and on the Mac's Tailscale IPv4 address (`100.64.0.0/10`,
+resolved via `tailscale ip -4`; `--tailscale-ip` overrides it for testing and
+is rejected unless it is a Tailscale IPv4 address). The default port is 8765.
+
+Binding to the tailnet is necessary but not sufficient: **Tailscale ACLs are
+the relay's network-level access control.** The relay speaks plain HTTP on the
+tailnet and every route requires the bearer token — but any tailnet device
+that can reach the port can attempt authentication indefinitely, probe for
+weaknesses, and burn relay resources. The ACL is what keeps that set to
+exactly the orchestrator. Tailscale's default ACL allows all tailnet traffic
+(`*` to `*:*`), so if you have never edited your ACLs, every device on your
+tailnet can already reach the relay's port.
+
+### Recommended policy
+
+In the Tailscale admin console, restrict the relay's port to the devices that
+need it — the owner and the tagged orchestrator nodes — and nothing else:
+
+```json
+{
+  "tagOwners": {
+    "tag:zigzag-client": ["autogroup:member"]
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["autogroup:member", "tag:zigzag-client"],
+      "dst": ["100.x.y.z:8765"]
+    }
+  ]
+}
+```
+
+Replace `100.x.y.z` with the Mac's Tailscale IPv4 address (`tailscale ip -4`
+on the Mac). Notes:
+
+- Prefer a tag (`tag:zigzag-client`) for the orchestrator VM over naming
+  individual devices, so a rebuilt VM keeps access without an ACL change —
+  but keep the tag's membership minimal.
+- Do not open the port to `autogroup:shared` or `*`: shared nodes and future
+  tailnet members would gain network access to the relay.
+- The relay host itself needs no inbound rule beyond this one; with a
+  default-deny policy, everything not explicitly accepted is dropped.
+
+### If the ACL is misconfigured
+
+- **Too open** (the default allow-all, or the relay port left reachable
+  during a default-deny migration): every tailnet device — including
+  compromised or shared nodes — can reach the relay. The bearer token still
+  guards every route, and the exec allowlist can only be changed from the
+  Mac's GUI login session, but a network-reachable attacker can attempt
+  authentication without limit, exploit any future unauthenticated endpoint,
+  and run resource-exhaustion attacks against the HTTP server.
+- **Too closed** (orchestrator not in `src`, wrong IP in `dst`): the poller
+  and orchestrator tooling lose connectivity — events stop flowing and
+  `/v1/spawn` calls fail. The relay itself keeps running; this fails safe,
+  not open.
+- **Stale IP in `dst`**: the Mac's Tailscale address can change (reinstall,
+  `tailscale logout`/`login`). If the relay becomes unreachable after such a
+  change, compare `tailscale ip -4` on the Mac against the ACL.
+
+When in doubt, verify from both sides: from an allowed host, `curl` against
+the Tailscale IP without the bearer token should return `401` (reachable and
+authenticated), and with the token `200`. From anything not in `src`, the
+connection should time out — if it instead returns `401`, the ACL is too open.
+
 ## Mac-owned review loop
 
 At startup, the daemon reads `~/.zigzag/config.yaml`, validates it against the

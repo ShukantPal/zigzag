@@ -18,6 +18,15 @@ mod review_loop;
 mod update;
 
 const MAX_BODY: usize = 64 * 1024;
+/// Upper bound on simultaneous in-flight connections. The accept loop
+/// sheds excess connections with 503 instead of spawning unbounded
+/// threads: each thread carries a stack plus a 10s read timeout, so a
+/// slow flood could otherwise exhaust memory or file descriptors.
+const MAX_CONNECTIONS: usize = 32;
+/// Upper bound on the request line plus all header lines, in bytes.
+const MAX_HEADER_BLOCK_BYTES: usize = 8 * 1024;
+/// Upper bound on the number of header lines in one request.
+const MAX_HEADER_COUNT: usize = 100;
 const MAX_FINISHED_PROCS: usize = 128;
 const FINISHED_PROC_RETENTION: Duration = Duration::from_secs(60 * 60);
 const COMPAT_OUTPUT_CAP: usize = 2 * 1024 * 1024;
@@ -120,9 +129,11 @@ struct SpawnRequest {
     execution_id: Option<String>,
 }
 
+#[derive(Debug)]
 enum ReadRequestError {
     Message(String),
     ExecutionDenied,
+    HeadersTooLarge,
 }
 
 fn main() {
@@ -224,12 +235,16 @@ fn run() -> Result<(), String> {
         SocketAddr::new(IpAddr::from([127, 0, 0, 1]), config.port),
         SocketAddr::new(tailnet, config.port),
     ];
+    // One limiter for both listeners: the cap bounds total handler threads,
+    // not threads per socket.
+    let limiter = Arc::new(ConnectionLimiter::new(MAX_CONNECTIONS));
     for address in addresses {
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("could not bind {address}: {error}"))?;
         let state = Arc::clone(&state);
+        let limiter = Arc::clone(&limiter);
         println!("zigzag listening on http://{address}");
-        thread::spawn(move || serve(listener, state));
+        thread::spawn(move || serve(listener, state, limiter));
     }
     // The replacement only signals readiness after it has opened durable state
     // and rebound both listeners. The watchdog rolls back if this does not
@@ -691,15 +706,67 @@ fn is_tailscale_ipv4(address: IpAddr) -> bool {
     matches!(address, IpAddr::V4(address) if address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
 }
 
-fn serve(listener: TcpListener, state: Arc<Server>) {
+/// Admission control for inbound connections. The permit is held for the
+/// whole handler thread and released on drop, so at most `max` connections
+/// are ever in flight at once.
+struct ConnectionLimiter {
+    active: Mutex<usize>,
+    max: usize,
+}
+
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl ConnectionLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            max,
+        }
+    }
+
+    /// Best-effort admission: a permit while fewer than `max` connections are
+    /// in flight, `None` when the server is saturated.
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut active = self.active.lock().expect("connection limiter poisoned");
+        if *active >= self.max {
+            return None;
+        }
+        *active += 1;
+        Some(ConnectionPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .expect("connection limiter poisoned");
+        *active = active.saturating_sub(1);
+    }
+}
+
+fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<ConnectionLimiter>) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                let state = Arc::clone(&state);
-                thread::spawn(move || {
-                    let _ = handle(stream, state);
-                });
-            }
+            Ok(mut stream) => match limiter.try_acquire() {
+                Some(permit) => {
+                    let state = Arc::clone(&state);
+                    thread::spawn(move || {
+                        let _permit = permit;
+                        let _ = handle(stream, state);
+                    });
+                }
+                None => {
+                    eprintln!("zigzag connection shed: already at {MAX_CONNECTIONS} connections");
+                    let _ = reply(&mut stream, 503, error("too_many_connections"));
+                }
+            },
             Err(error) => eprintln!("zigzag accept error: {error}"),
         }
     }
@@ -745,6 +812,17 @@ where
         Ok(request) => request,
         Err(ReadRequestError::ExecutionDenied) => {
             denied(&mut stream, "")?;
+            return Ok(());
+        }
+        Err(ReadRequestError::HeadersTooLarge) => {
+            reply(
+                &mut stream,
+                431,
+                Json::Object(vec![(
+                    "error".to_owned(),
+                    Json::String("request header fields too large".to_owned()),
+                )]),
+            )?;
             return Ok(());
         }
         Err(ReadRequestError::Message(error)) => {
@@ -1908,10 +1986,11 @@ fn read_json(result: ReadResult) -> Json {
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
     let mut reader = BufReader::new(stream);
-    let mut first = String::new();
-    reader
-        .read_line(&mut first)
-        .map_err(|_| ReadRequestError::Message("could not read request line".to_owned()))?;
+    // The budget covers the request line too: an unbounded request line is
+    // the same allocation attack as unbounded headers.
+    let mut budget = MAX_HEADER_BLOCK_BYTES;
+    let first = read_header_line(&mut reader, &mut budget)?
+        .ok_or_else(|| ReadRequestError::Message("malformed request line".to_owned()))?;
     let mut parts = first.split_whitespace();
     let method = parts
         .next()
@@ -1927,13 +2006,18 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
         ));
     }
     let mut headers = HashMap::new();
+    let mut header_count = 0;
     loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|_| ReadRequestError::Message("could not read headers".to_owned()))?;
+        let line = read_header_line(&mut reader, &mut budget)?
+            .ok_or_else(|| ReadRequestError::Message("could not read headers".to_owned()))?;
         if line == "\r\n" || line == "\n" {
             break;
+        }
+        // Count lines, not map entries: duplicate header names collapse in
+        // the map, but each line still costs the peer nothing to send.
+        header_count += 1;
+        if header_count > MAX_HEADER_COUNT {
+            return Err(ReadRequestError::HeadersTooLarge);
         }
         let (name, value) = line
             .trim_end()
@@ -1978,6 +2062,41 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ReadRequestError> {
         headers,
         body,
     })
+}
+
+/// Read one header line, deducting its bytes from `budget`.
+///
+/// The budget caps the whole header block (request line included). Reads go
+/// through `take(budget)`, so a peer can never make the block larger than the
+/// cap no matter how long a single line is: `read_until` returns as soon as
+/// the budget is consumed, even without a line terminator. `None` is a clean
+/// EOF before any byte of the line.
+fn read_header_line(
+    reader: &mut BufReader<&mut TcpStream>,
+    budget: &mut usize,
+) -> Result<Option<String>, ReadRequestError> {
+    if *budget == 0 {
+        return Err(ReadRequestError::HeadersTooLarge);
+    }
+    let mut line = Vec::new();
+    let consumed = reader
+        .by_ref()
+        .take(*budget as u64)
+        .read_until(b'\n', &mut line)
+        .map_err(|_| ReadRequestError::Message("could not read headers".to_owned()))?;
+    *budget -= consumed;
+    if consumed == 0 {
+        return Ok(None);
+    }
+    if !line.ends_with(b"\n") {
+        // Budget exhausted before the terminator: the header block is over
+        // the cap. (A peer that disconnects mid-header lands here too; it is
+        // still a client error, as before.)
+        return Err(ReadRequestError::HeadersTooLarge);
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| ReadRequestError::Message("malformed header".to_owned()))
 }
 
 fn query(target: &str) -> Result<HashMap<String, String>, String> {
@@ -2047,6 +2166,7 @@ fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<(), String> {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -2324,6 +2444,145 @@ mod tests {
             read_request(&mut server),
             Err(ReadRequestError::ExecutionDenied)
         ));
+    }
+
+    #[test]
+    fn connection_limiter_admits_up_to_the_cap_and_releases_on_drop() {
+        let limiter = Arc::new(ConnectionLimiter::new(2));
+        let first = limiter.try_acquire();
+        assert!(first.is_some());
+        let second = limiter.try_acquire();
+        assert!(second.is_some());
+        assert!(limiter.try_acquire().is_none());
+        drop(first);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    fn connection_limiter_never_exceeds_the_cap_concurrently() {
+        let limiter = Arc::new(ConnectionLimiter::new(MAX_CONNECTIONS));
+        let (done, results) = std::sync::mpsc::channel();
+        // Every thread races for the same bounded pool. Admitted permits
+        // travel back through the channel, so they stay held until the main
+        // thread has collected them all.
+        for _ in 0..MAX_CONNECTIONS * 2 {
+            let limiter = Arc::clone(&limiter);
+            let done = done.clone();
+            thread::spawn(move || {
+                done.send(limiter.try_acquire()).unwrap();
+            });
+        }
+        drop(done);
+        let permits: Vec<Option<ConnectionPermit>> = results.iter().collect();
+        assert_eq!(
+            permits.iter().filter(|permit| permit.is_some()).count(),
+            MAX_CONNECTIONS
+        );
+        drop(permits);
+        assert_eq!(*limiter.active.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn more_than_one_hundred_headers_are_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "GET /v1/health HTTP/1.1\r\n").unwrap();
+            for index in 0..=MAX_HEADER_COUNT {
+                write!(stream, "X-Flood-{index}: value\r\n").unwrap();
+            }
+            write!(stream, "\r\n").unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        assert!(matches!(
+            read_request(&mut server),
+            Err(ReadRequestError::HeadersTooLarge)
+        ));
+    }
+
+    #[test]
+    fn exactly_one_hundred_headers_still_parse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "GET /v1/health HTTP/1.1\r\n").unwrap();
+            for index in 0..MAX_HEADER_COUNT {
+                write!(stream, "X-Ok-{index}: value\r\n").unwrap();
+            }
+            write!(stream, "\r\n").unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        let request = read_request(&mut server).unwrap();
+        assert_eq!(request.headers.len(), MAX_HEADER_COUNT);
+    }
+
+    #[test]
+    fn header_block_over_eight_kib_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "GET /v1/health HTTP/1.1\r\nX-Big: ").unwrap();
+            stream
+                .write_all(&vec![b'a'; MAX_HEADER_BLOCK_BYTES])
+                .unwrap();
+            write!(stream, "\r\n\r\n").unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        client.join().unwrap();
+        assert!(matches!(
+            read_request(&mut server),
+            Err(ReadRequestError::HeadersTooLarge)
+        ));
+    }
+
+    #[test]
+    fn unterminated_header_line_cannot_outgrow_the_budget() {
+        // The client never sends a line terminator; the server must stop at
+        // the budget instead of buffering the line without bound.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            write!(stream, "GET /v1/health HTTP/1.1\r\nX-Big: ").unwrap();
+            stream
+                .write_all(&vec![b'a'; 2 * MAX_HEADER_BLOCK_BYTES])
+                .unwrap();
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let result = read_request(&mut server);
+        assert!(matches!(result, Err(ReadRequestError::HeadersTooLarge)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "server waited for a terminator instead of enforcing the budget"
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn reply_reports_431_as_request_header_fields_too_large() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+                "unexpected status line: {response}"
+            );
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        reply(&mut server, 431, error("request header fields too large")).unwrap();
+        // Close so the client's read_to_end sees EOF.
+        drop(server);
+        client.join().unwrap();
     }
 
     #[test]
