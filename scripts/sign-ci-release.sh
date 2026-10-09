@@ -1,5 +1,11 @@
 #!/bin/bash
-# Sign a release binary with the Developer ID identity required by the updater.
+# Sign a release binary with the Apple identity required by the updater.
+#
+# The updater (relay/src/update.rs) and scripts/verify-release.sh require:
+#   identifier "com.shukantpal.zigzag" and
+#   certificate leaf[subject.OU] = "7YZK8D3B48"
+# (the "(NH5F3PDHQ8)" parenthetical in the certificate CN is stale; the real
+# TeamIdentifier is 7YZK8D3B48 — see PROVENANCE.md).
 set -euo pipefail
 
 : "${SIGNING_IDENTITY:?ZIGZAG_SIGNING_IDENTITY is required for release signing}"
