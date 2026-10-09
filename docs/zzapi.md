@@ -19,7 +19,8 @@ zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
 zzapi agents create --prompt TEXT --project-dir DIR
                     (--branch BRANCH | --no-branch | --pr NUMBER)
-                    [--worktree PATH] [--model MODEL]
+                    [--worktree PATH] [--harness codex|gemini|opencode]
+                    [--model MODEL]
                     [--approval-mode MODE] [--timeout-secs N]
 zzapi agents logs ID [--stream stdout|stderr|both] [--after N] [--tail N]
                     [--follow] [--prefix]

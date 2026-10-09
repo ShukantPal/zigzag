@@ -3,10 +3,18 @@
 ## Agent lifecycle
 
 Relay-native agent creation is deliberately narrower than `/v1/exec`: callers
-submit a provider request instead of arbitrary commands. The relay starts a
-supervised Codex group in a permitted worktree or, with explicit `--no-branch`,
-directly in the project directory; it persists lifecycle state,
-captures stdout/stderr, and records an API-created transcript.
+select a supported CLI harness (`codex`, `gemini`, or `opencode`) instead of
+supplying arbitrary commands. The relay starts the chosen CLI in a permitted
+worktree or, with explicit `--no-branch`, directly in the project directory;
+it persists lifecycle state, captures stdout/stderr, and records an
+API-created transcript. The harness defaults to `codex` for compatibility.
+
+The shared approval modes map to each CLI's options: Gemini uses `default`,
+`auto_edit`, or `yolo`; OpenCode uses inline permission configuration for
+`suggest` and `auto-edit`, and `--auto` for `full-auto`; Codex keeps its native
+approval flags.
+Model selection uses each CLI's `--model` option. With no model override,
+Gemini and OpenCode use their own configured defaults.
 
 The registry reaper records terminal exit. After relay restart it cannot
 reattach pipes: a live old group becomes `orphaned`; a dead one becomes
