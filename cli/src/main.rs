@@ -858,14 +858,19 @@ fn cmd_agents_transcript(
     let mut previous = None;
     loop {
         let mut q = Vec::new();
-        if let Some(tail) = tail {
+        if let Some(cursor) = previous.as_ref().and_then(transcript_cursor) {
+            q.push(("after", cursor.to_string()));
+        } else if let Some(tail) = tail {
             q.push(("tail", tail.to_string()));
         }
         let response = client.get(&format!("/v1/agents/{id}/transcript"), &q)?;
         if client.json {
             println!("{}", json_output(&response, follow));
         } else if let Some(previous) = previous.as_ref() {
-            print_transcript_updates(previous, &response);
+            print_transcript_updates(&response);
+            if !transcript_log_degraded(previous) && transcript_log_degraded(&response) {
+                warn_transcript_degraded();
+            }
         } else {
             print_transcript(&response);
         }
@@ -900,21 +905,27 @@ fn print_transcript(transcript: &serde_json::Value) {
     if !command.is_empty() {
         println!("command       {command}");
     }
-    print_transcript_section("prompt", transcript.get("prompt"));
-    print_transcript_section("last message", transcript.get("last_message"));
-    print_transcript_section("stdout", transcript.get("stdout"));
-    print_transcript_section("stderr", transcript.get("stderr"));
-    if transcript
-        .get("log_degraded")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        eprintln!("warning: agent transcript is incomplete because log capture degraded");
+    for (section, field) in [
+        ("prompt", "prompt"),
+        ("last message", "last_message"),
+        ("stdout", "stdout"),
+        ("stderr", "stderr"),
+    ] {
+        print_transcript_section(section, transcript_text(transcript, field));
+    }
+    if transcript_log_degraded(transcript) {
+        warn_transcript_degraded();
     }
 }
 
-fn print_transcript_section(name: &str, value: Option<&serde_json::Value>) {
-    let text = value.and_then(serde_json::Value::as_str).unwrap_or("");
+fn transcript_text<'a>(transcript: &'a serde_json::Value, key: &str) -> &'a str {
+    transcript
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+fn print_transcript_section(name: &str, text: &str) {
     if !text.is_empty() {
         println!("\n--- {name} ---");
         print!("{text}");
@@ -924,47 +935,26 @@ fn print_transcript_section(name: &str, value: Option<&serde_json::Value>) {
     }
 }
 
-fn print_transcript_updates(previous: &serde_json::Value, current: &serde_json::Value) {
+fn print_transcript_updates(current: &serde_json::Value) {
     for key in ["stdout", "stderr"] {
-        let before = previous
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let after = current
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let appended = appended_text(before, after);
-        if !appended.is_empty() {
-            println!("\n--- {key} ---");
-            print!("{appended}");
-            if !appended.ends_with('\n') {
-                println!();
-            }
-        }
+        print_transcript_section(key, transcript_text(current, key));
     }
+    std::io::stdout().flush().ok();
 }
 
-/// Return the text appended after `previous`. When `--tail` causes the relay
-/// to drop a leading prefix, preserve the longest suffix/prefix overlap.
-fn appended_text(previous: &str, current: &str) -> String {
-    if let Some(appended) = current.strip_prefix(previous) {
-        return appended.to_string();
-    }
-    if previous.contains(current) {
-        return String::new();
-    }
-    let max_overlap = previous.len().min(current.len());
-    for overlap in (0..=max_overlap).rev() {
-        let previous_start = previous.len() - overlap;
-        if previous.is_char_boundary(previous_start)
-            && current.is_char_boundary(overlap)
-            && previous[previous_start..] == current[..overlap]
-        {
-            return current[overlap..].to_string();
-        }
-    }
-    current.to_string()
+fn transcript_cursor(transcript: &serde_json::Value) -> Option<u64> {
+    after_u64(transcript.get("next_cursor"))
+}
+
+fn transcript_log_degraded(transcript: &serde_json::Value) -> bool {
+    transcript
+        .get("log_degraded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn warn_transcript_degraded() {
+    eprintln!("warning: agent transcript is incomplete because log capture degraded");
 }
 
 fn log_retention_lost(response: &serde_json::Value, after: u64) -> bool {
@@ -1330,11 +1320,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transcript_follow_emits_only_appended_output() {
-        assert_eq!(appended_text("first", "first second"), " second");
-        assert_eq!(appended_text("abcdef", "cdefghi"), "ghi");
-        assert_eq!(appended_text("already seen", "seen"), "");
-        assert_eq!(appended_text("hello ", "hello 🌍"), "🌍");
+    fn transcript_follow_uses_the_relay_cursor() {
+        assert_eq!(
+            transcript_cursor(&serde_json::json!({"next_cursor": 7})),
+            Some(7)
+        );
+        assert_eq!(transcript_cursor(&serde_json::json!({})), None);
     }
 
     #[test]
