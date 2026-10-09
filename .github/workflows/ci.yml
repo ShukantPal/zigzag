@@ -130,6 +130,17 @@ jobs:
           grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
           grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
+  full-stack-e2e:
+    # Drive the released binaries together: a real relay, zzapi, and the
+    # status TUI's live-relay view.  The script uses a fake long-lived Codex
+    # executable, so it verifies lifecycle side effects without credentials.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+      - run: cargo build --locked -p zigzag -p zzapi
+      - run: bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi
+
   zzapi:
     # Build the zzapi CLI for macOS (Shukant's Mac) and Linux (Muse's VM).
     # Runs on every PR and main push; binaries are uploaded as artifacts

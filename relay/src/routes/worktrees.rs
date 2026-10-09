@@ -25,10 +25,24 @@ pub(crate) struct WorktreeError {
 /// Canonicalize each configured root, dropping roots that do not exist. An
 /// empty result rejects every path (fail closed).
 pub(crate) fn canonical_worktree_roots() -> Vec<PathBuf> {
-    WORKTREE_ALLOWED_ROOTS
-        .iter()
+    let roots: Vec<PathBuf> = std::env::var_os("ZIGZAG_WORKTREE_ROOTS")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_else(|| WORKTREE_ALLOWED_ROOTS.iter().map(PathBuf::from).collect());
+    roots
+        .into_iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect()
+}
+
+/// Root accepted for repositories used by worktree and agent creation.
+///
+/// The environment override makes it possible to run an isolated relay on a
+/// non-macOS host (including CI) without weakening the production default.
+pub(crate) fn configured_worktree_repo_root() -> PathBuf {
+    let root = std::env::var_os("ZIGZAG_WORKTREE_REPO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(WORKTREE_REPO_ROOT));
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 /// Canonicalize `path` (which must exist) and require it to sit under `roots`.
 pub(crate) fn canonical_path_under_roots(
@@ -396,8 +410,7 @@ pub(crate) fn worktree_create(stream: &mut TcpStream, body: Vec<u8>) -> Result<(
         _ => return reply(stream, 400, error("invalid_worktree_request")),
     };
     let roots = canonical_worktree_roots();
-    let repo_root = std::fs::canonicalize(WORKTREE_REPO_ROOT)
-        .unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT));
+    let repo_root = configured_worktree_repo_root();
     match worktree_create_plan(&path, &branch, &repo, &roots, &repo_root) {
         Ok(response) => reply(stream, 200, response),
         Err(failure) => reply(stream, failure.code, error(failure.message)),

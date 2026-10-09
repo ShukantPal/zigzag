@@ -7,12 +7,12 @@ use crate::proc::{
     AgentSpawnDetails, agent_transcript_path, kill_process_group, process_group_running,
     recovered_agent_identity_matches, spawn_proc,
 };
-#[cfg(not(test))]
-use crate::routes::worktrees::{WORKTREE_REPO_ROOT, canonical_worktree_roots};
 use crate::routes::worktrees::{
     WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
     valid_worktree_branch, worktree_branch_checked_out, worktree_branch_exists,
 };
+#[cfg(not(test))]
+use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
 use crate::server::{Server, Supervisor};
 use relay_core::{AgentRecord, Json, parse_json};
 use std::net::TcpStream;
@@ -42,7 +42,7 @@ fn agent_worktree_roots() -> Vec<PathBuf> {
 
 #[cfg(not(test))]
 fn agent_worktree_repo_root() -> PathBuf {
-    std::fs::canonicalize(WORKTREE_REPO_ROOT).unwrap_or_else(|_| PathBuf::from(WORKTREE_REPO_ROOT))
+    configured_worktree_repo_root()
 }
 
 #[cfg(test)]
