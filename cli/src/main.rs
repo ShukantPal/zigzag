@@ -25,6 +25,9 @@ use std::time::Duration;
 const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
+/// The relay permits synchronous executions for up to five minutes. Leave a
+/// little room for the response to cross the network after that deadline.
+const EXEC_CLIENT_TIMEOUT_SECS: u64 = 330;
 
 // ---------------------------------------------------------------------------
 // errors
@@ -36,9 +39,11 @@ struct ApiError {
     message: String,
 }
 
+#[derive(Debug)]
 enum Fail {
     Api(ApiError),
     Config(String),
+    Command,
 }
 
 impl From<ApiError> for Fail {
@@ -58,7 +63,7 @@ impl From<ApiError> for Fail {
     version
 )]
 struct Cli {
-    /// Relay hostname (port is always 8765)
+    /// Relay hostname (or host:port; default port is 8765)
     #[arg(long, env = "ZIGZAG_HOSTNAME", default_value = DEFAULT_HOSTNAME)]
     hostname: String,
 
@@ -349,7 +354,16 @@ impl Client {
     }
 
     fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
-        self.request("POST", path, &[], Some(body), 120)
+        self.post_with_timeout(path, body, 120)
+    }
+
+    fn post_with_timeout(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request("POST", path, &[], Some(body), timeout_secs)
     }
 }
 
@@ -386,14 +400,7 @@ fn resolve_token(token_file: Option<&str>) -> Result<String, Fail> {
     } else {
         path.clone()
     };
-    let mut contents = String::new();
-    std::fs::File::open(&expanded)
-        .and_then(|mut f| f.read_to_string(&mut contents))
-        .map_err(|e| {
-            Fail::Config(format!(
-                "cannot read token file {expanded}: {e}\nset ZIGZAG_TOKEN or --token-file"
-            ))
-        })?;
+    let contents = read_private_token(&expanded)?;
     let token = contents.trim().to_string();
     if token.is_empty() {
         return Err(Fail::Config(format!("token file {expanded} is empty")));
@@ -401,8 +408,39 @@ fn resolve_token(token_file: Option<&str>) -> Result<String, Fail> {
     Ok(token)
 }
 
+fn read_private_token(path: &str) -> Result<String, Fail> {
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        Fail::Config(format!(
+            "cannot read token file {path}: {e}\nset ZIGZAG_TOKEN or --token-file"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = file
+            .metadata()
+            .map_err(|e| Fail::Config(format!("cannot inspect token file {path}: {e}")))?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(Fail::Config(format!(
+                "token file {path} must be owned by the current user and have mode 0600 (run: chmod 600 {path})"
+            )));
+        }
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).map_err(|e| {
+        Fail::Config(format!(
+            "cannot read token file {path}: {e}\nset ZIGZAG_TOKEN or --token-file"
+        ))
+    })?;
+    Ok(contents)
+}
+
 fn make_client(cli: &Cli) -> Result<Client, Fail> {
-    let base = format!("http://{}:{DEFAULT_PORT}", cli.hostname);
+    let base = relay_base(&cli.hostname);
     let token = resolve_token(cli.token_file.as_deref())?;
     let mut builder = ureq::AgentBuilder::new();
     if let Ok(proxy) = std::env::var("ZIGZAG_PROXY") {
@@ -419,6 +457,17 @@ fn make_client(cli: &Cli) -> Result<Client, Fail> {
         agent: builder.build(),
         json: cli.json,
     })
+}
+
+fn relay_base(hostname: &str) -> String {
+    let has_port = hostname
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    if has_port {
+        format!("http://{hostname}")
+    } else {
+        format!("http://{hostname}:{DEFAULT_PORT}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,9 +559,19 @@ fn after_u64(v: Option<&serde_json::Value>) -> Option<u64> {
 
 fn emit(client: &Client, payload: &serde_json::Value, table: impl FnOnce()) {
     if client.json {
-        println!("{}", serde_json::to_string_pretty(payload).unwrap());
+        println!("{}", json_output(payload, false));
     } else {
         table();
+    }
+}
+
+/// A followed stream is JSON Lines so each response remains independently
+/// parseable. One-shot commands retain their readable, pretty JSON output.
+fn json_output(payload: &serde_json::Value, streaming: bool) -> String {
+    if streaming {
+        serde_json::to_string(payload).unwrap()
+    } else {
+        serde_json::to_string_pretty(payload).unwrap()
     }
 }
 
@@ -746,7 +805,7 @@ fn cmd_agents_logs(
         }
         let resp = client.get(&format!("/v1/agents/{id}/logs"), &q)?;
         if client.json {
-            println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+            println!("{}", json_output(&resp, follow));
         } else if let Some(records) = resp.get("records").and_then(|r| r.as_array()) {
             for rec in records {
                 let stream_name = s(rec, "stream");
@@ -759,6 +818,12 @@ fn cmd_agents_logs(
             }
             out.flush().ok();
         }
+        if log_retention_lost(&resp, after) {
+            eprintln!(
+                "warning: agent log retention lost earlier records; output starts at the oldest retained record"
+            );
+            return Err(Fail::Command);
+        }
         after = after_u64(resp.get("next_cursor")).unwrap_or(after);
         let complete = resp
             .get("complete")
@@ -769,6 +834,10 @@ fn cmd_agents_logs(
         }
     }
     Ok(())
+}
+
+fn log_retention_lost(response: &serde_json::Value, after: u64) -> bool {
+    after_u64(response.get("dropped_before")).is_some_and(|dropped_before| after < dropped_before)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,10 +886,10 @@ fn cmd_exec(client: &Client, bin: &str, args: &[String], id: Option<&str>) -> Re
         "bin": bin,
         "args": args,
     });
-    let resp = client.post("/v1/exec", &body)?;
+    let resp = client.post_with_timeout("/v1/exec", &body, EXEC_CLIENT_TIMEOUT_SECS)?;
     if s(&resp, "error") == "denied" {
         println!("denied (id={})", s(&resp, "id"));
-        std::process::exit(1);
+        return Err(Fail::Command);
     }
     emit(client, &resp, || {
         let stdout = s(&resp, "stdout");
@@ -838,11 +907,18 @@ fn cmd_exec(client: &Client, bin: &str, args: &[String], id: Option<&str>) -> Re
             s(&resp, "truncated")
         );
     });
-    let exit_code = resp.get("exit_code").and_then(|e| e.as_i64());
-    if !matches!(exit_code, Some(0) | None) {
-        std::process::exit(1);
+    if !exec_succeeded(&resp) {
+        return Err(Fail::Command);
     }
     Ok(())
+}
+
+fn exec_succeeded(response: &serde_json::Value) -> bool {
+    response.get("exit_code").and_then(|code| code.as_i64()) == Some(0)
+        && !response
+            .get("timed_out")
+            .and_then(|timed_out| timed_out.as_bool())
+            .unwrap_or(false)
 }
 
 fn cmd_spawn(
@@ -913,7 +989,7 @@ fn cmd_events(
         ];
         let resp = client.request("GET", "/v1/events", &q, None, timeout + 30)?;
         if client.json {
-            println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+            println!("{}", json_output(&resp, follow));
         } else if let Some(events) = resp.get("events").and_then(|e| e.as_array()) {
             for ev in events {
                 let at = s(ev, "occurred_at")
@@ -925,22 +1001,53 @@ fn cmd_events(
             }
             out.flush().ok();
         }
-        if resp.get("reset").and_then(|r| r.as_bool()).unwrap_or(false) {
-            eprintln!("warning: event store reset; restarting from 0");
-            after = 0;
-            epoch.clear();
-            if !follow {
-                break;
-            }
-            continue;
+        let progress = event_progress(&resp, after, &epoch);
+        if progress.reset {
+            eprintln!("warning: event store reset; resumed at its current cursor");
         }
-        after = after_u64(resp.get("next")).unwrap_or(after);
-        epoch = s(&resp, "epoch");
+        if progress.lost {
+            eprintln!(
+                "warning: event retention lost earlier events; output starts at the oldest retained event"
+            );
+            return Err(Fail::Command);
+        }
+        after = progress.after;
+        epoch = progress.epoch;
         if !follow {
             break;
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EventProgress {
+    after: u64,
+    epoch: String,
+    reset: bool,
+    lost: bool,
+}
+
+/// Advance from the server response itself. On an epoch reset, that response
+/// already contains the retained events from the new epoch; reusing its
+/// cursor prevents a follow request from printing them a second time.
+fn event_progress(response: &serde_json::Value, after: u64, epoch: &str) -> EventProgress {
+    EventProgress {
+        after: after_u64(response.get("next")).unwrap_or(after),
+        epoch: response
+            .get("epoch")
+            .and_then(|value| value.as_str())
+            .unwrap_or(epoch)
+            .to_string(),
+        reset: response
+            .get("reset")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        lost: response
+            .get("lost")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,7 +1185,107 @@ fn main() {
             eprintln!("error: {msg}");
             std::process::exit(2);
         }
+        Err(Fail::Command) => std::process::exit(1),
     }
     // Note: Ctrl-C during --follow terminates via the default SIGINT
     // disposition; the shell reports exit code 130.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_only_succeeds_with_an_explicit_zero_exit_code() {
+        assert!(exec_succeeded(&serde_json::json!({"exit_code": 0})));
+        assert!(!exec_succeeded(&serde_json::json!({"exit_code": 1})));
+        assert!(!exec_succeeded(&serde_json::json!({"exit_code": null})));
+        assert!(!exec_succeeded(
+            &serde_json::json!({"timed_out": true, "exit_code": 0})
+        ));
+        assert!(!exec_succeeded(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn exec_timeout_covers_the_relay_execution_window() {
+        assert!(std::hint::black_box(EXEC_CLIENT_TIMEOUT_SECS) > 300);
+    }
+
+    #[test]
+    fn epoch_reset_uses_the_response_cursor_without_replaying_events() {
+        let response = serde_json::json!({
+            "epoch": "new-epoch",
+            "reset": true,
+            "lost": false,
+            "next": 9,
+            "events": [{"sequence": 8}, {"sequence": 9}],
+        });
+        assert_eq!(
+            event_progress(&response, 42, "old-epoch"),
+            EventProgress {
+                after: 9,
+                epoch: "new-epoch".to_string(),
+                reset: true,
+                lost: false,
+            }
+        );
+    }
+
+    #[test]
+    fn retention_loss_is_exposed_by_event_progress() {
+        let response = serde_json::json!({"epoch": "current", "lost": true, "next": 12});
+        assert!(event_progress(&response, 2, "current").lost);
+    }
+
+    #[test]
+    fn log_retention_loss_only_applies_before_the_retained_cursor() {
+        let response = serde_json::json!({"dropped_before": 8});
+        assert!(log_retention_lost(&response, 0));
+        assert!(!log_retention_lost(&response, 8));
+        assert!(!log_retention_lost(&response, 9));
+    }
+
+    #[test]
+    fn relay_base_accepts_an_explicit_port_for_local_or_proxied_relays() {
+        assert_eq!(relay_base("relay.example"), "http://relay.example:8765");
+        assert_eq!(relay_base("127.0.0.1:19876"), "http://127.0.0.1:19876");
+    }
+
+    #[test]
+    fn followed_json_is_json_lines_not_pretty_multi_document_output() {
+        let first = json_output(&serde_json::json!({"next": 1}), true);
+        let second = json_output(&serde_json::json!({"next": 2}), true);
+        for line in [first, second] {
+            assert!(serde_json::from_str::<serde_json::Value>(&line).is_ok());
+            assert!(!line.contains('\n'));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_must_be_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "zzapi-private-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "secret\\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_private_token(path.to_str().unwrap()).unwrap(),
+            "secret\\n"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            read_private_token(path.to_str().unwrap()),
+            Err(Fail::Config(message)) if message.contains("mode 0600")
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -14,11 +14,21 @@ cp target/release/zzapi ~/bin/   # or anywhere on your PATH
 
 | Flag / env | Default | Purpose |
 |---|---|---|
-| `--hostname` / `ZIGZAG_HOSTNAME` | `100.101.237.83` | relay host (port is always 8765) |
+| `--hostname` / `ZIGZAG_HOSTNAME` | `100.101.237.83` | relay host (default port: 8765; an explicit `host:port` is accepted) |
 | `--token-file` / `ZIGZAG_TOKEN_FILE` | `~/.codex/zigzag.token` | file holding the bearer token |
 | `ZIGZAG_TOKEN` | — | bearer token directly (overrides the file) |
 | `ZIGZAG_PROXY` | — | HTTP proxy URL (needed when reaching the relay from the VM) |
 | `--json` | — | print raw JSON instead of human-readable tables |
+
+Token files must be regular files owned by the current user with mode `0600`;
+the client rejects group- or world-readable token files. `ZIGZAG_TOKEN` is
+still useful for managed secret injection where no token file is present.
+
+For `--follow` commands, `--json` emits [JSON Lines](https://jsonlines.org/):
+one compact JSON response per line. This keeps an indefinite stream parseable.
+When an event or agent-log cursor predates retained data, the response is still
+printed with a warning, then the command exits `1` so automation cannot mistake
+a partial stream for a complete one.
 
 ## Usage
 
@@ -65,6 +75,6 @@ the full handle for you.
 ## Exit codes
 
 - `0` — success
-- `1` — API error (auth failure, 404, allowlist denial, non-zero exec exit)
+- `1` — API error (auth failure, 404, allowlist denial, retention loss, failed or indeterminate exec)
 - `2` — usage / config error
 - `130` — interrupted (Ctrl-C during `--follow`; via the shell's SIGINT handling)
