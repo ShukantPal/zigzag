@@ -231,7 +231,6 @@ where
             &state,
             agent_route("POST", path).expect("checked"),
             request.body,
-            load_policy(),
         ),
         ("POST", path) => match proc_route(path) {
             Some(ProcRoute::Kill(handle)) => kill_proc(&mut stream, &state, handle),
