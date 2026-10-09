@@ -31,14 +31,22 @@ pub struct Policy {
 }
 
 /// A binary pinned at policy load time: the symlink-resolved path plus the
-/// file's (device, inode) identity. Re-checked before every spawn, so a
-/// symlink swap or file replacement in the binary's directory cannot silently
-/// redirect execution to an attacker-controlled file.
+/// file's (device, inode, ctime) identity. Re-checked before every spawn, so
+/// a symlink swap or file replacement in the binary's directory cannot
+/// silently redirect execution to an attacker-controlled file.
+///
+/// ctime is pinned alongside (device, inode) because inode numbers can be
+/// reused: a delete+recreate often hands back the same inode (observed on
+/// Linux CI), which a pure (device, inode) check would miss. ctime cannot be
+/// forged — any replacement bumps it to now — so the reused-inode swap is
+/// still detected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BinaryIdentity {
     canonical: PathBuf,
     device: u64,
     inode: u64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +69,8 @@ fn resolve_binary_identity(path: &str) -> Option<BinaryIdentity> {
         canonical,
         device: metadata.dev(),
         inode: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
     })
 }
 
@@ -82,7 +92,11 @@ fn verify_binary_identity(identity: &BinaryIdentity) -> Result<PathBuf, String> 
     // Same path, different file: replaced between policy load and exec.
     let metadata = fs::metadata(&canonical)
         .map_err(|_| "configured binary could not be re-read".to_owned())?;
-    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+    if metadata.dev() != identity.device
+        || metadata.ino() != identity.inode
+        || metadata.ctime() != identity.ctime
+        || metadata.ctime_nsec() != identity.ctime_nsec
+    {
         return Err("configured binary was replaced since policy load".to_owned());
     }
     Ok(canonical)
@@ -1162,12 +1176,16 @@ mod tests {
     fn verified_path_rejects_a_binary_replaced_after_policy_load() {
         let dir = temp_bin_dir("replaced");
         let bin = dir.join("bin");
+        let evil = dir.join("evil");
         std::fs::write(&bin, "v1").unwrap();
+        std::fs::write(&evil, "evil").unwrap();
         let policy = policy(&bin_policy_json(&bin));
         assert!(policy.verified_path("ztool", &args(&["run"])).is_ok());
-        // Same path, new file: the recorded (device, inode) no longer matches.
-        std::fs::remove_file(&bin).unwrap();
-        std::fs::write(&bin, "v2").unwrap();
+        // Atomic swap onto the same path: the recorded identity (device,
+        // inode, ctime) no longer matches. rename() is used instead of
+        // remove+recreate because some filesystems hand the freed inode
+        // straight back, which would make the test racy.
+        std::fs::rename(&evil, &bin).unwrap();
         assert!(policy.verified_path("ztool", &args(&["run"])).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1226,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_binary_identity_rejects_inode_and_path_mismatch() {
+    fn verify_binary_identity_rejects_inode_ctime_and_path_mismatch() {
         let dir = temp_bin_dir("identity");
         let bin = dir.join("bin");
         std::fs::write(&bin, "v1").unwrap();
@@ -1236,6 +1254,8 @@ mod tests {
             canonical: canonical.clone(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
         };
         assert!(verify_binary_identity(&good).is_ok());
         // Same path, different file.
@@ -1244,6 +1264,13 @@ mod tests {
             ..good.clone()
         };
         assert!(verify_binary_identity(&tampered_inode).is_err());
+        // Same (device, inode) — e.g. the inode was reused after a
+        // delete+recreate — but a fresh ctime.
+        let reused_inode = BinaryIdentity {
+            ctime: metadata.ctime().wrapping_add(1),
+            ..good.clone()
+        };
+        assert!(verify_binary_identity(&reused_inode).is_err());
         // Same identity fields, but the path now resolves elsewhere.
         let other = dir.join("other");
         std::fs::write(&other, "other").unwrap();
@@ -1267,8 +1294,9 @@ mod tests {
         );
         assert_eq!(policy.trusted_gh_path_for_repo("other/repo"), None);
         // Replacing the binary after policy load invalidates the trust.
-        std::fs::remove_file(&gh).unwrap();
-        std::fs::write(&gh, "evil").unwrap();
+        let evil = dir.join("evil");
+        std::fs::write(&evil, "evil").unwrap();
+        std::fs::rename(&evil, &gh).unwrap();
         assert_eq!(policy.trusted_gh_path_for_repo("leveled-inc/leveled"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
