@@ -40,8 +40,8 @@ use crate::routes::agents::{
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
-    valid_worktree_branch, worktree_create_plan, worktree_delete_plan,
+    cleanup_agent_worktree, resolve_existing_worktree_path, resolve_new_worktree_path,
+    resolve_worktree_repo, valid_worktree_branch, worktree_create_plan, worktree_delete_plan,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -1316,6 +1316,14 @@ fn worktree_create_and_delete_roundtrip() {
     let wt_root = base.join("worktrees");
     std::fs::create_dir_all(&wt_root).unwrap();
     let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("repo-start.sh"), "printf 'start\\n' >> \"$(dirname \"$0\")/hook.log\"\nprintf '%s\\n' \"$PWD\" >> \"$(dirname \"$0\")/hook.log\"\n").unwrap();
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        "printf 'stop\\n' >> \"$(dirname \"$0\")/hook.log\"\n",
+    )
+    .unwrap();
     let roots = vec![wt_root.canonicalize().unwrap()];
     let repo_root = base.canonicalize().unwrap();
     let plan = |path: &str, branch: &str| {
@@ -1335,6 +1343,9 @@ fn worktree_create_and_delete_roundtrip() {
         wt_canonical.to_str()
     );
     assert!(wt.join(".git").exists());
+    let hook_log = std::fs::read_to_string(hooks.join("hook.log")).unwrap();
+    assert!(hook_log.starts_with("start\n"));
+    assert!(hook_log.contains(wt.to_str().unwrap()));
 
     // The same branch cannot back a second worktree.
     let err = plan(wt_root.join("feature-a2").to_str().unwrap(), "feature-a").unwrap_err();
@@ -1355,6 +1366,11 @@ fn worktree_create_and_delete_roundtrip() {
     let response = worktree_delete_plan(wt.to_str().unwrap(), &roots, &agents).unwrap();
     assert_eq!(response.object("removed"), Some(&Json::Bool(true)));
     assert!(!wt.exists());
+    assert!(
+        std::fs::read_to_string(hooks.join("hook.log"))
+            .unwrap()
+            .contains("stop\n")
+    );
 
     // Creating on an existing branch checks it out instead of creating it.
     let output = Command::new("git")
@@ -1374,6 +1390,43 @@ fn worktree_create_and_delete_roundtrip() {
     // Deleting a path that is gone fails instead of claiming success.
     worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).unwrap();
     assert!(worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn agent_worktree_cleanup_runs_stop_hook_and_deletes_feature_branch() {
+    let base = worktree_test_base("agent-wt-cleanup");
+    let worktree_root = base.join("allowed");
+    std::fs::create_dir_all(&worktree_root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        "printf 'stopped\\n' > \"$(dirname \"$0\")/stop-ran\"\n",
+    )
+    .unwrap();
+    let worktree = worktree_root.join("feature-cleanup");
+    agent_create_worktree(&repo, &worktree, "feature-cleanup").unwrap();
+
+    let roots = vec![std::env::temp_dir().canonicalize().unwrap()];
+    cleanup_agent_worktree(worktree.to_str().unwrap(), &roots).unwrap();
+    assert!(!worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("stop-ran")).unwrap(),
+        "stopped\n"
+    );
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/feature-cleanup",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "feature branch was not deleted");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -1750,17 +1803,23 @@ fn agent_delete_dead_process_deregisters_without_signalling() {
 }
 
 #[test]
-fn agent_delete_terminates_process_group_and_keeps_worktree() {
+fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
-    // A stand-in worktree: the endpoint must leave it in place.
-    let worktree = std::env::temp_dir().join(format!(
-        "zigzag-agent-delete-wt-{}",
-        unique_handle(&HashMap::new()).unwrap()
-    ));
-    std::fs::create_dir_all(&worktree).unwrap();
-    std::fs::write(worktree.join("sentinel.txt"), b"keep me").unwrap();
+    let base = worktree_test_base("agent-delete-wt");
+    let worktree_root = base.join("allowed");
+    std::fs::create_dir_all(&worktree_root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        "printf 'stopped\\n' > \"$(dirname \"$0\")/stop-ran\"\n",
+    )
+    .unwrap();
+    let worktree = worktree_root.join("codex-delete-me");
+    agent_create_worktree(&repo, &worktree, "codex/delete-me").unwrap();
 
     // A real process in its own process group.
     let mut child = Command::new("/bin/sleep")
@@ -1816,9 +1875,24 @@ fn agent_delete_terminates_process_group_and_keeps_worktree() {
         state.supervisor.registry.get("delete-me").unwrap().state,
         "stopped"
     );
-    // The worktree is left in place.
-    assert!(worktree.join("sentinel.txt").exists());
-    let _ = std::fs::remove_dir_all(&worktree);
+    assert!(!worktree.exists(), "agent worktree was not removed");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-me",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "agent branch was not deleted");
+    assert!(
+        std::fs::read_to_string(hooks.join("stop-ran"))
+            .unwrap()
+            .contains("stopped\n")
+    );
+    let _ = std::fs::remove_dir_all(&base);
 
     // A second DELETE of the now-terminal agent is a 409.
     let response = request_once(

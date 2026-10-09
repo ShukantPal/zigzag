@@ -9,8 +9,9 @@ use crate::proc::{
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::{
-    WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
-    valid_worktree_branch, worktree_branch_checkout_path, worktree_branch_exists,
+    WorktreeError, cleanup_agent_worktree, git_output, resolve_new_worktree_path,
+    resolve_worktree_repo, run_worktree_hook, valid_worktree_branch,
+    worktree_branch_checked_out, worktree_branch_checkout_path, worktree_branch_exists,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
@@ -601,6 +602,7 @@ pub(crate) fn agent_create_worktree(
         "agent_create worktree path={} branch={branch}",
         path.display()
     );
+    run_worktree_hook(repo, path, "repo-start.sh");
     Ok(path.to_path_buf())
 }
 
@@ -1181,8 +1183,7 @@ pub(crate) fn agent_restart_request(
 }
 
 /// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
-/// group and deregister it. The worktree is deliberately left in place; use
-/// `DELETE /v1/worktrees` to remove it.
+/// group, remove its worktree, and deregister it.
 pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
     let Some(agent) = state.supervisor.registry.get(id) else {
         return reply(stream, 404, error("unknown_agent"));
@@ -1220,7 +1221,16 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     }
     log::info!("agent_stop id={id} pgid={pgid} graceful={graceful}");
     match &worktree {
-        Some(path) => log::info!("agent_stop id={id}: worktree retained at {path}"),
+        Some(path) if stopped => match cleanup_agent_worktree(path, &agent_worktree_roots()) {
+            Ok(()) => log::info!("agent_stop id={id}: worktree cleaned up at {path}"),
+            Err(failure) => log::warn!(
+                "agent_stop id={id}: worktree cleanup failed at {path}: {}",
+                failure.message
+            ),
+        },
+        Some(path) => log::info!(
+            "agent_stop id={id}: worktree retained because process group is still running at {path}"
+        ),
         None => log::info!("agent_stop id={id}: no worktree recorded"),
     }
     reply(
