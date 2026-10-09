@@ -10,7 +10,7 @@
 //! git repo, and no network is touched.
 
 use crate::exec;
-use crate::proc::agent_transcript_path;
+use crate::proc::{agent_stderr_path, agent_transcript_path};
 use crate::review_loop;
 use crate::routes::worktrees::{worktree_create_plan, worktree_delete_plan};
 use crate::tests::{
@@ -404,6 +404,13 @@ fn e2e_agent_create_persists_transcript_and_serves_it() {
         transcript.contains("persisted-agent-output"),
         "persisted transcript missing Codex output: {transcript}"
     );
+    let stderr_path = agent_stderr_path(&handle).expect("valid agent stderr path");
+    let stderr =
+        std::fs::read_to_string(&stderr_path).expect("API-created agent stderr was not persisted");
+    assert!(
+        stderr.contains("persisted-agent-stderr"),
+        "persisted stderr missing Codex diagnostics: {stderr}"
+    );
 
     let served = response_json(request_once(
         Arc::clone(&state),
@@ -419,6 +426,13 @@ fn e2e_agent_create_persists_transcript_and_serves_it() {
             .is_some_and(|stdout| stdout.contains("persisted-agent-output")),
         "transcript endpoint did not return persisted output: {served:?}"
     );
+    assert!(
+        served
+            .object("stderr")
+            .and_then(Json::as_str)
+            .is_some_and(|stderr| stderr.contains("persisted-agent-stderr")),
+        "transcript endpoint did not return persisted stderr: {served:?}"
+    );
 
     let output = Command::new("git")
         .args(["worktree", "remove", "--force", worktree_text.as_ref()])
@@ -428,6 +442,7 @@ fn e2e_agent_create_persists_transcript_and_serves_it() {
     assert!(output.status.success());
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
     std::fs::remove_file(transcript_path).expect("could not clean up agent transcript");
+    std::fs::remove_file(stderr_path).expect("could not clean up agent stderr");
 }
 
 /// A failing command records its exit code and stderr instead of vanishing.

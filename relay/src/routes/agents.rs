@@ -4,8 +4,9 @@ use crate::events::{
 use crate::exec;
 use crate::http::{error, query, reply};
 use crate::proc::{
-    AgentSpawnDetails, agent_transcript_path, force_kill_process_group, kill_process_group,
-    managed_agent_running, process_group_running, recovered_agent_identity_matches, spawn_proc,
+    AgentSpawnDetails, agent_stderr_path, agent_transcript_path, force_kill_process_group,
+    kill_process_group, managed_agent_running, process_group_running,
+    recovered_agent_identity_matches, spawn_proc,
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::{
@@ -380,10 +381,8 @@ fn transcript_json(
     ]))
 }
 
-/// Read agent logs from the ordered diagnostics spool. API-created agents now
-/// tee stdout into that spool as well as their durable transcript, so live
-/// tails have one cursor across both streams. Agents created before that tee
-/// was introduced retain a transcript-only stdout fallback.
+/// Read agent logs from the ordered diagnostics spool, falling back to durable
+/// output files for agents whose stdout has not yet been copied into the spool.
 pub(crate) fn agent_logs_json(
     registry: &relay_core::AgentRegistry,
     id: &str,
@@ -401,6 +400,7 @@ pub(crate) fn agent_logs_json(
     };
 
     let stderr_logs = registry.logs_json(id, "stderr", after, tail)?;
+    let durable_stderr = agent_stderr_path(id).and_then(|path| std::fs::read_to_string(path).ok());
     let mut records = Vec::new();
     if matches!(stream, "stdout" | "both") && after < transcript.len() as u64 {
         let mut start = usize::try_from(after)
@@ -424,10 +424,33 @@ pub(crate) fn agent_logs_json(
             ]));
         }
     }
-    if matches!(stream, "stderr" | "both")
-        && let Some(Json::Array(stderr_records)) = stderr_logs.object("records")
-    {
-        records.extend(stderr_records.iter().cloned());
+    if matches!(stream, "stderr" | "both") {
+        if after == 0 {
+            if let Some(stderr) = durable_stderr.as_deref() {
+                let data = match tail {
+                    Some(limit) if stderr.len() > limit => {
+                        let mut start = stderr.len() - limit;
+                        while !stderr.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        stderr[start..].to_owned()
+                    }
+                    _ => stderr.to_owned(),
+                };
+                if !data.is_empty() {
+                    records.push(Json::Object(vec![
+                        ("stream".to_owned(), Json::String("stderr".to_owned())),
+                        ("cursor".to_owned(), Json::number(0)),
+                        ("data".to_owned(), Json::String(data)),
+                    ]));
+                }
+            }
+        }
+        if durable_stderr.is_none()
+            && let Some(Json::Array(stderr_records)) = stderr_logs.object("records")
+        {
+            records.extend(stderr_records.iter().cloned());
+        }
     }
     Some(Json::Object(vec![
         ("records".to_owned(), Json::Array(records)),
@@ -437,7 +460,12 @@ pub(crate) fn agent_logs_json(
                 agent.log_next.max(
                     agent_transcript_path(id)
                         .and_then(|path| std::fs::metadata(path).ok())
-                        .map_or(0, |metadata| metadata.len()),
+                        .map_or(0, |metadata| metadata.len())
+                        .max(
+                            agent_stderr_path(id)
+                                .and_then(|path| std::fs::metadata(path).ok())
+                                .map_or(0, |metadata| metadata.len()),
+                        ),
                 ),
             ),
         ),
@@ -857,7 +885,6 @@ fn agent_create_request(
         AgentSpawnDetails {
             worktree_path: (!request.no_branch).then_some(worktree_str.clone()),
             deadline_at,
-            persist_transcript: true,
         },
     ) {
         Ok(handle) => {
@@ -1237,7 +1264,6 @@ pub(crate) fn agent_restart_request(
                     .saturating_add(secs)
                     .to_string()
             }),
-            persist_transcript: true,
         },
     ) {
         Ok(spawned) => spawned,

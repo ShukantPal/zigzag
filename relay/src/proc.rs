@@ -8,7 +8,7 @@ use crate::session::CappedOutput;
 use relay_core::{AgentRecord, AgentRegistry, Json, Store};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -33,6 +33,10 @@ pub(crate) struct ProcEntry {
     pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: Arc<Mutex<CappedOutput>>,
     pub(crate) stderr: Arc<Mutex<CappedOutput>>,
+    pub(crate) stdout_path: Option<PathBuf>,
+    pub(crate) stderr_path: Option<PathBuf>,
+    pub(crate) stdout_read: u64,
+    pub(crate) stderr_read: u64,
 }
 pub(crate) struct SpawnedProc {
     pub(crate) id: String,
@@ -43,9 +47,6 @@ pub(crate) struct SpawnedProc {
 pub(crate) struct AgentSpawnDetails {
     pub(crate) worktree_path: Option<String>,
     pub(crate) deadline_at: Option<String>,
-    /// API-created Codex agents write their JSON event stream here. Generic
-    /// `/v1/spawn` processes continue to use only the diagnostics spool.
-    pub(crate) persist_transcript: bool,
 }
 
 /// Durable JSONL transcript for an API-created Codex agent.
@@ -64,9 +65,16 @@ pub(crate) fn agent_transcript_path(agent_id: &str) -> Option<PathBuf> {
     )
 }
 
-fn create_agent_transcript(agent_id: &str) -> Result<File, String> {
-    let path = agent_transcript_path(agent_id)
-        .ok_or_else(|| "could not construct agent transcript path".to_owned())?;
+/// Stderr is kept beside the JSONL transcript rather than in a pipe owned by
+/// the relay.  A relay replacement (or a crash) closes every pipe it owns;
+/// leaving a long-running Codex process with a pipe for stderr makes its next
+/// diagnostic write raise SIGPIPE and abort the task.
+pub(crate) fn agent_stderr_path(agent_id: &str) -> Option<PathBuf> {
+    let transcript = agent_transcript_path(agent_id)?;
+    Some(transcript.with_extension("stderr"))
+}
+
+fn create_agent_output(path: PathBuf) -> Result<File, String> {
     let parent = path
         .parent()
         .expect("agent transcript path always has a parent");
@@ -85,7 +93,19 @@ fn create_agent_transcript(agent_id: &str) -> Result<File, String> {
     }
     options
         .open(path)
-        .map_err(|_| "could not create agent transcript".to_owned())
+        .map_err(|_| "could not create agent output".to_owned())
+}
+
+fn create_agent_transcript(agent_id: &str) -> Result<File, String> {
+    let path = agent_transcript_path(agent_id)
+        .ok_or_else(|| "could not construct agent transcript path".to_owned())?;
+    create_agent_output(path)
+}
+
+fn create_agent_stderr(agent_id: &str) -> Result<File, String> {
+    let path = agent_stderr_path(agent_id)
+        .ok_or_else(|| "could not construct agent stderr path".to_owned())?;
+    create_agent_output(path)
 }
 pub(crate) fn spawn_proc(
     supervisor: &Supervisor,
@@ -107,26 +127,45 @@ pub(crate) fn spawn_proc(
         prune_procs(&mut table, Instant::now());
         unique_handle(&table)?
     };
-    let transcript = if details.persist_transcript {
-        Some(create_agent_transcript(&handle)?)
-    } else {
-        None
+    let transcript_path = agent_transcript_path(&handle)
+        .ok_or_else(|| "could not construct agent transcript path".to_owned())?;
+    let stderr_path = agent_stderr_path(&handle)
+        .ok_or_else(|| "could not construct agent stderr path".to_owned())?;
+    let transcript = create_agent_transcript(&handle)?;
+    let durable_stderr = match create_agent_stderr(&handle) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&transcript_path);
+            return Err(error);
+        }
     };
-    let mut child = Command::new(path)
+    let stdout_stdio = File::try_clone(&transcript)
+        .map(Stdio::from)
+        .map_err(|_| "could not open agent transcript".to_owned())?;
+    let stderr_stdio = File::try_clone(&durable_stderr)
+        .map(Stdio::from)
+        .map_err(|_| "could not open agent stderr".to_owned())?;
+    let mut command = Command::new(path);
+    command
         .args(&request.args)
         .stdin(Stdio::null())
-        // Keep stdout piped even for API-created agents so every live output
-        // chunk enters the registry's ordered log spool. The drain below also
-        // writes the same raw bytes to the durable transcript.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // A dedicated process group makes kill requests cover the command's
-        // descendants without involving the relay itself.
-        .process_group(0)
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take().expect("stderr was piped");
+        .stdout(stdout_stdio)
+        // Both streams are durable, never relay-owned pipes.
+        .stderr(stderr_stdio);
+    // Do not merely create a process group: launchd and terminal teardown can
+    // still deliver session-level hangups to it. A new session isolates the
+    // task from the relay while retaining a stable PGID for pause/kill and
+    // restart recovery. `setsid` also makes the leader PID its process-group
+    // ID, as required by the durable registry.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|error| error.to_string())?;
     let process_group = child.id() as i32;
     let Some(process_identity) = process_identity(process_group) else {
         let _ = force_kill_process_group(process_group);
@@ -188,31 +227,16 @@ pub(crate) fn spawn_proc(
         let _ = kill_process_group(process_group);
         return Err(error);
     }
-    if let Some(child_stdout) = child_stdout {
-        drain_to_capture(
-            child_stdout,
-            Arc::clone(&stdout),
-            Arc::clone(&supervisor.registry),
-            Arc::clone(&store),
-            handle.clone(),
-            "stdout",
-            transcript,
-        );
-    } else {
-        stdout
-            .lock()
-            .expect("stdout capture lock poisoned")
-            .complete = true;
-    }
-    drain_to_capture(
-        child_stderr,
-        Arc::clone(&stderr),
-        Arc::clone(&supervisor.registry),
-        store,
-        handle.clone(),
-        "stderr",
-        None,
-    );
+    // File streams do not need a relay reader to remain valid across a
+    // restart. The reaper tails them into the bounded diagnostics spool.
+    stdout
+        .lock()
+        .expect("stdout capture lock poisoned")
+        .complete = true;
+    stderr
+        .lock()
+        .expect("stderr capture lock poisoned")
+        .complete = true;
     table.insert(
         handle.clone(),
         ProcEntry {
@@ -229,61 +253,89 @@ pub(crate) fn spawn_proc(
             exit_code: None,
             stdout,
             stderr,
+            stdout_path: Some(transcript_path),
+            stderr_path: Some(stderr_path),
+            stdout_read: 0,
+            stderr_read: 0,
         },
     );
     prune_procs(&mut table, Instant::now());
     Ok(SpawnedProc { id, handle })
 }
-pub(crate) fn drain_to_capture(
-    mut pipe: impl Read + Send + 'static,
-    capture: Arc<Mutex<CappedOutput>>,
-    registry: Arc<AgentRegistry>,
-    store: Arc<Store>,
-    agent_id: String,
-    stream: &'static str,
-    mut transcript: Option<File>,
-) {
-    thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Some(writer) = transcript.as_mut()
-                        && writer.write_all(&chunk[..n]).is_err()
-                    {
-                        // Continue serving the live spool if the optional
-                        // durable transcript becomes unavailable.
-                        transcript = None;
-                    }
-                    if let Ok(mut output) = capture.lock() {
-                        output.append(&chunk[..n]);
-                    } else {
-                        break;
-                    }
-                    // A spool failure never stops pipe draining; it is recorded
-                    // as log_degraded and retried on the next chunk.
-                    let _ = registry.append_log(&agent_id, stream, &chunk[..n]);
-                    if let Ok(Some(agent)) = registry.record_first_output(
-                        &agent_id,
-                        &relay_timestamp(),
-                        stream,
-                        n as u64,
-                    ) && persist_first_output(&store, &agent).is_err()
-                    {
-                        let _ = registry.mark_audit_degraded(&agent_id);
-                    }
-                }
-            }
-        }
-        if let Ok(mut output) = capture.lock() {
-            output.complete = true;
-        }
-    });
-}
 pub(crate) fn output_is_complete(entry: &ProcEntry) -> bool {
     entry.stdout.lock().is_ok_and(|output| output.complete)
         && entry.stderr.lock().is_ok_and(|output| output.complete)
+}
+
+/// Copy newly appended durable output into the compatibility capture and
+/// registry spool. The files remain the source of truth across a relay crash;
+/// this tailer merely restores live log streaming while the relay is present.
+pub(crate) fn sync_durable_output(
+    entry: &mut ProcEntry,
+    handle: &str,
+    registry: &AgentRegistry,
+    store: &Store,
+) {
+    sync_durable_stream(
+        entry.stdout_path.as_deref(),
+        &mut entry.stdout_read,
+        &entry.stdout,
+        registry,
+        store,
+        handle,
+        "stdout",
+    );
+    sync_durable_stream(
+        entry.stderr_path.as_deref(),
+        &mut entry.stderr_read,
+        &entry.stderr,
+        registry,
+        store,
+        handle,
+        "stderr",
+    );
+}
+
+fn sync_durable_stream(
+    path: Option<&Path>,
+    read: &mut u64,
+    capture: &Arc<Mutex<CappedOutput>>,
+    registry: &AgentRegistry,
+    store: &Store,
+    agent_id: &str,
+    stream: &'static str,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    if file.seek(SeekFrom::Start(*read)).is_err() {
+        return;
+    }
+    let mut chunk = [0u8; 8192];
+    loop {
+        let Ok(count) = file.read(&mut chunk) else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        *read += count as u64;
+        if let Ok(mut output) = capture.lock() {
+            output.append(&chunk[..count]);
+        } else {
+            return;
+        }
+        let _ = registry.append_log(agent_id, stream, &chunk[..count]);
+        if let Ok(Some(agent)) =
+            registry.record_first_output(agent_id, &relay_timestamp(), stream, count as u64)
+            && persist_first_output(store, &agent).is_err()
+        {
+            let _ = registry.mark_audit_degraded(agent_id);
+        }
+    }
 }
 pub(crate) fn proc_json(entry: &ProcEntry) -> Json {
     let (stdout, stdout_truncated) = entry
@@ -409,6 +461,7 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
         loop {
             if let Ok(mut entries) = state.supervisor.procs.lock() {
                 for (handle, entry) in entries.iter_mut() {
+                    sync_durable_output(entry, handle, &state.supervisor.registry, &state.store);
                     update_proc_status_with_handle(
                         entry,
                         handle,
