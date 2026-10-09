@@ -13,6 +13,7 @@ Token files must be owned by the current user and mode 0600. Global `--json`
 emits raw JSON.
 
 ```text
+zzapi [--hostname HOST[:PORT]] update
 zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
@@ -30,6 +31,13 @@ zzapi proc get ID
 zzapi events [--after N] [--epoch E] [--timeout N] [--follow]
 zzapi review-gate --repo OWNER/REPO --pr N
 ```
+
+`zzapi update` uses the configured hostname as an SSH destination (the relay
+port is ignored), downloads
+`/Users/shukant/Workspace/ShukantPal/zigzag/target/release/zzapi` with `scp`,
+and atomically replaces the current executable. It requires `ssh`/`scp` and
+the user's existing SSH config, including any Tailscale proxy settings. It
+does not require relay credentials.
 
 The CLI intentionally exposes the common surface only. Use an authenticated
 HTTP client for provider and transcript endpoints until corresponding verbs

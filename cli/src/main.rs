@@ -11,6 +11,7 @@
 //!
 //! Examples:
 //!   zzapi health
+//!   zzapi update
 //!   zzapi agents list
 //!   zzapi agents create --prompt "Fix the flaky test" \
 //!       --project-dir /Users/shukant/Workspace/leveled-inc/leveled --branch codex/fix-flaky
@@ -29,6 +30,7 @@ const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_SOCKET_PORT: u16 = 8766;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
+const MAC_ZZAPI_PATH: &str = "/Users/shukant/Workspace/ShukantPal/zigzag/target/release/zzapi";
 /// The relay permits synchronous executions for up to five minutes. Leave a
 /// little room for the response to cross the network after that deadline.
 const EXEC_CLIENT_TIMEOUT_SECS: u64 = 330;
@@ -85,6 +87,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Download and install the latest zzapi binary from the configured Mac
+    Update,
     /// Liveness probe
     Health,
     /// Manage agents
@@ -501,6 +505,75 @@ fn relay_base(hostname: &str) -> String {
     } else {
         format!("http://{hostname}:{DEFAULT_PORT}")
     }
+}
+
+/// `--hostname` is also the SSH host for updates. The relay accepts a port,
+/// while ssh/scp use the host from the same setting and the user's SSH config.
+fn ssh_host(hostname: &str) -> Result<&str, Fail> {
+    let host = hostname
+        .rsplit_once(':')
+        .filter(|(_, port)| port.parse::<u16>().is_ok())
+        .map(|(host, _)| host)
+        .unwrap_or(hostname);
+    if host.is_empty() || host.starts_with('-') || host.contains('/') || host.contains('@') {
+        return Err(Fail::Config(format!("invalid SSH hostname {hostname:?}")));
+    }
+    Ok(host)
+}
+
+fn cmd_update(hostname: &str) -> Result<(), Fail> {
+    let host = ssh_host(hostname)?;
+    let executable = std::env::current_exe()
+        .map_err(|e| Fail::Config(format!("cannot locate current zzapi executable: {e}")))?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| Fail::Config("current zzapi executable has no parent directory".into()))?;
+    let temp = parent.join(format!(".zzapi-update-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let remote = format!("{host}:{MAC_ZZAPI_PATH}");
+    let output = std::process::Command::new("scp")
+        .args(["-p", "--"])
+        .arg(&remote)
+        .arg(&temp)
+        .output()
+        .map_err(|e| Fail::Config(format!("cannot run scp: {e}")))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp);
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(Fail::Config(if detail.is_empty() {
+            format!("scp from {remote} failed ({})", output.status)
+        } else {
+            format!("scp from {remote} failed: {detail}")
+        }));
+    }
+    let metadata = std::fs::metadata(&temp)
+        .map_err(|e| Fail::Config(format!("cannot inspect downloaded zzapi: {e}")))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Fail::Config(
+            "downloaded zzapi is empty or not a regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| Fail::Config(format!("cannot make downloaded zzapi executable: {e}")))?;
+    }
+    let version = std::process::Command::new(&temp)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|result| result.status.success())
+        .map(|result| String::from_utf8_lossy(&result.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty());
+    std::fs::rename(&temp, &executable)
+        .map_err(|e| Fail::Config(format!("cannot replace {}: {e}", executable.display())))?;
+    match version {
+        Some(version) => println!("updated successfully ({version})"),
+        None => println!("updated successfully"),
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1470,9 @@ fn report_api_error(e: &ApiError) {
 }
 
 fn run(cli: Cli) -> Result<(), Fail> {
+    if matches!(&cli.command, Commands::Update) {
+        return cmd_update(&cli.hostname);
+    }
     if let Commands::Agents {
         cmd:
             AgentsCmd::Create {
@@ -1418,6 +1494,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
         }
     };
     match cli.command {
+        Commands::Update => unreachable!("update command handled before relay client setup"),
         Commands::Health => cmd_health(&client),
         Commands::Agents { cmd } => match cmd {
             AgentsCmd::List { state, task_id } => {
@@ -1582,6 +1659,13 @@ mod tests {
     fn relay_base_accepts_an_explicit_port_for_local_or_proxied_relays() {
         assert_eq!(relay_base("relay.example"), "http://relay.example:8765");
         assert_eq!(relay_base("127.0.0.1:19876"), "http://127.0.0.1:19876");
+    }
+
+    #[test]
+    fn update_uses_ssh_host_without_relay_port() {
+        assert_eq!(ssh_host("100.101.237.83:8765").unwrap(), "100.101.237.83");
+        assert_eq!(ssh_host("mac-relay").unwrap(), "mac-relay");
+        assert!(ssh_host("-oProxyCommand=bad").is_err());
     }
 
     #[test]

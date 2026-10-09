@@ -33,6 +33,9 @@ a partial stream for a complete one.
 ## Usage
 
 ```bash
+# update this installed binary from the Mac (uses SSH config/Tailscale proxy)
+zzapi update
+
 # health
 zzapi health
 
