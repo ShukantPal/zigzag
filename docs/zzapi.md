@@ -32,12 +32,9 @@ zzapi events [--after N] [--epoch E] [--timeout N] [--follow]
 zzapi review-gate --repo OWNER/REPO --pr N
 ```
 
-`zzapi update` uses the configured hostname as an SSH destination (the relay
-port is ignored), downloads
-`/Users/shukant/Workspace/ShukantPal/zigzag/target/release/zzapi` with `scp`,
-and atomically replaces the current executable. It requires `ssh`/`scp` and
-the user's existing SSH config, including any Tailscale proxy settings. It
-does not require relay credentials.
+`zzapi update` downloads the latest `zzapi-linux-x86_64` GitHub release asset,
+checks that it can run and report its version, then atomically replaces the
+current executable. It does not require relay credentials or agent flags.
 
 The CLI intentionally exposes the common surface only. Use an authenticated
 HTTP client for provider and transcript endpoints until corresponding verbs

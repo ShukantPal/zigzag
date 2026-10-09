@@ -30,7 +30,8 @@ const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_SOCKET_PORT: u16 = 8766;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
-const MAC_ZZAPI_PATH: &str = "/Users/shukant/Workspace/ShukantPal/zigzag/target/release/zzapi";
+const LATEST_ZZAPI_URL: &str =
+    "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64";
 /// The relay permits synchronous executions for up to five minutes. Leave a
 /// little room for the response to cross the network after that deadline.
 const EXEC_CLIENT_TIMEOUT_SECS: u64 = 330;
@@ -87,7 +88,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Download and install the latest zzapi binary from the configured Mac
+    /// Download and install the latest zzapi binary from GitHub releases
     Update,
     /// Liveness probe
     Health,
@@ -507,22 +508,7 @@ fn relay_base(hostname: &str) -> String {
     }
 }
 
-/// `--hostname` is also the SSH host for updates. The relay accepts a port,
-/// while ssh/scp use the host from the same setting and the user's SSH config.
-fn ssh_host(hostname: &str) -> Result<&str, Fail> {
-    let host = hostname
-        .rsplit_once(':')
-        .filter(|(_, port)| port.parse::<u16>().is_ok())
-        .map(|(host, _)| host)
-        .unwrap_or(hostname);
-    if host.is_empty() || host.starts_with('-') || host.contains('/') || host.contains('@') {
-        return Err(Fail::Config(format!("invalid SSH hostname {hostname:?}")));
-    }
-    Ok(host)
-}
-
-fn cmd_update(hostname: &str) -> Result<(), Fail> {
-    let host = ssh_host(hostname)?;
+fn cmd_update() -> Result<(), Fail> {
     let executable = std::env::current_exe()
         .map_err(|e| Fail::Config(format!("cannot locate current zzapi executable: {e}")))?;
     let parent = executable
@@ -530,50 +516,54 @@ fn cmd_update(hostname: &str) -> Result<(), Fail> {
         .ok_or_else(|| Fail::Config("current zzapi executable has no parent directory".into()))?;
     let temp = parent.join(format!(".zzapi-update-{}", std::process::id()));
     let _ = std::fs::remove_file(&temp);
-    let remote = format!("{host}:{MAC_ZZAPI_PATH}");
-    let output = std::process::Command::new("scp")
-        .args(["-p", "--"])
-        .arg(&remote)
-        .arg(&temp)
-        .output()
-        .map_err(|e| Fail::Config(format!("cannot run scp: {e}")))?;
-    if !output.status.success() {
+    let result = (|| {
+        let response = ureq::get(LATEST_ZZAPI_URL)
+            .timeout(Duration::from_secs(120))
+            .call()
+            .map_err(|e| Fail::Config(format!("cannot download latest zzapi: {e}")))?;
+        let mut reader = response.into_reader();
+        let mut binary = Vec::new();
+        reader
+            .read_to_end(&mut binary)
+            .map_err(|e| Fail::Config(format!("cannot read downloaded zzapi: {e}")))?;
+        if binary.is_empty() {
+            return Err(Fail::Config("downloaded zzapi is empty".into()));
+        }
+        std::fs::write(&temp, binary)
+            .map_err(|e| Fail::Config(format!("cannot save downloaded zzapi: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| Fail::Config(format!("cannot make downloaded zzapi executable: {e}")),
+            )?;
+        }
+        let version = std::process::Command::new(&temp)
+            .arg("--version")
+            .output()
+            .map_err(|e| {
+                Fail::Config(format!("downloaded zzapi cannot run on this system: {e}"))
+            })?;
+        if !version.status.success() {
+            return Err(Fail::Config(
+                "downloaded zzapi failed its --version check".into(),
+            ));
+        }
+        let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+        if version.is_empty() {
+            return Err(Fail::Config(
+                "downloaded zzapi did not report a version".into(),
+            ));
+        }
+        std::fs::rename(&temp, &executable)
+            .map_err(|e| Fail::Config(format!("cannot replace {}: {e}", executable.display())))?;
+        println!("updated successfully ({version})");
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&temp);
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(Fail::Config(if detail.is_empty() {
-            format!("scp from {remote} failed ({})", output.status)
-        } else {
-            format!("scp from {remote} failed: {detail}")
-        }));
     }
-    let metadata = std::fs::metadata(&temp)
-        .map_err(|e| Fail::Config(format!("cannot inspect downloaded zzapi: {e}")))?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Fail::Config(
-            "downloaded zzapi is empty or not a regular file".into(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| Fail::Config(format!("cannot make downloaded zzapi executable: {e}")))?;
-    }
-    let version = std::process::Command::new(&temp)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|result| result.status.success())
-        .map(|result| String::from_utf8_lossy(&result.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty());
-    std::fs::rename(&temp, &executable)
-        .map_err(|e| Fail::Config(format!("cannot replace {}: {e}", executable.display())))?;
-    match version {
-        Some(version) => println!("updated successfully ({version})"),
-        None => println!("updated successfully"),
-    }
-    Ok(())
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,7 +1461,7 @@ fn report_api_error(e: &ApiError) {
 
 fn run(cli: Cli) -> Result<(), Fail> {
     if matches!(&cli.command, Commands::Update) {
-        return cmd_update(&cli.hostname);
+        return cmd_update();
     }
     if let Commands::Agents {
         cmd:
@@ -1662,10 +1652,11 @@ mod tests {
     }
 
     #[test]
-    fn update_uses_ssh_host_without_relay_port() {
-        assert_eq!(ssh_host("100.101.237.83:8765").unwrap(), "100.101.237.83");
-        assert_eq!(ssh_host("mac-relay").unwrap(), "mac-relay");
-        assert!(ssh_host("-oProxyCommand=bad").is_err());
+    fn update_downloads_the_linux_release_asset() {
+        assert_eq!(
+            LATEST_ZZAPI_URL,
+            "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64"
+        );
     }
 
     #[test]
