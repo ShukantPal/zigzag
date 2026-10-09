@@ -617,9 +617,14 @@ class EventStream:
         self.poll_warnings = []
         changed = False
         socket_warning: str | None = None
+        # A caller may request a long event wait (or configure a long TUI
+        # interval). Wake at the reconciliation deadline so an API-only state
+        # change is never held back by an otherwise healthy, quiet socket.
+        refresh_in = max(0.0, self.next_agent_refresh - time.monotonic())
+        wait_timeout = min(timeout, refresh_in)
         if self.socket is not None:
             try:
-                frame = self.socket.receive(timeout)
+                frame = self.socket.receive(wait_timeout)
                 if frame is None:
                     changed = self._maintain()
                     return changed
@@ -662,8 +667,8 @@ class EventStream:
             message = self._get(
                 f"/v1/events?after={self.after}"
                 f"&epoch={urllib.parse.quote(self.epoch, safe='')}"
-                f"&timeout={max(1, int(timeout))}",
-                timeout,
+                f"&timeout={max(1, int(wait_timeout))}",
+                wait_timeout,
             )
         except (OSError, ValueError, json.JSONDecodeError) as error:
             self.poll_warnings.append(f"relay events unavailable: {error}")

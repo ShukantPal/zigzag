@@ -233,6 +233,38 @@ class SnapshotIngestionTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in stream.events], [pushed_event["id"]])
         self.assertEqual(stream.after, 2)
 
+    def test_socket_agent_snapshots_replace_stale_state_with_stopped_and_orphaned(self):
+        stream = EventStream("http://relay", "token")
+        stream.agents = {"agent-1": {"id": "agent-1", "state": "running"}}
+        stream.next_agent_refresh = time.monotonic() + 60
+        stream.next_socket_retry = time.monotonic() + 60
+        socket = unittest.mock.Mock()
+        socket.receive.side_effect = [
+            {"topic": "agents", "snapshot": True, "agents": [{"id": "agent-1", "state": "stopped"}]},
+            {"topic": "agents", "snapshot": True, "agents": [{"id": "agent-1", "state": "orphaned"}]},
+            {"topic": "agents", "snapshot": True, "agents": []},
+        ]
+        stream.socket = socket
+
+        self.assertTrue(stream.poll(1))
+        self.assertEqual(stream.agents["agent-1"]["state"], "stopped")
+        self.assertTrue(stream.poll(1))
+        self.assertEqual(stream.agents["agent-1"]["state"], "orphaned")
+        self.assertTrue(stream.poll(1))
+        self.assertEqual(stream.agents, {})
+
+    def test_socket_wait_is_bounded_by_agent_reconciliation_deadline(self):
+        stream = EventStream("http://relay", "token")
+        stream.next_agent_refresh = 0
+        stream.next_socket_retry = time.monotonic() + 60
+        socket = unittest.mock.Mock()
+        socket.receive.return_value = None
+        stream.socket = socket
+        with patch.object(EventStream, "_get", return_value={"agents": []}) as get:
+            self.assertFalse(stream.poll(60))
+        self.assertEqual(socket.receive.call_args.args[0], 0)
+        get.assert_called_once_with("/v1/agents", 10)
+
     def test_socket_drop_marker_resynchronizes_through_the_http_cursor(self):
         stream = EventStream("http://relay", "token")
         stream.epoch, stream.after = "e1", 7
@@ -378,6 +410,7 @@ class SnapshotIngestionTests(unittest.TestCase):
     def test_event_stream_poll_long_polls_with_cursor_and_folds_new_events(self):
         stream = EventStream("http://relay", "token")
         stream.epoch, stream.after = "e1", 7
+        stream.next_agent_refresh = time.monotonic() + 60
         spawned = event("process_spawned", "2026-01-01T00:00:00.000Z", sequence=8)
         spawned["payload"] = {"agent_id": "agent-1"}
         completed = event("process_completed", "2026-01-01T00:00:01.000Z", sequence=9)
