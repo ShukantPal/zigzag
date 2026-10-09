@@ -552,14 +552,20 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
         };
         // Registries written by older daemons encode some numeric fields as
         // strings.  Accept either form.
-        let integer = |key| {
-            get(key)
-                .and_then(|value| match value {
-                    Json::Number(_) => value.as_u64(),
-                    Json::String(text) => text.parse::<u64>().ok(),
-                    _ => None,
-                })
-                .ok_or_else(|| "invalid agent registry".to_owned())
+        let integer = |value: Option<&Json>| {
+            value.and_then(|value| match value {
+                Json::Number(_) => value.as_u64(),
+                Json::String(text) => text.parse::<u64>().ok(),
+                _ => None,
+            })
+        };
+        let required_integer =
+            |key| integer(get(key)).ok_or_else(|| "invalid agent registry".to_owned());
+        let optional_integer = |key| match get(key) {
+            Some(Json::Null) | None => Ok(None),
+            value => integer(value)
+                .map(Some)
+                .ok_or_else(|| "invalid agent registry".to_owned()),
         };
         let record = AgentRecord {
             id: text("id")?,
@@ -570,8 +576,8 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 .and_then(Json::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| text("id").unwrap_or_default()),
-            leader_pid: integer("leader_pid")? as i32,
-            process_group: integer("process_group")? as i32,
+            leader_pid: required_integer("leader_pid")? as i32,
+            process_group: required_integer("process_group")? as i32,
             process_identity: match get("process_identity") {
                 Some(Json::String(value)) => Some(value.clone()),
                 Some(Json::Null) | None => None,
@@ -595,12 +601,12 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 .and_then(Json::as_bool)
                 .unwrap_or(false),
             redacted: get("redacted").and_then(Json::as_bool).unwrap_or(false),
-            stdout_next: integer("stdout_next")?,
-            stderr_next: integer("stderr_next")?,
-            stdout_dropped_before: integer("stdout_dropped_before")?,
-            stderr_dropped_before: integer("stderr_dropped_before")?,
-            log_next: integer("log_next")?,
-            log_dropped_before: integer("log_dropped_before")?,
+            stdout_next: required_integer("stdout_next")?,
+            stderr_next: required_integer("stderr_next")?,
+            stdout_dropped_before: required_integer("stdout_dropped_before")?,
+            stderr_dropped_before: required_integer("stderr_dropped_before")?,
+            log_next: required_integer("log_next")?,
+            log_dropped_before: required_integer("log_dropped_before")?,
             first_output_at: match get("first_output_at") {
                 Some(Json::String(value)) => Some(value.clone()),
                 Some(Json::Null) | None => None,
@@ -611,18 +617,7 @@ fn decode_agents(text: &str) -> Result<std::collections::BTreeMap<String, AgentR
                 Some(Json::Null) | None => None,
                 _ => return Err("invalid agent registry".to_owned()),
             },
-            first_output_bytes: match get("first_output_bytes") {
-                Some(Json::Null) | None => None,
-                Some(Json::String(text)) => Some(
-                    text.parse::<u64>()
-                        .map_err(|_| "invalid agent registry".to_owned())?,
-                ),
-                Some(value) => Some(
-                    value
-                        .as_u64()
-                        .ok_or_else(|| "invalid agent registry".to_owned())?,
-                ),
-            },
+            first_output_bytes: optional_integer("first_output_bytes")?,
         };
         entries.insert(record.id.clone(), record);
     }
@@ -1737,6 +1732,20 @@ mod tests {
         assert!(!logs.contains("secret-value"));
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
+    }
+
+    #[test]
+    fn decode_agents_accepts_legacy_string_counters() {
+        let agents =
+            decode_agents(include_str!("../tests/fixtures/legacy-events.agents.json")).unwrap();
+        let record = agents.get("legacy-0003").unwrap();
+        assert_eq!(record.stdout_next, 0);
+        assert_eq!(record.stderr_next, 64);
+        assert_eq!(record.stdout_dropped_before, 0);
+        assert_eq!(record.stderr_dropped_before, 0);
+        assert_eq!(record.log_next, 0);
+        assert_eq!(record.log_dropped_before, 0);
+        assert_eq!(record.first_output_bytes, Some(7));
     }
 
     #[test]
