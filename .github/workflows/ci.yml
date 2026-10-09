@@ -120,12 +120,40 @@ jobs:
           grep -q '"type":"done"' "$RUNNER_TEMP/reviewer-task/events.jsonl"
           grep -q '"verdict":"approve"' "$RUNNER_TEMP/reviewer-task/last-message.txt"
 
+  zzapi:
+    # Build the zzapi CLI for macOS (Shukant's Mac) and Linux (Muse's VM).
+    # Runs on every PR and main push; binaries are uploaded as artifacts
+    # and attached to releases by the release job.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: zzapi-macos-aarch64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: zzapi-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p zzapi --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/zzapi ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
   release:
     # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
     # immutable image digest. The Actions, toolchain, signed binary, and
     # provenance below are pinned verification boundaries.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [python, rust]
+    needs: [python, rust, zzapi]
     runs-on: macos-14
     permissions:
       contents: write
@@ -181,6 +209,12 @@ jobs:
           printf '{"version":"%s","target":"aarch64-apple-darwin","sha256":"%s","commit":"%s"}\n' \
             "$VERSION" "$DIGEST" "$GITHUB_SHA" > zigzag-macos-aarch64.manifest.json
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Download zzapi binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zzapi-*
+          merge-multiple: true
+      - run: ls -lh zzapi-macos-aarch64 zzapi-linux-x86_64
       - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
         with:
           subject-path: zigzag-macos-aarch64
@@ -197,6 +231,8 @@ jobs:
           files: |
             zigzag-macos-aarch64
             zigzag-macos-aarch64.manifest.json
+            zzapi-macos-aarch64
+            zzapi-linux-x86_64
       - name: Verify release trust chain
         # Dogfood the updater's verification: prove the just-published
         # release is verifiable end-to-end before relays can pick it up.
