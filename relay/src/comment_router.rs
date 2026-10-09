@@ -261,10 +261,10 @@ pub(crate) fn watch_loop(state: Arc<Server>, config: Config) {
         };
         let interval = watch_cycle(
             watched,
-            Instant::now(),
             &mut burst_until,
             config.burst_window,
             config.quiet_interval,
+            Instant::now,
             |watched_pr| scan_pr(&state, watched_pr, config.shadow),
         );
         thread::sleep(interval);
@@ -273,15 +273,15 @@ pub(crate) fn watch_loop(state: Arc<Server>, config: Config) {
 
 fn watch_cycle(
     watched: Vec<WatchedPr>,
-    now: Instant,
     burst_until: &mut Instant,
     burst_window: Duration,
     quiet_interval: Duration,
+    mut now: impl FnMut() -> Instant,
     mut scan: impl FnMut(&WatchedPr) -> Result<bool, String>,
 ) -> Duration {
     for watched_pr in watched {
         match scan(&watched_pr) {
-            Ok(true) => *burst_until = now + burst_window,
+            Ok(true) => *burst_until = now() + burst_window,
             Ok(false) => {}
             Err(error) => eprintln!(
                 "GitHub comment watch for {}#{} failed: {error}",
@@ -289,7 +289,7 @@ fn watch_cycle(
             ),
         }
     }
-    poll_interval(now, *burst_until, quiet_interval)
+    poll_interval(now(), *burst_until, quiet_interval)
 }
 
 fn poll_interval(now: Instant, burst_until: Instant, quiet_interval: Duration) -> Duration {
@@ -1195,10 +1195,10 @@ mod tests {
         assert!(
             watch_cycle(
                 vec![watched],
-                now,
                 &mut burst_until,
                 Duration::from_secs(300),
                 Duration::from_secs(300),
+                || now,
                 |current| {
                     scan_comments(
                         current,
@@ -1218,10 +1218,10 @@ mod tests {
         assert_eq!(
             watch_cycle(
                 Vec::new(),
-                now + Duration::from_secs(301),
                 &mut burst_until,
                 Duration::from_secs(300),
                 Duration::from_secs(300),
+                || now + Duration::from_secs(301),
                 |_| Ok(false),
             ),
             Duration::from_secs(300)
