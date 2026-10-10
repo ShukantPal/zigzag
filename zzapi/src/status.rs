@@ -401,6 +401,15 @@ fn build(
     });
     out
 }
+fn resolve_selection(
+    rows: &[Execution],
+    selected_id: Option<&str>,
+    previous_index: usize,
+) -> usize {
+    selected_id
+        .and_then(|id| rows.iter().position(|row| row.id == id))
+        .unwrap_or_else(|| previous_index.min(rows.len().saturating_sub(1)))
+}
 fn snapshot(
     c: &Client,
     state: &Path,
@@ -764,6 +773,7 @@ pub(super) fn cmd_status(
         .map_err(|e| Fail::Config(format!("cannot enter terminal mode: {e}")))?;
     let (mut rows, mut warnings, mut lost) = (rows, w, lost);
     let mut selected = 0usize;
+    let mut selected_id = rows.get(selected).map(|row| row.id.clone());
     let mut table_state = ratatui::widgets::TableState::default();
     let (mut transcript_items, mut transcript_notice) = rows
         .get(selected)
@@ -818,6 +828,7 @@ pub(super) fn cmd_status(
                         transcript_scroll = transcript_scroll.saturating_add(1);
                     } else {
                         selected = (selected + 1).min(rows.len().saturating_sub(1));
+                        selected_id = rows.get(selected).map(|row| row.id.clone());
                         (transcript_items, transcript_notice) = rows
                             .get(selected)
                             .map(|row| read_codex_transcript(&row.agent))
@@ -835,6 +846,7 @@ pub(super) fn cmd_status(
                         transcript_scroll = transcript_scroll.saturating_sub(1);
                     } else {
                         selected = selected.saturating_sub(1);
+                        selected_id = rows.get(selected).map(|row| row.id.clone());
                         (transcript_items, transcript_notice) = rows
                             .get(selected)
                             .map(|row| read_codex_transcript(&row.agent))
@@ -872,7 +884,8 @@ pub(super) fn cmd_status(
                     rows = r;
                     warnings = w;
                     lost = lo;
-                    selected = selected.min(rows.len().saturating_sub(1));
+                    selected = resolve_selection(&rows, selected_id.as_deref(), selected);
+                    selected_id = rows.get(selected).map(|row| row.id.clone());
                     (transcript_items, transcript_notice) = rows
                         .get(selected)
                         .map(|row| read_codex_transcript(&row.agent))
@@ -1094,6 +1107,28 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_selected_execution_when_new_rows_are_inserted_before_it() {
+        let rows = vec![
+            Execution {
+                id: "new-agent".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "selected-agent".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "older-agent".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(resolve_selection(&rows, Some("selected-agent"), 1), 1);
+        assert_eq!(resolve_selection(&rows, Some("selected-agent"), 0), 1);
+        assert_eq!(resolve_selection(&rows, Some("removed-agent"), 2), 2);
+    }
 
     #[test]
     fn parses_rfc3339_and_unix_started_at_values() {
