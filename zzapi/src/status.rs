@@ -24,8 +24,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INTERNAL: &str = "relay-update";
 const EVENT_PROMPT_LIMIT: usize = 100;
-const OUTPUT_TAIL: u64 = 32 * 1024 * 1024;
 const EVENT_LIMIT: usize = 10_000;
+const CODEX_TRANSCRIPT_LIMIT: usize = 16 * 1024 * 1024;
 #[derive(Clone, Default)]
 struct Execution {
     task: String,
@@ -391,7 +391,7 @@ fn build(
             r.worktree = wt.get(&r.task).cloned().unwrap_or_default()
         }
         if r.branch.is_empty() {
-            r.branch = git_branch(&r.worktree)
+            r.branch = git_branch(&r.worktree);
         }
     }
     out.sort_by(|a, b| {
@@ -400,6 +400,15 @@ fn build(
             .then_with(|| b.latest().cmp(&a.latest()))
     });
     out
+}
+fn resolve_selection(
+    rows: &[Execution],
+    selected_id: Option<&str>,
+    previous_index: usize,
+) -> usize {
+    selected_id
+        .and_then(|id| rows.iter().position(|row| row.id == id))
+        .unwrap_or_else(|| previous_index.min(rows.len().saturating_sub(1)))
 }
 fn snapshot(
     c: &Client,
@@ -475,23 +484,21 @@ fn tail_path(path: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    if max_width == UnicodeWidthChar::width('…').unwrap_or(1) {
+    let ellipsis_width = UnicodeWidthChar::width('…').unwrap_or(1);
+    if max_width <= ellipsis_width {
         return "…".into();
     }
-
-    let suffix_width = max_width - UnicodeWidthChar::width('…').unwrap_or(1);
     let mut suffix = String::new();
     let mut width = 0;
     for ch in path.chars().rev() {
         let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + char_width > suffix_width {
+        if width + char_width > max_width - ellipsis_width {
             break;
         }
         suffix.push(ch);
         width += char_width;
     }
-    suffix = suffix.chars().rev().collect();
-    format!("…{suffix}")
+    format!("…{}", suffix.chars().rev().collect::<String>())
 }
 fn print_once(rows: &[Execution], warnings: &[String], root: &Path, lost: bool) {
     println!("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tSTATE\tAGENT ID\tDIR\tLAST EVENT\tFLAGS");
@@ -524,37 +531,211 @@ fn print_once(rows: &[Execution], warnings: &[String], root: &Path, lost: bool) 
         eprintln!("WARNING: {w}")
     }
 }
-fn output(c: &Client, e: &Execution) -> String {
-    if e.agent.is_empty() {
-        return "No retained supervised agent matches this execution.".into();
+#[derive(Clone, Debug)]
+struct TranscriptItem {
+    id: String,
+    item: Value,
+    state: String,
+    raw: Value,
+    diagnostic: Option<String>,
+}
+
+fn codex_transcript_path(agent_id: &str) -> Option<PathBuf> {
+    if agent_id.len() != 32 || !agent_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
     }
-    match c.get(
-        &format!("/v1/agents/{}/logs", e.agent),
-        &[("stream", "both".into()), ("tail", OUTPUT_TAIL.to_string())],
-    ) {
-        Ok(v) => {
-            let text = v
-                .get("records")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().map(|r| s(r, "data")).collect::<String>())
-                .unwrap_or_default();
-            let l: Vec<_> = text.lines().collect();
-            if l.is_empty() {
-                "No spool output yet.".into()
-            } else {
-                l[l.len().saturating_sub(40)..].join("\n")
-            }
+    Some(
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join(".zigzag/agents/codex")
+            .join(format!("{agent_id}.jsonl")),
+    )
+}
+
+fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
+    let mut items: Vec<TranscriptItem> = Vec::new();
+    let mut indices = HashMap::<String, usize>::new();
+    let complete = if text.ends_with('\n') {
+        text
+    } else {
+        text.rfind('\n').map_or("", |end| &text[..=end])
+    };
+    for (line_number, line) in complete.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
         }
-        Err(e) => format!("Relay output unavailable: {}", e.message),
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            items.push(TranscriptItem {
+                id: format!("diagnostic-{line_number}"),
+                item: Value::Null,
+                state: "diagnostic".into(),
+                raw: Value::String(line.to_owned()),
+                diagnostic: Some(format!(
+                    "Malformed JSONL record at line {}",
+                    line_number + 1
+                )),
+            });
+            continue;
+        };
+        let kind = s(&event, "type");
+        if kind.starts_with("item.") {
+            let Some(item) = event.get("item") else {
+                items.push(TranscriptItem {
+                    id: format!("diagnostic-{line_number}"),
+                    item: Value::Null,
+                    state: "diagnostic".into(),
+                    raw: event,
+                    diagnostic: Some(format!(
+                        "{kind} record has no item at line {}",
+                        line_number + 1
+                    )),
+                });
+                continue;
+            };
+            let item_id = s(item, "id");
+            let key = if item_id.is_empty() {
+                format!("anonymous-{line_number}")
+            } else {
+                item_id
+            };
+            let state = kind.strip_prefix("item.").unwrap_or(&kind).to_owned();
+            if let Some(index) = indices.get(&key).copied() {
+                items[index] = TranscriptItem {
+                    id: key,
+                    item: item.clone(),
+                    state,
+                    raw: event,
+                    diagnostic: None,
+                };
+            } else {
+                indices.insert(key.clone(), items.len());
+                items.push(TranscriptItem {
+                    id: key,
+                    item: item.clone(),
+                    state,
+                    raw: event,
+                    diagnostic: None,
+                });
+            }
+        } else {
+            // Lifecycle records have no thread item, but remain useful context and
+            // must be inspectable just like item records.
+            let label = match kind.as_str() {
+                "thread.started" => "Thread started".to_owned(),
+                "turn.started" => "Turn started".to_owned(),
+                "turn.completed" => "Turn completed".to_owned(),
+                "turn.failed" => format!(
+                    "Turn failed: {}",
+                    s(event.get("error").unwrap_or(&Value::Null), "message")
+                ),
+                "error" => format!("Error: {}", s(&event, "message")),
+                _ => format!("Event: {}", if kind.is_empty() { "unknown" } else { &kind }),
+            };
+            items.push(TranscriptItem {
+                id: format!("event-{line_number}"),
+                item: Value::Null,
+                state: kind,
+                raw: event,
+                diagnostic: Some(label),
+            });
+        }
+    }
+    items
+}
+
+fn transcript_label(item: &TranscriptItem) -> (String, String) {
+    if let Some(label) = &item.diagnostic {
+        return (label.clone(), String::new());
+    }
+    let kind = s(&item.item, "type");
+    let state = match s(&item.item, "status").as_str() {
+        "in_progress" => "running",
+        "completed" => "done",
+        "failed" => "failed",
+        "declined" => "declined",
+        _ => item.state.as_str(),
+    }
+    .to_owned();
+    let summary = match kind.as_str() {
+        "agent_message" => s(&item.item, "text"),
+        "reasoning" => "Reasoning summary (expand to inspect)".into(),
+        "command_execution" => s(&item.item, "command"),
+        "file_change" => {
+            let n = item
+                .item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!("{n} file change(s)")
+        }
+        "mcp_tool_call" => format!("{}.{}", s(&item.item, "server"), s(&item.item, "tool")),
+        "collab_tool_call" => s(&item.item, "tool"),
+        "web_search" => format!("Search: {}", s(&item.item, "query")),
+        "todo_list" => "Plan updated".into(),
+        "error" => s(&item.item, "message"),
+        _ => format!(
+            "{} {}",
+            if kind.is_empty() {
+                "Unknown item"
+            } else {
+                &kind
+            },
+            item.item
+        ),
+    };
+    (safe_text(&summary), state)
+}
+
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '�'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn read_codex_transcript(agent_id: &str) -> (Vec<TranscriptItem>, Option<String>) {
+    let Some(path) = codex_transcript_path(agent_id) else {
+        return (
+            Vec::new(),
+            Some("No local Codex JSONL transcript for this execution".into()),
+        );
+    };
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.len() as usize > CODEX_TRANSCRIPT_LIMIT => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "Transcript exceeds the {} MiB display limit",
+                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
+                )),
+            );
+        }
+        Err(error) => return (Vec::new(), Some(format!("Transcript unavailable: {error}"))),
+        _ => {}
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => (parse_codex_transcript(&text), None),
+        Err(error) => (Vec::new(), Some(format!("Transcript unavailable: {error}"))),
     }
 }
 
-fn transcript_path(e: &Execution, root: &Path) -> PathBuf {
-    if !e.worktree.is_empty() {
-        return PathBuf::from(&e.worktree).join("last-message.txt");
+fn read_agent_prompt(client: &Client, agent_id: &str) -> Option<String> {
+    if agent_id.is_empty() {
+        return None;
     }
-    let task = e.task.strip_prefix("codex-").unwrap_or(&e.task);
-    root.join(task).join("last-message.txt")
+    client
+        .get(
+            &format!("/v1/agents/{agent_id}/transcript"),
+            &[("tail", "1".into())],
+        )
+        .ok()?
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(safe_text)
 }
 
 pub(super) fn cmd_status(
@@ -592,23 +773,35 @@ pub(super) fn cmd_status(
         .map_err(|e| Fail::Config(format!("cannot enter terminal mode: {e}")))?;
     let (mut rows, mut warnings, mut lost) = (rows, w, lost);
     let mut selected = 0usize;
+    let mut selected_id = rows.get(selected).map(|row| row.id.clone());
     let mut table_state = ratatui::widgets::TableState::default();
-    let mut detail_scroll = 0u16;
-    let (mut detail, mut transcript) = (false, false);
-    let mut output_text = String::new();
+    let (mut transcript_items, mut transcript_notice) = rows
+        .get(selected)
+        .map(|row| read_codex_transcript(&row.agent))
+        .unwrap_or_default();
+    let mut transcript_prompt = rows
+        .get(selected)
+        .and_then(|row| read_agent_prompt(c, &row.agent));
+    let (mut transcript_selected, mut transcript_scroll, mut transcript_focus, mut raw_view) =
+        (0usize, 0u16, false, false);
+    let mut expanded = HashSet::<String>::new();
     let mut tick = Instant::now();
+    let mut transcript_tick = Instant::now();
     loop {
         draw(
             &mut terminal,
             &mut table_state,
             &rows,
             &warnings,
-            &root,
             selected,
-            detail_scroll,
-            detail,
-            transcript,
-            &output_text,
+            &transcript_items,
+            transcript_notice.as_deref(),
+            transcript_prompt.as_deref(),
+            transcript_selected,
+            transcript_scroll,
+            transcript_focus,
+            raw_view,
+            &expanded,
             lost,
         );
         if event::poll(Duration::from_millis(100)).unwrap_or(false) {
@@ -624,47 +817,63 @@ pub(super) fn cmd_status(
                 _ => None,
             };
             match key {
-                Some(KeyCode::Char('q' | 'Q')) | Some(KeyCode::Esc) => {
-                    if detail || transcript {
-                        detail = false;
-                        transcript = false
-                    } else {
-                        break;
-                    }
+                Some(KeyCode::Char('q' | 'Q')) | Some(KeyCode::Esc) => break,
+                Some(KeyCode::Tab) | Some(KeyCode::Left) | Some(KeyCode::Right) => {
+                    transcript_focus = !transcript_focus;
                 }
                 Some(KeyCode::Char('j')) | Some(KeyCode::Down) => {
-                    selected = (selected + 1).min(rows.len().saturating_sub(1));
-                    detail_scroll = 0;
-                }
-                Some(KeyCode::Char('k')) | Some(KeyCode::Up) => {
-                    selected = selected.saturating_sub(1);
-                    detail_scroll = 0;
-                }
-                Some(KeyCode::Char('h')) | Some(KeyCode::Left) => {
-                    detail_scroll = detail_scroll.saturating_sub(1);
-                }
-                Some(KeyCode::Char('l')) | Some(KeyCode::Right) => {
-                    detail_scroll = detail_scroll.saturating_add(1);
-                }
-                Some(KeyCode::Char('t')) => {
-                    transcript = !transcript;
-                    detail = true;
-                    detail_scroll = 0;
-                    if transcript && !rows.is_empty() {
-                        let path = transcript_path(&rows[selected], &root);
-                        output_text = format!(
-                            "Transcript for {} / {}\nSource: {}\nCommand: tail -F '{}'\nRelay output (last 40 lines):\n{}",
-                            rows[selected].task,
-                            rows[selected].id,
-                            path.display(),
-                            path.display().to_string().replace('\'', "'\\''"),
-                            output(c, &rows[selected])
-                        )
+                    if transcript_focus {
+                        transcript_selected =
+                            (transcript_selected + 1).min(transcript_items.len().saturating_sub(1));
+                        transcript_scroll = transcript_scroll.saturating_add(1);
+                    } else {
+                        selected = (selected + 1).min(rows.len().saturating_sub(1));
+                        selected_id = rows.get(selected).map(|row| row.id.clone());
+                        (transcript_items, transcript_notice) = rows
+                            .get(selected)
+                            .map(|row| read_codex_transcript(&row.agent))
+                            .unwrap_or_default();
+                        transcript_prompt = rows
+                            .get(selected)
+                            .and_then(|row| read_agent_prompt(c, &row.agent));
+                        transcript_selected = 0;
+                        transcript_scroll = 0;
                     }
                 }
-                Some(KeyCode::Enter) => {
-                    detail = !detail;
-                    transcript = false
+                Some(KeyCode::Char('k')) | Some(KeyCode::Up) => {
+                    if transcript_focus {
+                        transcript_selected = transcript_selected.saturating_sub(1);
+                        transcript_scroll = transcript_scroll.saturating_sub(1);
+                    } else {
+                        selected = selected.saturating_sub(1);
+                        selected_id = rows.get(selected).map(|row| row.id.clone());
+                        (transcript_items, transcript_notice) = rows
+                            .get(selected)
+                            .map(|row| read_codex_transcript(&row.agent))
+                            .unwrap_or_default();
+                        transcript_prompt = rows
+                            .get(selected)
+                            .and_then(|row| read_agent_prompt(c, &row.agent));
+                        transcript_selected = 0;
+                        transcript_scroll = 0;
+                    }
+                }
+                Some(KeyCode::PageDown) | Some(KeyCode::Char(']')) => {
+                    transcript_scroll = transcript_scroll.saturating_add(10)
+                }
+                Some(KeyCode::PageUp) | Some(KeyCode::Char('[')) => {
+                    transcript_scroll = transcript_scroll.saturating_sub(10)
+                }
+                Some(KeyCode::Char('v')) => raw_view = !raw_view,
+                Some(KeyCode::Enter) | Some(KeyCode::Char(' ')) if transcript_focus => {
+                    if let Some(item) = transcript_items.get(transcript_selected)
+                        && !item.diagnostic.as_ref().is_some_and(|text| {
+                            text.starts_with("Thread started") || text.starts_with("Turn started")
+                        })
+                        && !expanded.insert(item.id.clone())
+                    {
+                        expanded.remove(&item.id);
+                    }
                 }
                 _ => {}
             }
@@ -675,11 +884,32 @@ pub(super) fn cmd_status(
                     rows = r;
                     warnings = w;
                     lost = lo;
-                    selected = selected.min(rows.len().saturating_sub(1))
+                    selected = resolve_selection(&rows, selected_id.as_deref(), selected);
+                    selected_id = rows.get(selected).map(|row| row.id.clone());
+                    (transcript_items, transcript_notice) = rows
+                        .get(selected)
+                        .map(|row| read_codex_transcript(&row.agent))
+                        .unwrap_or_default();
+                    transcript_prompt = rows
+                        .get(selected)
+                        .and_then(|row| read_agent_prompt(c, &row.agent));
+                    transcript_selected =
+                        transcript_selected.min(transcript_items.len().saturating_sub(1));
                 }
                 Err(e) => warnings = vec![format!("relay status unavailable: {}", e.message)],
             }
             tick = Instant::now()
+        }
+        // Refresh the local JSONL independently from the slower relay snapshot.
+        // Codex appends transcript records while the agent is running, so tying
+        // this read to the status interval makes the transcript feel stale.
+        if transcript_tick.elapsed() >= Duration::from_millis(500) {
+            if let Some(row) = rows.get(selected) {
+                (transcript_items, transcript_notice) = read_codex_transcript(&row.agent);
+                transcript_selected =
+                    transcript_selected.min(transcript_items.len().saturating_sub(1));
+            }
+            transcript_tick = Instant::now();
         }
     }
     Ok(())
@@ -725,52 +955,33 @@ fn draw(
     table_state: &mut ratatui::widgets::TableState,
     rows: &[Execution],
     warnings: &[String],
-    root: &Path,
     selected: usize,
-    detail_scroll: u16,
-    detail: bool,
-    transcript: bool,
-    out_text: &str,
+    transcript_items: &[TranscriptItem],
+    transcript_notice: Option<&str>,
+    transcript_prompt: Option<&str>,
+    transcript_selected: usize,
+    transcript_scroll: u16,
+    transcript_focus: bool,
+    raw_view: bool,
+    expanded: &HashSet<String>,
     lost: bool,
 ) {
     let _ = terminal.terminal.draw(|frame| {
         let areas = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(5),
-                Constraint::Min(6),
-            ])
+            .constraints([Constraint::Length(2), Constraint::Min(5)])
             .split(frame.area());
-        let dir_column_width =
-            (areas[1].width.saturating_sub(2) as usize * 13 / 100).saturating_sub(2);
-        let title = if transcript {
-            "zzapi status — output  q/Esc back"
-        } else {
-            "zzapi status — ↑↓/j/k select  Enter history  t output  ←→/h/l scroll details  q quit"
-        };
         frame.render_widget(
-            Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
+            Paragraph::new("zzapi status — ↑↓ select pane  Enter expand  v raw JSON  Tab switch  PgUp/PgDn scroll  q quit")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
             areas[0],
         );
-
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+            .split(areas[1]);
         let table_rows = rows.iter().map(|e| {
-            let dir = if e.worktree.is_empty() {
-                task_dir(&e.task, root)
-            } else {
-                e.worktree.clone()
-            };
-            let started = if e.started_at.is_empty() {
-                "?".into()
-            } else {
-                e.started_at
-                    .chars()
-                    .take(19)
-                    .collect::<String>()
-                    .replace('T', " ")
-            };
             Row::new(vec![
-                Cell::from(e.id.as_str()),
                 Cell::from(e.task.as_str()),
                 Cell::from(if e.pr.is_empty() && e.branch.is_empty() {
                     "-".to_owned()
@@ -781,136 +992,115 @@ fn draw(
                 } else {
                     format!("{} {}", e.pr, e.branch)
                 }),
-                Cell::from(if e.state.is_empty() {
-                    "not observed"
-                } else {
-                    &e.state
-                }),
-                Cell::from(if e.command.is_empty() {
-                    "-"
-                } else {
-                    &e.command
-                }),
-                Cell::from(started),
-                Cell::from(if e.exit_code.is_empty() {
-                    "-"
-                } else {
-                    &e.exit_code
-                }),
-                Cell::from(tail_path(&dir, dir_column_width)),
-                Cell::from(e.latest()),
+                Cell::from(if e.state.is_empty() { "unknown" } else { &e.state }),
             ])
         });
-        let header = Row::new([
-            "ID",
-            "TASK",
-            "PR / BRANCH",
-            "STATE",
-            "COMMAND",
-            "STARTED",
-            "EXIT",
-            "DIR",
-            "LAST EVENT",
-        ])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+        let header = Row::new(["AGENT / TASK", "PR / BRANCH", "STATE"]).style(
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        );
+        let table = Table::new(
+            table_rows,
+            [Constraint::Percentage(48), Constraint::Percentage(33), Constraint::Percentage(19)],
         )
-        .bottom_margin(0);
-        let widths = [
-            Constraint::Percentage(11),
-            Constraint::Percentage(12),
-            Constraint::Percentage(17),
-            Constraint::Percentage(9),
-            Constraint::Percentage(16),
-            Constraint::Percentage(10),
-            Constraint::Percentage(5),
-            Constraint::Percentage(10),
-            Constraint::Percentage(10),
-        ];
-        let table = Table::new(table_rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Executions "))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("» ");
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(" Agents "))
+        .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("» ");
         table_state.select((!rows.is_empty()).then_some(selected));
-        frame.render_stateful_widget(table, areas[1], table_state);
+        frame.render_stateful_widget(table, panes[0], table_state);
 
         let mut lines = Vec::new();
-        if rows.is_empty() {
-            lines.push(Line::from("No execution events observed."));
-        } else if transcript {
-            let e = &rows[selected];
-            lines.push(Line::from(format!("Output for {} / {}", e.task, e.id)));
-            lines.extend(out_text.lines().map(Line::from));
-        } else if detail {
-            let e = &rows[selected];
+        if let Some(e) = rows.get(selected) {
+            let path = codex_transcript_path(&e.agent)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "local JSONL transcript unavailable".into());
+            let worktree = if e.worktree.is_empty() {
+                "-"
+            } else {
+                &e.worktree
+            };
+            lines.push(Line::from(format!("Worktree: {worktree}")));
             lines.push(Line::from(format!(
-                "{} / {} — {}",
+                "Branch: {}",
+                if e.branch.is_empty() { "-" } else { &e.branch }
+            )));
+            lines.push(Line::from(format!(
+                "PR: {}",
+                if e.pr.is_empty() { "-" } else { &e.pr }
+            )));
+            lines.push(Line::from(format!(
+                "Agent ID: {}",
+                if e.agent.is_empty() { "-" } else { &e.agent }
+            )));
+            lines.push(Line::from(format!(
+                "{} / {} · {} · {}",
                 e.task,
                 e.id,
+                e.state,
                 e.flags(lost)
             )));
-            let start = e.events.len().saturating_sub(12);
-            for i in start..e.events.len() {
-                let v = &e.events[i];
-                if i > start {
-                    let previous = &e.events[i - 1];
-                    if !s(previous, "clock").is_empty()
-                        && !s(v, "clock").is_empty()
-                        && s(previous, "clock") != s(v, "clock")
-                    {
-                        lines.push(Line::from(format!(
-                            "↳ cross-clock: {} → {} (not subtracted)",
-                            s(previous, "occurred_at"),
-                            s(v, "occurred_at")
-                        )));
-                    } else if elapsed(previous, v).is_none() {
-                        lines.push(Line::from(
-                            "↳ timing not observed: invalid, missing, or out-of-order timestamp",
-                        ));
-                    }
+            lines.push(Line::from(format!("Source: {}", tail_path(&path, panes[1].width.saturating_sub(12) as usize))));
+            if let Some(summary) = e.events.iter().rev().find_map(request_summary) {
+                lines.push(Line::from(format!("Request: {summary}")));
+            }
+            if let Some(notice) = transcript_notice {
+                lines.push(Line::from(Span::styled(notice, Style::default().fg(Color::Yellow))));
+            }
+            if let Some(prompt) = transcript_prompt {
+                lines.push(Line::from(Span::styled(
+                    "YOU",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(prompt.lines().map(|line| Line::from(line.to_owned())));
+            }
+            for (index, item) in transcript_items.iter().enumerate() {
+                let (summary, state) = transcript_label(item);
+                let kind = s(&item.item, "type");
+                let marker = if kind.ends_with("tool_call") || kind == "command_execution" { "▸" } else { "•" };
+                let selected_style = if index == transcript_selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else { Style::default() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), selected_style),
+                    Span::styled(format!("[{state}] "), Style::default().fg(Color::Yellow)),
+                    Span::styled(summary, selected_style),
+                ]));
+                if expanded.contains(&item.id) {
+                    let detail = if raw_view || item.diagnostic.is_some() {
+                        serde_json::to_string_pretty(&item.raw).unwrap_or_else(|_| item.raw.to_string())
+                    } else {
+                        let kind = s(&item.item, "type");
+                        match kind.as_str() {
+                            "command_execution" => {
+                                let output = s(&item.item, "aggregated_output");
+                                format!("{}\nexit code: {}", if output.is_empty() { "(no captured output)" } else { &output }, s(&item.item, "exit_code"))
+                            }
+                            "agent_message" | "reasoning" => s(&item.item, "text"),
+                            "mcp_tool_call" => ["arguments", "result", "error"].iter()
+                                .filter_map(|key| item.item.get(key).map(|value| format!("{key}: {value}")))
+                                .collect::<Vec<_>>().join("\n"),
+                            "file_change" => item.item.get("changes").map(Value::to_string).unwrap_or_default(),
+                            _ => serde_json::to_string_pretty(&item.item).unwrap_or_else(|_| item.item.to_string()),
+                        }
+                    };
+                    lines.extend(safe_text(&detail).lines().map(|line| Line::from(line.to_owned())));
                 }
-                let mut event_line = format!(
-                    "{}  {}  [{}]",
-                    short_time(v.get("occurred_at")),
-                    s(v, "kind"),
-                    s(v, "source")
-                );
-                if let Some(summary) = request_summary(v) {
-                    event_line.push_str("  — ");
-                    event_line.push_str(&summary);
-                }
-                lines.push(Line::from(event_line));
+            }
+            if transcript_items.is_empty() && transcript_notice.is_none() {
+                lines.push(Line::from("No Codex events yet."));
             }
         } else {
-            lines.push(Line::from(
-                "Select an execution and press Enter for event history or t for output.",
-            ));
+            lines.push(Line::from("No agent executions observed."));
         }
         for warning in warnings {
-            lines.push(Line::from(vec![Span::styled(
-                format!("WARNING: {warning}"),
-                Style::default().fg(Color::Red),
-            )]));
+            lines.push(Line::from(Span::styled(format!("WARNING: {warning}"), Style::default().fg(Color::Red))));
         }
-        let detail_title = if transcript {
-            " Output "
-        } else if detail {
-            " Event history "
-        } else {
-            " Details "
-        };
+        let title = if transcript_focus { " Transcript · focused " } else { " Transcript " };
         let paragraph = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(detail_title))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: true })
-            .scroll((detail_scroll, 0));
-        frame.render_widget(paragraph, areas[2]);
+            .scroll((transcript_scroll, 0));
+        frame.render_widget(paragraph, panes[1]);
     });
 }
 
@@ -919,36 +1109,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_started_summary_shows_truncated_prompt_and_model() {
-        let event = serde_json::json!({
-            "kind": "relay_request_started",
-            "payload": {"prompt": "  review   this change  ", "model": "gpt-6"}
-        });
-        assert_eq!(
-            request_summary(&event).as_deref(),
-            Some("prompt: review this change · model: gpt-6")
-        );
+    fn preserves_selected_execution_when_new_rows_are_inserted_before_it() {
+        let rows = vec![
+            Execution {
+                id: "new-agent".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "selected-agent".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "older-agent".into(),
+                ..Default::default()
+            },
+        ];
 
-        let long = "x".repeat(EVENT_PROMPT_LIMIT + 1);
-        let event = serde_json::json!({"kind":"relay_request_started","payload":{"prompt":long}});
-        let summary = request_summary(&event).unwrap();
-        assert_eq!(
-            summary.chars().count(),
-            "prompt: ".chars().count() + EVENT_PROMPT_LIMIT + 1
-        );
-        assert!(summary.ends_with('…'));
-    }
-
-    #[test]
-    fn request_started_summary_shows_process_and_command() {
-        let event = serde_json::json!({
-            "kind": "relay_request_started",
-            "payload": {"process": "codex", "command": ["run", "--fast"]}
-        });
-        assert_eq!(
-            request_summary(&event).as_deref(),
-            Some("process: codex · command: run --fast")
-        );
+        assert_eq!(resolve_selection(&rows, Some("selected-agent"), 1), 1);
+        assert_eq!(resolve_selection(&rows, Some("selected-agent"), 0), 1);
+        assert_eq!(resolve_selection(&rows, Some("removed-agent"), 2), 2);
     }
 
     #[test]
@@ -973,13 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn truncates_paths_from_the_left() {
-        assert_eq!(tail_path("/repo/worktree/task-123", 12), "…ee/task-123");
-        assert_eq!(tail_path("/repo/task", 20), "/repo/task");
-        assert_eq!(tail_path("/repo/task", 1), "…");
-    }
-
-    #[test]
     fn combines_events_with_agent_state_and_worktree() {
         let events = vec![
             serde_json::json!({"id":"e1","task_id":"agent-1","execution_id":"run-1","kind":"process_spawned","occurred_at":"2026-10-08T00:00:00Z","clock":"host"}),
@@ -1000,5 +1172,68 @@ mod tests {
         assert_eq!(rows[0].pr, "#123");
         assert_eq!(rows[0].branch, "codex/fix-thing");
         assert!(rows[0].flags(false).contains("audit degraded"));
+    }
+
+    #[test]
+    fn request_summaries_are_compact_and_support_prompt_or_process() {
+        let prompt = serde_json::json!({
+            "kind":"relay_request_started",
+            "payload":{"prompt":"  review   this change  ","model":"gpt-6"}
+        });
+        assert_eq!(
+            request_summary(&prompt).as_deref(),
+            Some("prompt: review this change · model: gpt-6")
+        );
+        let process = serde_json::json!({
+            "kind":"relay_request_started",
+            "payload":{"process":"codex","command":["run","--fast"]}
+        });
+        assert_eq!(
+            request_summary(&process).as_deref(),
+            Some("process: codex · command: run --fast")
+        );
+    }
+
+    #[test]
+    fn path_tail_truncation_uses_terminal_display_width() {
+        assert_eq!(tail_path("/repo/worktree/task-123", 12), "…ee/task-123");
+        assert_eq!(tail_path("/repo/task", 20), "/repo/task");
+        assert_eq!(tail_path("/repo/task", 1), "…");
+    }
+
+    #[test]
+    fn reconciles_item_updates_and_keeps_malformed_records_visible() {
+        let data = concat!(
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"status\":\"in_progress\"}}\n",
+            "{\"type\":\"item.updated\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"ok\",\"status\":\"in_progress\"}}\n",
+            "bad json\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"exit_code\":0,\"status\":\"completed\"}}\n",
+        );
+        let items = parse_codex_transcript(data);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, "completed");
+        assert_eq!(s(&items[0].item, "exit_code"), "0");
+        assert!(
+            items[1]
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("Malformed")
+        );
+    }
+
+    #[test]
+    fn ignores_an_incomplete_final_jsonl_record() {
+        let items = parse_codex_transcript(
+            "{\"type\":\"turn.started\"}\n{\"type\":\"item.started\",\"item\":",
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, "turn.started");
+    }
+
+    #[test]
+    fn rejects_invalid_agent_ids_for_transcript_paths() {
+        assert!(codex_transcript_path("../etc/passwd").is_none());
+        assert!(codex_transcript_path("g0000000000000000000000000000000").is_none());
     }
 }

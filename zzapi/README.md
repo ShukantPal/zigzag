@@ -62,6 +62,7 @@ zzapi agents logs <id> --stream stderr --tail 5000
 zzapi agents pause <id>      # relay PR in flight
 zzapi agents resume <id>     # relay PR in flight
 zzapi agents stop <id>       # relay PR in flight
+zzapi status                 # live agent list and Codex JSONL transcript
 
 # worktrees
 zzapi worktrees create --path /private/tmp/my-branch/ --branch my-branch \
@@ -89,6 +90,12 @@ zzapi review-gate --repo leveled-inc/leveled --pr 1031
 
 Agent IDs accept a unique prefix — `zzapi agents logs 360fc6b36a9d` resolves
 the full handle for you.
+
+In `zzapi status`, use `↑/↓` to choose an agent, `Tab` or `←/→` to focus the
+transcript, `↑/↓` to select an item, and `Enter` or `Space` to expand tool
+details and captured command output. Press `v` to inspect the selected event's
+raw JSON, `PgUp/PgDn` to scroll, and `q` to exit. The transcript reads the local
+Codex JSONL file at `~/.zigzag/agents/codex/<agent-id>.jsonl`.
 
 ## Exit codes
 
