@@ -1064,6 +1064,10 @@ pub(crate) fn persisted_agent_config(
             Json::String(request.project_dir.clone()),
         ),
         ("branch".to_owned(), Json::String(request.branch.clone())),
+        (
+            "pr".to_owned(),
+            request.pr.map(Json::number).unwrap_or(Json::Null),
+        ),
         ("no_branch".to_owned(), Json::Bool(request.no_branch)),
         (
             "auto_pr".to_owned(),

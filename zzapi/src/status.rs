@@ -33,6 +33,8 @@ struct Execution {
     state: String,
     agent: String,
     command: String,
+    pr: String,
+    branch: String,
     started_at: String,
     exit_code: String,
     started: Option<i64>,
@@ -211,6 +213,18 @@ fn worktree_map(state: &Path) -> HashMap<String, String> {
     }
     m
 }
+fn git_branch(worktree: &str) -> String {
+    if worktree.is_empty() {
+        return String::new();
+    }
+    std::process::Command::new("git")
+        .args(["-C", worktree, "branch", "--show-current"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
 fn audit(state: &Path) -> (Vec<Value>, Vec<String>) {
     let dir = state.with_extension("audit");
     let mut es = vec![];
@@ -295,6 +309,15 @@ fn build(
         r.state = s(a, "state");
         r.agent = s(a, "id");
         r.command = s(a, "command");
+        let config = s(a, "agent_config");
+        let config = serde_json::from_str::<Value>(&config).unwrap_or(Value::Null);
+        r.pr = ["pr", "pull_request", "pr_number"]
+            .iter()
+            .map(|key| s(&config, key))
+            .find(|value| !value.is_empty())
+            .map(|value| format!("#{value}"))
+            .unwrap_or_default();
+        r.branch = s(&config, "branch");
         r.exit_code = if a.get("exit_code").is_some_and(Value::is_null) {
             String::new()
         } else {
@@ -322,6 +345,9 @@ fn build(
     for r in &mut out {
         if r.worktree.is_empty() {
             r.worktree = wt.get(&r.task).cloned().unwrap_or_default()
+        }
+        if r.branch.is_empty() {
+            r.branch = git_branch(&r.worktree)
         }
     }
     out.sort_by(|a, b| {
@@ -702,6 +728,15 @@ fn draw(
             Row::new(vec![
                 Cell::from(e.id.as_str()),
                 Cell::from(e.task.as_str()),
+                Cell::from(if e.pr.is_empty() && e.branch.is_empty() {
+                    "-".to_owned()
+                } else if e.pr.is_empty() {
+                    e.branch.clone()
+                } else if e.branch.is_empty() {
+                    e.pr.clone()
+                } else {
+                    format!("{} {}", e.pr, e.branch)
+                }),
                 Cell::from(if e.state.is_empty() {
                     "not observed"
                 } else {
@@ -725,6 +760,7 @@ fn draw(
         let header = Row::new([
             "ID",
             "TASK",
+            "PR / BRANCH",
             "STATE",
             "COMMAND",
             "STARTED",
@@ -739,14 +775,15 @@ fn draw(
         )
         .bottom_margin(0);
         let widths = [
-            Constraint::Percentage(13),
-            Constraint::Percentage(14),
-            Constraint::Percentage(10),
-            Constraint::Percentage(20),
-            Constraint::Percentage(13),
-            Constraint::Percentage(6),
-            Constraint::Percentage(13),
             Constraint::Percentage(11),
+            Constraint::Percentage(12),
+            Constraint::Percentage(17),
+            Constraint::Percentage(9),
+            Constraint::Percentage(16),
+            Constraint::Percentage(10),
+            Constraint::Percentage(5),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
         ];
         let table = Table::new(table_rows, widths)
             .header(header)
@@ -866,7 +903,7 @@ mod tests {
             serde_json::json!({"id":"e1","task_id":"agent-1","execution_id":"run-1","kind":"process_spawned","occurred_at":"2026-10-08T00:00:00Z","clock":"host"}),
         ];
         let agents = vec![
-            serde_json::json!({"id":"agent-handle","task_id":"agent-1","execution_id":"run-1","state":"orphaned","command":"codex exec","started_at":"2026-10-08T00:00:00Z","exit_code":1,"audit_degraded":true}),
+            serde_json::json!({"id":"agent-handle","task_id":"agent-1","execution_id":"run-1","state":"orphaned","command":"codex exec","started_at":"2026-10-08T00:00:00Z","exit_code":1,"audit_degraded":true,"agent_config":"{\"pr\":123,\"branch\":\"codex/fix-thing\"}"}),
         ];
         let wt = HashMap::from([("agent-1".to_owned(), "/tmp/agent-1".to_owned())]);
         let rows = build(events, &agents, &wt, false);
@@ -878,6 +915,8 @@ mod tests {
         assert_eq!(rows[0].started_at, "2026-10-08T00:00:00Z");
         assert_eq!(rows[0].exit_code, "1");
         assert_eq!(rows[0].worktree, "/tmp/agent-1");
+        assert_eq!(rows[0].pr, "#123");
+        assert_eq!(rows[0].branch, "codex/fix-thing");
         assert!(rows[0].flags(false).contains("audit degraded"));
     }
 }
