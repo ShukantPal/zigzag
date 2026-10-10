@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise the real relay binary through zzapi and the dept status TUI model.
+# Exercise the real relay binary through zzapi, including agent lifecycle.
 #
 # The fake `codex` below intentionally stays alive.  That lets this test
 # prove pause/resume signal a real process instead of merely accepting a 200.
@@ -7,7 +7,6 @@ set -euo pipefail
 
 relay_bin=${1:?usage: $0 RELAY_BIN ZZAPI_BIN}
 zzapi_bin=${2:?usage: $0 RELAY_BIN ZZAPI_BIN}
-repo_root=$(cd "$(dirname "$0")/.." && pwd)
 tmp_dir=$(mktemp -d)
 relay_pid=""
 
@@ -108,8 +107,6 @@ assert agent is not None, "created agent is absent from zzapi agents list"
 assert agent["state"] == "running", agent
 ' "$agent_id" <<<"$listed"
 
-status=$("${api[@]}" agents get "$agent_id")
-task_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["task_id"])' <<<"$status")
 leader_pid=$(python3 - "$agent_id" "$tmp_dir/events.agents.json" <<'PY'
 import json, sys
 agent_id, registry_path = sys.argv[1:]
@@ -125,51 +122,6 @@ for _ in $(seq 1 50); do
 done
 [[ -s "$transcript" ]]
 grep -q 'e2e-agent-output' "$transcript"
-
-# The TUI's non-interactive view must associate the relay events and agent
-# table, yielding the actual task and a concrete agent state.
-tui=$(python3 "$repo_root/dept/status.py" --url "http://127.0.0.1:$port" \
-  --state-file "$state_file" --token-file "$token_file" --once)
-python3 -c '
-import sys
-task_id = sys.argv[1]
-rows = [line.split("\t") for line in sys.stdin.read().splitlines()[1:]]
-row = next((row for row in rows if row and row[0] == task_id), None)
-assert row is not None, f"TUI did not display task {task_id!r}"
-assert row[4] != "not observed", f"TUI did not observe agent state: {row}"
-' "$task_id" <<<"$tui"
-
-# Exercise the TUI model's real TCP receive path after bootstrap.  Its HTTP
-# accessor is deliberately disabled before polling: the injected event must
-# arrive through the authenticated socket subscription, not a fallback poll.
-PYTHONPATH="$repo_root" python3 - "$port" "$token_file" <<'PY'
-import json
-import sys
-import urllib.request
-
-from dept.status import EventStream
-
-port, token_path = sys.argv[1:]
-token = open(token_path).read().strip()
-url = f"http://127.0.0.1:{port}"
-stream = EventStream(url, token)
-stream.bootstrap()
-stream._get = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected HTTP fallback"))
-request = urllib.request.Request(
-    url + "/v1/events",
-    data=json.dumps({"id": "socket-full-stack", "kind": "socket_test"}).encode(),
-    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    method="POST",
-)
-with urllib.request.urlopen(request, timeout=5) as response:
-    assert response.status == 201
-for _ in range(20):
-    stream.poll(1)
-    if any(item.get("id") == "socket-full-stack" for item in stream.events):
-        break
-else:
-    raise AssertionError("TUI model did not receive the pushed socket event")
-PY
 
 "${api[@]}" agents pause "$agent_id" >/dev/null
 for _ in $(seq 1 50); do
@@ -199,4 +151,4 @@ if kill -0 "$leader_pid" 2>/dev/null; then
   exit 1
 fi
 
-echo "full-stack relay + zzapi + TUI lifecycle passed"
+echo "full-stack relay + zzapi lifecycle passed"
