@@ -1,7 +1,7 @@
 //! Agent provider abstraction.
 //!
-//! The relay can spawn agents from multiple CLIs (Codex, Gemini, OpenCode,
-//! Grok). Each provider knows how to invoke its CLI non-interactively:
+//! The relay can spawn agents from multiple CLIs (Codex, Gemini, Antigravity,
+//! OpenCode, Grok). Each provider knows how to invoke its CLI non-interactively:
 //! how to pass the prompt, which flags enable headless/JSON mode, and
 //! how to point it at a working directory.
 //!
@@ -73,6 +73,7 @@ pub(crate) fn provider_from_name(name: &str) -> Result<Box<dyn Provider>, String
     match name {
         "codex" => Ok(Box::new(CodexProvider)),
         "gemini" => Ok(Box::new(GeminiProvider)),
+        "antigravity" | "agy" => Ok(Box::new(AntigravityProvider)),
         "opencode" => Ok(Box::new(OpenCodeProvider)),
         "grok" => Ok(Box::new(GrokProvider)),
         _ => Err(format!("unknown provider: {name}")),
@@ -80,7 +81,7 @@ pub(crate) fn provider_from_name(name: &str) -> Result<Box<dyn Provider>, String
 }
 
 /// All known provider names, for API documentation and validation.
-pub(crate) const PROVIDER_NAMES: &[&str] = &["codex", "gemini", "opencode", "grok"];
+pub(crate) const PROVIDER_NAMES: &[&str] = &["codex", "gemini", "antigravity", "opencode", "grok"];
 
 /// Default provider when the API request omits one.
 pub(crate) const DEFAULT_PROVIDER: &str = "codex";
@@ -149,6 +150,30 @@ impl Provider for GeminiProvider {
             argv.push(model.clone());
         }
         // Gemini CLI respects cwd; the relay sets it via spawn options.
+        let _ = &opts.project_dir;
+        Ok(argv)
+    }
+}
+
+// --- Antigravity CLI ---
+
+pub(crate) struct AntigravityProvider;
+
+impl Provider for AntigravityProvider {
+    fn name(&self) -> &'static str {
+        "antigravity"
+    }
+    fn bin(&self) -> &'static str {
+        "agy"
+    }
+    fn spawn_argv(&self, opts: &AgentOpts) -> Result<Vec<String>, String> {
+        // AGY's print mode is a single non-interactive prompt. Its working
+        // directory is set by the relay's process spawn options.
+        let mut argv = vec!["-p".to_owned(), opts.prompt.clone()];
+        if let Some(model) = &opts.model {
+            argv.extend(["--model".to_owned(), model.clone()]);
+        }
+        argv.extend(["--output-format".to_owned(), "stream-json".to_owned()]);
         let _ = &opts.project_dir;
         Ok(argv)
     }
@@ -279,6 +304,20 @@ mod tests {
         let argv = GeminiProvider.spawn_argv(&opts()).unwrap();
         assert_eq!(argv[0], "-p");
         assert_eq!(argv[1], "hello");
+    }
+
+    #[test]
+    fn antigravity_argv_uses_headless_prompt_and_alias() {
+        let provider = provider_from_name("agy").expect("AGY alias");
+        assert_eq!(provider.name(), "antigravity");
+        assert_eq!(provider.bin(), "agy");
+        let argv = provider.spawn_argv(&opts()).unwrap();
+        assert_eq!(argv[0], "-p");
+        assert_eq!(argv[1], "hello");
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--output-format", "stream-json"])
+        );
     }
 
     #[test]

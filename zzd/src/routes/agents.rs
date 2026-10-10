@@ -61,6 +61,7 @@ pub(crate) fn agent_harness_bin(harness: &str) -> &'static str {
     match harness {
         "gemini" => "gemini",
         "opencode" => "opencode",
+        "antigravity" | "agy" => "agy",
         _ => "codex",
     }
 }
@@ -582,9 +583,17 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
         Some(_) => return Err("invalid_agent_create_request"),
     };
     let harness = string_field("harness", false)?.unwrap_or_else(|| "codex".to_owned());
-    if !matches!(harness.as_str(), "codex" | "gemini" | "opencode") {
+    if !matches!(
+        harness.as_str(),
+        "codex" | "gemini" | "opencode" | "antigravity" | "agy"
+    ) {
         return Err("invalid_agent_create_request");
     }
+    let harness = if harness == "agy" {
+        "antigravity".to_owned()
+    } else {
+        harness
+    };
     Ok(AgentCreateRequest {
         prompt: string_field("prompt", true)?.expect("required field"),
         project_dir: string_field("project_dir", true)?.expect("required field"),
@@ -627,6 +636,17 @@ pub(crate) fn agent_argv(
     prompt: &str,
 ) -> Vec<String> {
     match harness {
+        "antigravity" | "agy" => {
+            let mut args = vec!["-p".into(), prompt.into()];
+            if !model.is_empty() {
+                args.extend(["--model".into(), model.into()]);
+            }
+            args.extend(["--output-format".into(), "stream-json".into()]);
+            if approval == "full-auto" {
+                args.push("--dangerously-skip-permissions".into());
+            }
+            args
+        }
         "gemini" => {
             let mut args = vec!["--prompt".into(), prompt.into()];
             if !model.is_empty() {
@@ -1205,9 +1225,17 @@ pub(crate) fn restart_config(text: &str) -> Result<AgentRestartConfig, &'static 
         Some((_, value)) => Some(value.as_u64().ok_or("invalid_agent_config")?),
     };
     let harness = optional("harness")?.unwrap_or_else(|| "codex".to_owned());
-    if !matches!(harness.as_str(), "codex" | "gemini" | "opencode") {
+    if !matches!(
+        harness.as_str(),
+        "codex" | "gemini" | "opencode" | "antigravity" | "agy"
+    ) {
         return Err("invalid_agent_config");
     }
+    let harness = if harness == "agy" {
+        "antigravity".to_owned()
+    } else {
+        harness
+    };
     Ok(AgentRestartConfig {
         prompt: required("prompt")?,
         worktree: required("worktree")?,

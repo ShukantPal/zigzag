@@ -1677,7 +1677,7 @@ fn agent_create_request_parsing_and_helpers() {
         )
         .is_err()
     );
-    for harness in ["gemini", "opencode"] {
+    for harness in ["gemini", "opencode", "antigravity"] {
         let body =
             format!(r#"{{"prompt":"x","project_dir":"y","branch":"z","harness":"{harness}"}}"#);
         assert_eq!(
@@ -1685,6 +1685,11 @@ fn agent_create_request_parsing_and_helpers() {
             harness
         );
     }
+    let alias = parse_agent_create_request(
+        br#"{"prompt":"x","project_dir":"y","branch":"z","harness":"agy"}"#,
+    )
+    .unwrap();
+    assert_eq!(alias.harness, "antigravity");
 }
 
 #[test]
@@ -1736,6 +1741,32 @@ fn agent_argv_maps_common_options_for_each_harness() {
     );
     assert!(opencode.iter().any(|v| v == "--auto"));
     assert_eq!(opencode.last().map(String::as_str), Some("do it"));
+
+    let antigravity = agent_argv(
+        "antigravity",
+        "gemini-3-pro",
+        "full-auto",
+        "/tmp/wt",
+        true,
+        "do it",
+    );
+    assert_eq!(antigravity.first().map(String::as_str), Some("-p"));
+    assert!(
+        antigravity
+            .windows(2)
+            .any(|v| v == ["--model", "gemini-3-pro"])
+    );
+    assert!(
+        antigravity
+            .windows(2)
+            .any(|v| v == ["--output-format", "stream-json"])
+    );
+    assert!(
+        antigravity
+            .iter()
+            .any(|v| v == "--dangerously-skip-permissions")
+    );
+    assert_eq!(antigravity[1], "do it");
     assert_eq!(
         agent_harness_config("opencode", "suggest").as_deref(),
         Some(r#"{"permission":{"*":"ask"}}"#)
@@ -1754,6 +1785,8 @@ fn agent_harness_selects_matching_cli_binary() {
         ("codex", "codex"),
         ("gemini", "gemini"),
         ("opencode", "opencode"),
+        ("antigravity", "agy"),
+        ("agy", "agy"),
     ] {
         assert_eq!(agent_harness_bin(harness), expected_bin);
     }
