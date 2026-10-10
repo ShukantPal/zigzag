@@ -3,18 +3,15 @@
 ## System overview
 
 ```text
-VM / automation host                         Mac GUI login session
----------------------                        ---------------------
-dept.py / watchers -- SSH -----------------> ~/.codex/dept/t-*/codex-launch.sh
-       |                                         |
-       | HTTP (Tailscale, bearer token)           v
-       +---------------------------------> zigzag relay (LaunchAgent)
-                                             | event/audit store
-                                             | agent registry + log spools
-                                             +--> Codex process groups/worktrees
+Authorized clients                             Mac GUI login session
+------------------                             ---------------------
+zzapi / HTTP clients -- bearer token --------> zigzag relay (LaunchAgent)
+                                                   | event/audit store
+                                                   | agent registry + log spools
+                                                   +--> agent processes/worktrees
 
-status.py <----- events + agents + audit ------+
-zzapi ---------- supported relay routes -------+
+zzapi events stream <--- authenticated socket -----+
+zzapi status       <--- API state/events -----------+
 ```
 
 The relay is a per-user Mac LaunchAgent named `com.shukantpal.zigzag`; it is
@@ -31,31 +28,23 @@ Tailscale ACL and bearer token form its network/authentication boundary.
 | `zzd/src/{github,review_loop,provider,session,update}.rs` | GitHub watch, Rust review loop, providers, GUI/Tailscale checks, and signed update. |
 | `zz/` | Shared durable JSON store, registry, parser, and secret-file support. |
 | `zzapi/src/main.rs` | `zzapi`, the typed Rust relay client. |
-| `dept/` | Python dispatcher, status UI, config, lifecycle helpers, and scheduled watchers. |
+| `zzapi/src/status.rs` | Read-only terminal status UI. |
 | `launchd/` | LaunchAgent template and installation instructions. |
 | `scripts/` | Signing, verification, hooks, reviewer launch, and full-stack E2E. |
 
 ## Work creation paths
 
-There are two distinct paths.
-
-1. Relay-native: `POST /v1/agents` (usually `zzapi agents create`) creates or
-   uses a permitted worktree, starts a fixed provider command, persists an
-   agent record, captures logs, and creates a transcript for API-created
-   agents.
-2. Department manager: `dept.py start` or `resume` prepares
-   `~/.codex/dept/<task-id>/` on the Mac and normally calls `/v1/spawn` to run
-   allowlisted `codex-launch`. With `--ssh`, it instead starts `codex exec`
-   over SSH with `nohup` and tracks that attempt itself.
-
-IDs differ: `t-xxxxxx` is a logical department task, a relay `proc` is also
-the compatibility-era agent ID, and an `execution_id` identifies one attempt.
-Retried tasks do not necessarily have the same execution.
+`POST /v1/agents` (usually `zzapi agents create`) creates or uses a permitted
+worktree, starts a supported provider command, persists an agent record,
+captures logs, and creates a transcript for API-created Codex agents. The
+compatibility `/v1/spawn` route can launch an allowlisted background command.
+An `execution_id` identifies one attempt; retried tasks do not necessarily
+share an execution ID.
 
 ## Status and completion
 
 The relay stores bounded live events plus a separate per-execution audit
-archive. `status.py` combines those with agent snapshots to project task
-phase. An event is not proof of completion: inspect an agent/proc terminal
-state or `dept.py status`, then inspect the final output. `zzapi events`
-consumes events; it never launches tasks.
+archive. `zzapi status` presents relay state and event history. An event is not
+proof of completion: inspect the agent or process terminal state and final
+output. Use `zzapi events` to read the retained feed or `zzapi events stream`
+for live delivery; event commands do not launch tasks.

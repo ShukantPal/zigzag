@@ -9,9 +9,8 @@ launchctl print "gui/$(id -u)/com.shukantpal.zigzag"
 tail -n 100 ~/.codex/zigzag/zigzag.error.log
 zzapi health
 zzapi agents list --state running
-python3 dept/status.py --once
-python3 dept/dept.py status t-abcdef
-python3 dept/dept.py result t-abcdef
+zzapi status
+zzapi events --follow
 ```
 
 LaunchAgent status and authenticated health are separate checks. Never print
@@ -19,12 +18,11 @@ or copy the relay token.
 
 ## Stuck-task runbook
 
-1. Identify transport/task with `dept.py list` and `dept.py status TASK`; if there is no ledger, inspect the task directory and relay agent list before choosing a kill handle.
+1. Identify the agent with `zzapi agents list --state running`, then inspect its state and logs before choosing a stop action.
 2. Check relay health: `launchctl print`, `zzapi health`, and the error-log tail. A registered agent with failed health is daemon/startup/token/network trouble, not task completion.
-3. For relay work, inspect `zzapi agents list --state running`, `zzapi agents get ID`, `zzapi agents logs ID --stream stderr --tail 1500`, then `dept.py result TASK`. `orphaned`, `lost_after_restart`, `audit_degraded`, `log_degraded`, and `dropped_before` show restart/data-loss conditions.
-4. For SSH work, use `dept.py result TASK`, then inspect `pid`, `child-pid.txt`, `exit-code.txt`, `events.jsonl`, `stderr.log`, and `last-message.txt` beneath `~/.codex/dept/TASK`.
-5. Check `python3 dept/status.py --once --all`; use the real Rust binary's `timeline` for chronology, not the stale wrapper. Cross-clock timestamps are not durations.
-6. Only then stop: `zzapi agents stop ID` for relay-native agents, or `dept.py kill TASK` for manager-owned tasks. Stopping leaves a worktree.
+3. Inspect `zzapi agents get ID` and `zzapi agents logs ID --stream stderr --tail 1500`. `orphaned`, `lost_after_restart`, `audit_degraded`, `log_degraded`, and `dropped_before` show restart or data-loss conditions.
+4. Review event history with `zzapi events --follow`; use the daemon's `zigzag timeline TASK_ID --state-file PATH` subcommand when you need a task chronology. Cross-clock timestamps are not durations.
+5. Only after reviewing state and output, stop with `zzapi agents stop ID`. Stopping leaves a worktree.
 
 ## Common failures
 
@@ -46,8 +44,6 @@ cargo build --locked --workspace --all-targets
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-python3 dept/config.py --check
-python3 -m unittest discover -s dept -p 'test_*.py'
 bash scripts/e2e-full-stack.sh target/debug/zigzag target/debug/zzapi
 ```
 
