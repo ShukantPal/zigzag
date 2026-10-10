@@ -87,6 +87,45 @@ fn agent_create_test_repo(id: &str) -> PathBuf {
     repo
 }
 
+/// Small authenticated client used by the lifecycle tests. Keeping requests
+/// behind this boundary makes the test follow the same client -> HTTP ->
+/// daemon route path as `zzapi`, while injecting the execution policy that a
+/// GUI login session normally reads from Keychain.
+struct ApiClient {
+    state: Arc<crate::server::Server>,
+    policy: exec::Policy,
+}
+
+impl ApiClient {
+    fn call(&self, method: &str, target: &str, body: &str) -> (String, Json) {
+        let raw = request_once(Arc::clone(&self.state), &self.policy, method, target, body);
+        let json = response_json(raw.clone());
+        (raw, json)
+    }
+}
+
+fn fake_codex() -> (std::path::PathBuf, exec::Policy) {
+    let root = std::env::temp_dir().join(format!("zigzag-fake-codex-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let binary = root.join("codex");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nprintf 'fake-codex stdout: %s\\n' \"$*\"\nprintf 'fake-codex stderr\\n' >&2\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let policy = exec::Policy::parse(&format!(
+        r#"{{"bins":{{"codex":{{"path":"{}","commands":[["exec"]]}}}}}}"#,
+        binary.display()
+    ))
+    .unwrap();
+    (root, policy)
+}
+
 /// Full agent lifecycle: spawn -> poll to completion -> agent record ->
 /// logs -> event stream. This is the closest thing to "create a Codex agent
 /// and watch it finish" without burning real Codex credits.
@@ -443,6 +482,160 @@ fn e2e_agent_create_persists_transcript_and_serves_it() {
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
     std::fs::remove_file(transcript_path).expect("could not clean up agent transcript");
     std::fs::remove_file(stderr_path).expect("could not clean up agent stderr");
+}
+
+/// Exercise the public agent/event command permutations through an
+/// authenticated client and the daemon's real TCP request handler. The fake
+/// Codex executable keeps this hermetic while still testing binary
+/// verification, process supervision, persistence, filtering, and log cursors.
+#[test]
+fn e2e_client_agent_commands_events_and_fake_codex() {
+    let (state, _state_path) = test_server();
+    let (fake_root, policy) = fake_codex();
+    let client = ApiClient { state, policy };
+    let task_id = unique_id("client-agent");
+    let execution_id = unique_id("execution");
+
+    let (raw, health) = client.call("GET", "/v1/health", "");
+    assert!(raw.starts_with("HTTP/1.1 200"), "health failed: {raw}");
+    assert_eq!(health.object("status").and_then(Json::as_str), Some("ok"));
+
+    let (_, empty) = client.call("GET", "/v1/agents", "");
+    assert!(json_array(empty.object("agents").unwrap()).is_empty());
+
+    let spawn_body = format!(
+        r#"{{"id":"{task_id}","execution_id":"{execution_id}","bin":"codex","args":["exec","e2e-prompt"]}}"#
+    );
+    let (raw, created) = client.call("POST", "/v1/spawn", &spawn_body);
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "agent create failed: {raw}"
+    );
+    assert_eq!(
+        created.object("id").and_then(Json::as_str),
+        Some(task_id.as_str())
+    );
+    let agent_id = created
+        .object("proc")
+        .and_then(Json::as_str)
+        .expect("create response missing agent handle")
+        .to_owned();
+
+    // Poll through the compatibility process endpoint until the supervised
+    // agent has completed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (raw, proc) = client.call("GET", &format!("/v1/proc/{agent_id}"), "");
+        assert!(raw.starts_with("HTTP/1.1 200"), "proc get failed: {raw}");
+        if proc.object("running") == Some(&Json::Bool(false)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake Codex did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let (_, by_state) = client.call("GET", "/v1/agents?state=succeeded", "");
+    let agents = json_array(by_state.object("agents").unwrap());
+    assert_eq!(agents.len(), 1);
+    assert_eq!(
+        agents[0].object("id").and_then(Json::as_str),
+        Some(agent_id.as_str())
+    );
+    let (_, by_task) = client.call("GET", &format!("/v1/agents?task_id={task_id}"), "");
+    assert_eq!(json_array(by_task.object("agents").unwrap()).len(), 1);
+    let (_, no_match) = client.call("GET", "/v1/agents?state=running", "");
+    assert!(json_array(no_match.object("agents").unwrap()).is_empty());
+
+    let (raw, agent) = client.call("GET", &format!("/v1/agents/{agent_id}"), "");
+    assert!(raw.starts_with("HTTP/1.1 200"), "agent get failed: {raw}");
+    assert_eq!(
+        agent.object("task_id").and_then(Json::as_str),
+        Some(task_id.as_str())
+    );
+    assert_eq!(
+        agent.object("execution_id").and_then(Json::as_str),
+        Some(execution_id.as_str())
+    );
+    assert_eq!(
+        agent.object("state").and_then(Json::as_str),
+        Some("succeeded")
+    );
+
+    for (stream, expected, excluded) in [
+        ("stdout", "fake-codex stdout", "fake-codex stderr"),
+        ("stderr", "fake-codex stderr", "fake-codex stdout"),
+        ("both", "fake-codex stdout", ""),
+    ] {
+        let (_, logs) = client.call(
+            "GET",
+            &format!("/v1/agents/{agent_id}/logs?stream={stream}&follow=0"),
+            "",
+        );
+        let text = json_array(logs.object("records").unwrap())
+            .iter()
+            .filter_map(|record| record.object("data").and_then(Json::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains(expected),
+            "{stream} did not include output: {text}"
+        );
+        if !excluded.is_empty() {
+            assert!(
+                !text.contains(excluded),
+                "{stream} leaked other stream: {text}"
+            );
+        }
+    }
+
+    let (_, cursor_logs) = client.call(
+        "GET",
+        &format!("/v1/agents/{agent_id}/logs?stream=both&after=1&tail=1&follow=0"),
+        "",
+    );
+    assert!(
+        cursor_logs.object("next_cursor").is_some(),
+        "logs missing cursor: {cursor_logs:?}"
+    );
+
+    let event_body = format!(
+        r#"{{"id":"{task_id}-client-event","task_id":"{task_id}","kind":"client_marker"}}"#
+    );
+    let (raw, posted) = client.call("POST", "/v1/events", &event_body);
+    assert!(raw.starts_with("HTTP/1.1 201"), "event post failed: {raw}");
+    assert_eq!(posted.object("duplicate"), Some(&Json::Bool(false)));
+    let (raw, duplicate) = client.call("POST", "/v1/events", &event_body);
+    assert!(raw.starts_with("HTTP/1.1 200"), "event retry failed: {raw}");
+    assert_eq!(duplicate.object("duplicate"), Some(&Json::Bool(true)));
+    let (raw, events) = client.call("GET", "/v1/events?after=0&timeout=0", "");
+    assert!(raw.starts_with("HTTP/1.1 200"), "events get failed: {raw}");
+    assert!(
+        json_array(events.object("events").unwrap())
+            .iter()
+            .any(|event| {
+                event.object("id").and_then(Json::as_str)
+                    == Some(format!("{task_id}-client-event").as_str())
+            })
+    );
+    let (_, later_events) = client.call("GET", "/v1/events?after=1000000&timeout=0", "");
+    assert!(json_array(later_events.object("events").unwrap()).is_empty());
+    assert!(
+        client
+            .call("GET", "/v1/events?after=invalid&timeout=0", "")
+            .0
+            .starts_with("HTTP/1.1 400")
+    );
+    assert!(
+        client
+            .call("GET", "/v1/agents?bogus=1", "")
+            .0
+            .starts_with("HTTP/1.1 400")
+    );
+
+    let _ = std::fs::remove_dir_all(fake_root);
 }
 
 /// A failing command records its exit code and stderr instead of vanishing.
