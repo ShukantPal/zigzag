@@ -27,6 +27,13 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+// Release builds set this to the version encoded in the GitHub release tag.
+// Keep Cargo's package version as the fallback for local builds.
+const VERSION: &str = match option_env!("ZZAPI_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 mod status;
 
 const DEFAULT_HOSTNAME: &str = "100.101.237.83";
@@ -70,7 +77,7 @@ impl From<ApiError> for Fail {
 #[command(
     name = "zzapi",
     about = "Command-line client for the zigzag relay REST API",
-    version
+    version = VERSION
 )]
 struct Cli {
     /// Relay hostname (or host:port; default port is 8765)
