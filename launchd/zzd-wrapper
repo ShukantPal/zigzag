@@ -1,0 +1,129 @@
+#!/bin/bash
+# Stable LaunchAgent entry point. Keep this file separate from the replaceable daemon.
+set -euo pipefail
+
+REPO="ShukantPal/zigzag"
+ASSET="zigzag-macos-aarch64"
+MANIFEST="${ASSET}.manifest.json"
+TARGET="aarch64-apple-darwin"
+TEAM_ID="7YZK8D3B48"
+IDENTIFIER="com.shukantpal.zigzag"
+LABEL="${ZZD_LAUNCHD_LABEL:-com.shukantpal.zigzag}"
+INSTALL_DIR="${ZZD_INSTALL_DIR:-$HOME/.codex/zigzag}"
+BINARY="${ZZD_BINARY_PATH:-$INSTALL_DIR/zigzag}"
+VERSION_FILE="$INSTALL_DIR/zigzag.version"
+
+fail() { echo "zzd-wrapper: $*" >&2; exit 1; }
+for tool in curl python3 shasum codesign launchctl; do
+  command -v "$tool" >/dev/null 2>&1 || fail "required command not found: $tool"
+done
+[ "$(uname -s)" = Darwin ] || fail "this wrapper supports macOS only"
+[ -x "$BINARY" ] || fail "daemon binary not found or not executable: $BINARY"
+mkdir -p "$INSTALL_DIR"
+
+# launchd normally serializes invocations. This also protects manual launches.
+LOCK="$INSTALL_DIR/.zzd-update-lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  OWNER="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [[ "$OWNER" =~ ^[0-9]+$ ]] && kill -0 "$OWNER" 2>/dev/null; then
+    exec "$BINARY" "$@"
+  fi
+  rm -rf "$LOCK"
+  mkdir "$LOCK" || exec "$BINARY" "$@"
+fi
+printf '%s\n' "$$" > "$LOCK/pid"
+TMP="$(mktemp -d "$INSTALL_DIR/.zzd-update.XXXXXX")"
+cleanup() { rm -rf "$TMP"; rmdir "$LOCK" 2>/dev/null || true; }
+trap cleanup EXIT
+run_daemon() {
+  cleanup
+  trap - EXIT
+  exec "$BINARY" "$@"
+}
+
+API_URL="${ZZD_RELEASE_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
+if ! curl --connect-timeout 10 --max-time 60 --fail --silent --show-error --location "$API_URL" -o "$TMP/release.json"; then
+  echo "zzd-wrapper: release lookup failed; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+
+read_release_field() {
+  python3 - "$TMP/release.json" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    release = json.load(f)
+name = sys.argv[2]
+asset = next((a for a in release.get("assets", []) if a.get("name") == name), None)
+if asset is None:
+    raise SystemExit(1)
+print(asset.get("browser_download_url", ""))
+PY
+}
+
+if ! TAG="$(python3 - "$TMP/release.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f).get("tag_name", ""))
+PY
+)"; then
+  echo "zzd-wrapper: invalid release metadata; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "zzd-wrapper: invalid latest tag; starting installed daemon" >&2; run_daemon "$@" ;; esac
+CURRENT="$(cat "$VERSION_FILE" 2>/dev/null || true)"
+if [ "$TAG" = "$CURRENT" ]; then
+  run_daemon "$@"
+fi
+
+MANIFEST_URL="$(read_release_field "$MANIFEST")" || { echo "zzd-wrapper: release manifest unavailable; starting installed daemon" >&2; run_daemon "$@"; }
+BINARY_URL="$(read_release_field "$ASSET")" || { echo "zzd-wrapper: release binary unavailable; starting installed daemon" >&2; run_daemon "$@"; }
+case "$MANIFEST_URL$BINARY_URL" in *https://github.com/*) ;; *) echo "zzd-wrapper: release asset URL is not hosted on github.com; starting installed daemon" >&2; run_daemon "$@" ;; esac
+
+if ! curl --connect-timeout 10 --max-time 60 --fail --silent --show-error --location "$MANIFEST_URL" -o "$TMP/manifest.json" \
+    || ! curl --connect-timeout 10 --max-time 60 --fail --silent --show-error --location "$BINARY_URL" -o "$TMP/$ASSET"; then
+  echo "zzd-wrapper: release download failed; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+
+if ! python3 - "$TMP/manifest.json" "$TAG" "$TARGET" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    m = json.load(f)
+ok = (m.get("version") == sys.argv[2]
+      and m.get("target") == sys.argv[3]
+      and re.fullmatch(r"[0-9a-f]{64}", m.get("sha256", "")) is not None)
+raise SystemExit(0 if ok else 1)
+PY
+then
+  echo "zzd-wrapper: release manifest version/target is invalid; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+EXPECTED="$(python3 - "$TMP/manifest.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    print(json.load(f)["sha256"])
+PY
+)"
+ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')"
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  echo "zzd-wrapper: release SHA-256 mismatch; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+REQUIREMENT="anchor apple generic and identifier \"$IDENTIFIER\" and certificate leaf[subject.OU] = \"$TEAM_ID\""
+if ! codesign --verify --strict --deep --verbose=2 "-R=$REQUIREMENT" "$TMP/$ASSET" \
+    || ! codesign -d --verbose=4 "$TMP/$ASSET" 2>"$TMP/codesign.txt" \
+    || ! grep -q "Identifier=$IDENTIFIER" "$TMP/codesign.txt" \
+    || ! grep -q "TeamIdentifier=$TEAM_ID" "$TMP/codesign.txt"; then
+  echo "zzd-wrapper: release code signature is not trusted; starting installed daemon" >&2
+  run_daemon "$@"
+fi
+
+chmod 755 "$TMP/$ASSET"
+mv -f "$TMP/$ASSET" "$BINARY"
+printf '%s\n' "$TAG" > "$TMP/version"
+mv -f "$TMP/version" "$VERSION_FILE"
+echo "zzd-wrapper: installed $TAG; restarting LaunchAgent" >&2
+cleanup
+trap - EXIT
+launchctl kickstart -k "gui/$(id -u)/$LABEL"
+exit 0
