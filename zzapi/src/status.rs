@@ -1,9 +1,22 @@
 //! Read-only agent status dashboard migrated from dept/status.py.
 use super::{ApiError, Client, Fail};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal as RatatuiTerminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +31,9 @@ struct Execution {
     events: Vec<Value>,
     state: String,
     agent: String,
+    command: String,
+    started_at: String,
+    exit_code: String,
     started: Option<i64>,
     worktree: String,
     audit_bad: bool,
@@ -277,7 +293,14 @@ fn build(
         }
         r.state = s(a, "state");
         r.agent = s(a, "id");
+        r.command = s(a, "command");
+        r.exit_code = if a.get("exit_code").is_some_and(Value::is_null) {
+            String::new()
+        } else {
+            s(a, "exit_code")
+        };
         r.started = timestamp(a.get("started_at"));
+        r.started_at = s(a, "started_at");
         r.audit_bad = a
             .get("audit_degraded")
             .and_then(Value::as_bool)
@@ -374,44 +397,6 @@ fn task_dir(task: &str, root: &Path) -> String {
         .trim()
         .into()
 }
-fn compact(x: &str, n: usize) -> String {
-    let c: Vec<_> = x.chars().collect();
-    if c.len() <= n {
-        return x.into();
-    }
-    if n <= 3 {
-        return ".".repeat(n);
-    }
-    format!("...{}", c[c.len() + 3 - n..].iter().collect::<String>())
-}
-fn line(e: &Execution, n: i64, root: &Path, lost: bool) -> String {
-    let (total, cross) = e.total(n);
-    let wt = if e.worktree.is_empty() {
-        task_dir(&e.task, root)
-    } else {
-        e.worktree.clone()
-    };
-    format!(
-        "{:<20} {:<24} {:<14} {:<15} {:<11} {:<20} {:<30} {:<24} {}",
-        e.task.chars().take(20).collect::<String>(),
-        e.phase().chars().take(24).collect::<String>(),
-        dur(e.current(n)),
-        format!("{}{}", dur(total), if cross { "*" } else { "" }),
-        if e.state.is_empty() {
-            "not observed".into()
-        } else {
-            e.state.chars().take(11).collect::<String>()
-        },
-        if e.agent.is_empty() {
-            "-".into()
-        } else {
-            e.agent.chars().take(20).collect::<String>()
-        },
-        compact(&wt, 30),
-        e.latest(),
-        e.flags(lost)
-    )
-}
 fn print_once(rows: &[Execution], warnings: &[String], root: &Path, lost: bool) {
     println!("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tSTATE\tAGENT ID\tDIR\tLAST EVENT\tFLAGS");
     for e in rows {
@@ -507,65 +492,86 @@ pub(super) fn cmd_status(
                 .into(),
         ));
     }
-    let _term =
-        Terminal::enter().map_err(|e| Fail::Config(format!("cannot enter terminal mode: {e}")))?;
+    let mut terminal = TerminalSession::enter()
+        .map_err(|e| Fail::Config(format!("cannot enter terminal mode: {e}")))?;
     let (mut rows, mut warnings, mut lost) = (rows, w, lost);
-    let (mut selected, mut offset, mut hscroll) = (0usize, 0usize, 0usize);
+    let mut selected = 0usize;
+    let mut table_state = ratatui::widgets::TableState::default();
+    let mut detail_scroll = 0u16;
     let (mut detail, mut transcript) = (false, false);
     let mut output_text = String::new();
     let mut tick = Instant::now();
     loop {
         draw(
+            &mut terminal,
+            &mut table_state,
             &rows,
             &warnings,
             &root,
             selected,
-            offset,
-            hscroll,
+            detail_scroll,
             detail,
             transcript,
             &output_text,
             lost,
         );
-        match key(100) {
-            Some('q') | Some('Q') | Some('\x1b') => {
-                if detail || transcript {
-                    detail = false;
+        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            let key = match event::read() {
+                Ok(Event::Key(key))
+                    if key.kind != KeyEventKind::Release
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c') =>
+                {
+                    Some(KeyCode::Char('q'))
+                }
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => Some(key.code),
+                _ => None,
+            };
+            match key {
+                Some(KeyCode::Char('q' | 'Q')) | Some(KeyCode::Esc) => {
+                    if detail || transcript {
+                        detail = false;
+                        transcript = false
+                    } else {
+                        break;
+                    }
+                }
+                Some(KeyCode::Char('j')) | Some(KeyCode::Down) => {
+                    selected = (selected + 1).min(rows.len().saturating_sub(1));
+                    detail_scroll = 0;
+                }
+                Some(KeyCode::Char('k')) | Some(KeyCode::Up) => {
+                    selected = selected.saturating_sub(1);
+                    detail_scroll = 0;
+                }
+                Some(KeyCode::Char('h')) | Some(KeyCode::Left) => {
+                    detail_scroll = detail_scroll.saturating_sub(1);
+                }
+                Some(KeyCode::Char('l')) | Some(KeyCode::Right) => {
+                    detail_scroll = detail_scroll.saturating_add(1);
+                }
+                Some(KeyCode::Char('t')) => {
+                    transcript = !transcript;
+                    detail = true;
+                    detail_scroll = 0;
+                    if transcript && !rows.is_empty() {
+                        let path = transcript_path(&rows[selected], &root);
+                        output_text = format!(
+                            "Transcript for {} / {}\nSource: {}\nCommand: tail -F '{}'\nRelay output (last 40 lines):\n{}",
+                            rows[selected].task,
+                            rows[selected].id,
+                            path.display(),
+                            path.display().to_string().replace('\'', "'\\''"),
+                            output(c, &rows[selected])
+                        )
+                    }
+                }
+                Some(KeyCode::Enter) => {
+                    detail = !detail;
                     transcript = false
-                } else {
-                    break;
                 }
+                _ => {}
             }
-            Some('j') => selected = (selected + 1).min(rows.len().saturating_sub(1)),
-            Some('k') => selected = selected.saturating_sub(1),
-            Some('h') => hscroll = hscroll.saturating_sub(8),
-            Some('l') => hscroll += 8,
-            Some('t') => {
-                transcript = !transcript;
-                detail = true;
-                if transcript && !rows.is_empty() {
-                    let path = transcript_path(&rows[selected], &root);
-                    output_text = format!(
-                        "Transcript for {} / {}\nSource: {}\nCommand: tail -F '{}'\nRelay output (last 40 lines):\n{}",
-                        rows[selected].task,
-                        rows[selected].id,
-                        path.display(),
-                        path.display().to_string().replace('\'', "'\\''"),
-                        output(c, &rows[selected])
-                    )
-                }
-            }
-            Some('\n') | Some('\r') => {
-                detail = !detail;
-                transcript = false
-            }
-            _ => {}
-        }
-        if selected < offset {
-            offset = selected
-        }
-        if selected >= offset + 10 {
-            offset = selected.saturating_sub(9)
         }
         if tick.elapsed() >= Duration::from_secs(interval.max(1)) {
             match snapshot(c, &state, all) {
@@ -582,187 +588,216 @@ pub(super) fn cmd_status(
     }
     Ok(())
 }
-fn size() -> (usize, usize) {
-    unsafe {
-        let mut w: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(1, libc::TIOCGWINSZ, &mut w) == 0 {
-            return (w.ws_row as usize, w.ws_col as usize);
+struct TerminalSession {
+    terminal: RatatuiTerminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalSession {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        let backend = CrosstermBackend::new(stdout);
+        match RatatuiTerminal::new(backend) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
+                Err(error)
+            }
         }
     }
-    (24, 100)
 }
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            crossterm::cursor::Show,
+            LeaveAlternateScreen
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw(
+    terminal: &mut TerminalSession,
+    table_state: &mut ratatui::widgets::TableState,
     rows: &[Execution],
     warnings: &[String],
     root: &Path,
     selected: usize,
-    offset: usize,
-    hscroll: usize,
+    detail_scroll: u16,
     detail: bool,
     transcript: bool,
     out_text: &str,
     lost: bool,
 ) {
-    let (h, w) = size();
-    let mut o = String::from("\x1b[2J\x1b[H");
-    o.push_str(if transcript {
-        "zzapi status — output  q/Esc back"
-    } else {
-        "zzapi status — read-only  ↑↓/j/k select  ←→/h/l scroll  Enter history  t output  q quit"
-    });
-    o.push('\n');
-    let heads = "TASK                 PHASE                    PHASE ELAPSED  OBSERVED TOTAL  STATE       AGENT ID             DIR                            LAST EVENT  FLAGS";
-    o.push_str(
-        &heads
-            .chars()
-            .skip(hscroll)
-            .take(w.saturating_sub(1))
-            .collect::<String>(),
-    );
-    o.push('\n');
-    for (i, e) in rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take((h / 2).saturating_sub(3).max(1))
-    {
-        if i == selected {
-            o.push_str("\x1b[7m")
-        }
-        o.push_str(
-            &line(e, now(), root, lost)
-                .chars()
-                .skip(hscroll)
-                .take(w.saturating_sub(1))
-                .collect::<String>(),
-        );
-        if i == selected {
-            o.push_str("\x1b[0m")
-        }
-        o.push('\n')
-    }
-    o.push_str(&"-".repeat(w.saturating_sub(1)));
-    o.push('\n');
-    if rows.is_empty() {
-        o.push_str("No execution events observed.\n")
-    } else if transcript {
-        o.push_str(&format!(
-            "Output for {} / {}\n{}\n",
-            rows[selected].task, rows[selected].id, out_text
-        ))
-    } else if detail {
-        let e = &rows[selected];
-        o.push_str(&format!("{} / {} — {}\n", e.task, e.id, e.flags(lost)));
-        let start = e.events.len().saturating_sub(12);
-        for i in start..e.events.len() {
-            let v = &e.events[i];
-            if i > start {
-                let previous = &e.events[i - 1];
-                if !s(previous, "clock").is_empty()
-                    && !s(v, "clock").is_empty()
-                    && s(previous, "clock") != s(v, "clock")
-                {
-                    o.push_str(&format!(
-                        "  ↳ cross-clock: {} → {} (not subtracted)\n",
-                        s(previous, "occurred_at"),
-                        s(v, "occurred_at")
-                    ));
-                } else if elapsed(previous, v).is_none() {
-                    o.push_str("  ↳ timing not observed: invalid, missing, or out-of-order same-clock timestamp\n");
-                }
-            }
-            o.push_str(&format!(
-                "  {}  {}  [{}]\n",
-                short_time(v.get("occurred_at")),
-                s(v, "kind"),
-                s(v, "source")
-            ))
-        }
-    } else {
-        o.push_str("Select an execution and press Enter for event history or t for output.\n")
-    }
-    for x in warnings {
-        o.push_str(&format!("WARNING: {x}\n"))
-    }
-    let _ = io::stdout().write_all(o.as_bytes());
-    let _ = io::stdout().flush();
-}
-fn key(ms: i32) -> Option<char> {
-    unsafe {
-        let mut p = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
+    let _ = terminal.terminal.draw(|frame| {
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(5),
+                Constraint::Min(6),
+            ])
+            .split(frame.area());
+        let title = if transcript {
+            "zzapi status — output  q/Esc back"
+        } else {
+            "zzapi status — ↑↓/j/k select  Enter history  t output  ←→/h/l scroll details  q quit"
         };
-        if libc::poll(&mut p, 1, ms) < 1 {
-            return None;
-        }
-        let mut b = [0u8; 1];
-        if libc::read(0, b.as_mut_ptr() as *mut _, 1) != 1 {
-            return None;
-        }
-        if b[0] == 27 {
-            let mut a = [0u8; 2];
-            let mut p = libc::pollfd {
-                fd: 0,
-                events: libc::POLLIN,
-                revents: 0,
+        frame.render_widget(
+            Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
+            areas[0],
+        );
+
+        let table_rows = rows.iter().map(|e| {
+            let dir = if e.worktree.is_empty() {
+                task_dir(&e.task, root)
+            } else {
+                e.worktree.clone()
             };
-            if libc::poll(&mut p, 1, 30) < 1 {
-                return Some('\x1b');
-            }
-            if libc::read(0, a.as_mut_ptr() as *mut _, 1) != 1 {
-                return Some('\x1b');
-            }
-            if libc::poll(&mut p, 1, 30) < 1 {
-                return Some('\x1b');
-            }
-            if libc::read(0, a[1..].as_mut_ptr() as *mut _, 1) != 1 {
-                return Some('\x1b');
-            }
-            return match a {
-                [91, 65] => Some('k'),
-                [91, 66] => Some('j'),
-                [91, 67] => Some('l'),
-                [91, 68] => Some('h'),
-                _ => Some('\x1b'),
+            let started = if e.started_at.is_empty() {
+                "?".into()
+            } else {
+                e.started_at
+                    .chars()
+                    .take(19)
+                    .collect::<String>()
+                    .replace('T', " ")
             };
-        }
-        if b[0] == 3 {
-            return Some('q');
-        }
-        Some(b[0] as char)
-    }
-}
-struct Terminal {
-    old: libc::termios,
-}
-impl Terminal {
-    fn enter() -> io::Result<Self> {
-        unsafe {
-            let mut old: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(0, &mut old) != 0 {
-                return Err(io::Error::last_os_error());
+            Row::new(vec![
+                Cell::from(e.id.as_str()),
+                Cell::from(e.task.as_str()),
+                Cell::from(if e.state.is_empty() {
+                    "not observed"
+                } else {
+                    &e.state
+                }),
+                Cell::from(if e.command.is_empty() {
+                    "-"
+                } else {
+                    &e.command
+                }),
+                Cell::from(started),
+                Cell::from(if e.exit_code.is_empty() {
+                    "-"
+                } else {
+                    &e.exit_code
+                }),
+                Cell::from(dir),
+                Cell::from(e.latest()),
+            ])
+        });
+        let header = Row::new([
+            "ID",
+            "TASK",
+            "STATE",
+            "COMMAND",
+            "STARTED",
+            "EXIT",
+            "DIR",
+            "LAST EVENT",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(0);
+        let widths = [
+            Constraint::Percentage(13),
+            Constraint::Percentage(14),
+            Constraint::Percentage(10),
+            Constraint::Percentage(20),
+            Constraint::Percentage(13),
+            Constraint::Percentage(6),
+            Constraint::Percentage(13),
+            Constraint::Percentage(11),
+        ];
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(" Executions "))
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("» ");
+        table_state.select((!rows.is_empty()).then_some(selected));
+        frame.render_stateful_widget(table, areas[1], table_state);
+
+        let mut lines = Vec::new();
+        if rows.is_empty() {
+            lines.push(Line::from("No execution events observed."));
+        } else if transcript {
+            let e = &rows[selected];
+            lines.push(Line::from(format!("Output for {} / {}", e.task, e.id)));
+            lines.extend(out_text.lines().map(Line::from));
+        } else if detail {
+            let e = &rows[selected];
+            lines.push(Line::from(format!(
+                "{} / {} — {}",
+                e.task,
+                e.id,
+                e.flags(lost)
+            )));
+            let start = e.events.len().saturating_sub(12);
+            for i in start..e.events.len() {
+                let v = &e.events[i];
+                if i > start {
+                    let previous = &e.events[i - 1];
+                    if !s(previous, "clock").is_empty()
+                        && !s(v, "clock").is_empty()
+                        && s(previous, "clock") != s(v, "clock")
+                    {
+                        lines.push(Line::from(format!(
+                            "↳ cross-clock: {} → {} (not subtracted)",
+                            s(previous, "occurred_at"),
+                            s(v, "occurred_at")
+                        )));
+                    } else if elapsed(previous, v).is_none() {
+                        lines.push(Line::from(
+                            "↳ timing not observed: invalid, missing, or out-of-order timestamp",
+                        ));
+                    }
+                }
+                lines.push(Line::from(format!(
+                    "{}  {}  [{}]",
+                    short_time(v.get("occurred_at")),
+                    s(v, "kind"),
+                    s(v, "source")
+                )));
             }
-            let mut raw = old;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let _ = io::stdout().write_all(b"\x1b[?1049h\x1b[?25l");
-            Ok(Self { old })
+        } else {
+            lines.push(Line::from(
+                "Select an execution and press Enter for event history or t for output.",
+            ));
         }
-    }
-}
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::tcsetattr(0, libc::TCSANOW, &self.old);
+        for warning in warnings {
+            lines.push(Line::from(vec![Span::styled(
+                format!("WARNING: {warning}"),
+                Style::default().fg(Color::Red),
+            )]));
         }
-        let _ = io::stdout().write_all(b"\x1b[?25h\x1b[?1049l");
-        let _ = io::stdout().flush();
-    }
+        let detail_title = if transcript {
+            " Output "
+        } else if detail {
+            " Event history "
+        } else {
+            " Details "
+        };
+        let paragraph = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(detail_title))
+            .wrap(Wrap { trim: true })
+            .scroll((detail_scroll, 0));
+        frame.render_widget(paragraph, areas[2]);
+    });
 }
 
 #[cfg(test)]
@@ -796,7 +831,7 @@ mod tests {
             serde_json::json!({"id":"e1","task_id":"agent-1","execution_id":"run-1","kind":"process_spawned","occurred_at":"2026-10-08T00:00:00Z","clock":"host"}),
         ];
         let agents = vec![
-            serde_json::json!({"id":"agent-handle","task_id":"agent-1","execution_id":"run-1","state":"orphaned","started_at":"2026-10-08T00:00:00Z","audit_degraded":true}),
+            serde_json::json!({"id":"agent-handle","task_id":"agent-1","execution_id":"run-1","state":"orphaned","command":"codex exec","started_at":"2026-10-08T00:00:00Z","exit_code":1,"audit_degraded":true}),
         ];
         let wt = HashMap::from([("agent-1".to_owned(), "/tmp/agent-1".to_owned())]);
         let rows = build(events, &agents, &wt, false);
@@ -804,6 +839,9 @@ mod tests {
         assert_eq!(rows[0].phase(), "process_spawned");
         assert_eq!(rows[0].state, "orphaned");
         assert_eq!(rows[0].agent, "agent-handle");
+        assert_eq!(rows[0].command, "codex exec");
+        assert_eq!(rows[0].started_at, "2026-10-08T00:00:00Z");
+        assert_eq!(rows[0].exit_code, "1");
         assert_eq!(rows[0].worktree, "/tmp/agent-1");
         assert!(rows[0].flags(false).contains("audit degraded"));
     }
