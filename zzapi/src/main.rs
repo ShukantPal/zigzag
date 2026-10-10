@@ -220,9 +220,12 @@ enum AgentsCmd {
     },
     /// Create and start an agent using a supported AI CLI
     Create {
-        /// Inline prompt text or prompt-file path
+        /// Inline prompt text; an existing client-side file path is read as a prompt file
         #[arg(long)]
-        prompt: String,
+        prompt: Option<String>,
+        /// Read prompt text from a file on the machine running zzapi
+        #[arg(long, conflicts_with = "prompt")]
+        prompt_file: Option<String>,
         /// Project directory the agent works in
         #[arg(long)]
         project_dir: String,
@@ -962,6 +965,39 @@ fn cmd_agents_create(
     Ok(())
 }
 
+fn resolve_agent_prompt(prompt: Option<&str>, prompt_file: Option<&str>) -> Result<String, Fail> {
+    match (prompt, prompt_file) {
+        (Some(_), Some(_)) => Err(Fail::Config(
+            "cannot specify both --prompt and --prompt-file".to_owned(),
+        )),
+        (None, None) => Err(Fail::Config(
+            "must specify either --prompt or --prompt-file".to_owned(),
+        )),
+        (Some(prompt), None) => {
+            let path = std::path::Path::new(prompt);
+            if path.is_file() {
+                eprintln!(
+                    "debug: reading prompt from client-side file {}",
+                    path.display()
+                );
+                std::fs::read_to_string(path).map_err(|e| {
+                    Fail::Config(format!(
+                        "could not read prompt file {}: {e}",
+                        path.display()
+                    ))
+                })
+            } else {
+                Ok(prompt.to_owned())
+            }
+        }
+        (None, Some(path)) => {
+            eprintln!("debug: reading prompt from client-side file {path}");
+            std::fs::read_to_string(path)
+                .map_err(|e| Fail::Config(format!("could not read --prompt-file {path}: {e}")))
+        }
+    }
+}
+
 fn validate_agents_create_options(
     branch: Option<&str>,
     no_branch: bool,
@@ -1596,17 +1632,24 @@ fn run(cli: Cli) -> Result<(), Fail> {
     if matches!(&cli.command, Commands::Update) {
         return cmd_update();
     }
+    let mut resolved_agent_prompt = None;
     if let Commands::Agents {
         cmd:
             AgentsCmd::Create {
                 branch,
                 no_branch,
                 pr,
+                prompt,
+                prompt_file,
                 ..
             },
     } = &cli.command
     {
         validate_agents_create_options(branch.as_deref(), *no_branch, *pr)?;
+        resolved_agent_prompt = Some(resolve_agent_prompt(
+            prompt.as_deref(),
+            prompt_file.as_deref(),
+        )?);
     }
     let client = make_client(&cli)?;
     // clap's trailing_var_arg keeps a leading "--" out, but strip it anyway
@@ -1628,7 +1671,8 @@ fn run(cli: Cli) -> Result<(), Fail> {
             }
             AgentsCmd::Get { id } => cmd_agents_get(&client, &id),
             AgentsCmd::Create {
-                prompt,
+                prompt: _,
+                prompt_file: _,
                 project_dir,
                 branch,
                 no_branch,
@@ -1640,7 +1684,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 timeout_secs,
             } => cmd_agents_create(
                 &client,
-                &prompt,
+                resolved_agent_prompt
+                    .as_deref()
+                    .expect("agent create prompt resolved before client setup"),
                 &project_dir,
                 branch.as_deref(),
                 no_branch,
@@ -1737,6 +1783,47 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_file_reads_client_side_content() {
+        let path = std::env::temp_dir().join(format!(
+            "zzapi-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "file prompt").unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        assert_eq!(
+            resolve_agent_prompt(None, Some(&path)).unwrap(),
+            "file prompt"
+        );
+        assert_eq!(
+            resolve_agent_prompt(Some(&path), None).unwrap(),
+            "file prompt"
+        );
+        assert_eq!(
+            resolve_agent_prompt(Some("inline prompt"), None).unwrap(),
+            "inline prompt"
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_missing_prompt_file_is_a_clear_config_error() {
+        let path = std::env::temp_dir()
+            .join(format!("zzapi-missing-prompt-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            resolve_agent_prompt(None, Some(&path)),
+            Err(Fail::Config(message)) if message.contains("could not read --prompt-file")
+        ));
+    }
 
     #[test]
     fn transcript_follow_uses_the_relay_cursor() {
