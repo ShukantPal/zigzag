@@ -168,6 +168,15 @@ def checked_model(model: str, free_models: set[str]) -> str:
     return model
 
 
+def default_model(free_models: set[str]) -> str:
+    """Keep the preferred default when available, otherwise use a live free model."""
+    if DEFAULT_MODEL in free_models:
+        return DEFAULT_MODEL
+    if not free_models:
+        raise RunnerError("OpenCode reported no free Zen models")
+    return sorted(free_models)[0]
+
+
 def checked_session_id(session_id: str) -> str:
     if not SESSION_ID.fullmatch(session_id):
         raise RunnerError("session_id must be an OpenCode session identifier")
@@ -445,7 +454,11 @@ def run_prepared_task(task_dir: Path, options: argparse.Namespace) -> int:
     free_models = available_free_zen_models()
 
     if options.operation == "run":
-        model = checked_model(runtime.get("model", DEFAULT_MODEL), free_models)
+        model = (
+            checked_model(runtime["model"], free_models)
+            if "model" in runtime
+            else default_model(free_models)
+        )
         command = [str(OPENCODE_BIN), "run", "--pure", "--format", "json", "--dir", str(project), "--model", model]
         if "title" in runtime:
             command.extend(["--title", runtime["title"]])

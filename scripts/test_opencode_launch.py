@@ -225,6 +225,18 @@ class OpenCodeLaunchTests(unittest.TestCase):
         config = json.loads(next(record["config"] for record in self.call_records() if record["args"][:1] == ["run"]))
         self.assertEqual(config, {"model": "opencode/big-pickle", "small_model": "opencode/big-pickle"})
 
+    def test_unavailable_preferred_default_falls_back_to_a_live_free_model(self) -> None:
+        preferred = runner.DEFAULT_MODEL
+        runner.DEFAULT_MODEL = "opencode/retired-model"
+        try:
+            self.stage()
+            self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), 0)
+        finally:
+            runner.DEFAULT_MODEL = preferred
+        self.assertIn("opencode/big-pickle", self.run_calls()[0])
+        config = json.loads(next(record["config"] for record in self.call_records() if record["args"][:1] == ["run"]))
+        self.assertEqual(config, {"model": "opencode/big-pickle", "small_model": "opencode/big-pickle"})
+
     def test_metadata_filter_rejects_listed_non_zen_nonfree_and_foreign_models(self) -> None:
         for model in ("opencode/wrong-endpoint", "opencode/paid-listed", "opencode/hidden-fee", "openai/wrong-provider", "anthropic/claude"):
             with self.subTest(model=model):
