@@ -16,11 +16,14 @@ approval flags.
 Model selection uses each CLI's `--model` option. With no model override,
 Gemini and OpenCode use their own configured defaults.
 
-The registry reaper records terminal exit. After relay restart it cannot
-reattach pipes: a live old group becomes `orphaned`; a dead one becomes
-`lost_after_restart`. Terminal entries and spool metadata are pruned after
-seven days. Generic `/v1/spawn` compatibility processes do not necessarily
-have the API-created transcript.
+The registry reaper records terminal exit. After relay restart, the daemon
+verifies each live agent's recorded PID birth identity and keeps a verified
+process in `running`. It tails the durable transcript and stderr files, and
+records `unexpected_exit` if the process disappears while the relay is away.
+A dead process detected during startup becomes `lost_after_restart`.
+Terminal entries and spool metadata are pruned after seven days. Generic
+`/v1/spawn` compatibility processes do not necessarily have the API-created
+transcript.
 
 Agent controls are listing/get, graceful stop (SIGTERM then SIGKILL), pause
 (SIGSTOP), and resume (SIGCONT). Paused state is reapplied where possible

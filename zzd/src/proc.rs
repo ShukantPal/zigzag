@@ -345,6 +345,45 @@ fn sync_durable_stream(
         }
     }
 }
+
+fn sync_recovered_agent_output(agent: &AgentRecord, registry: &AgentRegistry, store: &Store) {
+    let Some(stdout_path) = agent_transcript_path(&agent.id) else {
+        return;
+    };
+    let Some(stderr_path) = agent_stderr_path(&agent.id) else {
+        return;
+    };
+    for (path, stream, offset) in [
+        (stdout_path, "stdout", agent.stdout_next),
+        (stderr_path, "stderr", agent.stderr_next),
+    ] {
+        let Ok(mut file) = File::open(path) else {
+            continue;
+        };
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = file.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            if registry
+                .append_log(&agent.id, stream, &chunk[..count])
+                .is_err()
+            {
+                let _ = registry.mark_audit_degraded(&agent.id);
+                break;
+            }
+            if let Ok(Some(updated)) =
+                registry.record_first_output(&agent.id, &relay_timestamp(), stream, count as u64)
+                && persist_first_output(store, &updated).is_err()
+            {
+                let _ = registry.mark_audit_degraded(&agent.id);
+            }
+        }
+    }
+}
 pub(crate) fn proc_json(entry: &ProcEntry) -> Json {
     let (stdout, stdout_truncated) = entry
         .stdout
@@ -467,8 +506,10 @@ pub(crate) fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant
 pub(crate) fn start_reaper(state: Arc<Server>) {
     thread::spawn(move || {
         loop {
+            let mut in_memory = std::collections::HashSet::new();
             if let Ok(mut entries) = state.supervisor.procs.lock() {
                 for (handle, entry) in entries.iter_mut() {
+                    in_memory.insert(handle.clone());
                     sync_durable_output(entry, handle, &state.supervisor.registry, &state.store);
                     update_proc_status_with_handle(
                         entry,
@@ -478,6 +519,51 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
                     );
                 }
                 prune_procs(&mut entries, Instant::now());
+            }
+            // A restarted daemon cannot wait(2) for its former children, but
+            // agent sessions and their output files survive daemon replacement.
+            // Keep those registry records live while their PID birth identity
+            // still matches, then record an honest terminal state when they exit.
+            for agent in state.supervisor.registry.list(Some("running"), None) {
+                if in_memory.contains(&agent.id) {
+                    continue;
+                }
+                sync_recovered_agent_output(&agent, &state.supervisor.registry, &state.store);
+                if recovered_agent_identity_matches(&agent) {
+                    continue;
+                }
+                let payload = Json::Object(vec![
+                    ("agent_id".to_owned(), Json::String(agent.id.clone())),
+                    (
+                        "state".to_owned(),
+                        Json::String("unexpected_exit".to_owned()),
+                    ),
+                    (
+                        "reason".to_owned(),
+                        Json::String("process_exited_after_daemon_restart".to_owned()),
+                    ),
+                ]);
+                if state
+                    .store
+                    .add(relay_event(
+                        "process_failed",
+                        &agent.task_id,
+                        &agent.execution_id,
+                        payload,
+                    ))
+                    .is_err()
+                {
+                    let _ = state.supervisor.registry.mark_audit_degraded(&agent.id);
+                    continue;
+                }
+                if state
+                    .supervisor
+                    .registry
+                    .transition(&agent.id, "unexpected_exit", None)
+                    .is_err()
+                {
+                    let _ = state.supervisor.registry.mark_audit_degraded(&agent.id);
+                }
             }
             let _ = state
                 .supervisor

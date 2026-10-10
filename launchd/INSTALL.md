@@ -247,6 +247,8 @@ process records are retained for up to one hour (with at most 128 retained).
 Each supervised task runs in its own session and writes stdout/stderr to
 durable private files. A relay self-update, `launchctl` restart, or crash does
 not signal those task sessions; on startup the durable registry verifies the
-recorded PID birth identity and retains a live task as `orphaned` until it
-finishes. Process-handle polling remains live-daemon-only, but agent status
-and durable logs remain available after recovery.
+recorded PID birth identity and continues reporting a live task as `running`.
+The restarted daemon tails its durable output and records an unexpected exit if
+the task exits while the relay is away. Process-handle polling remains
+live-daemon-only, but agent status and durable logs remain available after
+recovery.
