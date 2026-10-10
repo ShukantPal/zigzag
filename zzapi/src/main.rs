@@ -242,7 +242,7 @@ enum AgentsCmd {
         #[arg(long)]
         worktree: Option<String>,
         /// CLI harness to run
-        #[arg(long, value_parser = ["codex", "gemini", "opencode"], default_value = "codex")]
+        #[arg(long, value_parser = ["codex", "gemini", "opencode", "antigravity", "agy"], default_value = "codex")]
         harness: String,
         /// Model override
         #[arg(long)]

@@ -339,7 +339,7 @@ components:
           type: string
         harness:
           type: string
-          enum: [codex, gemini, opencode]
+          enum: [codex, gemini, opencode, antigravity, agy]
           default: codex
           description: CLI used to run the agent.
         approval_mode:
