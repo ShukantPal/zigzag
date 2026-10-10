@@ -88,7 +88,7 @@ fn agent_codex_path() -> &'static Path {
         let path = std::env::temp_dir().join(format!("zigzag-test-codex-{}", std::process::id()));
         std::fs::write(
             &path,
-            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *persist-transcript*)\n      printf '{\"type\":\"item.completed\",\"text\":\"persisted-agent-output\"}\\n'\n      printf 'persisted-agent-stderr\\n' >&2\n      exit 0\n      ;;\n  esac\ndone\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *persist-transcript*)\n      printf '{\"type\":\"step_start\",\"part\":{\"type\":\"step-start\"}}\\n'\n      printf '{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"persisted-agent-output\"}}\\n'\n      printf '{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\"}}\\n'\n      printf 'persisted-agent-stderr\\n' >&2\n      exit 0\n      ;;\n  esac\ndone\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .expect("could not create test Codex runner");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
@@ -674,6 +674,7 @@ pub(crate) fn agent_argv(
             if approval == "full-auto" {
                 args.push("--auto".into());
             }
+            args.push("--".into());
             args.push(prompt.into());
             args
         }
