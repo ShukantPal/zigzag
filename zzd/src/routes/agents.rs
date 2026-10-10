@@ -832,31 +832,31 @@ fn agent_create_request(
     };
     let mut request = request;
     if let Some(pr) = request.pr {
-        let output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr.to_string(),
-                "--json",
-                "headRefName",
-                "--jq",
-                ".headRefName",
-            ])
+        let remote = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
             .current_dir(&repo)
             .output();
-        match output {
+        let repository = match remote {
             Ok(output) if output.status.success() => {
-                request.branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                crate::github::github_repository(&String::from_utf8_lossy(&output.stdout))
             }
-            Ok(output) => {
-                log::warn!(
-                    "agent_create could not resolve PR #{pr}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                return reply(stream, 400, error("could_not_resolve_pr_branch"));
+            _ => None,
+        };
+        let Some(repository) = repository else {
+            return reply(stream, 400, error("could_not_resolve_pr_branch"));
+        };
+        let pr_data = crate::session::require_gui_login_session()
+            .and_then(|_| crate::github_api::get(&format!("repos/{repository}/pulls/{pr}")));
+        match pr_data {
+            Ok(pr_data) => {
+                request.branch = pr_data
+                    .pointer("head.ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
             }
             Err(message) => {
-                log::error!("agent_create could not run gh to resolve PR #{pr}: {message}");
+                log::warn!("agent_create could not resolve PR #{pr}: {message}");
                 return reply(stream, 500, error("could_not_resolve_pr_branch"));
             }
         }

@@ -1,8 +1,8 @@
 //! Verified, in-process relay updates.
 //!
 //! A GitHub Release is discovery only.  The release manifest is checked before
-//! a candidate is made current and `gh attestation verify` is constrained by
-//! the repository, workflow, source ref, and the bundled Sigstore trust root.
+//! a candidate is made current and its GitHub attestation is verified offline
+//! against the repository, workflow, source ref, and bundled Sigstore root.
 
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -111,6 +111,9 @@ trait Runtime: Send + Sync {
     fn status(&self, command: &str, args: &[String]) -> Result<(), String>;
     fn spawn(&self, command: &Path, args: &[String]) -> Result<(), String>;
     fn terminate(&self, process: u32) -> Result<(), String>;
+    fn attestation_bundles(&self, digest: &str) -> Result<Vec<Vec<u8>>, String> {
+        crate::github_api::attestation_bundles(REPOSITORY, digest)
+    }
     fn exec(
         &self,
         command: &Path,
@@ -816,27 +819,43 @@ fn verify_attestation(
     let root = directory.join("sigstore-trusted-root.json");
     // Always use the reviewed roots embedded in the running verified image.
     atomic_write(&root, TRUST_ROOT.as_bytes())?;
-    let mut args = vec![
-        "attestation".to_owned(),
-        "verify".to_owned(),
-        candidate.to_string_lossy().into_owned(),
-        "--repo".to_owned(),
-        REPOSITORY.to_owned(),
-        "--signer-workflow".to_owned(),
-        WORKFLOW.to_owned(),
-        "--source-ref".to_owned(),
-        "refs/heads/main".to_owned(),
-    ];
-    if let Some(commit) = commit {
-        args.extend(["--source-digest".to_owned(), commit.to_owned()]);
+    let digest = sha256_file(candidate)?;
+    let bundles = runtime.attestation_bundles(&digest)?;
+    if bundles.is_empty() {
+        return Err("GitHub returned no artifact attestations".to_owned());
     }
-    args.extend([
-        "--predicate-type".to_owned(),
-        "https://slsa.dev/provenance/v1".to_owned(),
-        "--custom-trusted-root".to_owned(),
-        root.to_string_lossy().into_owned(),
-    ]);
-    runtime.status("gh", &args)
+    let mut last_error = None;
+    for (index, bundle) in bundles.iter().enumerate() {
+        let bundle_path = directory.join(format!("attestation-{digest}-{index}.jsonl"));
+        atomic_write(&bundle_path, bundle)?;
+        let mut args = vec![
+            "attestation".to_owned(),
+            "verify".to_owned(),
+            candidate.to_string_lossy().into_owned(),
+            "--bundle".to_owned(),
+            bundle_path.to_string_lossy().into_owned(),
+            "--repo".to_owned(),
+            REPOSITORY.to_owned(),
+            "--signer-workflow".to_owned(),
+            WORKFLOW.to_owned(),
+            "--source-ref".to_owned(),
+            "refs/heads/main".to_owned(),
+        ];
+        if let Some(commit) = commit {
+            args.extend(["--source-digest".to_owned(), commit.to_owned()]);
+        }
+        args.extend([
+            "--predicate-type".to_owned(),
+            "https://slsa.dev/provenance/v1".to_owned(),
+            "--custom-trusted-root".to_owned(),
+            root.to_string_lossy().into_owned(),
+        ]);
+        match runtime.status("gh", &args) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "attestation verification failed".to_owned()))
 }
 
 fn download(runtime: &dyn Runtime, url: &str, output: &Path) -> Result<(), String> {
@@ -1174,6 +1193,15 @@ mod tests {
     }
 
     impl Runtime for MockRuntime {
+        fn attestation_bundles(&self, digest: &str) -> Result<Vec<Vec<u8>>, String> {
+            self.calls.lock().unwrap().push(Call {
+                operation: "attestations",
+                command: "github-api".to_owned(),
+                args: vec![format!("repos/{REPOSITORY}/attestations/sha256:{digest}")],
+            });
+            Ok(vec![b"mock-signed-bundle".to_vec()])
+        }
+
         fn output(&self, command: &str, args: &[String]) -> Result<CommandOutput, String> {
             self.calls.lock().unwrap().push(Call {
                 operation: "output",
@@ -1345,11 +1373,20 @@ mod tests {
         }));
         let attestations = calls
             .iter()
-            .filter(|call| call.command == "gh")
+            .filter(|call| call.operation == "attestations")
             .collect::<Vec<_>>();
         assert_eq!(attestations.len(), 2);
         for call in &attestations {
+            assert!(call.args[0].contains("repos/ShukantPal/zigzag/attestations/sha256:"));
+        }
+        let verifiers = calls
+            .iter()
+            .filter(|call| call.command == "gh")
+            .collect::<Vec<_>>();
+        assert_eq!(verifiers.len(), 2);
+        for call in &verifiers {
             let joined = call.args.join(" ");
+            assert!(joined.contains("--bundle"));
             assert!(joined.contains("--repo ShukantPal/zigzag"));
             assert!(
                 joined.contains("--signer-workflow ShukantPal/zigzag/.github/workflows/ci.yml")
@@ -1358,13 +1395,10 @@ mod tests {
             assert!(joined.contains("--custom-trusted-root"));
         }
         assert!(
-            !attestations[0]
-                .args
-                .iter()
-                .any(|arg| arg == "--source-digest"),
+            !verifiers[0].args.iter().any(|arg| arg == "--source-digest"),
             "the manifest is authenticated before its claimed commit is trusted"
         );
-        assert!(attestations[1].args.windows(2).any(|args| {
+        assert!(verifiers[1].args.windows(2).any(|args| {
             args == [
                 "--source-digest",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
