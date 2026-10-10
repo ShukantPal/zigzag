@@ -801,6 +801,7 @@ fn prune_drops_finished_entries_past_the_retention_window() {
         registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
         procs: Mutex::new(HashMap::new()),
         codex_app_server: Mutex::new(None),
+        opencode_server: Mutex::new(None),
     };
     let request = exec::ExecRequest {
         id: "old".to_owned(),
@@ -838,6 +839,7 @@ fn persistent_agent_streams_and_session_survive_relay_teardown() {
         registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
         procs: Mutex::new(HashMap::new()),
         codex_app_server: Mutex::new(None),
+        opencode_server: Mutex::new(None),
     };
     let store = Arc::new(Store::open(registry_path.with_extension("events"), 10).unwrap());
     let spawned = spawn_proc(
@@ -1092,6 +1094,7 @@ pub(crate) fn test_server() -> (Arc<Server>, PathBuf) {
                 registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                 procs: Mutex::new(HashMap::new()),
                 codex_app_server: Mutex::new(None),
+                opencode_server: Mutex::new(None),
             },
             updater: Arc::new(update::Manager::new(update::Config {
                 directory: path.with_extension("updates"),

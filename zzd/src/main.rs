@@ -103,12 +103,17 @@ fn run() -> Result<(), String> {
             registry,
             procs: Mutex::new(HashMap::new()),
             codex_app_server: Mutex::new(None),
+            opencode_server: Mutex::new(None),
         },
         updater: Arc::clone(&updater),
         review_state_file: config.review_state_file.clone(),
         review_loop_shadow,
         review_config: Mutex::new(None),
     });
+    let update_state = Arc::clone(&state);
+    updater.set_pre_update_hook(Arc::new(move || {
+        update_state.supervisor.stop_harness_servers()
+    }))?;
     let recovered = state
         .supervisor
         .registry
@@ -125,33 +130,27 @@ fn run() -> Result<(), String> {
                 .map(|thread_id| (agent, thread_id))
         })
         .collect();
-    if !native_threads.is_empty() {
-        match state.supervisor.codex_server() {
-            Ok(app_server) => {
-                for (agent, thread_id) in native_threads {
-                    if let Err(error) = app_server.resume_thread(&thread_id) {
-                        log::error!(
-                            "could not resume Codex thread for agent {}: {error}",
-                            agent.id
-                        );
-                        let _ = state.supervisor.registry.transition(
-                            &agent.id,
-                            "lost_after_restart",
-                            None,
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                log::error!("could not restart app-server for durable threads: {error}");
-                for (agent, _) in native_threads {
-                    let _ =
-                        state
-                            .supervisor
-                            .registry
-                            .transition(&agent.id, "lost_after_restart", None);
-                }
-            }
+    for (agent, session_id) in native_threads {
+        let resumed = match agent.harness.as_deref() {
+            Some("opencode") => state
+                .supervisor
+                .opencode_server()
+                .and_then(|server| server.resume_session(&session_id)),
+            _ => state
+                .supervisor
+                .codex_server()
+                .and_then(|server| server.resume_thread(&session_id)),
+        };
+        if let Err(error) = resumed {
+            log::error!(
+                "could not resume {} session for agent {}: {error}",
+                agent.harness.as_deref().unwrap_or("Codex"),
+                agent.id
+            );
+            let _ = state
+                .supervisor
+                .registry
+                .transition(&agent.id, "lost_after_restart", None);
         }
     }
     // Re-apply SIGSTOP to agents that were paused before the restart: their
