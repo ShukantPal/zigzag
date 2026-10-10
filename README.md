@@ -8,6 +8,13 @@ Zigzag is a Mac-hosted relay for dispatching and supervising Codex agents throug
 - **CLI (`zzapi`, Rust):** Authenticated client for agent, worktree, execution, and event operations. It prints readable output by default and supports `--json` for scripts.
 - **Status TUI (`zzapi status`):** Read-only terminal dashboard for agent/task state, output, and event history. It uses the relay API and local task metadata.
 
+The Rust workspace is organized by crate: [`zz/`](zz/) contains shared state,
+registry, and parsing code; [`zzd/`](zzd/) contains the `zigzag` daemon, HTTP
+routes, process supervision, event socket, and relay services; [`zzapi/`](zzapi/)
+contains the `zzapi` client and status TUI. Event consumers can use the retained
+HTTP event feed or `zzapi events stream` for live delivery over the authenticated
+socket.
+
 The daemon listens on loopback and the Mac's Tailscale address (HTTP on port `8765`; the bidirectional TCP event socket defaults to `8766`). Every API request requires the relay bearer token. Keep network access limited to trusted tailnet clients with a Tailscale ACL. See [architecture](docs/architecture.md) and [operations](docs/operations.md) for deployment details.
 
 The relay can poll GitHub PR conversation comments, inline review comments, and review bodies, then resume the Codex session recorded for that PR. Routing runs live by default, keys durable comment events by GitHub's GraphQL `node_id`, skips replies whose first line begins `> 🤖`, and dispatches Codex resumes through the relay supervisor and shared session-operation gate. The `--comment-router-live` flag remains accepted for compatibility and has no effect. See the [native PR comment routing installation guide](launchd/INSTALL.md#native-pr-comment-routing) for the Mac-local reloadable session file and LaunchAgent setup.
@@ -81,7 +88,9 @@ The JSON policy maps binary names to absolute paths and permitted argv prefixes.
 
 ## Development
 
-The workspace includes the shared `zz` library, `zigzag` daemon, and `zzapi` CLI. From the repository root:
+The workspace includes the shared `zz` library, `zzd` daemon crate (built as
+the `zigzag` binary), and `zzapi` CLI crate (built as the `zzapi` binary). From
+the repository root:
 
 ```sh
 cargo build --workspace

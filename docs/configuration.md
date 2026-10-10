@@ -33,17 +33,14 @@ disallowed host it should time out. If the VM cannot connect while Mac health
 works, check ACL source/destination, current `tailscale ip -4`, proxy settings,
 and token transport—never open the relay broadly to debug.
 
-## Department and review configuration
+## Review configuration
 
-`dept/config.py` produces the checked-in materialized config; deployment
-`config.json`/`CODEX_DEPT_CONFIG` controls SSH/proxy/state location and stays
-ignored. The Rust review policy lives in `~/.zigzag/config.yaml`; invalid YAML,
+The Rust review policy lives in `~/.zigzag/config.yaml`; invalid YAML,
 duplicate keys, tags, unknown fields, or invalid schema disable reviews
 fail-closed while the HTTP relay continues serving.
 
 Review configuration includes repository/lens/CI/human-actor policy. It is the
-authority behind `/v1/review-gate`; Python `approval_gate.py` fetches, rather
-than reimplements, that decision.
+authority behind `/v1/review-gate` and the daemon's review loop.
 
 ## Signed updates
 
