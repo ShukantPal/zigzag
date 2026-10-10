@@ -33,8 +33,8 @@ const DEFAULT_HOSTNAME: &str = "100.101.237.83";
 const DEFAULT_PORT: u16 = 8765;
 const DEFAULT_SOCKET_PORT: u16 = 8766;
 const DEFAULT_TOKEN_FILE: &str = ".codex/zigzag.token";
-const LATEST_ZZAPI_URL: &str =
-    "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64";
+const LATEST_ZZAPI_DOWNLOAD_BASE: &str =
+    "https://github.com/ShukantPal/zigzag/releases/latest/download/";
 /// The relay permits synchronous executions for up to five minutes. Leave a
 /// little room for the response to cross the network after that deadline.
 const EXEC_CLIENT_TIMEOUT_SECS: u64 = 330;
@@ -570,6 +570,29 @@ fn make_update_agent(proxy_url: Option<&str>) -> Result<ureq::Agent, Fail> {
     Ok(builder.build())
 }
 
+fn latest_zzapi_url(os: &str, arch: &str) -> Result<String, Fail> {
+    let asset = match (os, arch) {
+        ("macos", "aarch64") => "zzapi-macos-aarch64",
+        ("linux", "x86_64") => "zzapi-linux-x86_64",
+        ("macos", "x86_64") => {
+            return Err(Fail::Config(
+                "the latest release does not include a macOS x86_64 zzapi binary".into(),
+            ));
+        }
+        ("linux", "aarch64") => {
+            return Err(Fail::Config(
+                "the latest release does not include a Linux aarch64 zzapi binary".into(),
+            ));
+        }
+        _ => {
+            return Err(Fail::Config(format!(
+                "automatic zzapi updates are not supported on {os}/{arch}"
+            )));
+        }
+    };
+    Ok(format!("{LATEST_ZZAPI_DOWNLOAD_BASE}{asset}"))
+}
+
 fn cmd_update() -> Result<(), Fail> {
     let executable = std::env::current_exe()
         .map_err(|e| Fail::Config(format!("cannot locate current zzapi executable: {e}")))?;
@@ -589,8 +612,9 @@ fn cmd_update() -> Result<(), Fail> {
                 .map(|(name, value)| (*name, value.as_deref())),
         );
         let agent = make_update_agent(proxy_url.as_deref())?;
+        let download_url = latest_zzapi_url(std::env::consts::OS, std::env::consts::ARCH)?;
         let response = agent
-            .get(LATEST_ZZAPI_URL)
+            .get(&download_url)
             .timeout(Duration::from_secs(120))
             .call()
             .map_err(|e| Fail::Config(format!("cannot download latest zzapi: {e}")))?;
@@ -1773,11 +1797,31 @@ mod tests {
     }
 
     #[test]
-    fn update_downloads_the_linux_release_asset() {
+    fn update_selects_release_assets_for_published_platforms() {
         assert_eq!(
-            LATEST_ZZAPI_URL,
+            latest_zzapi_url("linux", "x86_64").unwrap(),
             "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-linux-x86_64"
         );
+        assert_eq!(
+            latest_zzapi_url("macos", "aarch64").unwrap(),
+            "https://github.com/ShukantPal/zigzag/releases/latest/download/zzapi-macos-aarch64"
+        );
+    }
+
+    #[test]
+    fn update_reports_platforms_without_a_published_binary() {
+        assert!(matches!(
+            latest_zzapi_url("macos", "x86_64"),
+            Err(Fail::Config(message)) if message.contains("macOS x86_64")
+        ));
+        assert!(matches!(
+            latest_zzapi_url("linux", "aarch64"),
+            Err(Fail::Config(message)) if message.contains("Linux aarch64")
+        ));
+        assert!(matches!(
+            latest_zzapi_url("windows", "x86_64"),
+            Err(Fail::Config(message)) if message.contains("windows/x86_64")
+        ));
     }
 
     #[test]
