@@ -20,14 +20,27 @@ account flow and system keyring on the relay host.
 Model selection uses each CLI's `--model` option. With no model override,
 Gemini, OpenCode, and Antigravity use their own configured defaults.
 
-The registry reaper records terminal exit. After relay restart, the daemon
-verifies each live agent's recorded PID birth identity and keeps a verified
-process in `running`. It tails the durable transcript and stderr files, and
-records `unexpected_exit` if the process disappears while the relay is away.
-A dead process detected during startup becomes `lost_after_restart`.
-Terminal entries and spool metadata are pruned after seven days. Generic
-`/v1/spawn` compatibility processes do not necessarily have the API-created
-transcript.
+Codex agents use one long-lived app-server for the daemon's local isolation
+domain and one durable thread per agent. The per-thread `cwd` is the agent's
+worktree (or project directory for `--no-branch`). On daemon startup, active
+thread IDs are resumed from the durable registry. A Codex thread ID is only a
+routing key; it is not a tenant security boundary. Agents that share an
+app-server also share its process failure domain.
+
+`POST /v1/agents/{id}/messages` accepts `{ "text": "...", "delivery":
+"steer" | "queue" }`. `zzapi agents message <id> --steer "..."` sends a
+mid-turn instruction; `--queue "..."` appends a follow-up turn. Stop remains
+thread-scoped. Pause/resume are unavailable for app-server threads because
+signaling their shared process would affect every agent in the domain.
+
+Other harnesses retain their one-shot process lifecycle. The registry reaper
+records terminal exit. After relay restart, the daemon verifies each live
+agent's recorded PID birth identity and keeps a verified process in `running`.
+It tails the durable transcript and stderr files, and records `unexpected_exit`
+if the process disappears while the relay is away. A dead process detected
+during startup becomes `lost_after_restart`. Terminal entries and spool
+metadata are pruned after seven days. Generic `/v1/spawn` compatibility
+processes do not necessarily have the API-created transcript.
 
 Agent controls are listing/get, graceful stop (SIGTERM then SIGKILL), pause
 (SIGSTOP), and resume (SIGCONT). Paused state is reapplied where possible
