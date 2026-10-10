@@ -334,7 +334,7 @@ components:
           description: Pull request number whose head branch should be used.
         worktree:
           type: string
-          description: Worktree path; defaults to /private/tmp/<branch-slug>/.
+          description: Worktree path; defaults to ~/.zigzag/worktrees/<branch-slug>/ (configurable with ZIGZAG_WORKTREE_BASE).
         model:
           type: string
         harness:
@@ -392,7 +392,8 @@ components:
       type: object
       description: >
         Create a git worktree. Paths are canonicalized: `..` is rejected and
-        only /private/tmp/ and /Users/shukant/.codex/worktrees/ are permitted.
+        only configured worktree roots are permitted (default ~/.zigzag/worktrees/
+        and /Users/shukant/.codex/worktrees/).
         Implemented in a parallel PR; this documents the intended contract.
       required: [path, branch, repo]
       properties:

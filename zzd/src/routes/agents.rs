@@ -10,6 +10,7 @@ use crate::proc::{
     recovered_agent_identity_matches, spawn_proc,
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
+use crate::routes::worktrees::configured_worktree_base;
 use crate::routes::worktrees::{
     WorktreeError, cleanup_agent_worktree, git_output, resolve_new_worktree_path,
     resolve_worktree_repo, run_worktree_hook, valid_worktree_branch, worktree_branch_checkout_path,
@@ -601,7 +602,11 @@ pub(crate) fn parse_agent_create_request(body: &[u8]) -> Result<AgentCreateReque
 
 /// Derive the default worktree directory from a branch name.
 pub(crate) fn default_agent_worktree(branch: &str) -> String {
-    format!("/private/tmp/{}/", branch.replace('/', "-"))
+    format!(
+        "{}/{}/",
+        configured_worktree_base().display(),
+        branch.replace('/', "-")
+    )
 }
 
 /// Model identifier validation, mirroring dept.py's MODEL_RE.

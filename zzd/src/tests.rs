@@ -40,8 +40,9 @@ use crate::routes::agents::{
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    cleanup_agent_worktree, resolve_existing_worktree_path, resolve_new_worktree_path,
-    resolve_worktree_repo, valid_worktree_branch, worktree_create_plan, worktree_delete_plan,
+    cleanup_agent_worktree, configured_worktree_base, resolve_existing_worktree_path,
+    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch, worktree_create_plan,
+    worktree_delete_plan,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -1666,7 +1667,7 @@ fn agent_create_request_parsing_and_helpers() {
     );
     assert_eq!(
         default_agent_worktree("codex/a/b"),
-        "/private/tmp/codex-a-b/"
+        format!("{}/codex-a-b/", configured_worktree_base().display())
     );
     assert!(valid_agent_model("org/model:1.0"));
     assert!(!valid_agent_model("model name"));

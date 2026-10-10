@@ -39,7 +39,7 @@ target/release/zigzag \
   --state-file ~/.codex/zigzag/events.json
 ```
 
-In another terminal, point `zzapi` at the local relay and dispatch an agent. Codex CLI must be installed and signed in for the Mac user. The agent gets its own branch/worktree under `/private/tmp` by default.
+In another terminal, point `zzapi` at the local relay and dispatch an agent. Codex CLI must be installed and signed in for the Mac user. The agent gets its own branch/worktree under `~/.zigzag/worktrees` by default. Set `ZIGZAG_WORKTREE_BASE` to choose a different default base; `ZIGZAG_WORKTREE_ROOTS` configures allowed roots and, when set alone, its first root is also the default base.
 
 ```sh
 export ZIGZAG_HOSTNAME=127.0.0.1:8765
