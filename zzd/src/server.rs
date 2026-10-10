@@ -15,13 +15,13 @@ use crate::routes::providers::providers_request;
 use crate::routes::worktrees::{worktree_create, worktree_delete};
 use crate::session::require_gui_login_session;
 use crate::update;
-use relay_core::{AgentRegistry, Json, Store, parse_json};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use zz::{AgentRegistry, Json, Store, parse_json};
 
 /// Upper bound on simultaneous in-flight connections. The accept loop
 /// sheds excess connections with 503 instead of spawning unbounded
@@ -39,7 +39,7 @@ pub(crate) struct Server {
     pub(crate) review_config: Mutex<Option<Arc<review_loop::ReviewLoopConfig>>>,
 }
 /// Live handles deliberately disappear on restart; the durable half lives in
-/// `relay-core::AgentRegistry` and records the resulting orphan/loss state.
+/// `zz::AgentRegistry` and records the resulting orphan/loss state.
 pub(crate) struct Supervisor {
     pub(crate) registry: Arc<AgentRegistry>,
     pub(crate) procs: Mutex<HashMap<String, ProcEntry>>,

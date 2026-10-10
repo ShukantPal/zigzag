@@ -1,8 +1,8 @@
 use crate::logging;
-use relay_core::{Json, ReadResult};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use zz::{Json, ReadResult};
 
 pub(crate) const MAX_BODY: usize = 64 * 1024;
 /// Upper bound on the request line plus all header lines, in bytes.

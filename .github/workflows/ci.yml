@@ -43,7 +43,7 @@ jobs:
         # starts instead of exiting with "invalid agent registry".
         run: |
           SMOKE_DIR="$(mktemp -d)"
-          cp relay-core/tests/fixtures/legacy-events.agents.json "$SMOKE_DIR/events.agents.json"
+          cp zz/tests/fixtures/legacy-events.agents.json "$SMOKE_DIR/events.agents.json"
           printf '{"epoch":"00000000000000000000000000000001","next_sequence":1,"events":[]}' > "$SMOKE_DIR/events.json"
           head -c 48 /dev/urandom | base64 > "$SMOKE_DIR/token"
           chmod 600 "$SMOKE_DIR/token"
@@ -269,7 +269,7 @@ jobs:
           for i in 1 2 3 4 5 6; do
             if bash scripts/verify-release.sh \
               --tag "${{ steps.manifest.outputs.version }}" \
-              --trust-root relay/trust/sigstore-trusted-root.json; then
+              --trust-root zzd/trust/sigstore-trusted-root.json; then
               exit 0
             fi
             echo "verification attempt $i failed; retrying in 20s" >&2

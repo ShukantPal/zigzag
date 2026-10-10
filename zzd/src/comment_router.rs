@@ -11,12 +11,12 @@ use crate::exec;
 use crate::proc::{AgentSpawnDetails, kill_process_group, process_group_running, spawn_proc};
 use crate::server::{Server, Supervisor};
 use crate::session::require_gui_login_session;
-use relay_core::{Json, parse_json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::{Json, parse_json};
 
 const ROUTED_OWNER: &str = "ShukantPal";
 const BOT_MARKER: &str = "> 🤖";
@@ -506,7 +506,7 @@ fn terminate_spawned(supervisor: &Supervisor, handle: &str) {
 
 fn release_when_finished(
     gate: Arc<SessionGate>,
-    registry: Arc<relay_core::AgentRegistry>,
+    registry: Arc<zz::AgentRegistry>,
     session_id: String,
     handle: String,
 ) {
@@ -828,7 +828,7 @@ fn parse_watch_entry(value: &str) -> Result<WatchedPr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relay_core::Store;
+    use zz::Store;
 
     #[test]
     fn graphql_node_id_is_the_only_comment_identity() {

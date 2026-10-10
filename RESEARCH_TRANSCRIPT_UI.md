@@ -13,7 +13,7 @@ Relay-native agents created through `POST /v1/agents` write Codex's JSONL stdout
 ~/.zigzag/agents/codex/<32-hex-agent-id>.stderr
 ```
 
-The directory is created with mode `0700`; output files use `0600`. The JSONL is the raw Codex `--json` event stream (each line is a JSON event), and stderr is a separate text file. This is distinct from the durable registry at the configured state-file path, its adjacent `<state>.agents.json` registry, and its bounded `<state>.agent-logs/` diagnostic spool. The spool is capped at 32 MiB per relay-core constant and reports eviction/degradation metadata. See [`relay/src/proc.rs`](relay/src/proc.rs), [`relay-core/src/lib.rs`](relay-core/src/lib.rs), and [`docs/agents.md`](docs/agents.md).
+The directory is created with mode `0700`; output files use `0600`. The JSONL is the raw Codex `--json` event stream (each line is a JSON event), and stderr is a separate text file. This is distinct from the durable registry at the configured state-file path, its adjacent `<state>.agents.json` registry, and its bounded `<state>.agent-logs/` diagnostic spool. The spool is capped at 32 MiB by a constant in the `zz` crate and reports eviction/degradation metadata. See [`zzd/src/proc.rs`](zzd/src/proc.rs), [`zz/src/lib.rs`](zz/src/lib.rs), and [`docs/agents.md`](docs/agents.md).
 
 Other task artifacts may live under `~/.codex/dept/t-*/` (prompt, markers, final message and task events). Codex session rollout files also exist under `~/.codex/sessions/**/rollout-*.jsonl`, but they are described as session metadata for resume CWD recovery, not as the relay agent transcript API's source. `/v1/spawn` compatibility processes do not necessarily have the API-created Codex JSONL transcript.
 
@@ -31,7 +31,7 @@ All HTTP routes require `Authorization: Bearer <relay-token>`.
 | Authenticated TCP socket (`8766`) | `agents`, `events`, and `logs.<id>` subscriptions | Pushes agent snapshots/events and log records; not a transcript topic, and no replay guarantee beyond log cursors/resynchronizing over HTTP. |
 | `GET /v1/events?after=&epoch=&timeout=` | Long-poll retained lifecycle events | Useful for status/timeline updates, not transcript contents. Bounded retention with reset/lost signals. |
 
-The `zzapi` CLI has agents list/get/logs and transcript verbs, but its docs say providers and transcripts may require authenticated HTTP until CLI verbs are fully exposed; actual CLI support has moved ahead of that note. The OpenAPI spec documents agent logs but not `/transcript` or the TCP socket protocol. See [`relay/src/routes/agents.rs`](relay/src/routes/agents.rs), [`relay/src/socket.rs`](relay/src/socket.rs), [`cli/src/main.rs`](cli/src/main.rs), and [`openapi.yaml`](openapi.yaml).
+The `zzapi` CLI has agents list/get/logs and transcript verbs, but its docs say providers and transcripts may require authenticated HTTP until CLI verbs are fully exposed; actual CLI support has moved ahead of that note. The OpenAPI spec documents agent logs but not `/transcript` or the TCP socket protocol. See [`zzd/src/routes/agents.rs`](zzd/src/routes/agents.rs), [`zzd/src/socket.rs`](zzd/src/socket.rs), [`zzapi/src/main.rs`](zzapi/src/main.rs), and [`openapi.yaml`](openapi.yaml).
 
 **Retention detail to resolve before promising complete remote history:** the raw stdout JSONL file is intentionally kept separately, but `agent_logs_json()` reads the bounded registry spool when `stdout_next > 0`. The transcript route is built on that function. Therefore, once output has entered the spool, the HTTP transcript/log views may only expose the retained 32 MiB window even while the raw JSONL file remains on disk. The UI must display `dropped_before`/`log_degraded` and make truncation visible. A follow-up relay change should serve the durable JSONL by byte range/cursor (or make that durable file the source of truth for this API), while preserving redaction expectations.
 
@@ -75,5 +75,5 @@ Suggested MVP: Tauri desktop client on Tailscale, read-only list/status and tran
 ## Repository and external references
 
 - [`README.md`](README.md), [`docs/architecture.md`](docs/architecture.md), [`docs/agents.md`](docs/agents.md), [`docs/relay.md`](docs/relay.md)
-- [`relay/src/proc.rs`](relay/src/proc.rs), [`relay/src/routes/agents.rs`](relay/src/routes/agents.rs), [`relay/src/socket.rs`](relay/src/socket.rs), [`relay-core/src/lib.rs`](relay-core/src/lib.rs)
+- [`zzd/src/proc.rs`](zzd/src/proc.rs), [`zzd/src/routes/agents.rs`](zzd/src/routes/agents.rs), [`zzd/src/socket.rs`](zzd/src/socket.rs), [`zz/src/lib.rs`](zz/src/lib.rs)
 - [Tauri](https://tauri.app/), [egui crate docs](https://docs.rs/egui/latest/egui/), [iced crate docs](https://docs.rs/iced/latest/iced/), [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)

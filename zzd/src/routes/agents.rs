@@ -18,12 +18,12 @@ use crate::routes::worktrees::{
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
 use crate::server::{Server, Supervisor};
-use relay_core::{AgentRecord, Json, parse_json};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::{AgentRecord, Json, parse_json};
 
 /// Grace period after SIGTERM before escalating to SIGKILL.
 const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
@@ -327,7 +327,7 @@ fn resume_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Res
 /// Build the full transcript for an agent: record metadata, prompt,
 /// last message, and concatenated stdout/stderr.
 fn transcript_json(
-    registry: &relay_core::AgentRegistry,
+    registry: &zz::AgentRegistry,
     id: &str,
     after: u64,
     tail: Option<usize>,
@@ -349,7 +349,7 @@ fn transcript_json(
         }
     }
 
-    // The relay intentionally does not retain prompt text (see relay-core).
+    // The relay intentionally does not retain prompt text (see zz).
     // For dept-managed Codex tasks, the prompt lives in the task directory.
     let task_dir = dept_task_dir(agent.task_id.as_str());
     let prompt = task_dir
@@ -400,7 +400,7 @@ fn transcript_json(
 /// Read agent logs from the ordered diagnostics spool, falling back to durable
 /// output files for agents whose stdout has not yet been copied into the spool.
 pub(crate) fn agent_logs_json(
-    registry: &relay_core::AgentRegistry,
+    registry: &zz::AgentRegistry,
     id: &str,
     stream: &str,
     after: u64,
@@ -1282,7 +1282,7 @@ pub(crate) fn restart_argv(
     Ok(args)
 }
 
-fn extract_codex_session_id(registry: &relay_core::AgentRegistry, id: &str) -> Option<String> {
+fn extract_codex_session_id(registry: &zz::AgentRegistry, id: &str) -> Option<String> {
     let logs = agent_logs_json(registry, id, "stdout", 0, None)?;
     let Json::Array(records) = logs.object("records")? else {
         return None;

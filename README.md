@@ -81,7 +81,7 @@ The JSON policy maps binary names to absolute paths and permitted argv prefixes.
 
 ## Development
 
-The workspace includes the relay, shared relay core, CLI, and event poller. From the repository root:
+The workspace includes the shared `zz` library, `zigzag` daemon, and `zzapi` CLI. From the repository root:
 
 ```sh
 cargo build --workspace

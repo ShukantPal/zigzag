@@ -18,5 +18,5 @@ Start here, then use the focused references below.
 | [Configuration and security](configuration.md) | Relay options, allowlist, Keychain, tokens, network boundary, and paths. |
 
 The implementation is the source of truth. In particular, route behavior lives
-in `relay/src/routes/`; `openapi.yaml` is a useful but incomplete public
+in `zzd/src/routes/`; `openapi.yaml` is a useful but incomplete public
 contract. See `launchd/INSTALL.md` for deployment/cutover details.

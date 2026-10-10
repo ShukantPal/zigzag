@@ -6,8 +6,8 @@
 
 use crate::http::reply;
 use crate::provider::{DEFAULT_PROVIDER, PROVIDER_NAMES, provider_from_name};
-use relay_core::Json;
 use std::net::TcpStream;
+use zz::Json;
 
 pub(crate) fn providers_request(stream: &mut TcpStream) -> Result<(), String> {
     let providers: Vec<Json> = PROVIDER_NAMES

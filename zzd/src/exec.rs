@@ -5,7 +5,6 @@
 //! that item, while the owner can update it with `zigzag config set-allowlist`.
 
 use keyring::Entry;
-use relay_core::{Json, parse_json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
@@ -14,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::{Json, parse_json};
 
 const KEYCHAIN_SERVICE: &str = "zigzag";
 const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";

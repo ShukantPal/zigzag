@@ -4,7 +4,6 @@
 //! a candidate is made current and `gh attestation verify` is constrained by
 //! the repository, workflow, source ref, and the bundled Sigstore trust root.
 
-use relay_core::{Json, parse_json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -15,6 +14,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use zz::{Json, parse_json};
 
 pub const REPOSITORY: &str = "ShukantPal/zigzag";
 const WORKFLOW: &str = "ShukantPal/zigzag/.github/workflows/ci.yml";
@@ -406,12 +406,12 @@ impl Manager {
             .map_err(|_| "update check lock poisoned".to_owned())?;
         let mut status = self.status();
         if matches!(status.policy, Policy::Paused) {
-            status.last_check = Some(relay_core::rfc3339_timestamp());
+            status.last_check = Some(zz::rfc3339_timestamp());
             status.last_result = Some("paused".to_owned());
             save_status(&self.config.directory, &status)?;
             return Ok(());
         }
-        status.last_check = Some(relay_core::rfc3339_timestamp());
+        status.last_check = Some(zz::rfc3339_timestamp());
         audit("relay_update_check_started", Json::Object(vec![]));
         let result = match self.fetch_candidate(&status) {
             Ok(result) => result,

@@ -3,13 +3,13 @@ use crate::http::{error, query, reply};
 use crate::review_loop;
 use crate::server::Server;
 use crate::session::require_gui_login_session;
-use relay_core::{Json, parse_json};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use zz::{Json, parse_json};
 
 static WATCHED_PR_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -72,7 +72,7 @@ fn add_watched_pr(pr: WatchedPr) -> Result<(), String> {
 }
 
 /// Discover and persist an open PR for an agent's pushed branch.
-pub(crate) fn watch_agent_pr(agent: &relay_core::AgentRecord) -> Result<bool, String> {
+pub(crate) fn watch_agent_pr(agent: &zz::AgentRecord) -> Result<bool, String> {
     let Some(worktree) = agent.worktree_path.as_deref() else {
         return Ok(false);
     };

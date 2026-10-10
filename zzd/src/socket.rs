@@ -7,7 +7,6 @@
 use crate::auth::authorized;
 use crate::routes::agents::agent_logs_json;
 use crate::server::{ConnectionLimiter, Server};
-use relay_core::{Json, Store};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Write};
@@ -17,6 +16,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use zz::{Json, Store};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -408,8 +408,8 @@ fn read_exact(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relay_core::{AgentRecord, Json};
     use std::net::TcpListener;
+    use zz::{AgentRecord, Json};
 
     #[test]
     fn framing_is_big_endian_json_and_rejects_bad_lengths() {
