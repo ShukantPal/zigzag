@@ -23,6 +23,7 @@ use std::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INTERNAL: &str = "relay-update";
+const EVENT_PROMPT_LIMIT: usize = 100;
 const OUTPUT_TAIL: u64 = 32 * 1024 * 1024;
 const EVENT_LIMIT: usize = 10_000;
 #[derive(Clone, Default)]
@@ -46,6 +47,49 @@ fn s(v: &Value, k: &str) -> String {
         Some(Value::Number(x)) => x.to_string(),
         Some(Value::Bool(x)) => x.to_string(),
         _ => String::new(),
+    }
+}
+fn request_summary(event: &Value) -> Option<String> {
+    if s(event, "kind") != "relay_request_started" {
+        return None;
+    }
+    let payload = event.get("payload")?;
+    if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
+        let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prompt = truncate(&prompt, EVENT_PROMPT_LIMIT);
+        let model = payload.get("model").and_then(Value::as_str).unwrap_or("");
+        return Some(if model.is_empty() {
+            format!("prompt: {prompt}")
+        } else {
+            format!("prompt: {prompt} · model: {model}")
+        });
+    }
+    let process = payload.get("process").and_then(Value::as_str)?;
+    let command = match payload.get("command") {
+        Some(Value::Array(args)) => args
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(Value::String(command)) => command.clone(),
+        _ => String::new(),
+    };
+    Some(if command.is_empty() {
+        format!("process: {process}")
+    } else {
+        format!(
+            "process: {process} · command: {}",
+            truncate(&command, EVENT_PROMPT_LIMIT)
+        )
+    })
+}
+fn truncate(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let clipped = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{clipped}…")
+    } else {
+        clipped
     }
 }
 fn now() -> i64 {
@@ -795,12 +839,17 @@ fn draw(
                         ));
                     }
                 }
-                lines.push(Line::from(format!(
+                let mut event_line = format!(
                     "{}  {}  [{}]",
                     short_time(v.get("occurred_at")),
                     s(v, "kind"),
                     s(v, "source")
-                )));
+                );
+                if let Some(summary) = request_summary(v) {
+                    event_line.push_str("  — ");
+                    event_line.push_str(&summary);
+                }
+                lines.push(Line::from(event_line));
             }
         } else {
             lines.push(Line::from(
@@ -831,6 +880,39 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_started_summary_shows_truncated_prompt_and_model() {
+        let event = serde_json::json!({
+            "kind": "relay_request_started",
+            "payload": {"prompt": "  review   this change  ", "model": "gpt-6"}
+        });
+        assert_eq!(
+            request_summary(&event).as_deref(),
+            Some("prompt: review this change · model: gpt-6")
+        );
+
+        let long = "x".repeat(EVENT_PROMPT_LIMIT + 1);
+        let event = serde_json::json!({"kind":"relay_request_started","payload":{"prompt":long}});
+        let summary = request_summary(&event).unwrap();
+        assert_eq!(
+            summary.chars().count(),
+            "prompt: ".chars().count() + EVENT_PROMPT_LIMIT + 1
+        );
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn request_started_summary_shows_process_and_command() {
+        let event = serde_json::json!({
+            "kind": "relay_request_started",
+            "payload": {"process": "codex", "command": ["run", "--fast"]}
+        });
+        assert_eq!(
+            request_summary(&event).as_deref(),
+            Some("process: codex · command: run --fast")
+        );
+    }
 
     #[test]
     fn parses_rfc3339_and_unix_started_at_values() {
