@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INTERNAL: &str = "relay-update";
 const OUTPUT_TAIL: u64 = 32 * 1024 * 1024;
@@ -397,6 +398,31 @@ fn task_dir(task: &str, root: &Path) -> String {
         .trim()
         .into()
 }
+fn tail_path(path: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(path) <= max_width {
+        return path.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == UnicodeWidthChar::width('…').unwrap_or(1) {
+        return "…".into();
+    }
+
+    let suffix_width = max_width - UnicodeWidthChar::width('…').unwrap_or(1);
+    let mut suffix = String::new();
+    let mut width = 0;
+    for ch in path.chars().rev() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > suffix_width {
+            break;
+        }
+        suffix.push(ch);
+        width += char_width;
+    }
+    suffix = suffix.chars().rev().collect();
+    format!("…{suffix}")
+}
 fn print_once(rows: &[Execution], warnings: &[String], root: &Path, lost: bool) {
     println!("TASK\tPHASE\tPHASE ELAPSED\tOBSERVED TOTAL\tSTATE\tAGENT ID\tDIR\tLAST EVENT\tFLAGS");
     for e in rows {
@@ -646,6 +672,8 @@ fn draw(
                 Constraint::Min(6),
             ])
             .split(frame.area());
+        let dir_column_width =
+            (areas[1].width.saturating_sub(2) as usize * 13 / 100).saturating_sub(2);
         let title = if transcript {
             "zzapi status — output  q/Esc back"
         } else {
@@ -690,7 +718,7 @@ fn draw(
                 } else {
                     &e.exit_code
                 }),
-                Cell::from(dir),
+                Cell::from(tail_path(&dir, dir_column_width)),
                 Cell::from(e.latest()),
             ])
         });
@@ -823,6 +851,13 @@ mod tests {
         let c = serde_json::json!({"occurred_at":"2026-10-08T00:00:12Z","clock":"host-b"});
         assert_eq!(elapsed(&a, &b), Some(12));
         assert_eq!(elapsed(&a, &c), None);
+    }
+
+    #[test]
+    fn truncates_paths_from_the_left() {
+        assert_eq!(tail_path("/repo/worktree/task-123", 12), "…ee/task-123");
+        assert_eq!(tail_path("/repo/task", 20), "/repo/task");
+        assert_eq!(tail_path("/repo/task", 1), "…");
     }
 
     #[test]
