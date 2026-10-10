@@ -78,6 +78,7 @@ pub struct Manager {
     runtime: Arc<dyn Runtime>,
     manual_context: Mutex<Option<ManualContext>>,
     latest_available: Mutex<Option<String>>,
+    pre_update_hook: Mutex<Option<Arc<PreUpdateHook>>>,
 }
 struct ManualContext {
     active_work: Arc<ActiveWork>,
@@ -88,6 +89,7 @@ struct ManualContext {
 }
 type ActiveWork = dyn Fn() -> bool + Send + Sync;
 type Audit = dyn Fn(&str, Json) + Send + Sync;
+type PreUpdateHook = dyn Fn() -> Result<(), String> + Send + Sync;
 
 struct WatchdogConfig {
     ready: PathBuf,
@@ -235,7 +237,16 @@ impl Manager {
             runtime: Arc::new(SystemRuntime),
             manual_context: Mutex::new(None),
             latest_available: Mutex::new(None),
+            pre_update_hook: Mutex::new(None),
         }
+    }
+
+    pub fn set_pre_update_hook(&self, hook: Arc<PreUpdateHook>) -> Result<(), String> {
+        *self
+            .pre_update_hook
+            .lock()
+            .map_err(|_| "update hook lock poisoned")? = Some(hook);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -248,6 +259,7 @@ impl Manager {
             runtime,
             manual_context: Mutex::new(None),
             latest_available: Mutex::new(None),
+            pre_update_hook: Mutex::new(None),
         }
     }
 
@@ -453,6 +465,19 @@ impl Manager {
         // finish, and draining prevents new work from extending this wait.
         while active_work() {
             std::thread::sleep(Duration::from_millis(200));
+        }
+        let pre_update_hook = self
+            .pre_update_hook
+            .lock()
+            .map_err(|_| "update hook lock poisoned")?
+            .clone();
+        if let Some(hook) = pre_update_hook
+            && let Err(error) = hook()
+        {
+            self.draining.store(false, Ordering::Release);
+            status.last_result = Some(format!("pre_update_failed:{error}"));
+            save_status(&self.config.directory, &status)?;
+            return Err(error);
         }
         let apply = self.activate_and_exec(
             &manifest,
@@ -1478,6 +1503,14 @@ mod tests {
         let digest = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd".to_owned();
         let runtime = MockRuntime::release(&manifest("v2.0.0", TARGET, &digest), b"binary");
         let updater = Arc::new(manager(&dir, runtime.clone(), None));
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let hook_called_on_update = Arc::clone(&hook_called);
+        updater
+            .set_pre_update_hook(Arc::new(move || {
+                hook_called_on_update.store(true, Ordering::Release);
+                Ok(())
+            }))
+            .unwrap();
         save_status(&dir, &empty_status()).unwrap();
 
         let admission = updater.spawn_admission().unwrap().unwrap();
@@ -1513,8 +1546,10 @@ mod tests {
         }
         assert!(updater.is_draining());
         assert!(runtime.exec_calls().is_empty());
+        assert!(!hook_called.load(Ordering::Acquire));
         active.store(false, Ordering::Release);
         assert!(check.join().unwrap().is_err());
+        assert!(hook_called.load(Ordering::Acquire));
         assert_eq!(runtime.exec_calls().len(), 1);
         let _ = fs::remove_dir_all(dir);
     }

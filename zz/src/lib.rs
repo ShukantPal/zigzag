@@ -51,6 +51,10 @@ pub struct AgentRecord {
     /// (prompt, project_dir, branch, worktree, model, approval_mode,
     /// timeout_secs), enabling `POST /v1/agents/{id}/restart`.
     pub agent_config: Option<String>,
+    /// Native harness thread/session identifier. A thread ID is a routing key,
+    /// not a tenant security boundary.
+    pub harness_session_id: Option<String>,
+    pub harness: Option<String>,
 }
 
 impl AgentRecord {
@@ -113,6 +117,17 @@ impl AgentRecord {
             (
                 "restartable".to_owned(),
                 Json::Bool(self.agent_config.is_some()),
+            ),
+            (
+                "harness_session_id".to_owned(),
+                self.harness_session_id
+                    .clone()
+                    .map(Json::String)
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "harness".to_owned(),
+                self.harness.clone().map(Json::String).unwrap_or(Json::Null),
             ),
         ])
     }
@@ -342,6 +357,33 @@ impl AgentRegistry {
         *entries = updated;
         Ok(Some(result))
     }
+
+    pub fn set_harness_session(
+        &self,
+        id: &str,
+        harness: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned")?;
+        let Some(old) = entries.get(id) else {
+            return Ok(());
+        };
+        if old.harness.as_deref() == Some(harness)
+            && old.harness_session_id.as_deref() == Some(session_id)
+        {
+            return Ok(());
+        }
+        let mut updated = entries.clone();
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.harness = Some(harness.to_owned());
+        entry.harness_session_id = Some(session_id.to_owned());
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(())
+    }
     pub fn recover<F>(&self, process_is_current: F) -> Result<Vec<AgentRecord>, String>
     where
         F: Fn(&AgentRecord) -> bool,
@@ -354,6 +396,12 @@ impl AgentRegistry {
         let mut changed = Vec::new();
         for entry in updated.values_mut() {
             if entry.state == "running" {
+                // Native sessions are recovered through their durable harness
+                // history after the app-server reconnects; their routing key
+                // is not an OS process identity.
+                if entry.harness_session_id.is_some() {
+                    continue;
+                }
                 entry.state = if process_is_current(entry) {
                     "orphaned".to_owned()
                 } else {
@@ -671,6 +719,22 @@ fn agent_json(entry: &AgentRecord) -> Json {
                 .map(Json::String)
                 .unwrap_or(Json::Null),
         ),
+        (
+            "harness_session_id".to_owned(),
+            entry
+                .harness_session_id
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "harness".to_owned(),
+            entry
+                .harness
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
     ];
     // Omit null fields instead of writing explicit nulls.
     // The reader handles both forms, but omitting avoids round-trip
@@ -789,6 +853,8 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         first_output_bytes: optional_integer("first_output_bytes")?,
         restarted_from: optional_string("restarted_from")?,
         agent_config: optional_string("agent_config")?,
+        harness_session_id: optional_string("harness_session_id")?,
+        harness: optional_string("harness")?,
     };
     Ok(record)
 }
@@ -1709,6 +1775,8 @@ mod tests {
             first_output_bytes: None,
             restarted_from: None,
             agent_config: None,
+            harness_session_id: None,
+            harness: None,
         }
     }
 
@@ -1877,6 +1945,8 @@ mod tests {
             first_output_bytes: None,
             restarted_from: None,
             agent_config: None,
+            harness_session_id: None,
+            harness: None,
         };
         let json = agent_json(&record);
         let text = json.to_json();
@@ -1915,6 +1985,23 @@ mod tests {
             .unwrap();
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("agent-logs"));
+    }
+
+    #[test]
+    fn native_harness_thread_id_round_trips_and_is_preserved_for_resume() {
+        let file = path("agents-native-thread");
+        let registry = AgentRegistry::open(&file).unwrap();
+        let mut record = agent("native");
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some("thread-abc".to_owned());
+        registry.register(record).unwrap();
+        let still_running = registry.recover(|_| false).unwrap();
+        assert!(still_running.is_empty());
+        let reloaded = AgentRegistry::open(&file).unwrap();
+        let record = reloaded.get("native").unwrap();
+        assert_eq!(record.state, "running");
+        assert_eq!(record.harness.as_deref(), Some("codex"));
+        assert_eq!(record.harness_session_id.as_deref(), Some("thread-abc"));
     }
 
     #[test]

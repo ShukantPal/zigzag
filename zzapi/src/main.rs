@@ -264,6 +264,17 @@ enum AgentsCmd {
         /// Agent handle (unique prefix accepted)
         id: String,
     },
+    /// Send a live instruction to an interactive agent.
+    Message {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Interrupt the active turn with this instruction
+        #[arg(long, conflicts_with = "queue", required_unless_present = "queue")]
+        steer: Option<String>,
+        /// Append this instruction as the next turn
+        #[arg(long, conflicts_with = "steer", required_unless_present = "steer")]
+        queue: Option<String>,
+    },
     /// Gracefully stop an agent (leaves worktree)
     Stop {
         /// Agent handle (unique prefix accepted)
@@ -1050,6 +1061,33 @@ fn cmd_agents_resume(client: &Client, id: &str) -> Result<(), Fail> {
     Ok(())
 }
 
+fn cmd_agents_message(
+    client: &Client,
+    id: &str,
+    steer: Option<&str>,
+    queue: Option<&str>,
+) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let (text, delivery) = match (steer, queue) {
+        (Some(text), None) => (text, "steer"),
+        (None, Some(text)) => (text, "queue"),
+        _ => {
+            return Err(Fail::Config(
+                "provide exactly one of --steer or --queue".to_owned(),
+            ));
+        }
+    };
+    let body = serde_json::json!({"text":text,"delivery":delivery});
+    let response = client.post(&format!("/v1/agents/{id}/messages"), &body)?;
+    emit(client, &response, || {
+        println!(
+            "message accepted for {} ({delivery})",
+            s(&response, "agent_id")
+        )
+    });
+    Ok(())
+}
+
 fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
     let id = resolve_agent_id(client, id)?;
     let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
@@ -1699,6 +1737,9 @@ fn run(cli: Cli) -> Result<(), Fail> {
             ),
             AgentsCmd::Pause { id } => cmd_agents_pause(&client, &id),
             AgentsCmd::Resume { id } => cmd_agents_resume(&client, &id),
+            AgentsCmd::Message { id, steer, queue } => {
+                cmd_agents_message(&client, &id, steer.as_deref(), queue.as_deref())
+            }
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
             AgentsCmd::Logs {
                 id,
@@ -1976,6 +2017,39 @@ mod tests {
         ));
         assert!(validate_agents_create_options(None, true, None).is_ok());
         assert!(validate_agents_create_options(None, false, Some(123)).is_ok());
+    }
+
+    #[test]
+    fn agent_message_requires_exactly_one_delivery_mode() {
+        assert!(
+            Cli::try_parse_from([
+                "zzapi",
+                "agents",
+                "message",
+                "abc",
+                "--steer",
+                "change direction"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zzapi",
+                "agents",
+                "message",
+                "abc",
+                "--queue",
+                "after this turn"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["zzapi", "agents", "message", "abc"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "zzapi", "agents", "message", "abc", "--steer", "x", "--queue", "y"
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

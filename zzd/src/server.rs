@@ -43,6 +43,64 @@ pub(crate) struct Server {
 pub(crate) struct Supervisor {
     pub(crate) registry: Arc<AgentRegistry>,
     pub(crate) procs: Mutex<HashMap<String, ProcEntry>>,
+    /// One long-lived app-server per local isolation domain, multiplexed by thread ID.
+    pub(crate) codex_app_server: Mutex<Option<Arc<crate::harness::CodexServer>>>,
+    /// One loopback HTTP server per local isolation domain, multiplexed by session ID.
+    pub(crate) opencode_server: Mutex<Option<Arc<crate::harness::OpenCodeServer>>>,
+}
+
+impl Supervisor {
+    pub(crate) fn codex_server(&self) -> Result<Arc<crate::harness::CodexServer>, String> {
+        let mut current = self
+            .codex_app_server
+            .lock()
+            .map_err(|_| "app-server manager poisoned")?;
+        if let Some(server) = current.as_ref()
+            && server.is_running()
+        {
+            return Ok(Arc::clone(server));
+        }
+        *current = None;
+        let server = crate::harness::CodexServer::start()?;
+        *current = Some(Arc::clone(&server));
+        Ok(server)
+    }
+
+    pub(crate) fn opencode_server(&self) -> Result<Arc<crate::harness::OpenCodeServer>, String> {
+        let mut current = self
+            .opencode_server
+            .lock()
+            .map_err(|_| "OpenCode server manager poisoned")?;
+        if let Some(server) = current.as_ref()
+            && server.is_running()
+        {
+            return Ok(Arc::clone(server));
+        }
+        *current = None;
+        let server = crate::harness::OpenCodeServer::start()?;
+        *current = Some(Arc::clone(&server));
+        Ok(server)
+    }
+
+    pub(crate) fn stop_harness_servers(&self) -> Result<(), String> {
+        if let Some(server) = self
+            .codex_app_server
+            .lock()
+            .map_err(|_| "app-server manager poisoned")?
+            .take()
+        {
+            server.stop()?;
+        }
+        if let Some(server) = self
+            .opencode_server
+            .lock()
+            .map_err(|_| "OpenCode server manager poisoned")?
+            .take()
+        {
+            server.stop()?;
+        }
+        Ok(())
+    }
 }
 /// Admission control for inbound connections. The permit is held for the
 /// whole handler thread and released on drop, so at most `max` connections

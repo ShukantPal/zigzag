@@ -38,7 +38,8 @@ fn json_array(value: &Json) -> &[Json] {
 }
 
 fn agent_create_test_repo(id: &str) -> PathBuf {
-    let repo = std::env::temp_dir().join(format!("zigzag-agent-e2e-{id}"));
+    let repo = std::env::temp_dir().join(format!("zigzag-agent-e2e-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).expect("could not create agent test repository");
     for args in [
         vec!["init", "-b", "main"],
@@ -260,7 +261,8 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
     let id = unique_id("agent-api");
     let repo = agent_create_test_repo(&id);
     let branch = format!("codex/{id}");
-    let worktree = std::env::temp_dir().join(format!("zigzag-{id}"));
+    let worktree = std::env::temp_dir().join(format!("zigzag-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&worktree);
     let worktree_text = worktree.to_string_lossy();
     let body = format!(
         r#"{{"prompt":"keep running","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}"}}"#,
@@ -411,7 +413,8 @@ fn e2e_agent_create_persists_transcript_and_serves_it() {
     let id = unique_id("agent-transcript");
     let repo = agent_create_test_repo(&id);
     let branch = format!("codex/{id}");
-    let worktree = std::env::temp_dir().join(format!("zigzag-{id}"));
+    let worktree = std::env::temp_dir().join(format!("zigzag-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&worktree);
     let worktree_text = worktree.to_string_lossy();
     let body = format!(
         r#"{{"prompt":"persist-transcript","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}"}}"#,

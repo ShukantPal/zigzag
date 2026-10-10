@@ -755,6 +755,8 @@ fn recovery_replays_a_persisted_first_output_fact() {
         first_output_bytes: Some(3),
         restarted_from: None,
         agent_config: None,
+        harness_session_id: None,
+        harness: None,
     };
     replay_recovered_lifecycle(&store, &agent).unwrap();
     let events = store.timeline("task").unwrap();
@@ -798,6 +800,8 @@ fn prune_drops_finished_entries_past_the_retention_window() {
     let supervisor = Supervisor {
         registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
         procs: Mutex::new(HashMap::new()),
+        codex_app_server: Mutex::new(None),
+        opencode_server: Mutex::new(None),
     };
     let request = exec::ExecRequest {
         id: "old".to_owned(),
@@ -834,6 +838,8 @@ fn persistent_agent_streams_and_session_survive_relay_teardown() {
     let supervisor = Supervisor {
         registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
         procs: Mutex::new(HashMap::new()),
+        codex_app_server: Mutex::new(None),
+        opencode_server: Mutex::new(None),
     };
     let store = Arc::new(Store::open(registry_path.with_extension("events"), 10).unwrap());
     let spawned = spawn_proc(
@@ -1087,6 +1093,8 @@ pub(crate) fn test_server() -> (Arc<Server>, PathBuf) {
             supervisor: Supervisor {
                 registry: Arc::new(AgentRegistry::open(path.with_extension("agents")).unwrap()),
                 procs: Mutex::new(HashMap::new()),
+                codex_app_server: Mutex::new(None),
+                opencode_server: Mutex::new(None),
             },
             updater: Arc::new(update::Manager::new(update::Config {
                 directory: path.with_extension("updates"),
@@ -1837,6 +1845,11 @@ fn agent_route_selects_create_only_for_post_collection() {
         Some(AgentRoute::Create)
     ));
     assert!(agent_route("DELETE", "/v1/agents").is_none());
+    assert!(matches!(
+        agent_route("POST", "/v1/agents/abc/messages"),
+        Some(AgentRoute::Message("abc"))
+    ));
+    assert!(agent_route("GET", "/v1/agents/abc/messages").is_some());
 }
 
 #[test]
@@ -2004,6 +2017,8 @@ fn agent_record(id: &str) -> AgentRecord {
         paused_at: None,
         restarted_from: None,
         agent_config: None,
+        harness_session_id: None,
+        harness: None,
     }
 }
 
