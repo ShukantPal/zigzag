@@ -4,6 +4,7 @@ mod config;
 mod events;
 mod exec;
 mod github;
+mod harness;
 mod http;
 mod logging;
 mod proc;
@@ -101,6 +102,7 @@ fn run() -> Result<(), String> {
         supervisor: Supervisor {
             registry,
             procs: Mutex::new(HashMap::new()),
+            codex_app_server: Mutex::new(None),
         },
         updater: Arc::clone(&updater),
         review_state_file: config.review_state_file.clone(),
@@ -111,6 +113,47 @@ fn run() -> Result<(), String> {
         .supervisor
         .registry
         .recover(recovered_agent_identity_matches)?;
+    let native_threads: Vec<_> = state
+        .supervisor
+        .registry
+        .list(Some("running"), None)
+        .into_iter()
+        .filter_map(|agent| {
+            agent
+                .harness_session_id
+                .clone()
+                .map(|thread_id| (agent, thread_id))
+        })
+        .collect();
+    if !native_threads.is_empty() {
+        match state.supervisor.codex_server() {
+            Ok(app_server) => {
+                for (agent, thread_id) in native_threads {
+                    if let Err(error) = app_server.resume_thread(&thread_id) {
+                        log::error!(
+                            "could not resume Codex thread for agent {}: {error}",
+                            agent.id
+                        );
+                        let _ = state.supervisor.registry.transition(
+                            &agent.id,
+                            "lost_after_restart",
+                            None,
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                log::error!("could not restart app-server for durable threads: {error}");
+                for (agent, _) in native_threads {
+                    let _ =
+                        state
+                            .supervisor
+                            .registry
+                            .transition(&agent.id, "lost_after_restart", None);
+                }
+            }
+        }
+    }
     // Re-apply SIGSTOP to agents that were paused before the restart: their
     // process groups may still be alive. Dead groups are left for the recover
     // pass above, which marks the agents honestly.

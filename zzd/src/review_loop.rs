@@ -2927,6 +2927,8 @@ review_loop:
             first_output_bytes: None,
             restarted_from: None,
             agent_config: None,
+            harness_session_id: None,
+            harness: None,
         }
     }
 
@@ -2992,6 +2994,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),
@@ -3600,6 +3603,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: path.clone(),
@@ -3689,6 +3693,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),
@@ -3797,6 +3802,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),
@@ -4011,6 +4017,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),
@@ -4110,6 +4117,7 @@ review_loop:
             supervisor: Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),
@@ -4246,6 +4254,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::new(registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: path.with_extension("review-state"),
@@ -4314,6 +4323,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: review_state_path.clone(),
@@ -4377,6 +4387,7 @@ review_loop:
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: review_state_path.clone(),
@@ -4481,6 +4492,7 @@ review_loop:
                     "reviewer".to_owned(),
                     entry,
                 )])),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.with_extension("review-state"),
@@ -4533,6 +4545,7 @@ review_loop:
             supervisor: Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
+                codex_app_server: std::sync::Mutex::new(None),
             },
             updater: test_updater(),
             review_state_file: state_path.clone(),

@@ -105,6 +105,7 @@ pub(crate) enum AgentRoute<'a> {
     Transcript(&'a str),
     Pause(&'a str),
     Resume(&'a str),
+    Message(&'a str),
 }
 
 /// POST-only route: `/v1/agents/{id}/restart`.
@@ -133,6 +134,9 @@ pub(crate) fn agent_route<'a>(method: &'a str, path: &'a str) -> Option<AgentRou
     }
     if let Some(id) = rest.strip_suffix("/resume") {
         return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Resume(id));
+    }
+    if let Some(id) = rest.strip_suffix("/messages") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Message(id));
     }
     (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
 }
@@ -242,9 +246,10 @@ pub(crate) fn agent_request(
             }
         }
         // Pause, resume, and create are POST-only routes.
-        AgentRoute::Pause(_) | AgentRoute::Resume(_) | AgentRoute::Create => {
-            reply(stream, 404, error("not_found"))
-        }
+        AgentRoute::Pause(_)
+        | AgentRoute::Resume(_)
+        | AgentRoute::Message(_)
+        | AgentRoute::Create => reply(stream, 404, error("not_found")),
     }
 }
 
@@ -259,6 +264,7 @@ pub(crate) fn agent_post_request(
         AgentRoute::Create => agent_create_request(stream, state, body),
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
+        AgentRoute::Message(id) => agent_message_request(stream, state, id, body),
         _ => reply(stream, 404, error("not_found")),
     }
 }
@@ -270,6 +276,9 @@ fn pause_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Resu
     };
     if agent.state != "running" {
         return reply(stream, 409, error("agent_not_running"));
+    }
+    if agent.harness_session_id.is_some() {
+        return reply(stream, 409, error("thread_scoped_pause_unsupported"));
     }
     if agent.paused_at.is_some() {
         return reply(stream, 409, error("already_paused"));
@@ -310,6 +319,9 @@ fn resume_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Res
         return reply(stream, 409, error("not_paused"));
     }
     let process_group = agent.process_group;
+    if agent.harness_session_id.is_some() {
+        return reply(stream, 409, error("thread_scoped_resume_unsupported"));
+    }
     if unsafe { libc::kill(-process_group, libc::SIGCONT) } != 0 {
         log::warn!("agent_resume id={id} pgid={process_group}: SIGCONT failed");
     }
@@ -321,6 +333,106 @@ fn resume_agent_request(stream: &mut TcpStream, state: &Server, id: &str) -> Res
         Json::Object(vec![
             ("id".to_owned(), Json::String(id.to_owned())),
             ("paused".to_owned(), Json::Bool(false)),
+        ]),
+    )
+}
+
+fn agent_message_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    id: &str,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return reply(stream, 400, error("invalid_agent_message")),
+    };
+    let Some(object) = value.as_object() else {
+        return reply(stream, 400, error("invalid_agent_message"));
+    };
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "text" | "delivery"))
+    {
+        return reply(stream, 400, error("invalid_agent_message"));
+    }
+    let Some(text) = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return reply(stream, 400, error("invalid_agent_message"));
+    };
+    let delivery = match value
+        .get("delivery")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("steer")
+    {
+        "steer" => crate::harness::Delivery::Steer,
+        "queue" => crate::harness::Delivery::Queue,
+        _ => return reply(stream, 400, error("invalid_agent_message")),
+    };
+    let Some(agent) = state.supervisor.registry.get(id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if agent.state != "running" {
+        return reply(stream, 409, error("agent_not_running"));
+    }
+    let (Some(harness), Some(session_id)) = (
+        agent.harness.as_deref(),
+        agent.harness_session_id.as_deref(),
+    ) else {
+        return reply(stream, 409, error("agent_not_interactive"));
+    };
+    if harness != "codex" {
+        return reply(stream, 501, error("harness_message_unsupported"));
+    }
+    let server = match state.supervisor.codex_server() {
+        Ok(server) => server,
+        Err(message) => {
+            log::error!("could not start app-server: {message}");
+            return reply(stream, 503, error("harness_unavailable"));
+        }
+    };
+    let session = server.session(session_id.to_owned());
+    if let Err(message) = session.send(text, delivery) {
+        log::warn!("agent message dispatch failed id={id}: {message}");
+        return reply(stream, 503, error("harness_message_failed"));
+    }
+    let _ = state.store.add(relay_event(
+        "agent_message_accepted",
+        &agent.task_id,
+        &agent.execution_id,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(agent.id.clone())),
+            (
+                "delivery".to_owned(),
+                Json::String(
+                    match delivery {
+                        crate::harness::Delivery::Steer => "steer",
+                        crate::harness::Delivery::Queue => "queue",
+                    }
+                    .to_owned(),
+                ),
+            ),
+        ]),
+    ));
+    reply(
+        stream,
+        202,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(agent.id)),
+            ("accepted".to_owned(), Json::Bool(true)),
+            (
+                "delivery".to_owned(),
+                Json::String(
+                    match delivery {
+                        crate::harness::Delivery::Steer => "steer",
+                        crate::harness::Delivery::Queue => "queue",
+                    }
+                    .to_owned(),
+                ),
+            ),
         ]),
     )
 }
@@ -985,6 +1097,18 @@ fn agent_create_request(
     {
         return reply(stream, 500, error("could_not_persist_event"));
     }
+    #[cfg(not(test))]
+    if request.harness == "codex" {
+        return create_codex_thread(
+            stream,
+            state,
+            &request,
+            &task_id,
+            &execution_id,
+            &worktree_str,
+            &prompt_text,
+        );
+    }
     let deadline_at = request.timeout_secs.map(|secs| {
         unix_timestamp()
             .parse::<u64>()
@@ -1065,6 +1189,171 @@ fn agent_create_request(
             reply(stream, 500, error("could_not_spawn_process"))
         }
     }
+}
+
+#[cfg(not(test))]
+fn create_codex_thread(
+    stream: &mut TcpStream,
+    state: &Server,
+    request: &AgentCreateRequest,
+    task_id: &str,
+    execution_id: &str,
+    worktree: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let server = match state.supervisor.codex_server() {
+        Ok(server) => server,
+        Err(message) => {
+            log::error!("could not start codex app-server: {message}");
+            return reply(stream, 503, error("could_not_start_app_server"));
+        }
+    };
+    let thread_id = match server.start_thread(task_id, worktree, prompt) {
+        Ok(id) => id,
+        Err(message) => {
+            log::error!("could not start codex thread: {message}");
+            return reply(stream, 503, error("could_not_start_agent_thread"));
+        }
+    };
+    let id = match random_hex_128() {
+        Ok(id) => id,
+        Err(_) => return reply(stream, 500, error("could_not_create_agent")),
+    };
+    let pid = server.pid() as i32;
+    let record = AgentRecord {
+        id: id.clone(),
+        task_id: task_id.to_owned(),
+        execution_id: execution_id.to_owned(),
+        leader_pid: pid,
+        process_group: pid,
+        process_identity: None,
+        worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
+        started_at: unix_timestamp(),
+        deadline_at: request.timeout_secs.map(|seconds| {
+            unix_timestamp()
+                .parse::<u64>()
+                .unwrap_or(0)
+                .saturating_add(seconds)
+                .to_string()
+        }),
+        command: "codex app-server thread".to_owned(),
+        state: "running".to_owned(),
+        paused_at: None,
+        exit_code: None,
+        log_degraded: false,
+        audit_degraded: false,
+        redacted: false,
+        stdout_next: 0,
+        stderr_next: 0,
+        stdout_dropped_before: 0,
+        stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
+        first_output_at: None,
+        first_output_stream: None,
+        first_output_bytes: None,
+        restarted_from: None,
+        agent_config: None,
+        harness_session_id: Some(thread_id.clone()),
+        harness: Some("codex".to_owned()),
+    };
+    if state.supervisor.registry.register(record).is_err() {
+        let _ = server.session(thread_id.clone()).interrupt();
+        return reply(stream, 500, error("could_not_persist_agent"));
+    }
+    let config = persisted_agent_config(request, worktree, prompt);
+    if state
+        .supervisor
+        .registry
+        .set_agent_config(&id, &config)
+        .is_err()
+        || state
+            .supervisor
+            .registry
+            .set_harness_session(&id, "codex", &thread_id)
+            .is_err()
+    {
+        return reply(stream, 500, error("could_not_persist_agent_config"));
+    }
+    let _ = state.store.add(relay_event(
+        "process_spawned",
+        task_id,
+        execution_id,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(id.clone())),
+            ("thread_id".to_owned(), Json::String(thread_id.clone())),
+        ]),
+    ));
+    let events = server.session(thread_id.clone()).events();
+    let store = Arc::clone(&state.store);
+    let id_watch = id.clone();
+    let task_watch = task_id.to_owned();
+    let execution_watch = execution_id.to_owned();
+    thread::spawn(move || {
+        let transcript = agent_transcript_path(&id_watch);
+        while let Ok(event) = events.recv() {
+            let crate::harness::HarnessEvent::Notification(value) = event;
+            if let Some(path) = transcript.as_ref()
+                && let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", value);
+            }
+            let method = value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let _ = store.add(relay_event(
+                "agent_harness_event",
+                &task_watch,
+                &execution_watch,
+                Json::Object(vec![
+                    ("agent_id".to_owned(), Json::String(id_watch.clone())),
+                    ("method".to_owned(), Json::String(method.to_owned())),
+                ]),
+            ));
+            if method == "turn/completed" {
+                let _ = store.add(relay_event(
+                    "agent_turn_completed",
+                    &task_watch,
+                    &execution_watch,
+                    Json::Object(vec![
+                        ("agent_id".to_owned(), Json::String(id_watch.clone())),
+                        (
+                            "state".to_owned(),
+                            Json::String(
+                                value
+                                    .pointer("/params/turn/status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("completed")
+                                    .to_owned(),
+                            ),
+                        ),
+                    ]),
+                ));
+            }
+        }
+    });
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id)),
+            ("thread_id".to_owned(), Json::String(thread_id)),
+            (
+                "worktree".to_owned(),
+                if request.no_branch {
+                    Json::Null
+                } else {
+                    Json::String(worktree.to_owned())
+                },
+            ),
+            ("working_dir".to_owned(), Json::String(worktree.to_owned())),
+        ]),
+    )
 }
 
 pub(crate) fn persisted_agent_config(
@@ -1481,6 +1770,33 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     };
     if !matches!(agent.state.as_str(), "running" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));
+    }
+    if let (Some("codex"), Some(thread_id)) = (
+        agent.harness.as_deref(),
+        agent.harness_session_id.as_deref(),
+    ) {
+        let server = match state.supervisor.codex_server() {
+            Ok(server) => server,
+            Err(_) => return reply(stream, 503, error("harness_unavailable")),
+        };
+        if server.has_active_turn(thread_id)
+            && server.session(thread_id.to_owned()).interrupt().is_err()
+        {
+            return reply(stream, 503, error("harness_interrupt_failed"));
+        }
+        let _ = state.supervisor.registry.transition(id, "stopped", None);
+        return reply(
+            stream,
+            200,
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(id.to_owned())),
+                ("stopped".to_owned(), Json::Bool(true)),
+                (
+                    "worktree".to_owned(),
+                    agent.worktree_path.map(Json::String).unwrap_or(Json::Null),
+                ),
+            ]),
+        );
     }
     let pgid = agent.process_group;
     let worktree = agent.worktree_path.clone();

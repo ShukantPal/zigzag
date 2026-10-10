@@ -217,6 +217,8 @@ pub(crate) fn spawn_proc(
         first_output_bytes: None,
         restarted_from: None,
         agent_config: None,
+        harness_session_id: None,
+        harness: None,
     };
     // The registry transition commits before this spawn can be acknowledged.
     if let Err(error) = supervisor.registry.register(record) {
