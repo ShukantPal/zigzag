@@ -289,8 +289,6 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Mark formerly live agents honestly after a relay restart.  The caller
-    /// supplies a non-signalling identity probe; no lost pipe is ever reattached.
     /// Record restart linkage on a freshly spawned agent: which agent it was
     /// restarted from, and carry over the original creation config so the new
     /// agent can itself be restarted later.
@@ -342,6 +340,11 @@ impl AgentRegistry {
         *entries = updated;
         Ok(Some(result))
     }
+    /// Recover formerly live agents after a relay restart. The caller supplies
+    /// a non-signalling identity probe. Live, identity-verified agents remain
+    /// running and are monitored by the new relay; only processes that are
+    /// already gone are marked lost. The returned records are replayed into
+    /// the lifecycle event store.
     pub fn recover<F>(&self, process_is_current: F) -> Result<Vec<AgentRecord>, String>
     where
         F: Fn(&AgentRecord) -> bool,
@@ -352,17 +355,22 @@ impl AgentRegistry {
             .map_err(|_| "agent registry lock poisoned".to_owned())?;
         let mut updated = entries.clone();
         let mut changed = Vec::new();
+        let mut state_changed = false;
         for entry in updated.values_mut() {
-            if entry.state == "running" {
-                entry.state = if process_is_current(entry) {
-                    "orphaned".to_owned()
+            if matches!(entry.state.as_str(), "running" | "orphaned") {
+                let recovered_state = if process_is_current(entry) {
+                    "running"
                 } else {
-                    "lost_after_restart".to_owned()
+                    "lost_after_restart"
                 };
+                if entry.state != recovered_state {
+                    entry.state = recovered_state.to_owned();
+                    state_changed = true;
+                }
                 changed.push(entry.clone());
             }
         }
-        if !changed.is_empty() {
+        if state_changed {
             self.save(&updated)?;
             *entries = updated;
         }
@@ -1721,11 +1729,15 @@ mod tests {
         gone.process_group = 99;
         gone.process_identity = Some("test:99".to_owned());
         registry.register(gone).unwrap();
+        let mut legacy_orphan = agent("legacy-orphan");
+        legacy_orphan.state = "orphaned".to_owned();
+        registry.register(legacy_orphan).unwrap();
         let changed = registry
             .recover(|record| record.process_identity.as_deref() == Some("test:42"))
             .unwrap();
-        assert_eq!(changed.len(), 2);
-        assert_eq!(registry.get("live").unwrap().state, "orphaned");
+        assert_eq!(changed.len(), 3);
+        assert_eq!(registry.get("live").unwrap().state, "running");
+        assert_eq!(registry.get("legacy-orphan").unwrap().state, "running");
         assert_eq!(registry.get("gone").unwrap().state, "lost_after_restart");
         registry
             .append_log("live", "stdout", b"Bearer secret-value\n")

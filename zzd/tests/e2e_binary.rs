@@ -68,6 +68,19 @@ impl TestRelay {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tailscale, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+        // The agent-restart E2E drives the real agent API without requiring
+        // an installed CLI. Keep the fake harness alive after its daemon dies.
+        let codex = bin_dir.join("codex");
+        std::fs::write(
+            &codex,
+            "#!/bin/sh\necho started >> \"$HOME/fake-agent.started\"\nexec sleep 300\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let path = format!(
             "{}:{}",
             bin_dir.display(),
@@ -86,6 +99,8 @@ impl TestRelay {
             .arg("0")
             .env("PATH", path)
             .env("HOME", &dir)
+            .env("ZIGZAG_WORKTREE_ROOTS", &dir)
+            .env("ZIGZAG_WORKTREE_REPO_ROOT", &dir)
             .env("ZIGZAG_UPDATE_POLICY", "paused")
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -150,6 +165,50 @@ impl TestRelay {
     fn authed(&self, method: &str, target: &str, body: Option<&str>) -> (u16, String) {
         self.http(method, target, body, Some(&self.secret))
     }
+
+    fn restart(&mut self) {
+        self.child
+            .kill()
+            .expect("could not stop daemon for restart");
+        self.child.wait().expect("could not reap old daemon");
+
+        let bin_dir = self.dir.join("bin");
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let secret_file = self.dir.join("daemon.token");
+        let state_file = self.dir.join("events.json");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_zigzag"))
+            .arg("--secret-file")
+            .arg(&secret_file)
+            .arg("--state-file")
+            .arg(&state_file)
+            .arg("--port")
+            .arg("0")
+            .arg("--socket-port")
+            .arg("0")
+            .env("PATH", path)
+            .env("HOME", &self.dir)
+            .env("ZIGZAG_WORKTREE_ROOTS", &self.dir)
+            .env("ZIGZAG_WORKTREE_REPO_ROOT", &self.dir)
+            .env("ZIGZAG_UPDATE_POLICY", "paused")
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("failed to restart zigzag daemon");
+        self.port = wait_for_listening(&mut child);
+        assert!(
+            child
+                .try_wait()
+                .expect("could not poll restarted daemon")
+                .is_none(),
+            "daemon exited during restart"
+        );
+        self.child = child;
+    }
 }
 
 impl Drop for TestRelay {
@@ -160,10 +219,10 @@ impl Drop for TestRelay {
     }
 }
 
-/// Find an IP address (other than 127.0.0.1) that this machine can bind,
-/// for the fake `tailscale ip -4`. Prefers loopback aliases (Linux CI),
-/// falls back to the default route's local address (macOS, where the 127/8
-/// aliases are not bindable).
+/// Find an IP address that this machine can bind for the fake `tailscale ip
+/// -4`. Prefers loopback aliases (Linux CI), then the default route's address
+/// (macOS), and finally loopback for restricted test sandboxes. Tests use
+/// ephemeral ports, so two loopback listeners still bind independently.
 fn bindable_tailnet_ip() -> String {
     for candidate in ["127.0.0.2", "127.0.0.3"] {
         if std::net::TcpListener::bind((candidate, 0)).is_ok() {
@@ -181,7 +240,7 @@ fn bindable_tailnet_ip() -> String {
             return ip;
         }
     }
-    panic!("no bindable non-loopback address found for the fake tailscale");
+    "127.0.0.1".to_owned()
 }
 
 /// Drain the daemon's stderr until the `listening on http://127.0.0.1:PORT`
@@ -335,6 +394,54 @@ fn binary_agents_endpoints() {
 
     let (status, _) = relay.authed("GET", "/v1/agents?bogus=1", None);
     assert_eq!(status, 400, "bad agent query not rejected");
+}
+
+#[test]
+fn binary_agent_remains_tracked_across_real_daemon_restart() {
+    let mut relay = TestRelay::start();
+    // Use the test sandbox as both allowed project root and repository root.
+    // no_branch avoids creating a worktree; the fake Codex executable is a
+    // real detached child process that survives killing the daemon.
+    let project_dir = relay.dir.display().to_string();
+    let body = format!(
+        r#"{{"prompt":"keep running for restart test","project_dir":"{project_dir}","no_branch":true,"no_auto_pr":true}}"#
+    );
+    let (status, created) = relay.authed("POST", "/v1/agents", Some(&body));
+    assert_eq!(status, 200, "agent create failed: {created}");
+    let agent_id = created
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .expect("agent create response omitted id")
+        .to_owned();
+
+    let old_daemon_pid = relay.child.id();
+    relay.restart();
+    assert_ne!(
+        relay.child.id(),
+        old_daemon_pid,
+        "daemon process was not replaced"
+    );
+
+    let (status, agent) = relay.authed("GET", &format!("/v1/agents/{agent_id}"), None);
+    assert_eq!(
+        status, 200,
+        "agent disappeared after daemon restart: {agent}"
+    );
+    assert!(
+        agent.contains(r#""state":"running""#),
+        "live agent was not recovered as tracked: {agent}"
+    );
+    let (status, listing) = relay.authed("GET", "/v1/agents?state=running", None);
+    assert_eq!(status, 200, "agent listing failed after restart: {listing}");
+    assert!(
+        listing.contains(&agent_id),
+        "running agent missing from list: {listing}"
+    );
+
+    // Stop the detached child so the E2E leaves no process behind.
+    let (status, stopped) = relay.authed("DELETE", &format!("/v1/agents/{agent_id}"), None);
+    assert_eq!(status, 200, "could not clean up test agent: {stopped}");
 }
 
 #[test]

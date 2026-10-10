@@ -2638,9 +2638,7 @@ fn kill_agents_with(
             match agent.state.as_str() {
                 "running" | "orphaned" if process_is_current(&agent) => {
                     kill(agent.process_group);
-                    if agent.state == "orphaned" {
-                        let _ = registry.transition(agent_id, "cleanup_forced", None);
-                    }
+                    let _ = registry.transition(agent_id, "cleanup_forced", None);
                 }
                 // Even a record still labelled running can lag process exit
                 // and PID reuse until the reaper runs. Every cleanup signal
@@ -4301,9 +4299,9 @@ review_loop:
 
         let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
         registry.recover(recovered_agent_identity_matches).unwrap();
-        assert_eq!(registry.get("current").unwrap().state, "orphaned");
+        assert_eq!(registry.get("current").unwrap().state, "running");
         assert_eq!(registry.get("reused").unwrap().state, "lost_after_restart");
-        assert_eq!(registry.get("legacy").unwrap().state, "orphaned");
+        assert_eq!(registry.get("legacy").unwrap().state, "lost_after_restart");
 
         let state_path = registry_path.with_extension("events");
         let review_state_path = registry_path.with_extension("review-state");
@@ -4335,10 +4333,7 @@ review_loop:
         .unwrap();
         assert_eq!(store.state.rounds[&key].phase, RoundPhase::Superseded);
         assert_eq!(registry.get("current").unwrap().state, "cleanup_forced");
-        assert_eq!(
-            registry.get("legacy").unwrap().state,
-            "cleanup_skipped_unverified"
-        );
+        assert_eq!(registry.get("legacy").unwrap().state, "lost_after_restart");
         child.wait().unwrap();
 
         let _ = fs::remove_file(registry_path);
