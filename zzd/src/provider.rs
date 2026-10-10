@@ -166,12 +166,13 @@ impl Provider for OpenCodeProvider {
         "opencode"
     }
     fn spawn_argv(&self, opts: &AgentOpts) -> Result<Vec<String>, String> {
-        // `opencode run` with `--` before the prompt so prompt text is never
-        // parsed as flags. Stdin must be closed (the relay does this) or
-        // `opencode run` waits for an interactive session.
+        // `--format json` streams raw JSON events to stdout for the durable
+        // agent transcript. Keep `--` before the prompt so prompt text is
+        // never parsed as flags. Stdin must be closed (the relay does this)
+        // or `opencode run` waits for an interactive session.
         // NOTE: for the attested pilot flow, use the `opencode-launch`
         // wrapper script (PR #10) instead of invoking `opencode` directly.
-        let mut argv = vec!["run".to_owned()];
+        let mut argv = vec!["run".to_owned(), "--format".to_owned(), "json".to_owned()];
         if let Some(model) = &opts.model {
             argv.push("--model".to_owned());
             argv.push(model.clone());
@@ -259,10 +260,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_argv_uses_double_dash() {
+    fn opencode_argv_uses_json_format_before_double_dash() {
         let argv = OpenCodeProvider.spawn_argv(&opts()).unwrap();
         assert_eq!(argv[0], "run");
         let dash = argv.iter().position(|a| a == "--").expect("-- separator");
+        assert!(argv.windows(2).any(|args| args == ["--format", "json"]));
+        let format = argv.iter().position(|a| a == "--format").unwrap();
+        assert!(format < dash, "JSON format flag must precede --");
         assert_eq!(argv[dash + 1], "hello");
     }
 

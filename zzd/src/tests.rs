@@ -1735,6 +1735,9 @@ fn agent_argv_maps_common_options_for_each_harness() {
             .any(|v| v == ["--model", "anthropic/claude"])
     );
     assert!(opencode.iter().any(|v| v == "--auto"));
+    assert!(opencode.windows(2).any(|v| v == ["--format", "json"]));
+    let separator = opencode.iter().position(|v| v == "--").unwrap();
+    assert!(opencode.iter().position(|v| v == "--format").unwrap() < separator);
     assert_eq!(opencode.last().map(String::as_str), Some("do it"));
     assert_eq!(
         agent_harness_config("opencode", "suggest").as_deref(),

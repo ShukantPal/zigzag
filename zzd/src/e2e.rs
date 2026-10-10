@@ -402,19 +402,20 @@ fn e2e_agent_no_branch_runs_in_project_without_worktree_or_checkout() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
-/// API-created Codex agents save their JSON event stream outside the bounded
-/// diagnostics spool, so it remains available through the transcript API.
+/// API-created OpenCode agents save their JSON event stream outside the
+/// bounded diagnostics spool, so it remains available through the transcript
+/// API.
 #[test]
-fn e2e_agent_create_persists_transcript_and_serves_it() {
+fn e2e_opencode_agent_create_persists_transcript_and_serves_it() {
     let (state, _state_path) = test_server();
     let policy = test_policy();
-    let id = unique_id("agent-transcript");
+    let id = unique_id("opencode-agent-transcript");
     let repo = agent_create_test_repo(&id);
     let branch = format!("codex/{id}");
     let worktree = std::env::temp_dir().join(format!("zigzag-{id}"));
     let worktree_text = worktree.to_string_lossy();
     let body = format!(
-        r#"{{"prompt":"persist-transcript","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}"}}"#,
+        r#"{{"prompt":"persist-transcript","project_dir":"{}","branch":"{branch}","worktree":"{worktree_text}","harness":"opencode"}}"#,
         repo.display()
     );
 
