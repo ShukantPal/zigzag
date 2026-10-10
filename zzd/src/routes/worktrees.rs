@@ -9,8 +9,7 @@ use zz::{Json, parse_json};
 /// Roots the relay may create or remove git worktrees under. Candidate paths
 /// are canonicalized before the prefix check, so `..` segments and symlinks
 /// cannot escape the root.
-pub(crate) const WORKTREE_ALLOWED_ROOTS: [&str; 2] =
-    ["/private/tmp/", "/Users/shukant/.codex/worktrees/"];
+pub(crate) const LEGACY_WORKTREE_ROOT: &str = "/Users/shukant/.codex/worktrees/";
 /// Root the `repo` parameter of worktree creation must live under, so callers
 /// cannot point `git worktree add` at an arbitrary repository.
 pub(crate) const WORKTREE_REPO_ROOT: &str = "/Users/shukant/Workspace/";
@@ -25,13 +24,41 @@ pub(crate) struct WorktreeError {
 /// Canonicalize each configured root, dropping roots that do not exist. An
 /// empty result rejects every path (fail closed).
 pub(crate) fn canonical_worktree_roots() -> Vec<PathBuf> {
-    let roots: Vec<PathBuf> = std::env::var_os("ZIGZAG_WORKTREE_ROOTS")
-        .map(|value| std::env::split_paths(&value).collect())
-        .unwrap_or_else(|| WORKTREE_ALLOWED_ROOTS.iter().map(PathBuf::from).collect());
+    let configured_roots = std::env::var_os("ZIGZAG_WORKTREE_ROOTS");
+    let roots: Vec<PathBuf> = configured_roots
+        .as_ref()
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_else(|| {
+            vec![
+                configured_worktree_base(),
+                PathBuf::from(LEGACY_WORKTREE_ROOT),
+            ]
+        });
+    if let Some(base) = roots.first() {
+        // The default root lives under the user's home and may not exist on a
+        // fresh install. Create it before canonicalizing the allowed roots.
+        let _ = std::fs::create_dir_all(base);
+    }
     roots
         .into_iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect()
+}
+
+/// Base used for automatically selected agent worktrees. The explicit base
+/// setting wins; otherwise the first configured allowed root is also the
+/// default. With no overrides, worktrees live under `~/.zigzag/worktrees`.
+pub(crate) fn configured_worktree_base() -> PathBuf {
+    std::env::var_os("ZIGZAG_WORKTREE_BASE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("ZIGZAG_WORKTREE_ROOTS")
+                .and_then(|roots| std::env::split_paths(&roots).next())
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".zigzag/worktrees"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".zigzag/worktrees"))
 }
 
 /// Root accepted for repositories used by worktree and agent creation.

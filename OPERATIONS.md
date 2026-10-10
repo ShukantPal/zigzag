@@ -107,11 +107,11 @@ zigzag updates --dir ~/.codex/zigzag/relay status|pause|pin VERSION|unpin
 
 ### Relay-native agents and worktrees
 
-The relay agent path is intentionally narrower than `/v1/exec`: callers select a provider-level request, not arbitrary binary/arguments. `POST /v1/agents` accepts a prompt (inline or file path), `project_dir`, and one of `branch`, `no_branch`, or `pr`, plus optional `worktree`, `model`, `approval_mode`, and `timeout_secs`. Branch and PR modes run in a supervised worktree (default under `/private/tmp/<branch-slug>/`). No-branch mode runs directly in `project_dir` without creating a worktree or checking out a branch; the CLI requires explicit `--no-branch` to select it. Capacity is bounded (default 16 agents).
+The relay agent path is intentionally narrower than `/v1/exec`: callers select a provider-level request, not arbitrary binary/arguments. `POST /v1/agents` accepts a prompt (inline or file path), `project_dir`, and one of `branch`, `no_branch`, or `pr`, plus optional `worktree`, `model`, `approval_mode`, and `timeout_secs`. Branch and PR modes run in a supervised worktree (default under `~/.zigzag/worktrees/<branch-slug>/`). Set `ZIGZAG_WORKTREE_BASE` to choose another default base; `ZIGZAG_WORKTREE_ROOTS` sets the allowed roots and, when used alone, its first root becomes the default base. No-branch mode runs directly in `project_dir` without creating a worktree or checking out a branch; the CLI requires explicit `--no-branch` to select it. Capacity is bounded (default 16 agents).
 
 The registry reaper records terminal exit. A relay restart cannot reattach old pipes: a still-alive group becomes `orphaned`; a dead former group becomes `lost_after_restart`. Terminal registry entries and spool metadata are pruned after seven days. The generic spawn compatibility path does not create the same full transcript file; API-created agents do.
 
-`POST /v1/worktrees` and `DELETE /v1/worktrees` are explicit worktree helpers. They canonicalize paths, restrict them to approved roots (`/private/tmp` or `/Users/shukant/.codex/worktrees`), reject traversal/unusable paths, and refuse to remove a worktree used by a live agent. Stopping an agent leaves its worktree; cleanup is a separate, deliberate action.
+`POST /v1/worktrees` and `DELETE /v1/worktrees` are explicit worktree helpers. They canonicalize paths, restrict them to approved roots (by default `~/.zigzag/worktrees` or `/Users/shukant/.codex/worktrees`), reject traversal/unusable paths, and refuse to remove a worktree used by a live agent. `ZIGZAG_WORKTREE_ROOTS` replaces the allowed-root list. Stopping an agent leaves its worktree; cleanup is a separate, deliberate action.
 
 ### Event and completion model
 
