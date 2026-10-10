@@ -846,8 +846,12 @@ pub(super) fn cmd_status(
                         transcript_scroll = 0;
                     }
                 }
-                Some(KeyCode::PageDown) => transcript_scroll = transcript_scroll.saturating_add(10),
-                Some(KeyCode::PageUp) => transcript_scroll = transcript_scroll.saturating_sub(10),
+                Some(KeyCode::PageDown) | Some(KeyCode::Char(']')) => {
+                    transcript_scroll = transcript_scroll.saturating_add(10)
+                }
+                Some(KeyCode::PageUp) | Some(KeyCode::Char('[')) => {
+                    transcript_scroll = transcript_scroll.saturating_sub(10)
+                }
                 Some(KeyCode::Char('v')) => raw_view = !raw_view,
                 Some(KeyCode::Enter) | Some(KeyCode::Char(' ')) if transcript_focus => {
                     if let Some(item) = transcript_items.get(transcript_selected)
