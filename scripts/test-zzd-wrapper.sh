@@ -41,6 +41,23 @@ cat > "$TMP/bin/launchctl" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >> "$ZZD_LAUNCHCTL_LOG"
 SH
+cat > "$TMP/bin/security" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$ZZD_SECURITY_LOG"
+grep -q 'echo old-daemon' "$ZZD_BINARY_PATH"
+candidate=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = -T ]; then
+    candidate="$2"
+    break
+  fi
+  shift
+done
+[ -n "$candidate" ] && [ -x "$candidate" ]
+if [ "${ZZD_SECURITY_FAIL:-0}" = 1 ]; then
+  exit 1
+fi
+SH
 cat > "$TMP/install/zigzag" <<'SH'
 #!/bin/sh
 echo old-daemon
@@ -76,14 +93,35 @@ export ZZD_BINARY_PATH="$TMP/install/zigzag"
 export ZZD_RELEASE_API_URL="https://api.github.com/repos/ShukantPal/zigzag/releases/latest"
 export ZZD_FIXTURES="$TMP/fixtures"
 export ZZD_LAUNCHCTL_LOG="$TMP/launchctl.log"
+export ZZD_SECURITY_LOG="$TMP/security.log"
+export HOME="$TMP/home"
+mkdir -p "$HOME/Library/Keychains"
+touch "$HOME/Library/Keychains/login.keychain-db"
 
 "$WRAPPER" --probe > "$TMP/update-output" 2> "$TMP/update-error"
 [ "$(cat "$TMP/install/zigzag.version")" = v0.1.2 ]
 grep -q 'kickstart -k gui/' "$TMP/launchctl.log"
+grep -q -- '-U -a exec-allowlist -s zigzag -T .*login.keychain-db' "$TMP/security.log"
+[ "$(wc -l < "$TMP/security.log" | tr -d ' ')" = 1 ]
 
 # On the next launch, the installed version marker suppresses another restart.
 "$WRAPPER" --probe > "$TMP/normal-output"
 grep -q '^new-daemon$' "$TMP/normal-output"
+[ "$(wc -l < "$TMP/launchctl.log" | tr -d ' ')" = 1 ]
+
+# If ACL carry-forward fails, keep the installed daemon and version intact.
+cat > "$TMP/install/zigzag" <<'SH'
+#!/bin/sh
+echo old-daemon
+SH
+chmod +x "$TMP/install/zigzag"
+printf 'v0.1.1\n' > "$TMP/install/zigzag.version"
+export ZZD_SECURITY_FAIL=1
+"$WRAPPER" --probe > "$TMP/acl-failure-output" 2> "$TMP/acl-failure-error"
+unset ZZD_SECURITY_FAIL
+grep -q '^old-daemon$' "$TMP/acl-failure-output"
+grep -q 'could not authorize verified update' "$TMP/acl-failure-error"
+[ "$(cat "$TMP/install/zigzag.version")" = v0.1.1 ]
 [ "$(wc -l < "$TMP/launchctl.log" | tr -d ' ')" = 1 ]
 
 # A bad digest must not replace the daemon or request a restart.
@@ -96,9 +134,9 @@ m["sha256"] = "0" * 64
 p.write_text(json.dumps(m))
 PYBAD
 "$WRAPPER" --probe > "$TMP/rejected-output" 2> "$TMP/rejected-error"
-grep -q '^new-daemon$' "$TMP/rejected-output"
+grep -q '^old-daemon$' "$TMP/rejected-output"
 grep -q 'SHA-256 mismatch' "$TMP/rejected-error"
 [ "$(cat "$TMP/install/zigzag.version")" = v0.1.1 ]
 [ "$(wc -l < "$TMP/launchctl.log" | tr -d ' ')" = 1 ]
 
-echo "zzd wrapper update, no-op, and rejection paths passed"
+echo "zzd wrapper update, Keychain ACL, no-op, and rejection paths passed"

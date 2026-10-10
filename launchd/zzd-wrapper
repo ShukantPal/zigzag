@@ -14,7 +14,7 @@ BINARY="${ZZD_BINARY_PATH:-$INSTALL_DIR/zigzag}"
 VERSION_FILE="$INSTALL_DIR/zigzag.version"
 
 fail() { echo "zzd-wrapper: $*" >&2; exit 1; }
-for tool in curl python3 shasum codesign launchctl; do
+for tool in curl python3 shasum codesign launchctl security; do
   command -v "$tool" >/dev/null 2>&1 || fail "required command not found: $tool"
 done
 [ "$(uname -s)" = Darwin ] || fail "this wrapper supports macOS only"
@@ -119,6 +119,17 @@ if ! codesign --verify --strict --deep --verbose=2 "-R=$REQUIREMENT" "$TMP/$ASSE
 fi
 
 chmod 755 "$TMP/$ASSET"
+# Carry the verified replacement into the existing item's trusted-app ACL
+# before swapping binaries. `-U` updates the ACL while preserving the current
+# password data; do not pass `-w` here. The keyring item is service=zigzag,
+# account=exec-allowlist, stored in the user's login keychain.
+LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+if ! security add-generic-password -U \
+    -a exec-allowlist -s zigzag \
+    -T "$TMP/$ASSET" "$LOGIN_KEYCHAIN"; then
+  echo "zzd-wrapper: could not authorize verified update for Keychain access; starting installed daemon" >&2
+  run_daemon "$@"
+fi
 mv -f "$TMP/$ASSET" "$BINARY"
 printf '%s\n' "$TAG" > "$TMP/version"
 mv -f "$TMP/version" "$VERSION_FILE"
