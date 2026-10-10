@@ -1,5 +1,5 @@
 [workspace]
-members = ["relay-core", "relay", "poller", "cli"]
+members = ["zz", "zzd", "zzapi"]
 resolver = "2"
 
 [workspace.package]

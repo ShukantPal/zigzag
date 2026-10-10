@@ -5,10 +5,10 @@ use crate::proc::{
     process_group_running, prune_procs, sync_durable_output,
 };
 use crate::server::Server;
-use relay_core::{AgentRegistry, Json, Store};
 use std::net::TcpStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use zz::{AgentRegistry, Json, Store};
 
 pub(crate) enum ProcRoute<'a> {
     Poll(&'a str),
@@ -184,11 +184,11 @@ pub(crate) fn update_proc_status_with_handle(
     }
 }
 
-fn auto_create_pr_if_needed(agent: &relay_core::AgentRecord) {
+fn auto_create_pr_if_needed(agent: &zz::AgentRecord) {
     let Some(config_text) = agent.agent_config.as_deref() else {
         return;
     };
-    let Ok(config) = relay_core::parse_json(config_text) else {
+    let Ok(config) = zz::parse_json(config_text) else {
         return;
     };
     let Json::Object(fields) = config else { return };

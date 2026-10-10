@@ -8,8 +8,6 @@ use crate::proc::{
 use crate::server::Server;
 use crate::session::require_gui_login_session;
 use regex::Regex;
-use relay_core::AgentRegistry;
-use relay_core::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +17,8 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::AgentRegistry;
+use zz::Json;
 
 const CONFIG_SCHEMA: &str = include_str!("config-v1.json");
 const REVIEWER_RESULT_SCHEMA: &str = include_str!("reviewer-result-v1.json");
@@ -2623,7 +2623,7 @@ fn latest_managed_agent_for_task(registry: &AgentRegistry, task_id: &str) -> Opt
 fn kill_agents_with(
     registry: &AgentRegistry,
     agent_ids: &[String],
-    process_is_current: impl Fn(&relay_core::AgentRecord) -> bool,
+    process_is_current: impl Fn(&zz::AgentRecord) -> bool,
     mut kill: impl FnMut(i32),
 ) -> Vec<String> {
     let mut unverified = Vec::new();
@@ -2892,8 +2892,8 @@ review_loop:
         }
     }
 
-    fn agent(id: &str, task_id: &str, process_group: i32, state: &str) -> relay_core::AgentRecord {
-        relay_core::AgentRecord {
+    fn agent(id: &str, task_id: &str, process_group: i32, state: &str) -> zz::AgentRecord {
+        zz::AgentRecord {
             id: id.to_owned(),
             task_id: task_id.to_owned(),
             execution_id: format!("execution-{id}"),
@@ -2982,7 +2982,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -3590,7 +3590,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -3679,7 +3679,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -3787,7 +3787,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4001,7 +4001,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::new(AgentRegistry::open(&registry_path).unwrap()),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4100,7 +4100,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4236,7 +4236,7 @@ review_loop:
         let server = Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            store: Arc::new(zz::Store::open(&state_path, 1).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::new(registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4304,7 +4304,7 @@ review_loop:
         let server = Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            store: Arc::new(zz::Store::open(&state_path, 1).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4367,7 +4367,7 @@ review_loop:
         let server = Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            store: Arc::new(zz::Store::open(&state_path, 1).unwrap()),
             supervisor: Supervisor {
                 registry: Arc::clone(&registry),
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4468,7 +4468,7 @@ review_loop:
         let server = Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&state_path, 1).unwrap()),
+            store: Arc::new(zz::Store::open(&state_path, 1).unwrap()),
             supervisor: Supervisor {
                 registry,
                 procs: Mutex::new(std::collections::HashMap::from([(
@@ -4523,7 +4523,7 @@ review_loop:
         let server = Arc::new(Server {
             secret: "x".repeat(32),
             control_secret: Some("x".repeat(32)),
-            store: Arc::new(relay_core::Store::open(&event_path, 10).unwrap()),
+            store: Arc::new(zz::Store::open(&event_path, 10).unwrap()),
             supervisor: Supervisor {
                 registry,
                 procs: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4960,7 +4960,7 @@ review_loop:
     fn compare_filter_rejects_the_github_three_hundred_file_cap() {
         let complete = serde_json::json!({
             "file_count": 1,
-            "files": [{"filename": "relay/src/main.rs", "patch": "@@"}],
+            "files": [{"filename": "zzd/src/main.rs", "patch": "@@"}],
         });
         assert_eq!(
             serde_json::from_str::<Value>(

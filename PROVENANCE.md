@@ -15,13 +15,13 @@ by this repo's release workflow from a known commit.
    keyless-signed by Fulcio using the workflow's GitHub OIDC identity and
    recorded in the Rekor transparency log.
 
-## What the updater verifies (relay/src/update.rs)
+## What the updater verifies (zzd/src/update.rs)
 
 1. **Manifest attestation.** Verified with `gh attestation verify`, constrained
    to repo `ShukantPal/zigzag`, signer workflow
    `.github/workflows/ci.yml`, source ref `refs/heads/main`, predicate
    `https://slsa.dev/provenance/v1`, against the Sigstore trust root pinned in
-   `relay/trust/sigstore-trusted-root.json`. No source digest is pinned at this
+   `zzd/trust/sigstore-trusted-root.json`. No source digest is pinned at this
    stage: the manifest is authenticated before its claimed version or commit
    is trusted.
 2. **Manifest contents.** `version` must equal the release tag and `target`
@@ -60,5 +60,5 @@ pick the release up.
   publish, then verify.
 - `scripts/sign-ci-release.sh` — Apple signing.
 - `scripts/verify-release.sh` — standalone trust-chain verification.
-- `relay/src/update.rs` — the updater's in-process verification.
-- `relay/trust/sigstore-trusted-root.json` — pinned Sigstore trust root.
+- `zzd/src/update.rs` — the updater's in-process verification.
+- `zzd/trust/sigstore-trusted-root.json` — pinned Sigstore trust root.

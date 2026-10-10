@@ -1,6 +1,6 @@
 # Rust relay
 
-The `zigzag` binary in `relay/src/main.rs` is the authenticated Mac-local
+The `zigzag` binary in `zzd/src/main.rs` is the authenticated Mac-local
 control plane. The normal server requires `--secret-file PATH` (or
 `ZIGZAG_SECRET_FILE`) and `--state-file PATH` (or `ZIGZAG_STATE_FILE`).
 
@@ -42,7 +42,7 @@ All routes require the relay bearer token unless specifically noted.
 | `GET /v1/review-gate?repository=&pull_request=` | Review, CI, and human-approval decision. |
 
 `openapi.yaml` documents wire formats but does not yet enumerate every
-implemented route; check `relay/src/routes/` when they differ.
+implemented route; check `zzd/src/routes/` when they differ.
 
 ## Worktrees and provider agents
 

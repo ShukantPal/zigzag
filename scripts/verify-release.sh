@@ -1,7 +1,7 @@
 #!/bin/bash
 # verify-release.sh — verify the full GitHub trust chain of a zigzag release.
 #
-# This mirrors the checks in relay/src/update.rs (Manager::fetch_candidate):
+# This mirrors the checks in zzd/src/update.rs (Manager::fetch_candidate):
 #   1. The release manifest carries a SLSA v1 provenance attestation,
 #      keyless-signed by Fulcio using the release workflow's GitHub OIDC
 #      identity and recorded in the Rekor transparency log. We verify it was

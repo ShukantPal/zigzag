@@ -51,7 +51,6 @@ use crate::session::{
     is_tailscale_ipv4,
 };
 use crate::update;
-use relay_core::{AgentRecord, AgentRegistry, Json, Store, parse_json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -61,6 +60,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::{AgentRecord, AgentRegistry, Json, Store, parse_json};
 
 #[test]
 fn malformed_get_query_is_a_bad_request() {

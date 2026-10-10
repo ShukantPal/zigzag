@@ -1,9 +1,9 @@
 use crate::http::{error, reply};
 use crate::server::Server;
-use relay_core::{Json, parse_json};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use zz::{Json, parse_json};
 
 // --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
 /// Roots the relay may create or remove git worktrees under. Candidate paths

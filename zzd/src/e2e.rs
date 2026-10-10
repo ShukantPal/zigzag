@@ -17,11 +17,11 @@ use crate::tests::{
     poll_until_complete, request_once, request_once_with_gate_token, response_json, spawn_for_test,
     test_policy, test_server, worktree_test_base, worktree_test_repo, worktree_test_roots,
 };
-use relay_core::Json;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use zz::Json;
 
 static TASK_COUNTER: AtomicU64 = AtomicU64::new(0);
 

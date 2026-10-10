@@ -27,11 +27,11 @@ use crate::proc::{recovered_agent_identity_matches, start_reaper};
 use crate::routes::events::run_timeline;
 use crate::server::{ConnectionLimiter, MAX_CONNECTIONS, Server, Supervisor, serve};
 use crate::session::resolve_tailscale_ip;
-use relay_core::{AgentRegistry, Json, Store, read_secret_file};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
+use zz::{AgentRegistry, Json, Store, read_secret_file};
 
 fn main() {
     logging::init();

@@ -1,6 +1,6 @@
-use relay_core::{Json, Store, parse_rfc3339_millis};
 use std::env;
 use std::path::PathBuf;
+use zz::{Json, Store, parse_rfc3339_millis};
 
 pub(crate) fn run_timeline(arguments: &[String]) -> Result<(), String> {
     let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);

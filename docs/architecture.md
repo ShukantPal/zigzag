@@ -13,7 +13,6 @@ dept.py / watchers -- SSH -----------------> ~/.codex/dept/t-*/codex-launch.sh
                                              | agent registry + log spools
                                              +--> Codex process groups/worktrees
 
-poller <--------- GET /v1/events long poll ---+
 status.py <----- events + agents + audit ------+
 zzapi ---------- supported relay routes -------+
 ```
@@ -26,13 +25,12 @@ Tailscale ACL and bearer token form its network/authentication boundary.
 
 | Location | Role |
 | --- | --- |
-| `relay/src/main.rs` | `zigzag` daemon, config/control subcommands, and HTTP server. |
-| `relay/src/{server,http,auth,exec,proc,events}.rs` | Dispatch, authentication, restricted execution, supervision, durable events/audit. |
-| `relay/src/routes/` | Route handlers for agents, events, exec/spawn, procs, providers, and worktrees. |
-| `relay/src/{github,review_loop,provider,session,update}.rs` | GitHub watch, Rust review loop, providers, GUI/Tailscale checks, and signed update. |
-| `relay-core/` | Shared durable JSON store, registry, parser, and secret-file support. |
-| `cli/src/main.rs` | `zzapi`, the typed Rust relay client. |
-| `poller/src/main.rs` | VM event long-poll consumer with a durable cursor. |
+| `zzd/src/main.rs` | `zigzag` daemon, config/control subcommands, and HTTP server. |
+| `zzd/src/{server,http,auth,exec,proc,events}.rs` | Dispatch, authentication, restricted execution, supervision, durable events/audit. |
+| `zzd/src/routes/` | Route handlers for agents, events, exec/spawn, procs, providers, and worktrees. |
+| `zzd/src/{github,review_loop,provider,session,update}.rs` | GitHub watch, Rust review loop, providers, GUI/Tailscale checks, and signed update. |
+| `zz/` | Shared durable JSON store, registry, parser, and secret-file support. |
+| `zzapi/src/main.rs` | `zzapi`, the typed Rust relay client. |
 | `dept/` | Python dispatcher, status UI, config, lifecycle helpers, and scheduled watchers. |
 | `launchd/` | LaunchAgent template and installation instructions. |
 | `scripts/` | Signing, verification, hooks, reviewer launch, and full-stack E2E. |
@@ -59,5 +57,5 @@ Retried tasks do not necessarily have the same execution.
 The relay stores bounded live events plus a separate per-execution audit
 archive. `status.py` combines those with agent snapshots to project task
 phase. An event is not proof of completion: inspect an agent/proc terminal
-state or `dept.py status`, then inspect the final output. `poller` only
+state or `dept.py status`, then inspect the final output. `zzapi events`
 consumes events; it never launches tasks.

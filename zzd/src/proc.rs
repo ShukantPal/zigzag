@@ -5,7 +5,6 @@ use crate::exec;
 use crate::routes::procs::update_proc_status_with_handle;
 use crate::server::{Server, Supervisor};
 use crate::session::CappedOutput;
-use relay_core::{AgentRecord, AgentRegistry, Json, Store};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -15,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use zz::{AgentRecord, AgentRegistry, Json, Store};
 
 pub(crate) const MAX_FINISHED_PROCS: usize = 128;
 pub(crate) const FINISHED_PROC_RETENTION: Duration = Duration::from_secs(60 * 60);

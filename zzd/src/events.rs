@@ -1,6 +1,6 @@
-use relay_core::{AgentRecord, Json, Store};
 use std::io::Read;
 use std::sync::OnceLock;
+use zz::{AgentRecord, Json, Store};
 
 pub(crate) fn unix_timestamp() -> String {
     std::time::SystemTime::now()
@@ -10,7 +10,7 @@ pub(crate) fn unix_timestamp() -> String {
         .to_string()
 }
 pub(crate) fn relay_timestamp() -> String {
-    relay_core::rfc3339_timestamp()
+    zz::rfc3339_timestamp()
 }
 pub(crate) fn relay_clock() -> String {
     static CLOCK: OnceLock<String> = OnceLock::new();

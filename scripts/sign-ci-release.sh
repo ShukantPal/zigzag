@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sign a release binary with the Apple-issued identity required by the updater.
 #
-# The updater (relay/src/update.rs verify_codesign) pins the Apple Team ID
+# The updater (zzd/src/update.rs verify_codesign) pins the Apple Team ID
 # 7YZK8D3B48 and the identifier com.shukantpal.zigzag. The post-sign check
 # below enforces the SAME requirement the updater enforces, so a release whose
 # signing identity drifts (wrong cert type, wrong team) fails the build instead
@@ -11,7 +11,7 @@ set -euo pipefail
 
 : "${SIGNING_IDENTITY:?ZIGZAG_SIGNING_IDENTITY is required for release signing}"
 
-# Must match the requirement built in relay/src/update.rs verify_codesign().
+# Must match the requirement built in zzd/src/update.rs verify_codesign().
 UPDATER_REQUIREMENT='anchor apple generic and identifier "com.shukantpal.zigzag" and certificate leaf[subject.OU] = "7YZK8D3B48"'
 
 binary="${1:?usage: sign-ci-release.sh BINARY}"

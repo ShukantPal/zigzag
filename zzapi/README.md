@@ -75,7 +75,7 @@ zzapi exec --bin gh --args api repos/leveled-inc/leveled
 zzapi spawn --bin codex-launch --args run --prompt-file /tmp/p.txt
 zzapi proc get <proc-handle>
 
-# event stream (like the poller, but interactive)
+# event stream (interactively)
 zzapi events --follow
 zzapi events --after 2800 --timeout 30
 # low-latency event push over the relay's authenticated bidi socket

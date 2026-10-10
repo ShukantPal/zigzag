@@ -126,7 +126,7 @@ address; it must not be exposed on a public interface. See
 ACL policy. `ZIGZAG_PROXY` can be set when a client needs an HTTP proxy.
 
 The CLI token lookup also supports `ZIGZAG_TOKEN`, `ZIGZAG_TOKEN_FILE`, and
-the default token locations documented in [`cli/README.md`](cli/README.md).
+the default token locations documented in [`zzapi/README.md`](zzapi/README.md).
 Prefer the private token file over placing the token value in an environment
 variable.
 
@@ -170,4 +170,4 @@ relay; an unauthenticated request should return HTTP `401`.
 
 For additional daemon operations and CLI commands, see the
 [`documentation index`](docs/README.md), [`launchd/INSTALL.md`](launchd/INSTALL.md),
-and [`cli/README.md`](cli/README.md).
+and [`zzapi/README.md`](zzapi/README.md).

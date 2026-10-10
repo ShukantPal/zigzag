@@ -250,19 +250,3 @@ not signal those task sessions; on startup the durable registry verifies the
 recorded PID birth identity and retains a live task as `orphaned` until it
 finishes. Process-handle polling remains live-daemon-only, but agent status
 and durable logs remain available after recovery.
-
-## VM poller
-
-Provision an identical mode-600 token file using the existing secret-delivery
-mechanism. With the verified HTTP forward proxy:
-
-```sh
-ZIGZAG_PROXY="${HTTPS_PROXY%:*}:3130" poller \
-  --zigzag-url http://100.101.237.83:8765 \
-  --secret-file /secure/path/zigzag.token \
-  --state-file /var/lib/muse/zigzag-cursor.json
-```
-
-The poller has `--once` for supervised smoke tests and accepts `--timeout`
-(1–55 seconds, default 50). It retries network failures, reports reset/loss
-warnings on stderr, and emits exactly one JSON object per stdout line.

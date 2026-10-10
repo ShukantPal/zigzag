@@ -4,10 +4,10 @@ use crate::http::{denial_json, error, reply};
 use crate::logging;
 use crate::proc::{AgentSpawnDetails, spawn_proc};
 use crate::server::Server;
-use relay_core::{Json, parse_json};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Instant;
+use zz::{Json, parse_json};
 
 pub(crate) struct SpawnRequest {
     pub(crate) command: exec::ExecRequest,
