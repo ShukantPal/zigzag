@@ -776,6 +776,7 @@ pub(super) fn cmd_status(
         (0usize, 0u16, false, false);
     let mut expanded = HashSet::<String>::new();
     let mut tick = Instant::now();
+    let mut transcript_tick = Instant::now();
     loop {
         draw(
             &mut terminal,
@@ -882,6 +883,17 @@ pub(super) fn cmd_status(
             }
             tick = Instant::now()
         }
+        // Refresh the local JSONL independently from the slower relay snapshot.
+        // Codex appends transcript records while the agent is running, so tying
+        // this read to the status interval makes the transcript feel stale.
+        if transcript_tick.elapsed() >= Duration::from_millis(500) {
+            if let Some(row) = rows.get(selected) {
+                (transcript_items, transcript_notice) = read_codex_transcript(&row.agent);
+                transcript_selected =
+                    transcript_selected.min(transcript_items.len().saturating_sub(1));
+            }
+            transcript_tick = Instant::now();
+        }
     }
     Ok(())
 }
@@ -985,7 +997,31 @@ fn draw(
             let path = codex_transcript_path(&e.agent)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "local JSONL transcript unavailable".into());
-            lines.push(Line::from(format!("{} / {} · {} · {}", e.task, e.id, e.state, e.flags(lost))));
+            let worktree = if e.worktree.is_empty() {
+                "-"
+            } else {
+                &e.worktree
+            };
+            lines.push(Line::from(format!("Worktree: {worktree}")));
+            lines.push(Line::from(format!(
+                "Branch: {}",
+                if e.branch.is_empty() { "-" } else { &e.branch }
+            )));
+            lines.push(Line::from(format!(
+                "PR: {}",
+                if e.pr.is_empty() { "-" } else { &e.pr }
+            )));
+            lines.push(Line::from(format!(
+                "Agent ID: {}",
+                if e.agent.is_empty() { "-" } else { &e.agent }
+            )));
+            lines.push(Line::from(format!(
+                "{} / {} · {} · {}",
+                e.task,
+                e.id,
+                e.state,
+                e.flags(lost)
+            )));
             lines.push(Line::from(format!("Source: {}", tail_path(&path, panes[1].width.saturating_sub(12) as usize))));
             if let Some(summary) = e.events.iter().rev().find_map(request_summary) {
                 lines.push(Line::from(format!("Request: {summary}")));
