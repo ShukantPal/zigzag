@@ -116,7 +116,7 @@ fn get_all_at(
     for page in 1..=1000 {
         let separator = if endpoint.contains('?') { '&' } else { '?' };
         let url = format!("{api_root}/{endpoint}{separator}per_page=100&page={page}");
-        let value = response_json(headers(agent.get(&url), &token).call())?;
+        let value = response_json(headers(agent.get(&url), token).call())?;
         let items = value
             .as_array()
             .ok_or_else(|| "GitHub API returned an unexpected collection".to_owned())?;
@@ -139,7 +139,7 @@ pub(crate) fn delete(endpoint: &str) -> Result<(), String> {
     let (agent, token) = agent()?;
     match headers(agent.delete(&format!("{API_ROOT}/{endpoint}")), &token).call() {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) if code == 204 => Ok(()),
+        Err(ureq::Error::Status(204, _)) => Ok(()),
         Err(ureq::Error::Status(code, response)) => Err(format!(
             "GitHub API returned HTTP {code}: {}",
             response
