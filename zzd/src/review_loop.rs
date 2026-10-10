@@ -1889,14 +1889,8 @@ fn post_verdict_comment(
     number: u64,
     result: &ReviewerResult,
     marker: &str,
-    task_id: &str,
+    _task_id: &str,
 ) -> Result<CreatedComment, String> {
-    let policy_store = exec::load_policy()?;
-    let path = policy_store
-        .trusted_gh_path_for_repo(&policy.repository)
-        .ok_or_else(|| {
-            "execution policy does not authorize review comment publication".to_owned()
-        })?;
     let summary = if result.findings.is_empty() {
         format!(
             "Reviewed the exact head through the {} lens.\nNo blocking issues found.",
@@ -1926,32 +1920,12 @@ fn post_verdict_comment(
         summary,
         marker
     );
-    let body_path = review_task_dir(task_id)?.join("verdict-comment.json");
-    let payload = serde_json::to_vec(&serde_json::json!({"body": body}))
-        .map_err(|_| "could not encode validated review verdict".to_owned())?;
-    write_private(body_path.clone(), &payload)?;
     require_gui_login_session()?;
-    let response = exec::run(
-        &path,
-        exec::ExecRequest {
-            id: format!("publish-{task_id}"),
-            bin: "gh".to_owned(),
-            args: vec![
-                "api".to_owned(),
-                format!("repos/{}/issues/{number}/comments", policy.repository),
-                "--method".to_owned(),
-                "POST".to_owned(),
-                "--input".to_owned(),
-                body_path.to_string_lossy().into_owned(),
-                "--jq".to_owned(),
-                "{node_id}".to_owned(),
-            ],
-        },
-    );
-    if response.timed_out || response.truncated || response.exit_code != Some(0) {
-        return Err("could not publish validated review verdict".to_owned());
-    }
-    let comment: CreatedComment = serde_json::from_str(&response.stdout)
+    let response = crate::github_api::post(
+        &format!("repos/{}/issues/{number}/comments", policy.repository),
+        &serde_json::json!({"body": body}),
+    )?;
+    let comment: CreatedComment = serde_json::from_value(response)
         .map_err(|_| "GitHub did not return the created review comment identity".to_owned())?;
     if comment.node_id.is_empty() {
         return Err("GitHub returned an invalid review comment identity".to_owned());
@@ -1962,57 +1936,23 @@ fn post_verdict_comment(
 fn delete_verdict_comment(
     policy: &RepositoryPolicy,
     comment_node_id: &str,
-    task_id: &str,
+    _task_id: &str,
 ) -> Result<(), String> {
     require_gui_login_session()?;
-    let policy_store = exec::load_policy()?;
-    let path = policy_store
-        .trusted_gh_path_for_repo(&policy.repository)
-        .ok_or_else(|| "execution policy does not authorize review comment deletion".to_owned())?;
-    let lookup = exec::run(
-        &path,
-        exec::ExecRequest {
-            id: format!("locate-invalidation-{task_id}"),
-            bin: "gh".to_owned(),
-            args: vec![
-                "api".to_owned(),
-                "graphql".to_owned(),
-                "-f".to_owned(),
-                "query=query($id:ID!){node(id:$id){id}}".to_owned(),
-                "-f".to_owned(),
-                format!("id={comment_node_id}"),
-                "--jq".to_owned(),
-                ".data.node.id // \"\"".to_owned(),
-            ],
-        },
-    );
-    if lookup.timed_out || lookup.truncated || lookup.exit_code != Some(0) {
-        return Err("could not locate stale review verdict comment".to_owned());
-    }
-    if lookup.stdout.trim().is_empty() {
+    let lookup = crate::github_api::graphql(
+        "query($id:ID!){node(id:$id){... on IssueComment {databaseId}}}",
+        serde_json::json!({"id": comment_node_id}),
+    )?;
+    let Some(database_id) = lookup
+        .pointer("node.databaseId")
+        .and_then(serde_json::Value::as_u64)
+    else {
         return Ok(());
-    }
-    require_gui_login_session()?;
-    let deleted = exec::run(
-        &path,
-        exec::ExecRequest {
-            id: format!("invalidate-{task_id}"),
-            bin: "gh".to_owned(),
-            args: vec![
-                "api".to_owned(),
-                "graphql".to_owned(),
-                "-f".to_owned(),
-                "query=mutation($id:ID!){deleteIssueComment(input:{id:$id}){clientMutationId}}"
-                    .to_owned(),
-                "-f".to_owned(),
-                format!("id={comment_node_id}"),
-            ],
-        },
-    );
-    if deleted.timed_out || deleted.truncated || deleted.exit_code != Some(0) {
-        return Err("could not invalidate stale review verdict comment".to_owned());
-    }
-    Ok(())
+    };
+    crate::github_api::delete(&format!(
+        "repos/{}/issues/comments/{database_id}",
+        policy.repository
+    ))
 }
 
 fn evaluate_gate(
@@ -2963,11 +2903,11 @@ review_loop:
         assert_eq!(probed, ["ShukantPal/zigzag"]);
 
         let error = validate_review_transport(&config, |_| {
-            Err("the gh policy does not allow the PR scan".to_owned())
+            Err("GitHub API authentication is unavailable".to_owned())
         })
         .unwrap_err();
         assert!(error.contains("ShukantPal/zigzag"));
-        assert!(error.contains("gh policy"));
+        assert!(error.contains("GitHub API"));
     }
 
     #[test]

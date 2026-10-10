@@ -1,4 +1,4 @@
-use crate::exec;
+use crate::github_api;
 use crate::http::{error, query, reply};
 use crate::review_loop;
 use crate::server::Server;
@@ -100,48 +100,20 @@ pub(crate) fn watch_agent_pr(agent: &zz::AgentRecord) -> Result<bool, String> {
     if !pushed.status.success() || pushed.stdout.is_empty() {
         return Ok(false);
     }
-    let request = exec::ExecRequest {
-        id: format!("github-pr-lookup-{}", agent.id),
-        bin: "gh".to_owned(),
-        args: vec![
-            "api".to_owned(),
-            "--paginate".to_owned(),
-            "--slurp".to_owned(),
-            format!("repos/{repository}/pulls?state=open&per_page=100"),
-        ],
-    };
-    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
-    let path = policy
-        .verified_path(&request.bin, &request.args)
-        .map_err(|error| format!("gh policy does not allow PR lookup: {error}"))?;
-    let result = exec::run(&path, request);
-    if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub PR lookup failed".to_owned());
-    }
-    let value = parse_json(&result.stdout)
-        .map_err(|_| "GitHub PR lookup returned invalid JSON".to_owned())?;
-    let Json::Array(pages) = value else {
-        return Err("GitHub PR lookup returned an unexpected response".to_owned());
-    };
-    let Some(number) = pages
+    require_gui_login_session()?;
+    let pull_requests = github_api::get_all(&format!("repos/{repository}/pulls?state=open"))?;
+    let Some(number) = pull_requests
         .iter()
-        .flat_map(|page| match page {
-            Json::Array(items) => items.iter().collect::<Vec<_>>(),
-            item => vec![item],
-        })
         .find(|item| {
-            item.object("head")
-                .and_then(|head| head.object("ref"))
-                .and_then(Json::as_str)
+            item.pointer("/head/ref")
+                .and_then(serde_json::Value::as_str)
                 == Some(branch.as_str())
                 && item
-                    .object("head")
-                    .and_then(|head| head.object("repo"))
-                    .and_then(|repo| repo.object("full_name"))
-                    .and_then(Json::as_str)
+                    .pointer("/head/repo/full_name")
+                    .and_then(serde_json::Value::as_str)
                     == Some(repository.as_str())
         })
-        .and_then(|item| item.object("number").and_then(Json::as_u64))
+        .and_then(|item| item.get("number").and_then(serde_json::Value::as_u64))
     else {
         return Ok(false);
     };
@@ -169,7 +141,7 @@ fn git_text(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn github_repository(origin: &str) -> Option<String> {
+pub(crate) fn github_repository(origin: &str) -> Option<String> {
     let origin = origin.trim().trim_end_matches(".git");
     let path = origin
         .strip_prefix("git@github.com:")
@@ -203,28 +175,12 @@ pub(crate) fn watched_pr_cleanup_loop(state: Arc<Server>, interval: Duration) {
 }
 
 fn cleanup_if_merged(state: &Server, pr: &WatchedPr) -> Result<(), String> {
-    let request = exec::ExecRequest {
-        id: format!(
-            "github-pr-state-{}-{}",
-            pr.repository.replace('/', "-"),
-            pr.number
-        ),
-        bin: "gh".to_owned(),
-        args: vec![
-            "api".to_owned(),
-            format!("repos/{}/pulls/{}", pr.repository, pr.number),
-        ],
+    require_gui_login_session()?;
+    let value = match github_api::get(&format!("repos/{}/pulls/{}", pr.repository, pr.number)) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
     };
-    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
-    let path = policy
-        .verified_path(&request.bin, &request.args)
-        .map_err(|error| error.to_string())?;
-    let result = exec::run(&path, request);
-    if result.exit_code != Some(0) || result.timed_out || result.truncated {
-        return Ok(());
-    }
-    let value = parse_json(&result.stdout).map_err(|error| error.to_string())?;
-    if value.object("merged").and_then(Json::as_bool) != Some(true) {
+    if value.get("merged").and_then(serde_json::Value::as_bool) != Some(true) {
         return Ok(());
     }
     let agents = state.supervisor.registry.list(None, None);
@@ -318,26 +274,23 @@ pub(crate) fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval
     }
 }
 pub(crate) fn github_open_pull_requests(repo: &str) -> Result<Vec<u64>, String> {
-    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
-    let request = exec::ExecRequest {
-        id: format!("github-pr-scan-{repo}"),
-        bin: "gh".to_owned(),
-        args: vec![
-            "api".to_owned(),
-            "--paginate".to_owned(),
-            "--slurp".to_owned(),
-            format!("repos/{repo}/pulls?state=open&per_page=100"),
-        ],
-    };
-    let path = policy
-        .verified_path(&request.bin, &request.args)
-        .map_err(|error| format!("the gh policy does not allow the PR scan: {error}"))?;
-    let result = exec::run(&path, request);
-    if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub PR discovery did not complete successfully".to_owned());
+    if !crate::config::valid_github_repo(repo) {
+        return Err("GitHub PR discovery received an invalid repository".to_owned());
     }
-    parse_github_open_pull_requests(&result.stdout)
+    require_gui_login_session()?;
+    let pull_requests = github_api::get_all(&format!("repos/{repo}/pulls?state=open"))?;
+    let numbers = pull_requests
+        .iter()
+        .map(|pr| {
+            pr.get("number")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|number| *number > 0)
+                .ok_or_else(|| "GitHub PR discovery result is missing a PR number".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(numbers)
 }
+#[cfg(test)]
 pub(crate) fn parse_github_open_pull_requests(output: &str) -> Result<Vec<u64>, String> {
     let value = parse_json(output)
         .map_err(|_| "GitHub PR discovery did not return the expected JSON".to_owned())?;

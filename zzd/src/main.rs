@@ -5,6 +5,7 @@ mod events;
 mod exec;
 mod github;
 mod harness;
+mod github_api;
 mod http;
 mod logging;
 mod proc;
