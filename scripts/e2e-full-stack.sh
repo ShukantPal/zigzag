@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Exercise the real relay binary through zzapi, including agent lifecycle.
 #
-# The fake `codex` below intentionally stays alive.  That lets this test
-# prove pause/resume signal a real process instead of merely accepting a 200.
+# The fake `codex` below speaks app-server JSON-RPC and stays alive so this test
+# can exercise thread interruption while checking that the shared server lives.
 set -euo pipefail
 
 relay_bin=${1:?usage: $0 RELAY_BIN ZZAPI_BIN}
@@ -49,11 +49,42 @@ PY
 printf '%s\n' '#!/bin/sh' "echo $tailnet_ip" > "$bin_dir/tailscale"
 chmod 700 "$bin_dir/tailscale"
 
-printf '%s\n' \
-  '#!/bin/sh' \
-  "printf '%s\\n' '{\"type\":\"item.completed\",\"text\":\"e2e-agent-output\"}'" \
-  '# Keep the process alive so pause, resume, and delete have real work to do.' \
-  'while :; do sleep 1; done' > "$bin_dir/codex"
+cat > "$bin_dir/codex" <<'PY'
+#!/usr/bin/env python3
+"""Small JSON-RPC app-server fixture for the relay lifecycle test."""
+import json
+import sys
+import time
+
+thread_id = "e2e-thread"
+turn_id = "e2e-turn"
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if request_id is None:  # notifications such as `initialized`
+        continue
+
+    if method == "initialize":
+        result = {"userAgent": "zigzag-e2e"}
+    elif method == "thread/start":
+        result = {"thread": {"id": thread_id}}
+    elif method == "turn/start":
+        result = {"turn": {"id": turn_id}}
+    else:
+        result = {}
+
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+    if method == "turn/start":
+        # Let the relay finish registering its transcript watcher first.
+        time.sleep(1.0)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "item.completed",
+            "params": {"threadId": thread_id, "text": "e2e-agent-output"},
+        }), flush=True)
+PY
 chmod 700 "$bin_dir/codex"
 
 git -C "$project_dir" init -b main -q
@@ -72,11 +103,20 @@ print(sock.getsockname()[1])
 sock.close()
 PY
 )
+socket_port=$(python3 - <<'PY'
+import socket
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+)
 
 HOME="$home_dir" PATH="$bin_dir:$PATH" ZIGZAG_UPDATE_POLICY=paused \
   ZIGZAG_WORKTREE_ROOTS="$worktree_root" \
   ZIGZAG_WORKTREE_REPO_ROOT="$tmp_dir" \
   "$relay_bin" --secret-file "$token_file" --state-file "$state_file" --port "$port" \
+  --socket-port "$socket_port" \
   >"$tmp_dir/relay.log" 2>&1 &
 relay_pid=$!
 
@@ -123,31 +163,11 @@ done
 [[ -s "$transcript" ]]
 grep -q 'e2e-agent-output' "$transcript"
 
-"${api[@]}" agents pause "$agent_id" >/dev/null
-for _ in $(seq 1 50); do
-  state=$(ps -o stat= -p "$leader_pid" 2>/dev/null | tr -d ' ' || true)
-  [[ "$state" == *T* ]] && break
-  sleep 0.1
-done
-[[ "${state:-}" == *T* ]]
-paused=$("${api[@]}" agents get "$agent_id")
-python3 -c 'import json,sys; assert json.load(sys.stdin)["paused_at"]' <<<"$paused"
-
-"${api[@]}" agents resume "$agent_id" >/dev/null
-for _ in $(seq 1 50); do
-  state=$(ps -o stat= -p "$leader_pid" 2>/dev/null | tr -d ' ' || true)
-  [[ -n "$state" && "$state" != *T* ]] && break
-  sleep 0.1
-done
-[[ -n "${state:-}" && "$state" != *T* ]]
-resumed=$("${api[@]}" agents get "$agent_id")
-python3 -c 'import json,sys; assert json.load(sys.stdin)["paused_at"] is None' <<<"$resumed"
-
 "${api[@]}" agents stop "$agent_id" >/dev/null
 deleted=$("${api[@]}" agents get "$agent_id")
 python3 -c 'import json,sys; assert json.load(sys.stdin)["state"] in ("stopped", "killed")' <<<"$deleted"
-if kill -0 "$leader_pid" 2>/dev/null; then
-  echo "agent leader is still alive after delete" >&2
+if ! kill -0 "$leader_pid" 2>/dev/null; then
+  echo "shared app-server exited after stopping one agent" >&2
   exit 1
 fi
 

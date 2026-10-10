@@ -1352,14 +1352,19 @@ fn create_codex_thread(
         let transcript = agent_transcript_path(&id_watch);
         while let Ok(event) = events.recv() {
             let crate::harness::HarnessEvent::Notification(value) = event;
-            if let Some(path) = transcript.as_ref()
-                && let Ok(mut file) = std::fs::OpenOptions::new()
+            if let Some(path) = transcript.as_ref() {
+                if let Some(parent) = path.parent()
+                    && let Err(error) = std::fs::create_dir_all(parent)
+                {
+                    log::warn!("could not create agent transcript directory: {error}");
+                } else if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", value);
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{}", value);
+                }
             }
             let method = value
                 .get("method")
