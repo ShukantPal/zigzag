@@ -49,6 +49,8 @@ zzapi agents get <id-or-prefix>
 zzapi agents create --prompt "Fix the flaky test" \
     --project-dir /Users/shukant/Workspace/leveled-inc/leveled \
     --branch codex/fix-flaky
+zzapi agents create --prompt-file /tmp/prompt.md \
+    --project-dir /Users/shukant/Workspace/leveled-inc/leveled --no-branch
 
 # Read-only investigation in the project checkout (explicit opt-in)
 zzapi agents create --prompt "Trace the request flow" \
@@ -90,6 +92,11 @@ zzapi review-gate --repo leveled-inc/leveled --pr 1031
 
 Agent IDs accept a unique prefix — `zzapi agents logs 360fc6b36a9d` resolves
 the full handle for you.
+
+`agents create` accepts exactly one of `--prompt TEXT` or `--prompt-file PATH`.
+`--prompt-file` reads a file on the machine running `zzapi`. With `--prompt`,
+an existing client-side file is read as prompt text; values that are not local
+files remain inline text, preserving relay-side path behavior.
 
 In `zzapi status`, use `↑/↓` to choose an agent, `Tab` or `←/→` to focus the
 transcript, `↑/↓` to select an item, and `Enter` or `Space` to expand tool

@@ -78,6 +78,63 @@ fn update_is_listed_in_help_and_needs_no_agent_flags() {
 }
 
 #[test]
+fn agents_create_reads_prompt_files_client_side_and_keeps_inline_text() {
+    let (port, server) = transcript_server([
+        r#"{"id":"agent-file","working_dir":"/tmp"}"#,
+        r#"{"id":"agent-prompt-path","working_dir":"/tmp"}"#,
+        r#"{"id":"agent-inline","working_dir":"/tmp"}"#,
+    ]);
+    let path = std::env::temp_dir().join(format!(
+        "zzapi-prompt-protocol-{}-{}.md",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::write(&path, "read this prompt").unwrap();
+    let path = path.to_string_lossy().into_owned();
+
+    for prompt_args in [
+        vec!["--prompt-file", path.as_str()],
+        vec!["--prompt", path.as_str()],
+        vec!["--prompt", "do the thing"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+            .args([
+                "--hostname",
+                &format!("127.0.0.1:{port}"),
+                "agents",
+                "create",
+            ])
+            .args(prompt_args)
+            .args(["--project-dir", "/tmp", "--no-branch"])
+            .env("ZIGZAG_TOKEN", "test-token")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let requests = server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+    let prompts: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["prompt"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        prompts,
+        ["read this prompt", "read this prompt", "do the thing"]
+    );
+}
+
+#[test]
 fn admin_check_update_posts_authenticated_request_and_displays_update_result() {
     let (port, server) = transcript_server([
         r#"{"current_version":"1.2.3","latest_available_version":"1.2.4","update_applied":true}"#,

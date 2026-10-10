@@ -765,12 +765,18 @@ prefix is ambiguous, add characters; never guess which task a prefix means.
 ### `zzapi agents create`
 
 ```sh
-zzapi agents create --prompt TEXT_OR_FILE --project-dir PATH \
+zzapi agents create (--prompt TEXT | --prompt-file PATH) --project-dir PATH \
   (--branch BRANCH | --no-branch | --pr NUMBER) \
   [--worktree PATH] [--model MODEL] [--approval-mode MODE] [--timeout-secs N]
 ```
 
-Calls native `POST /v1/agents`. `--prompt` and `--project-dir` are required.
+Calls native `POST /v1/agents`. Specify exactly one of `--prompt` and
+`--prompt-file`, plus `--project-dir`. `--prompt-file` always reads a file on
+the machine running `zzapi`; a missing or unreadable file is an error. For
+backward compatibility, `--prompt` reads its value as a client-side file when
+it names an existing file, and otherwise sends it as inline text. This lets
+existing Mac-side file paths continue to be passed to the relay when that path
+does not exist on the client.
 Choose `--branch` for a worktree, `--pr` to resolve an existing PR's head
 branch with `gh pr view`, or explicit `--no-branch` to run directly in the
 project directory. Exactly one mode is required; `--branch` and `--no-branch`

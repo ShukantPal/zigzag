@@ -17,7 +17,7 @@ zzapi [--hostname HOST[:PORT]] update
 zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
-zzapi agents create --prompt TEXT --project-dir DIR
+zzapi agents create (--prompt TEXT | --prompt-file PATH) --project-dir DIR
                     (--branch BRANCH | --no-branch | --pr NUMBER)
                     [--worktree PATH] [--harness codex|gemini|opencode]
                     [--model MODEL]
