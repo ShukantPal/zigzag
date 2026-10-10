@@ -4,6 +4,7 @@ mod config;
 mod events;
 mod exec;
 mod github;
+mod github_api;
 mod http;
 mod logging;
 mod proc;

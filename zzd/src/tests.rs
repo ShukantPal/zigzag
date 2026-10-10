@@ -580,7 +580,7 @@ fn review_state_and_startup_mode_keep_shadow_observational_until_cutover() {
 fn github_pr_scan_requires_positive_numbers() {
     assert_eq!(
         parse_github_open_pull_requests(
-            r#"[[{"number":42,"html_url":"https://github.com/leveled-inc/leveled/pull/42"}]]"#,
+            r#"[{"number":42,"html_url":"https://github.com/leveled-inc/leveled/pull/42"}]"#,
         )
         .unwrap(),
         vec![42]

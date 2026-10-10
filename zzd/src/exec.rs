@@ -322,8 +322,8 @@ impl Policy {
         verify_binary_identity(identity).map_err(VerifyError::Unverifiable)
     }
 
-    /// Internal review-loop publication uses the same repository-scoped `gh`
-    /// identity without exposing a general GitHub write prefix on `/v1/exec`.
+    /// Test helper for the previous repository-scoped `gh` authorization path.
+    #[cfg(test)]
     pub fn trusted_gh_path_for_repo(&self, repo: &str) -> Option<PathBuf> {
         let policy = self.bins.get("gh")?;
         if !policy.gh_read_repos.contains(repo) {
