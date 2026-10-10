@@ -30,6 +30,35 @@ use zz::{AgentRecord, Json, parse_json};
 const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
 /// Grace period after SIGKILL before giving up.
 const AGENT_KILL_GRACE: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const DEFAULT_MAX_LIVE_AGENT_THREADS: usize = 4;
+#[cfg(not(test))]
+static NATIVE_AGENT_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(not(test))]
+fn max_live_agent_threads() -> usize {
+    std::env::var("ZIGZAG_MAX_LIVE_AGENT_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_LIVE_AGENT_THREADS)
+}
+
+#[cfg(not(test))]
+fn native_agent_capacity_available(state: &Server) -> bool {
+    state
+        .supervisor
+        .registry
+        .list(None, None)
+        .iter()
+        .filter(|agent| {
+            matches!(agent.state.as_str(), "running" | "paused")
+                && matches!(agent.harness.as_deref(), Some("codex" | "opencode"))
+                && agent.harness_session_id.is_some()
+        })
+        .count()
+        < max_live_agent_threads()
+}
 
 #[cfg(not(test))]
 fn agent_worktree_roots() -> Vec<PathBuf> {
@@ -384,17 +413,23 @@ fn agent_message_request(
     ) else {
         return reply(stream, 409, error("agent_not_interactive"));
     };
-    if harness != "codex" {
-        return reply(stream, 501, error("harness_message_unsupported"));
-    }
-    let server = match state.supervisor.codex_server() {
-        Ok(server) => server,
-        Err(message) => {
-            log::error!("could not start app-server: {message}");
-            return reply(stream, 503, error("harness_unavailable"));
-        }
+    let session = match harness {
+        "codex" => match state.supervisor.codex_server() {
+            Ok(server) => server.session(session_id.to_owned()),
+            Err(message) => {
+                log::error!("could not start Codex app-server: {message}");
+                return reply(stream, 503, error("harness_unavailable"));
+            }
+        },
+        "opencode" => match state.supervisor.opencode_server() {
+            Ok(server) => server.session(session_id.to_owned()),
+            Err(message) => {
+                log::error!("could not start OpenCode server: {message}");
+                return reply(stream, 503, error("harness_unavailable"));
+            }
+        },
+        _ => return reply(stream, 501, error("harness_message_unsupported")),
     };
-    let session = server.session(session_id.to_owned());
     if let Err(message) = session.send(text, delivery) {
         log::warn!("agent message dispatch failed id={id}: {message}");
         return reply(stream, 503, error("harness_message_failed"));
@@ -900,6 +935,18 @@ fn agent_create_request(
         Ok(request) => request,
         Err(message) => return reply(stream, 400, error(message)),
     };
+    #[cfg(not(test))]
+    let _native_admission = if matches!(request.harness.as_str(), "codex" | "opencode") {
+        let guard = NATIVE_AGENT_ADMISSION
+            .lock()
+            .map_err(|_| "native agent admission lock poisoned")?;
+        if !native_agent_capacity_available(state) {
+            return reply(stream, 429, error("live_agent_thread_limit_reached"));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let execution_id = match new_execution_id() {
         Ok(id) => id,
         Err(message) => {
@@ -1100,6 +1147,18 @@ fn agent_create_request(
     #[cfg(not(test))]
     if request.harness == "codex" {
         return create_codex_thread(
+            stream,
+            state,
+            &request,
+            &task_id,
+            &execution_id,
+            &worktree_str,
+            &prompt_text,
+        );
+    }
+    #[cfg(not(test))]
+    if request.harness == "opencode" {
+        return create_opencode_session(
             stream,
             state,
             &request,
@@ -1343,6 +1402,120 @@ fn create_codex_thread(
         Json::Object(vec![
             ("id".to_owned(), Json::String(id)),
             ("thread_id".to_owned(), Json::String(thread_id)),
+            (
+                "worktree".to_owned(),
+                if request.no_branch {
+                    Json::Null
+                } else {
+                    Json::String(worktree.to_owned())
+                },
+            ),
+            ("working_dir".to_owned(), Json::String(worktree.to_owned())),
+        ]),
+    )
+}
+
+#[cfg(not(test))]
+fn create_opencode_session(
+    stream: &mut TcpStream,
+    state: &Server,
+    request: &AgentCreateRequest,
+    task_id: &str,
+    execution_id: &str,
+    worktree: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let server = match state.supervisor.opencode_server() {
+        Ok(server) => server,
+        Err(message) => {
+            log::error!("could not start OpenCode server: {message}");
+            return reply(stream, 503, error("could_not_start_app_server"));
+        }
+    };
+    let approval = request.approval_mode.as_deref().unwrap_or("default");
+    let session_id =
+        match server.start_session(worktree, prompt, request.model.as_deref(), approval) {
+            Ok(id) => id,
+            Err(message) => {
+                log::error!("could not start OpenCode session: {message}");
+                return reply(stream, 503, error("could_not_start_agent_thread"));
+            }
+        };
+    let id = match random_hex_128() {
+        Ok(id) => id,
+        Err(_) => return reply(stream, 500, error("could_not_create_agent")),
+    };
+    let pid = server.pid() as i32;
+    let record = AgentRecord {
+        id: id.clone(),
+        task_id: task_id.to_owned(),
+        execution_id: execution_id.to_owned(),
+        leader_pid: pid,
+        process_group: pid,
+        process_identity: None,
+        worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
+        started_at: unix_timestamp(),
+        deadline_at: request.timeout_secs.map(|seconds| {
+            unix_timestamp()
+                .parse::<u64>()
+                .unwrap_or(0)
+                .saturating_add(seconds)
+                .to_string()
+        }),
+        command: "opencode serve session".to_owned(),
+        state: "running".to_owned(),
+        paused_at: None,
+        exit_code: None,
+        log_degraded: false,
+        audit_degraded: false,
+        redacted: false,
+        stdout_next: 0,
+        stderr_next: 0,
+        stdout_dropped_before: 0,
+        stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
+        first_output_at: None,
+        first_output_stream: None,
+        first_output_bytes: None,
+        restarted_from: None,
+        agent_config: None,
+        harness_session_id: Some(session_id.clone()),
+        harness: Some("opencode".to_owned()),
+    };
+    if state.supervisor.registry.register(record).is_err() {
+        let _ = server.session(session_id.clone()).interrupt();
+        return reply(stream, 500, error("could_not_persist_agent"));
+    }
+    let config = persisted_agent_config(request, worktree, prompt);
+    if state
+        .supervisor
+        .registry
+        .set_agent_config(&id, &config)
+        .is_err()
+        || state
+            .supervisor
+            .registry
+            .set_harness_session(&id, "opencode", &session_id)
+            .is_err()
+    {
+        return reply(stream, 500, error("could_not_persist_agent_config"));
+    }
+    let _ = state.store.add(relay_event(
+        "process_spawned",
+        task_id,
+        execution_id,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(id.clone())),
+            ("session_id".to_owned(), Json::String(session_id)),
+            ("harness".to_owned(), Json::String("opencode".to_owned())),
+        ]),
+    ));
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id)),
             (
                 "worktree".to_owned(),
                 if request.no_branch {
@@ -1771,18 +1944,27 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     if !matches!(agent.state.as_str(), "running" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));
     }
-    if let (Some("codex"), Some(thread_id)) = (
+    if let (Some(harness), Some(session_id)) = (
         agent.harness.as_deref(),
         agent.harness_session_id.as_deref(),
-    ) {
-        let server = match state.supervisor.codex_server() {
-            Ok(server) => server,
-            Err(_) => return reply(stream, 503, error("harness_unavailable")),
+    ) && matches!(harness, "codex" | "opencode")
+    {
+        let interrupt_result = match harness {
+            "codex" => match state.supervisor.codex_server() {
+                Ok(server) if server.has_active_turn(session_id) => {
+                    server.session(session_id.to_owned()).interrupt()
+                }
+                Ok(_) => Ok(()),
+                Err(message) => Err(message),
+            },
+            "opencode" => state
+                .supervisor
+                .opencode_server()
+                .and_then(|server| server.session(session_id.to_owned()).interrupt()),
+            _ => unreachable!(),
         };
-        if server.has_active_turn(thread_id)
-            && server.session(thread_id.to_owned()).interrupt().is_err()
-        {
-            return reply(stream, 503, error("harness_interrupt_failed"));
+        if interrupt_result.is_err() {
+            log::warn!("could not interrupt {harness} session for agent {id}");
         }
         let _ = state.supervisor.registry.transition(id, "stopped", None);
         return reply(

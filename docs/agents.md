@@ -9,27 +9,48 @@ worktree or, with explicit `--no-branch`, directly in the project directory;
 it persists lifecycle state, captures stdout/stderr, and records an
 API-created transcript. The harness defaults to `codex` for compatibility.
 
-The shared approval modes map to each CLI's options: Gemini uses `default`,
-`auto_edit`, or `yolo`; OpenCode uses inline permission configuration for
-`suggest` and `auto-edit`, and `--auto` for `full-auto`; Codex keeps its native
-approval flags.
-Model selection uses each CLI's `--model` option. With no model override,
-Gemini and OpenCode use their own configured defaults.
+The shared approval modes map to each harness: Gemini uses `default`,
+`auto_edit`, or `yolo`; OpenCode stores the permission rules on each session;
+Codex uses its app-server defaults. Model selection is passed to the harness
+session when supported. With no model override, Gemini and OpenCode use their
+configured defaults, and Codex uses its app-server default.
 
 Codex agents use one long-lived app-server for the daemon's local isolation
-domain and one durable thread per agent. The per-thread `cwd` is the agent's
-worktree (or project directory for `--no-branch`). On daemon startup, active
-thread IDs are resumed from the durable registry. A Codex thread ID is only a
-routing key; it is not a tenant security boundary. Agents that share an
-app-server also share its process failure domain.
+domain and one durable thread per agent. OpenCode agents use one loopback-only
+`opencode serve` process for the domain and one durable session per agent.
+Each session is created with that agent's worktree (or project directory for
+`--no-branch`). On daemon startup, active Codex threads and OpenCode sessions
+are reattached from the durable registry. Session IDs are routing keys, not
+tenant security boundaries; agents that share a server also share its process
+failure domain.
 
 `POST /v1/agents/{id}/messages` accepts `{ "text": "...", "delivery":
 "steer" | "queue" }`. `zzapi agents message <id> --steer "..."` sends a
-mid-turn instruction; `--queue "..."` appends a follow-up turn. Stop remains
-thread-scoped. Pause/resume are unavailable for app-server threads because
-signaling their shared process would affect every agent in the domain.
+mid-turn instruction; `--queue "..."` appends a follow-up turn for either
+native harness. Stop remains session-scoped. Pause/resume are unavailable for
+app-server sessions because signaling their shared process would affect every
+agent in the domain.
 
-Other harnesses currently retain their one-shot process lifecycle. Their
+The shared live-session budget defaults to four Codex threads and OpenCode
+sessions across a daemon domain. Set `ZIGZAG_MAX_LIVE_AGENT_THREADS` before
+starting the daemon to tune it for the machine; it must be a positive integer.
+The limit is checked when a native agent is created and returns HTTP 429 when
+the budget is full. Increase it after observing memory pressure and CPU
+contention while representative agents run; decrease it if those resources
+become constrained. Existing sessions keep running if the configured budget
+is lowered.
+Auto-update waits until registered agents stop before it shuts down the shared
+harness servers and replaces the daemon. If a daemon starts with running
+native agents after an interrupted restart, it reconnects their durable IDs.
+
+The initial default is based on local measurements, not a vendor limit. On a
+128 GiB Mac, the shared Codex app-server measured about 0.25–0.29 GiB RSS and
+the OpenCode server about 0.63 GiB RSS after the steering runs; both were
+below 1% CPU while idle. Active model/tool work varies, so the four-session
+budget bounds concurrent agent work while leaving room to tune against the
+machine's own active workload.
+
+Gemini and other one-shot harnesses retain their process lifecycle. Their
 registry reaper records terminal exit. After relay restart it cannot reattach
 pipes: a live old group becomes `orphaned`; a dead one becomes
 `lost_after_restart`. Terminal entries and spool metadata are pruned after
