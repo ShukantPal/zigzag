@@ -2332,7 +2332,13 @@ fn spawn_codex_task(
         "relay_request_started",
         task_id,
         &execution_id,
-        Json::Object(vec![]),
+        Json::Object(vec![
+            ("process".to_owned(), Json::String(bin.to_owned())),
+            (
+                "command".to_owned(),
+                Json::Array(args.iter().cloned().map(Json::String).collect()),
+            ),
+        ]),
     ))?;
     server.store.add(relay_event(
         "relay_accepted",

@@ -803,7 +803,17 @@ fn agent_create_request(
             "relay_request_started",
             &task_id,
             &execution_id,
-            Json::Object(vec![]),
+            Json::Object(vec![
+                ("prompt".to_owned(), Json::String(request.prompt.clone())),
+                (
+                    "model".to_owned(),
+                    request
+                        .model
+                        .clone()
+                        .map(Json::String)
+                        .unwrap_or(Json::Null),
+                ),
+            ]),
         ))
         .is_err()
     {

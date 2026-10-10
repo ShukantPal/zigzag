@@ -109,7 +109,24 @@ pub(crate) fn spawn_request(
             "relay_request_started",
             &request.command.id,
             &execution_id,
-            Json::Object(vec![]),
+            Json::Object(vec![
+                (
+                    "process".to_owned(),
+                    Json::String(request.command.bin.clone()),
+                ),
+                (
+                    "command".to_owned(),
+                    Json::Array(
+                        request
+                            .command
+                            .args
+                            .iter()
+                            .cloned()
+                            .map(Json::String)
+                            .collect(),
+                    ),
+                ),
+            ]),
         ))
         .is_err()
     {
