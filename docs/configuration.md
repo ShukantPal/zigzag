@@ -8,11 +8,33 @@ with `--secret-file` and `--state-file`, restarts on failure, and logs to
 is `launchd/com.shukantpal.zigzag.plist`; use `launchd/INSTALL.md` rather than
 creating another job.
 
-The relay's executable allowlist is held in macOS Keychain and may be loaded
-only from a GUI login session. `zigzag config get-allowlist` and
-`zigzag config set-allowlist --file PATH` are privileged GUI-session commands.
-Do not bootstrap/restart through SSH: Keychain access can hang and `/v1/exec`
-will cease to work even if the daemon remains alive.
+The relay prefers its executable allowlist in macOS Keychain. The daemon reads
+it in a GUI login session; `zigzag config get-allowlist` and
+`zigzag config set-allowlist --file PATH` remain privileged GUI-session
+commands. If the daemon has no GUI Keychain session or the Keychain item cannot
+be read, `/v1/exec` and `/v1/spawn` keep working with the configured fallback
+policy. The daemon logs a warning when it enters this degraded mode.
+
+To configure a fallback, set `ZIGZAG_EXEC_ALLOWLIST_FILE` in the daemon's
+environment to a JSON allowlist path. The file must be owned by the relay user
+and have permissions `0600` or stricter. For a LaunchAgent, add an
+`EnvironmentVariables` dictionary to its plist and restart the agent. Example:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>ZIGZAG_EXEC_ALLOWLIST_FILE</key>
+  <string>/Users/ACCOUNT/.codex/zigzag/exec-allowlist.json</string>
+</dict>
+```
+
+Write the policy JSON directly to the fallback path and protect it with
+`chmod 600 PATH`. The GUI-session `zigzag config set-allowlist --file PATH`
+command continues to update Keychain; it does not write the fallback file.
+When the fallback file is absent or invalid, the daemon uses an empty
+allowlist, so exec and spawn requests are denied while unrelated relay routes
+continue to work. When Keychain is readable, it remains authoritative and the
+file is ignored.
 
 ## Auth and network boundary
 

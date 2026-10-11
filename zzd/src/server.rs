@@ -110,7 +110,7 @@ pub(crate) fn serve(listener: TcpListener, state: Arc<Server>, limiter: Arc<Conn
 }
 pub(crate) fn handle(stream: TcpStream, state: Arc<Server>) -> Result<(), String> {
     handle_with_policy(stream, state, || {
-        require_gui_login_session().and_then(|_| exec::load_policy())
+        exec::load_server_policy(require_gui_login_session().is_ok())
     })
 }
 pub(crate) fn handle_with_policy<F>(
