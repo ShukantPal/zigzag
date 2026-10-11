@@ -19,7 +19,6 @@ use zz::{Json, parse_json};
 const KEYCHAIN_SERVICE: &str = "zigzag";
 const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";
 const FILE_ALLOWLIST_ENV: &str = "ZIGZAG_EXEC_ALLOWLIST_FILE";
-const EMPTY_POLICY: &str = r#"{"bins":{}}"#;
 static DEGRADED_POLICY_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Upper bound for one synchronous execution; the HTTP client must allow a
 /// slightly larger read timeout.
@@ -613,7 +612,9 @@ pub fn load_server_policy(gui_session_available: bool) -> Result<Policy, String>
 }
 
 fn empty_policy() -> Policy {
-    Policy::parse(EMPTY_POLICY).expect("built-in empty policy is valid")
+    Policy {
+        bins: BTreeMap::new(),
+    }
 }
 
 fn load_private_policy_file(path: &Path) -> Result<Policy, String> {

@@ -12,10 +12,10 @@
 //! - the OS assigns free ports, parsed from the daemon's
 //!   `listening on http://127.0.0.1:PORT` log line
 //!
-//! `/v1/exec` and `/v1/spawn` are expected to fail closed (500) here: the
-//! exec policy lives in the macOS keychain behind the GUI login session,
-//! which CI runners do not have. The in-crate `e2e` module covers those
-//! paths with an injected policy instead.
+//! `/v1/exec` and `/v1/spawn` are expected to deny commands here: CI runners
+//! have no GUI session for Keychain access and no configured file fallback.
+//! The in-crate `e2e` module covers successful execution with an injected
+//! policy instead.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -102,6 +102,7 @@ impl TestRelay {
             .env("ZIGZAG_WORKTREE_ROOTS", &dir)
             .env("ZIGZAG_WORKTREE_REPO_ROOT", &dir)
             .env("ZIGZAG_UPDATE_POLICY", "paused")
+            .env_remove("ZIGZAG_EXEC_ALLOWLIST_FILE")
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .stdin(Stdio::null())
@@ -479,7 +480,7 @@ fn binary_routing_and_framing_errors() {
 }
 
 #[test]
-fn binary_exec_and_spawn_fail_closed_without_gui_session() {
+fn binary_exec_and_spawn_deny_without_gui_session() {
     // CI runners (and this test) have no macOS GUI login session and no
     // keychain-backed exec policy, so both endpoints must fail closed.
     let relay = TestRelay::start();
@@ -489,9 +490,9 @@ fn binary_exec_and_spawn_fail_closed_without_gui_session() {
         "/v1/exec",
         Some(r#"{"id":"e2e-exec","bin":"sh","args":["-c","echo hi"]}"#),
     );
-    assert_eq!(status, 500, "exec did not fail closed: {body}");
+    assert_eq!(status, 200, "exec denial failed: {body}");
     assert!(
-        body.contains("could_not_read_execution_policy"),
+        body.contains("\"error\":\"denied\""),
         "unexpected exec body: {body}"
     );
 
@@ -500,9 +501,9 @@ fn binary_exec_and_spawn_fail_closed_without_gui_session() {
         "/v1/spawn",
         Some(r#"{"id":"e2e-spawn","bin":"sh","args":["-c","echo hi"]}"#),
     );
-    assert_eq!(status, 500, "spawn did not fail closed: {body}");
+    assert_eq!(status, 200, "spawn denial failed: {body}");
     assert!(
-        body.contains("could_not_read_execution_policy"),
+        body.contains("\"error\":\"denied\""),
         "unexpected spawn body: {body}"
     );
 }
