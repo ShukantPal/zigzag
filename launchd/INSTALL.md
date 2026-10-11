@@ -189,10 +189,12 @@ not touch the live Keychain item.
 
 ## Exec endpoint
 
-Zigzag runs as a LaunchAgent inside the Mac's GUI login session, where the
-macOS keychain is available. Its `POST /v1/exec` endpoint executes only a
-binary and argv prefix named in the Keychain-held policy. SSH sessions cannot
-read or modify that policy.
+Zigzag prefers the macOS Keychain policy for `POST /v1/exec` and `/v1/spawn`.
+If the daemon has no GUI Keychain session or its Keychain item cannot be read,
+it uses `ZIGZAG_EXEC_ALLOWLIST_FILE` when configured, otherwise an empty
+deny-all policy. See [configuration and security](../docs/configuration.md)
+for the fallback setup and permissions. SSH sessions cannot read or modify
+the Keychain policy.
 
 Shukant installs or updates it from his GUI login session by putting the JSON
 policy in a file and running:
@@ -201,9 +203,10 @@ policy in a file and running:
 zigzag config set-allowlist --file /secure/path/exec-allowlist.json
 ```
 
-Zigzag verifies that it is in a local graphical macOS session before either
-reading or writing the policy, and refuses those operations from SSH. This
-keeps Keychain policy access within the owner GUI-login session.
+Zigzag verifies that it is in a local graphical macOS session before reading
+or writing policy through the config commands, and refuses those commands
+from SSH. This keeps Keychain policy management within the owner GUI-login
+session.
 The command validates the policy, stores canonical JSON in the `zigzag` /
 `exec-allowlist` Keychain item, then prints the stored normalized policy for
 confirmation. macOS may prompt once to grant this specific Zigzag binary

@@ -11,12 +11,16 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zz::{Json, parse_json};
 
 const KEYCHAIN_SERVICE: &str = "zigzag";
 const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";
+const FILE_ALLOWLIST_ENV: &str = "ZIGZAG_EXEC_ALLOWLIST_FILE";
+const EMPTY_POLICY: &str = r#"{"bins":{}}"#;
+static DEGRADED_POLICY_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Upper bound for one synchronous execution; the HTTP client must allow a
 /// slightly larger read timeout.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
@@ -566,6 +570,64 @@ pub fn load_policy() -> Result<Policy, String> {
         .get_password()
         .map_err(|error| format!("could not read exec allowlist from keychain: {error}"))?;
     Policy::parse(&policy).map_err(|error| format!("invalid exec allowlist in keychain: {error}"))
+}
+
+/// Load the policy for HTTP exec/spawn. The Keychain remains authoritative
+/// in a GUI session; headless sessions and Keychain read failures use the
+/// explicitly configured file, or an empty deny-all policy.
+pub fn load_server_policy(gui_session_available: bool) -> Result<Policy, String> {
+    let reason = if gui_session_available {
+        match load_policy() {
+            Ok(policy) => return Ok(policy),
+            Err(error) => error,
+        }
+    } else {
+        "no local macOS GUI login session for Keychain access".to_owned()
+    };
+    let fallback = match std::env::var_os(FILE_ALLOWLIST_ENV) {
+        Some(path) if !path.is_empty() => {
+            let path = PathBuf::from(path);
+            match load_private_policy_file(&path) {
+                Ok(policy) => (policy, format!("using file allowlist {}", path.display())),
+                Err(error) => (
+                    empty_policy(),
+                    format!(
+                        "file allowlist {} could not be loaded ({error}); using deny-all policy",
+                        path.display()
+                    ),
+                ),
+            }
+        }
+        _ => (
+            empty_policy(),
+            "no file fallback configured; using deny-all policy".to_owned(),
+        ),
+    };
+    if !DEGRADED_POLICY_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "exec allowlist running in degraded mode: {reason}; {}",
+            fallback.1
+        );
+    }
+    Ok(fallback.0)
+}
+
+fn empty_policy() -> Policy {
+    Policy::parse(EMPTY_POLICY).expect("built-in empty policy is valid")
+}
+
+fn load_private_policy_file(path: &Path) -> Result<Policy, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("path is not a regular file".to_owned());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        return Err(
+            "file must be owned by the relay user and have mode 0600 or stricter".to_owned(),
+        );
+    }
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    Policy::parse(&contents).map_err(|error| format!("invalid policy: {error}"))
 }
 
 pub fn store_policy(policy: &Policy) -> Result<(), String> {
