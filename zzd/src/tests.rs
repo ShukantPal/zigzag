@@ -35,9 +35,9 @@ use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
-    agent_harness_config, agent_route, default_agent_worktree, dispatch_agent_message,
-    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
-    valid_agent_model,
+    agent_harness_config, agent_post_request_with_session_resolver, agent_route,
+    default_agent_worktree, dispatch_agent_message, parse_agent_create_request,
+    persisted_agent_config, restart_argv, restart_config, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -2162,10 +2162,7 @@ fn failed_native_agent_interrupt_preserves_running_tracking() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
-    for (id, harness) in [
-        ("codex-stop-failure", "codex"),
-        ("opencode-stop-failure", "opencode"),
-    ] {
+    for (id, harness) in [("opencode-stop-failure", "opencode")] {
         let mut record = agent_record(id);
         record.harness = Some(harness.to_owned());
         record.harness_session_id = Some(format!("{harness}-session"));
@@ -2230,6 +2227,46 @@ fn agent_message_dispatches_steer_and_queue_and_surfaces_send_failure() {
     assert_eq!(
         dispatch_agent_message(&failed, "cannot send", Delivery::Queue).unwrap_err(),
         "dispatch failed"
+    );
+}
+
+#[test]
+fn agent_message_route_returns_503_when_harness_send_fails() {
+    let (state, _state_path) = test_server();
+    let mut record = agent_record("message-failure");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    let failed = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: true,
+    });
+    agent_post_request_with_session_resolver(
+        &mut stream,
+        &state,
+        AgentRoute::Message("message-failure"),
+        br#"{"text":"cannot send","delivery":"queue"}"#.to_vec(),
+        move |_, _, _| Ok(failed.clone()),
+    )
+    .unwrap();
+    drop(stream);
+    let response = client.join().unwrap();
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("error")
+            .and_then(Json::as_str),
+        Some("harness_message_failed")
     );
 }
 

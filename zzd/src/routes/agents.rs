@@ -290,12 +290,55 @@ pub(crate) fn agent_post_request(
     route: AgentRoute<'_>,
     body: Vec<u8>,
 ) -> Result<(), String> {
+    agent_post_request_with_session_resolver(stream, state, route, body, resolve_agent_session)
+}
+
+pub(crate) fn agent_post_request_with_session_resolver<F>(
+    stream: &mut TcpStream,
+    state: &Server,
+    route: AgentRoute<'_>,
+    body: Vec<u8>,
+    resolve_session: F,
+) -> Result<(), String>
+where
+    F: Fn(
+        &Server,
+        &str,
+        &str,
+    ) -> Result<Arc<dyn crate::harness::HarnessSession>, (u16, &'static str)>,
+{
     match route {
         AgentRoute::Create => agent_create_request(stream, state, body),
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
-        AgentRoute::Message(id) => agent_message_request(stream, state, id, body),
+        AgentRoute::Message(id) => agent_message_request(stream, state, id, body, &resolve_session),
         _ => reply(stream, 404, error("not_found")),
+    }
+}
+
+fn resolve_agent_session(
+    state: &Server,
+    harness: &str,
+    session_id: &str,
+) -> Result<Arc<dyn crate::harness::HarnessSession>, (u16, &'static str)> {
+    match harness {
+        "codex" => state
+            .supervisor
+            .codex_server()
+            .map(|server| server.session(session_id.to_owned()))
+            .map_err(|message| {
+                log::error!("could not start Codex app-server: {message}");
+                (503, "harness_unavailable")
+            }),
+        "opencode" => state
+            .supervisor
+            .opencode_server()
+            .map(|server| server.session(session_id.to_owned()))
+            .map_err(|message| {
+                log::error!("could not start OpenCode server: {message}");
+                (503, "harness_unavailable")
+            }),
+        _ => Err((501, "harness_message_unsupported")),
     }
 }
 
@@ -372,6 +415,12 @@ fn agent_message_request(
     state: &Server,
     id: &str,
     body: Vec<u8>,
+    resolve_session: &impl Fn(
+        &Server,
+        &str,
+        &str,
+    )
+        -> Result<Arc<dyn crate::harness::HarnessSession>, (u16, &'static str)>,
 ) -> Result<(), String> {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -414,22 +463,9 @@ fn agent_message_request(
     ) else {
         return reply(stream, 409, error("agent_not_interactive"));
     };
-    let session = match harness {
-        "codex" => match state.supervisor.codex_server() {
-            Ok(server) => server.session(session_id.to_owned()),
-            Err(message) => {
-                log::error!("could not start Codex app-server: {message}");
-                return reply(stream, 503, error("harness_unavailable"));
-            }
-        },
-        "opencode" => match state.supervisor.opencode_server() {
-            Ok(server) => server.session(session_id.to_owned()),
-            Err(message) => {
-                log::error!("could not start OpenCode server: {message}");
-                return reply(stream, 503, error("harness_unavailable"));
-            }
-        },
-        _ => return reply(stream, 501, error("harness_message_unsupported")),
+    let session = match resolve_session(state, harness, session_id) {
+        Ok(session) => session,
+        Err((status, code)) => return reply(stream, status, error(code)),
     };
     if let Err(message) = dispatch_agent_message(session.as_ref(), text, delivery) {
         log::warn!("agent message dispatch failed id={id}: {message}");

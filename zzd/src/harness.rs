@@ -496,7 +496,11 @@ impl HarnessSession for CodexSession {
         Ok(())
     }
     fn interrupt(&self) -> Result<(), String> {
-        let turn_id = self
+        // A completed turn is already idle. Treat stopping that session as
+        // successful, while still propagating failures from a real interrupt
+        // request below so the registry keeps tracking sessions we failed to
+        // stop.
+        let turn_id = match self
             .server
             .shared
             .turns
@@ -504,7 +508,10 @@ impl HarnessSession for CodexSession {
             .map_err(|_| "turn map poisoned")?
             .get(&self.thread_id)
             .cloned()
-            .ok_or("agent has no active Codex turn")?;
+        {
+            Some(turn_id) => turn_id,
+            None => return Ok(()),
+        };
         self.server
             .rpc(
                 "turn/interrupt",
@@ -558,6 +565,43 @@ impl HarnessSession for OpenCodeSession {
         .call()
         .map(|_| ())
         .map_err(|error| format!("OpenCode interrupt failed: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexServer, Shared};
+    use std::collections::{HashMap, VecDeque};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn interrupting_idle_codex_session_succeeds_without_rpc() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let server = Arc::new(CodexServer {
+            shared: Arc::new(Shared {
+                writer: Mutex::new(writer),
+                child: Mutex::new(child),
+                pending: Mutex::new(HashMap::new()),
+                subscribers: Mutex::new(HashMap::new()),
+                turns: Mutex::new(HashMap::new()),
+                queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+                next_id: AtomicU64::new(1),
+            }),
+        });
+
+        server
+            .session("completed-thread".to_owned())
+            .interrupt()
+            .unwrap();
+        server.stop().unwrap();
     }
 }
 
