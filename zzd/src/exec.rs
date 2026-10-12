@@ -761,7 +761,34 @@ fn drain_limited(mut pipe: impl Read) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static FILE_ALLOWLIST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_file_allowlist_env<T>(value: Option<&std::ffi::OsStr>, f: impl FnOnce() -> T) -> T {
+        let _lock = FILE_ALLOWLIST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(FILE_ALLOWLIST_ENV);
+        match value {
+            Some(value) => unsafe { std::env::set_var(FILE_ALLOWLIST_ENV, value) },
+            None => unsafe { std::env::remove_var(FILE_ALLOWLIST_ENV) },
+        }
+
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var(FILE_ALLOWLIST_ENV, value) },
+                    None => unsafe { std::env::remove_var(FILE_ALLOWLIST_ENV) },
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        f()
+    }
 
     fn policy(text: &str) -> Policy {
         Policy::parse(text).unwrap()
@@ -781,6 +808,33 @@ mod tests {
 
     fn policy_allows_ztool_run(policy: &Policy) -> bool {
         policy.allowed_path("ztool", &args(&["run"])).is_some()
+    }
+
+    #[test]
+    fn load_server_policy_reads_configured_file_path_from_environment() {
+        let path = private_policy_file(
+            "loader-configured-path",
+            &bin_policy_json(Path::new("/bin/env-policy")),
+            0o600,
+        );
+
+        with_file_allowlist_env(path.as_os_str().into(), || {
+            let selected = load_server_policy(false).unwrap();
+            assert_eq!(
+                selected.allowed_path("ztool", &args(&["run"])),
+                Some("/bin/env-policy")
+            );
+        });
+    }
+
+    #[test]
+    fn load_server_policy_uses_deny_all_for_unset_or_empty_file_path() {
+        for value in [None, Some(std::ffi::OsStr::new(""))] {
+            with_file_allowlist_env(value, || {
+                let selected = load_server_policy(false).unwrap();
+                assert!(!policy_allows_ztool_run(&selected));
+            });
+        }
     }
 
     #[test]
