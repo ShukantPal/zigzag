@@ -483,9 +483,7 @@ pub(crate) fn dispatch_agent_message(
 
 #[cfg(not(test))]
 fn native_agent_record(
-    id: String,
-    task_id: &str,
-    execution_id: &str,
+    (id, task_id, execution_id): (&str, &str, &str),
     pid: i32,
     worktree: &str,
     request: &AgentCreateRequest,
@@ -493,7 +491,7 @@ fn native_agent_record(
     session_id: &str,
 ) -> AgentRecord {
     AgentRecord {
-        id,
+        id: id.to_owned(),
         task_id: task_id.to_owned(),
         execution_id: execution_id.to_owned(),
         leader_pid: pid,
@@ -1364,9 +1362,7 @@ fn create_codex_thread(
     };
     let pid = server.pid() as i32;
     let record = native_agent_record(
-        id.clone(),
-        task_id,
-        execution_id,
+        (&id, task_id, execution_id),
         pid,
         worktree,
         request,
@@ -1509,9 +1505,7 @@ fn create_opencode_session(
     };
     let pid = server.pid() as i32;
     let record = native_agent_record(
-        id.clone(),
-        task_id,
-        execution_id,
+        (&id, task_id, execution_id),
         pid,
         worktree,
         request,
