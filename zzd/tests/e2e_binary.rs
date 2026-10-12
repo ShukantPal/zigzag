@@ -68,18 +68,19 @@ impl TestRelay {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tailscale, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        // The agent-restart E2E drives the real agent API without requiring
-        // an installed CLI. Keep the fake harness alive after its daemon dies.
-        let codex = bin_dir.join("codex");
+        // The agent-restart E2E uses the legacy CLI path to exercise a
+        // detached process that survives the daemon. Native Codex agents use
+        // the app-server protocol and need a JSON-RPC fixture instead.
+        let gemini = bin_dir.join("gemini");
         std::fs::write(
-            &codex,
+            &gemini,
             "#!/bin/sh\necho started >> \"$HOME/fake-agent.started\"\nexec sleep 300\n",
         )
         .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&gemini, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let path = format!(
             "{}:{}",
@@ -405,7 +406,7 @@ fn binary_agent_remains_tracked_across_real_daemon_restart() {
     // real detached child process that survives killing the daemon.
     let project_dir = relay.dir.display().to_string();
     let body = format!(
-        r#"{{"prompt":"keep running for restart test","project_dir":"{project_dir}","no_branch":true,"no_auto_pr":true}}"#
+        r#"{{"prompt":"keep running for restart test","project_dir":"{project_dir}","no_branch":true,"no_auto_pr":true,"harness":"gemini"}}"#
     );
     let (status, created) = relay.authed("POST", "/v1/agents", Some(&body));
     assert_eq!(status, 200, "agent create failed: {created}");

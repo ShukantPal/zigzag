@@ -217,6 +217,8 @@ pub(crate) fn spawn_proc(
         first_output_bytes: None,
         restarted_from: None,
         agent_config: None,
+        harness_session_id: None,
+        harness: None,
     };
     // The registry transition commits before this spawn can be acknowledged.
     if let Err(error) = supervisor.registry.register(record) {
@@ -526,6 +528,14 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
             // still matches, then record an honest terminal state when they exit.
             for agent in state.supervisor.registry.list(Some("running"), None) {
                 if in_memory.contains(&agent.id) {
+                    continue;
+                }
+                // Native harness agents are multiplexed sessions owned by a
+                // shared app-server, not child processes represented in the
+                // process table. Their durable session IDs are recovered by
+                // the harness adapter at startup; a PID probe would always
+                // misclassify them as exited.
+                if agent.harness_session_id.is_some() {
                     continue;
                 }
                 sync_recovered_agent_output(&agent, &state.supervisor.registry, &state.store);

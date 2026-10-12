@@ -672,6 +672,8 @@ mod tests {
                 first_output_bytes: None,
                 restarted_from: None,
                 agent_config: None,
+                harness_session_id: None,
+                harness: None,
             })
             .unwrap();
         // API-created agents retain this durable transcript, but their live

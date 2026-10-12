@@ -25,6 +25,14 @@ pub(crate) struct Config {
     pub(crate) review_state_file: PathBuf,
 }
 pub(crate) fn server_config(arguments: Vec<String>) -> Result<Config, String> {
+    if let Ok(value) = env::var("ZIGZAG_MAX_LIVE_AGENT_THREADS") {
+        let limit = value
+            .parse::<usize>()
+            .map_err(|_| "ZIGZAG_MAX_LIVE_AGENT_THREADS must be a positive integer".to_owned())?;
+        if limit == 0 {
+            return Err("ZIGZAG_MAX_LIVE_AGENT_THREADS must be a positive integer".to_owned());
+        }
+    }
     let mut secret_file = env::var_os("ZIGZAG_SECRET_FILE").map(PathBuf::from);
     let mut state_file = env::var_os("ZIGZAG_STATE_FILE").map(PathBuf::from);
     let mut control_secret_file = env::var_os("ZIGZAG_CONTROL_SECRET_FILE").map(PathBuf::from);
