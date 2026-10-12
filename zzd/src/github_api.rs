@@ -5,13 +5,37 @@ use std::io::Read;
 use std::path::PathBuf;
 
 const API_ROOT: &str = "https://api.github.com";
+const MAX_PAGES: usize = 1000;
+const MAX_REDIRECTS: usize = 5;
+const GITHUB_BUNDLE_HOSTS: &[&str] = &[
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 fn github_token() -> Result<String, String> {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Some(token) = std::env::var(name)
-            .ok()
-            .filter(|token| !token.trim().is_empty())
-        {
+    github_token_from_env(
+        std::env::var("GH_TOKEN").ok(),
+        std::env::var("GITHUB_TOKEN").ok(),
+        std::env::var_os("GH_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("gh"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/gh"))
+            }),
+    )
+}
+
+fn github_token_from_env(
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<String, String> {
+    for token in [gh_token, github_token].into_iter().flatten() {
+        if !token.trim().is_empty() {
             return Ok(token);
         }
     }
@@ -19,13 +43,9 @@ fn github_token() -> Result<String, String> {
     // Resolve the same host configuration used by the GitHub CLI. Its secure
     // credential-store entry is keyed by the active username (and it keeps an
     // unkeyed active-account entry for older configurations).
-    let config = std::env::var_os("GH_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("gh")))
-        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/gh")))
-        .ok_or_else(|| {
-            "GitHub authentication is unavailable (set GH_TOKEN or GITHUB_TOKEN)".to_owned()
-        })?;
+    let config = config.ok_or_else(|| {
+        "GitHub authentication is unavailable (set GH_TOKEN or GITHUB_TOKEN)".to_owned()
+    })?;
     let contents = std::fs::read_to_string(config.join("hosts.yml")).unwrap_or_default();
     let hosts: serde_yaml::Value =
         serde_yaml::from_str(&contents).unwrap_or(serde_yaml::Value::Null);
@@ -64,6 +84,7 @@ fn agent() -> Result<(ureq::Agent, String), String> {
     let token = github_token()?;
     let agent = ureq::AgentBuilder::new()
         .user_agent(concat!("zigzag/", env!("CARGO_PKG_VERSION")))
+        .redirects(0)
         .build();
     Ok((agent, token))
 }
@@ -88,12 +109,21 @@ fn response_json(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
     };
     response
         .into_json()
-        .map_err(|error| format!("GitHub API returned invalid JSON: {error}"))
+        .map_err(|_| "GitHub API returned invalid JSON".to_owned())
 }
 
 pub(crate) fn get(endpoint: &str) -> Result<Value, String> {
     let (agent, token) = agent()?;
-    response_json(headers(agent.get(&format!("{API_ROOT}/{endpoint}")), &token).call())
+    get_at(&agent, API_ROOT, endpoint, &token)
+}
+
+fn get_at(
+    agent: &ureq::Agent,
+    api_root: &str,
+    endpoint: &str,
+    token: &str,
+) -> Result<Value, String> {
+    response_json(headers(agent.get(&format!("{api_root}/{endpoint}")), token).call())
 }
 
 /// Fetch every page from a REST collection endpoint. GitHub's maximum page
@@ -110,7 +140,7 @@ fn get_all_at(
     token: &str,
 ) -> Result<Vec<Value>, String> {
     let mut results = Vec::new();
-    for page in 1..=1000 {
+    for page in 1..=MAX_PAGES {
         let separator = if endpoint.contains('?') { '&' } else { '?' };
         let url = format!("{api_root}/{endpoint}{separator}per_page=100&page={page}");
         let value = response_json(headers(agent.get(&url), token).call())?;
@@ -127,14 +157,33 @@ fn get_all_at(
 
 pub(crate) fn post(endpoint: &str, body: &Value) -> Result<Value, String> {
     let (agent, token) = agent()?;
+    post_at(&agent, API_ROOT, endpoint, body, &token)
+}
+
+fn post_at(
+    agent: &ureq::Agent,
+    api_root: &str,
+    endpoint: &str,
+    body: &Value,
+    token: &str,
+) -> Result<Value, String> {
     response_json(
-        headers(agent.post(&format!("{API_ROOT}/{endpoint}")), &token).send_json(body.clone()),
+        headers(agent.post(&format!("{api_root}/{endpoint}")), token).send_json(body.clone()),
     )
 }
 
 pub(crate) fn delete(endpoint: &str) -> Result<(), String> {
     let (agent, token) = agent()?;
-    match headers(agent.delete(&format!("{API_ROOT}/{endpoint}")), &token).call() {
+    delete_at(&agent, API_ROOT, endpoint, &token)
+}
+
+fn delete_at(
+    agent: &ureq::Agent,
+    api_root: &str,
+    endpoint: &str,
+    token: &str,
+) -> Result<(), String> {
+    match headers(agent.delete(&format!("{api_root}/{endpoint}")), token).call() {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(204, _)) => Ok(()),
         // Keep authenticated response and transport details out of errors:
@@ -156,19 +205,7 @@ fn attestation_bundles_at(
     digest: &str,
     token: &str,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let response = response_json(
-        headers(
-            agent.get(&format!(
-                "{api_root}/repos/{repository}/attestations/sha256:{digest}?per_page=100"
-            )),
-            token,
-        )
-        .call(),
-    )?;
-    let attestations = response
-        .get("attestations")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "GitHub did not return artifact attestations".to_owned())?;
+    let attestations = attestation_metadata_at(agent, api_root, repository, digest, token)?;
     if attestations.is_empty() {
         return Err("GitHub returned no artifact attestations".to_owned());
     }
@@ -179,10 +216,8 @@ fn attestation_bundles_at(
                 .get("bundle_url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "GitHub attestation is missing its bundle URL".to_owned())?;
-            let response = agent
-                .get(url)
-                .call()
-                .map_err(|_| "could not download GitHub attestation bundle".to_owned())?;
+            validate_bundle_url(url, GITHUB_BUNDLE_HOSTS)?;
+            let response = get_bundle(url)?;
             let mut bytes = Vec::new();
             response
                 .into_reader()
@@ -192,6 +227,127 @@ fn attestation_bundles_at(
             decode_snappy_frame(&bytes)
         })
         .collect()
+}
+
+fn attestation_metadata_at(
+    agent: &ureq::Agent,
+    api_root: &str,
+    repository: &str,
+    digest: &str,
+    token: &str,
+) -> Result<Vec<Value>, String> {
+    let api_origin = url::Url::parse(api_root)
+        .map_err(|_| "GitHub API returned an invalid pagination URL".to_owned())?;
+    let mut next = Some(format!(
+        "{api_root}/repos/{repository}/attestations/sha256:{digest}?per_page=100"
+    ));
+    let mut results = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let Some(url) = next.take() else {
+            return Ok(results);
+        };
+        if !same_origin(&api_origin, &url) {
+            return Err("GitHub API returned an unsafe pagination URL".to_owned());
+        }
+        let response = headers(agent.get(&url), token).call();
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code, _)) => {
+                return Err(format!("GitHub API returned HTTP {code}"));
+            }
+            Err(ureq::Error::Transport(_)) => return Err("GitHub API request failed".to_owned()),
+        };
+        let link = response.header("Link").map(str::to_owned);
+        let value: Value = response
+            .into_json()
+            .map_err(|_| "GitHub API returned invalid JSON".to_owned())?;
+        let items = value
+            .get("attestations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "GitHub did not return artifact attestations".to_owned())?;
+        results.extend(items.iter().cloned());
+        next = link.as_deref().and_then(next_link);
+    }
+    Err("GitHub API pagination exceeded 1000 pages".to_owned())
+}
+
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let mut pieces = part.trim().split(';');
+        let url = pieces.next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
+        pieces
+            .any(|parameter| parameter.trim().eq_ignore_ascii_case("rel=\"next\""))
+            .then(|| url.to_owned())
+    })
+}
+
+fn same_origin(origin: &url::Url, candidate: &str) -> bool {
+    let Ok(candidate) = url::Url::parse(candidate) else {
+        return false;
+    };
+    origin.scheme() == candidate.scheme()
+        && origin.host_str() == candidate.host_str()
+        && origin.port_or_known_default() == candidate.port_or_known_default()
+        && candidate.username().is_empty()
+        && candidate.password().is_none()
+}
+
+fn validate_bundle_url(url: &str, allowed_hosts: &[&str]) -> Result<url::Url, String> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| "GitHub attestation bundle URL is unsafe".to_owned())?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if parsed.scheme() != "https"
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || (!allowed_hosts.iter().any(|allowed| host == *allowed) && !is_github_blob_host(&host))
+    {
+        return Err("GitHub attestation bundle URL is unsafe".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn is_github_blob_host(host: &str) -> bool {
+    if host == "tmastaging.blob.core.windows.net" {
+        return true;
+    }
+    let Some(account) = host.strip_suffix(".blob.core.windows.net") else {
+        return false;
+    };
+    let Some(number) = account.strip_prefix("productionresultssa") else {
+        return false;
+    };
+    (1..=2).contains(&number.len()) && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn get_bundle(url: &str) -> Result<ureq::Response, String> {
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let mut current = url.to_owned();
+    for _ in 0..=MAX_REDIRECTS {
+        validate_bundle_url(&current, GITHUB_BUNDLE_HOSTS)?;
+        let result = agent.get(&current).call();
+        match result {
+            Ok(response) => return Ok(response),
+            Err(ureq::Error::Status(301 | 302 | 303 | 307 | 308, response)) => {
+                let location = response
+                    .header("Location")
+                    .ok_or_else(|| "could not download GitHub attestation bundle".to_owned())?;
+                current = bundle_redirect_target(&current, location)?;
+            }
+            Err(_) => return Err("could not download GitHub attestation bundle".to_owned()),
+        }
+    }
+    Err("could not download GitHub attestation bundle".to_owned())
+}
+
+fn bundle_redirect_target(current: &str, location: &str) -> Result<String, String> {
+    let base = url::Url::parse(current)
+        .map_err(|_| "GitHub attestation bundle URL is unsafe".to_owned())?;
+    let target = base
+        .join(location)
+        .map_err(|_| "GitHub attestation bundle URL is unsafe".to_owned())?
+        .to_string();
+    validate_bundle_url(&target, GITHUB_BUNDLE_HOSTS)?;
+    Ok(target)
 }
 
 fn decode_snappy_frame(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -362,9 +518,23 @@ fn decode_snappy_block(block: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn graphql(query: &str, variables: Value) -> Result<Value, String> {
-    let response = post(
+    let (agent, token) = agent()?;
+    graphql_at(&agent, API_ROOT, query, variables, &token)
+}
+
+fn graphql_at(
+    agent: &ureq::Agent,
+    api_root: &str,
+    query: &str,
+    variables: Value,
+    token: &str,
+) -> Result<Value, String> {
+    let response = post_at(
+        agent,
+        api_root,
         "graphql",
         &serde_json::json!({"query": query, "variables": variables}),
+        token,
     )?;
     if response.get("errors").is_some() {
         // The remote error body is untrusted and can contain sensitive
@@ -384,6 +554,37 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8(request.clone()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let body_start = request.len();
+        request.resize(body_start + content_length, 0);
+        stream.read_exact(&mut request[body_start..]).unwrap();
+        String::from_utf8(request).unwrap()
+    }
+
+    fn write_response(stream: &mut std::net::TcpStream, status: &str, headers: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
     #[test]
     fn snappy_bundle_decoder_reads_uncompressed_and_literal_chunks() {
         let identifier = b"\xff\x06\x00\x00sNaPpY";
@@ -402,33 +603,41 @@ mod tests {
     }
 
     #[test]
-    fn api_errors_do_not_expose_response_bodies() {
+    fn public_request_errors_do_not_expose_body_or_token() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
+            let request = read_request(&mut stream);
+            assert!(request.contains("Authorization: Bearer sensitive-test-token\r\n"));
             let body = "Bearer sensitive-test-token";
-            write!(
-                stream,
-                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+            write_response(&mut stream, "401 Unauthorized", "", body);
         });
 
-        let agent = ureq::AgentBuilder::new().build();
-        let error =
-            response_json(agent.get(&format!("http://{address}/private")).call()).unwrap_err();
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let error = get_at(
+            &agent,
+            &format!("http://{address}"),
+            "private",
+            "sensitive-test-token",
+        )
+        .unwrap_err();
         assert_eq!(error, "GitHub API returned HTTP 401");
         assert!(!error.contains("sensitive-test-token"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn missing_github_token_and_auth_resolution_fail_safely() {
+        let error = github_token_from_env(None, None, None).unwrap_err();
+        assert_eq!(
+            error,
+            "GitHub authentication is unavailable (set GH_TOKEN or GITHUB_TOKEN)"
+        );
+        assert_eq!(
+            github_token_from_env(Some(" test ".into()), None, None).unwrap(),
+            " test "
+        );
     }
 
     fn masked_snappy_crc(contents: &[u8]) -> u32 {
@@ -443,35 +652,34 @@ mod tests {
     }
 
     #[test]
-    fn attestations_are_fetched_through_api_and_presigned_url_without_token() {
+    fn attestation_api_follows_next_link_pages_before_returning_candidates() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for request_index in 0..2 {
+            for page in 1..=2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0; 1];
-                while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_exact(&mut byte).unwrap();
-                    request.push(byte[0]);
-                }
-                let request = String::from_utf8(request).unwrap();
-                if request_index == 0 {
-                    assert!(request.contains("Authorization: Bearer test-token\r\n"));
-                    assert!(request.contains("/repos/o/r/attestations/sha256:abc"));
-                    let body = format!(
-                        "{{\"attestations\":[{{\"bundle_url\":\"http://{address}/bundle\"}}]}}"
+                let request = read_request(&mut stream);
+                assert!(request.contains("Authorization: Bearer test-token\r\n"));
+                if page == 1 {
+                    assert!(request.contains("/repos/o/r/attestations/sha256:abc?per_page=100"));
+                    let body =
+                        r#"{"attestations":[{"bundle_url":"https://api.github.com/bundle/1"}]}"#;
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        &format!("Link: <http://{address}/page/2>; rel=\"next\"\r\n"),
+                        body,
                     );
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 } else {
-                    assert!(!request.to_ascii_lowercase().contains("authorization:"));
-                    let body = "{\"bundle\":true}";
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    assert!(request.contains("/page/2"));
+                    let body =
+                        r#"{"attestations":[{"bundle_url":"https://api.github.com/bundle/2"}]}"#;
+                    write_response(&mut stream, "200 OK", "", body);
                 }
             }
         });
-        let agent = ureq::AgentBuilder::new().build();
-        let bundles = attestation_bundles_at(
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let candidates = attestation_metadata_at(
             &agent,
             &format!("http://{address}"),
             "o/r",
@@ -479,7 +687,189 @@ mod tests {
             "test-token",
         )
         .unwrap();
-        assert_eq!(bundles, [b"{\"bundle\":true}".to_vec()]);
+        assert_eq!(candidates.len(), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bundle_url_requires_https_and_an_allowlisted_destination() {
+        for unsafe_url in [
+            "http://github.com/bundle",
+            "https://127.0.0.1/bundle",
+            "https://localhost/bundle",
+            "https://github.com.attacker.example/bundle",
+            "https://user@github.com/bundle",
+            "https://anything.blob.core.windows.net/bundle",
+        ] {
+            assert!(validate_bundle_url(unsafe_url, GITHUB_BUNDLE_HOSTS).is_err());
+        }
+        assert!(validate_bundle_url("https://api.github.com/bundle", GITHUB_BUNDLE_HOSTS).is_ok());
+        assert!(
+            bundle_redirect_target("https://api.github.com/bundle", "http://127.0.0.1/").is_err()
+        );
+        assert!(
+            bundle_redirect_target("https://api.github.com/bundle", "https://attacker.example/")
+                .is_err()
+        );
+        assert_eq!(
+            bundle_redirect_target(
+                "https://api.github.com/bundle",
+                "https://productionresultssa19.blob.core.windows.net/bundle?sig=x",
+            )
+            .unwrap(),
+            "https://productionresultssa19.blob.core.windows.net/bundle?sig=x"
+        );
+        assert!(
+            validate_bundle_url(
+                "https://productionresultssa19.blob.core.windows.net/bundle?sig=x",
+                GITHUB_BUNDLE_HOSTS,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn post_delete_and_graphql_use_authenticated_http_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("POST /comments HTTP/1.1\r\n"));
+            assert!(request.contains("Authorization: Bearer test-token\r\n"));
+            assert!(request.contains("Accept: application/vnd.github+json\r\n"));
+            assert!(request.contains("X-GitHub-Api-Version: 2022-11-28\r\n"));
+            assert!(request.contains("\r\n\r\n{\"body\":\"hello\"}"));
+            write_response(
+                &mut stream,
+                "201 Created",
+                "Content-Type: application/json\r\n",
+                "{\"id\":7}",
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("DELETE /comments/7 HTTP/1.1\r\n"));
+            assert!(request.contains("Authorization: Bearer test-token\r\n"));
+            assert!(request.contains("Accept: application/vnd.github+json\r\n"));
+            assert!(request.contains("X-GitHub-Api-Version: 2022-11-28\r\n"));
+            write_response(&mut stream, "204 No Content", "", "");
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("POST /graphql HTTP/1.1\r\n"));
+            assert!(request.contains("Authorization: Bearer test-token\r\n"));
+            assert!(request.contains("Accept: application/vnd.github+json\r\n"));
+            assert!(request.contains("X-GitHub-Api-Version: 2022-11-28\r\n"));
+            assert!(request.contains("\"query\":\"query { viewer { login } }\""));
+            assert!(request.contains("\"variables\":{\"n\":3}"));
+            write_response(
+                &mut stream,
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                "{\"data\":{\"viewer\":{\"login\":\"test\"}}}",
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write_response(
+                &mut stream,
+                "500 Internal Server Error",
+                "",
+                "secret server failure",
+            );
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write_response(&mut stream, "403 Forbidden", "", "secret delete failure");
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write_response(
+                &mut stream,
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                "{\"errors\":[{\"message\":\"secret graphql failure\"}]}",
+            );
+        });
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let root = format!("http://{address}");
+        assert_eq!(
+            post_at(
+                &agent,
+                &root,
+                "comments",
+                &serde_json::json!({"body":"hello"}),
+                "test-token"
+            )
+            .unwrap(),
+            serde_json::json!({"id":7})
+        );
+        assert!(delete_at(&agent, &root, "comments/7", "test-token").is_ok());
+        assert_eq!(
+            graphql_at(
+                &agent,
+                &root,
+                "query { viewer { login } }",
+                serde_json::json!({"n":3}),
+                "test-token"
+            )
+            .unwrap(),
+            serde_json::json!({"viewer":{"login":"test"}})
+        );
+        let post_error = post_at(
+            &agent,
+            &root,
+            "comments",
+            &serde_json::json!({}),
+            "test-token",
+        )
+        .unwrap_err();
+        assert_eq!(post_error, "GitHub API returned HTTP 500");
+        assert!(!post_error.contains("secret"));
+        let delete_error = delete_at(&agent, &root, "comments/7", "test-token").unwrap_err();
+        assert_eq!(delete_error, "GitHub API returned HTTP 403");
+        assert!(!delete_error.contains("secret"));
+        let graphql_error = graphql_at(
+            &agent,
+            &root,
+            "query { viewer { login } }",
+            serde_json::json!({}),
+            "test-token",
+        )
+        .unwrap_err();
+        assert_eq!(graphql_error, "GitHub GraphQL request failed");
+        assert!(!graphql_error.contains("secret"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn server_errors_and_malformed_json_are_safe() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (status, body) in [
+                ("503 Service Unavailable", "token=secret-response-body"),
+                ("200 OK", "token=secret-malformed-json{"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                write_response(
+                    &mut stream,
+                    status,
+                    "Content-Type: application/json\r\n",
+                    body,
+                );
+            }
+        });
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let root = format!("http://{address}");
+        let failure = get_at(&agent, &root, "failure", "secret-token").unwrap_err();
+        assert_eq!(failure, "GitHub API returned HTTP 503");
+        assert!(!failure.contains("secret"));
+        let malformed = get_at(&agent, &root, "malformed", "secret-token").unwrap_err();
+        assert_eq!(malformed, "GitHub API returned invalid JSON");
+        assert!(!malformed.contains("secret"));
         server.join().unwrap();
     }
 

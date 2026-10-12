@@ -324,19 +324,6 @@ impl Policy {
             })?;
         verify_binary_identity(identity).map_err(VerifyError::Unverifiable)
     }
-
-    /// Test helper for the previous repository-scoped `gh` authorization path.
-    #[cfg(test)]
-    pub fn trusted_gh_path_for_repo(&self, repo: &str) -> Option<PathBuf> {
-        let policy = self.bins.get("gh")?;
-        if !policy.gh_read_repos.contains(repo) {
-            return None;
-        }
-        policy
-            .identity
-            .as_ref()
-            .and_then(|identity| verify_binary_identity(identity).ok())
-    }
 }
 
 fn is_read_only_gh_command(args: &[String], repos: &BTreeSet<String>) -> bool {
@@ -1402,13 +1389,6 @@ mod tests {
         )
     }
 
-    fn gh_policy_json(path: &Path) -> String {
-        format!(
-            r#"{{"bins":{{"gh":{{"path":"{}","commands":[["pr","list"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}}}}"#,
-            path.display()
-        )
-    }
-
     #[test]
     fn verified_path_canonicalizes_a_symlinked_binary_at_policy_load() {
         let dir = temp_bin_dir("symlink");
@@ -1536,25 +1516,6 @@ mod tests {
     }
 
     #[test]
-    fn trusted_gh_path_is_verified_before_it_is_returned() {
-        let dir = temp_bin_dir("gh-trusted");
-        let gh = dir.join("gh");
-        std::fs::write(&gh, "fake").unwrap();
-        let policy = policy(&gh_policy_json(&gh));
-        assert_eq!(
-            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
-            Some(std::fs::canonicalize(&gh).unwrap())
-        );
-        assert_eq!(policy.trusted_gh_path_for_repo("other/repo"), None);
-        // Replacing the binary after policy load invalidates the trust.
-        let evil = dir.join("evil");
-        std::fs::write(&evil, "evil").unwrap();
-        std::fs::rename(&evil, &gh).unwrap();
-        assert_eq!(policy.trusted_gh_path_for_repo("leveled-inc/leveled"), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn gh_policy_permits_only_pr_reads_and_safe_api_reads() {
         let policy = policy(
             r#"{"bins":{"gh":{"path":"/opt/homebrew/bin/gh","commands":[["pr","list"],["pr","view"],["pr","checks"],["api"]],"gh_read_repos":["leveled-inc/leveled"]}}}"#,
@@ -1611,13 +1572,6 @@ mod tests {
                     ]),
                 )
                 .is_none()
-        );
-        // The verified lookup returns the canonicalized configured path
-        // when it exists, and refuses (None) when it does not — either way,
-        // never a blind unverified path.
-        assert_eq!(
-            policy.trusted_gh_path_for_repo("leveled-inc/leveled"),
-            std::fs::canonicalize("/opt/homebrew/bin/gh").ok()
         );
         assert!(
             policy

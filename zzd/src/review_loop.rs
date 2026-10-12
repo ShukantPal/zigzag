@@ -1079,9 +1079,8 @@ fn retry_pending_comment_deletions(
     store: &mut StateStore,
     key: &str,
 ) -> Result<(), String> {
-    let task_id = format!("comment-cleanup-{}", stable_identifier(key, 80));
     retry_pending_comment_deletions_with(store, key, |comment_node_id| {
-        delete_verdict_comment(policy, comment_node_id, &task_id)
+        delete_verdict_comment(policy, comment_node_id)
     })
 }
 
@@ -1822,9 +1821,9 @@ fn collect_completed_reviewers(
             key,
             lens,
             &result,
-            |comment_node_id| delete_verdict_comment(policy, comment_node_id, &task_id),
+            |comment_node_id| delete_verdict_comment(policy, comment_node_id),
             || fetch_pr(&repository, number),
-            || post_verdict_comment(policy, number, &result, &marker, &task_id),
+            || post_verdict_comment(policy, number, &result, &marker),
         )?;
     }
     Ok(())
@@ -1889,7 +1888,6 @@ fn post_verdict_comment(
     number: u64,
     result: &ReviewerResult,
     marker: &str,
-    _task_id: &str,
 ) -> Result<CreatedComment, String> {
     let summary = if result.findings.is_empty() {
         format!(
@@ -1933,11 +1931,7 @@ fn post_verdict_comment(
     Ok(comment)
 }
 
-fn delete_verdict_comment(
-    policy: &RepositoryPolicy,
-    comment_node_id: &str,
-    _task_id: &str,
-) -> Result<(), String> {
+fn delete_verdict_comment(policy: &RepositoryPolicy, comment_node_id: &str) -> Result<(), String> {
     require_gui_login_session()?;
     let lookup = crate::github_api::graphql(
         "query($id:ID!){node(id:$id){... on IssueComment {databaseId}}}",
