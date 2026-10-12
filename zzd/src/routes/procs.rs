@@ -235,30 +235,41 @@ fn auto_create_pr_if_needed(agent: &zz::AgentRecord) {
             return;
         }
     }
-    let existing = Command::new("gh")
-        .args([
-            "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", "length",
-        ])
+    let origin = Command::new("git")
+        .args(["remote", "get-url", "origin"])
         .current_dir(repo)
         .output();
+    let repository = match origin {
+        Ok(output) if output.status.success() => {
+            crate::github::github_repository(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => None,
+    };
+    let Some(repository) = repository else {
+        log::warn!(
+            "auto_pr agent={} could not resolve GitHub repository",
+            agent.id
+        );
+        return;
+    };
+    if let Err(error) = crate::session::require_gui_login_session() {
+        log::warn!(
+            "auto_pr agent={} GitHub session unavailable: {error}",
+            agent.id
+        );
+        return;
+    }
+    let head = format!("{}:{branch}", repository_owner(&repository));
+    let head_query = url::form_urlencoded::byte_serialize(head.as_bytes()).collect::<String>();
+    let existing = crate::github_api::get_all(&format!(
+        "repos/{repository}/pulls?state=open&head={head_query}"
+    ));
     match existing {
-        Ok(output)
-            if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() != "0" =>
-        {
-            return;
-        }
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            log::warn!(
-                "auto_pr agent={} gh pr list failed: {}",
-                agent.id,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return;
-        }
+        Ok(prs) if !prs.is_empty() => return,
+        Ok(_) => {}
         Err(error) => {
             log::warn!(
-                "auto_pr agent={} could not run gh pr list: {error}",
+                "auto_pr agent={} GitHub PR lookup failed: {error}",
                 agent.id
             );
             return;
@@ -270,30 +281,46 @@ fn auto_create_pr_if_needed(agent: &zz::AgentRecord) {
     let body = format!(
         "## What changed\n\n{summary}\n\n## Agent transcript\n\n[Transcript]({transcript})\n"
     );
-    let created = Command::new("gh")
-        .args([
-            "pr", "create", "--head", branch, "--title", branch, "--body", &body,
-        ])
-        .current_dir(repo)
-        .output();
-    match created {
-        Ok(output) if output.status.success() => {
+    let default_branch = crate::github_api::get(&format!("repos/{repository}"))
+        .ok()
+        .and_then(|response| {
+            response
+                .get("default_branch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let Some(base) = default_branch else {
+        log::warn!(
+            "auto_pr agent={} could not read repository default branch",
+            agent.id
+        );
+        return;
+    };
+    match crate::github_api::post(
+        &format!("repos/{repository}/pulls"),
+        &serde_json::json!({"title": branch, "head": branch, "base": base, "body": body}),
+    ) {
+        Ok(created) => {
             log::info!(
                 "auto_pr agent={} created PR: {}",
                 agent.id,
-                String::from_utf8_lossy(&output.stdout).trim()
+                created
+                    .get("html_url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("GitHub API")
             );
         }
-        Ok(output) => log::warn!(
-            "auto_pr agent={} gh pr create failed: {}",
-            agent.id,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
         Err(error) => log::warn!(
-            "auto_pr agent={} could not run gh pr create: {error}",
+            "auto_pr agent={} GitHub PR create failed: {error}",
             agent.id
         ),
     }
+}
+
+fn repository_owner(repository: &str) -> &str {
+    repository
+        .split_once('/')
+        .map_or(repository, |(owner, _)| owner)
 }
 pub(crate) fn proc_route(path: &str) -> Option<ProcRoute<'_>> {
     let path = path.strip_prefix("/v1/proc/")?;

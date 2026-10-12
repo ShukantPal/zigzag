@@ -1,13 +1,13 @@
 //! Native GitHub PR-comment routing.
 //!
-//! The router deliberately reads GitHub through the same read-only `gh`
-//! policy as the PR watchdog. It only launches Codex after persisting a
+//! The router reads GitHub through the authenticated API client. It only launches Codex after persisting a
 //! GraphQL-node-id event and runs live by default. The legacy
 //! `--comment-router-live` flag remains accepted for compatibility.
 
 use crate::config::valid_github_repo;
 use crate::events::new_execution_id;
 use crate::exec;
+use crate::github_api;
 use crate::proc::{AgentSpawnDetails, kill_process_group, process_group_running, spawn_proc};
 use crate::server::{Server, Supervisor};
 use crate::session::require_gui_login_session;
@@ -556,32 +556,13 @@ fn github_comments(repo: &str, number: u64) -> Result<Vec<Comment>, String> {
         ),
         ("review", format!("repos/{repo}/pulls/{number}/reviews")),
     ] {
-        comments.extend(parse_comments(surface, &github_get(&endpoint)?)?);
+        require_gui_login_session()?;
+        let values = github_api::get_all(&endpoint)?;
+        let encoded = serde_json::to_string(&values).map_err(|error| error.to_string())?;
+        comments.extend(parse_comments(surface, &encoded)?);
     }
     comments.sort_by(|left, right| left.created_at.cmp(&right.created_at));
     Ok(comments)
-}
-
-fn github_get(endpoint: &str) -> Result<String, String> {
-    let policy = require_gui_login_session().and_then(|_| exec::load_policy())?;
-    let request = exec::ExecRequest {
-        id: format!("github-comment-scan-{}", endpoint.replace('/', "-")),
-        bin: "gh".to_owned(),
-        args: vec![
-            "api".to_owned(),
-            "--paginate".to_owned(),
-            "--slurp".to_owned(),
-            endpoint.to_owned(),
-        ],
-    };
-    let path = policy
-        .verified_path(&request.bin, &request.args)
-        .map_err(|error| format!("the gh policy does not allow the comment scan: {error}"))?;
-    let result = exec::run(&path, request);
-    if result.timed_out || result.truncated || result.exit_code != Some(0) {
-        return Err("GitHub comment scan did not complete successfully".to_owned());
-    }
-    Ok(result.stdout)
 }
 
 fn parse_comments(surface: &'static str, output: &str) -> Result<Vec<Comment>, String> {
