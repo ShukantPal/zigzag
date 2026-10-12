@@ -15,7 +15,7 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
 ];
 
 fn github_token() -> Result<String, String> {
-    github_token_from_env(
+    github_token_with_sources(
         std::env::var("GH_TOKEN").ok(),
         std::env::var("GITHUB_TOKEN").ok(),
         std::env::var_os("GH_CONFIG_DIR")
@@ -27,6 +27,14 @@ fn github_token() -> Result<String, String> {
                 std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/gh"))
             }),
     )
+}
+
+fn github_token_with_sources(
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<String, String> {
+    github_token_from_env(gh_token, github_token, config)
 }
 
 fn github_token_from_env(
@@ -82,11 +90,25 @@ fn github_token_from_env(
 
 fn agent() -> Result<(ureq::Agent, String), String> {
     let token = github_token()?;
+    Ok((build_agent(), token))
+}
+
+#[cfg(test)]
+fn agent_with_auth_sources(
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<(ureq::Agent, String), String> {
+    let token = github_token_with_sources(gh_token, github_token, config)?;
+    Ok((build_agent(), token))
+}
+
+fn build_agent() -> ureq::Agent {
     let agent = ureq::AgentBuilder::new()
         .user_agent(concat!("zigzag/", env!("CARGO_PKG_VERSION")))
         .redirects(0)
         .build();
-    Ok((agent, token))
+    agent
 }
 
 fn headers(request: ureq::Request, token: &str) -> ureq::Request {
@@ -115,6 +137,18 @@ fn response_json(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
 pub(crate) fn get(endpoint: &str) -> Result<Value, String> {
     let (agent, token) = agent()?;
     get_at(&agent, API_ROOT, endpoint, &token)
+}
+
+#[cfg(test)]
+fn get_with_auth_sources(
+    api_root: &str,
+    endpoint: &str,
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    config: Option<PathBuf>,
+) -> Result<Value, String> {
+    let (agent, token) = agent_with_auth_sources(gh_token, github_token, config)?;
+    get_at(&agent, api_root, endpoint, &token)
 }
 
 fn get_at(
@@ -297,6 +331,7 @@ fn validate_bundle_url(url: &str, allowed_hosts: &[&str]) -> Result<url::Url, St
         url::Url::parse(url).map_err(|_| "GitHub attestation bundle URL is unsafe".to_owned())?;
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     if parsed.scheme() != "https"
+        || parsed.port_or_known_default() != Some(443)
         || parsed.username() != ""
         || parsed.password().is_some()
         || (!allowed_hosts.iter().any(|allowed| host == *allowed) && !is_github_blob_host(&host))
@@ -614,12 +649,12 @@ mod tests {
             write_response(&mut stream, "401 Unauthorized", "", body);
         });
 
-        let agent = ureq::AgentBuilder::new().redirects(0).build();
-        let error = get_at(
-            &agent,
+        let error = get_with_auth_sources(
             &format!("http://{address}"),
             "private",
-            "sensitive-test-token",
+            Some("sensitive-test-token".to_owned()),
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(error, "GitHub API returned HTTP 401");
@@ -700,6 +735,8 @@ mod tests {
             "https://github.com.attacker.example/bundle",
             "https://user@github.com/bundle",
             "https://anything.blob.core.windows.net/bundle",
+            "https://api.github.com:8443/bundle",
+            "https://productionresultssa19.blob.core.windows.net:8443/bundle",
         ] {
             assert!(validate_bundle_url(unsafe_url, GITHUB_BUNDLE_HOSTS).is_err());
         }
@@ -710,6 +747,13 @@ mod tests {
         assert!(
             bundle_redirect_target("https://api.github.com/bundle", "https://attacker.example/")
                 .is_err()
+        );
+        assert!(
+            bundle_redirect_target(
+                "https://api.github.com/bundle",
+                "https://api.github.com:8443/bundle",
+            )
+            .is_err()
         );
         assert_eq!(
             bundle_redirect_target(
