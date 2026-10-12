@@ -78,16 +78,13 @@ fn headers(request: ureq::Request, token: &str) -> ureq::Request {
 fn response_json(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
     let response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(code, response)) => {
-            let detail = response.into_string().unwrap_or_default();
-            return Err(format!(
-                "GitHub API returned HTTP {code}: {}",
-                detail.chars().take(500).collect::<String>()
-            ));
+        // Do not include the response body or transport error here. Both are
+        // untrusted and can echo request credentials; callers may log this
+        // error, which would persist a GitHub token in cleartext.
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(format!("GitHub API returned HTTP {code}"));
         }
-        Err(ureq::Error::Transport(error)) => {
-            return Err(format!("GitHub API request failed: {error}"));
-        }
+        Err(ureq::Error::Transport(_)) => return Err("GitHub API request failed".to_owned()),
     };
     response
         .into_json()
@@ -140,16 +137,10 @@ pub(crate) fn delete(endpoint: &str) -> Result<(), String> {
     match headers(agent.delete(&format!("{API_ROOT}/{endpoint}")), &token).call() {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(204, _)) => Ok(()),
-        Err(ureq::Error::Status(code, response)) => Err(format!(
-            "GitHub API returned HTTP {code}: {}",
-            response
-                .into_string()
-                .unwrap_or_default()
-                .chars()
-                .take(500)
-                .collect::<String>()
-        )),
-        Err(ureq::Error::Transport(error)) => Err(format!("GitHub API request failed: {error}")),
+        // Keep authenticated response and transport details out of errors:
+        // callers may write them to persistent logs.
+        Err(ureq::Error::Status(code, _)) => Err(format!("GitHub API returned HTTP {code}")),
+        Err(ureq::Error::Transport(_)) => Err("GitHub API request failed".to_owned()),
     }
 }
 
@@ -405,6 +396,36 @@ mod tests {
         uncompressed.extend(masked_snappy_crc(b"ok").to_le_bytes());
         uncompressed.extend(b"ok");
         assert_eq!(decode_snappy_frame(&uncompressed).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn api_errors_do_not_expose_response_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let body = "Bearer sensitive-test-token";
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let agent = ureq::AgentBuilder::new().build();
+        let error =
+            response_json(agent.get(&format!("http://{address}/private")).call()).unwrap_err();
+        assert_eq!(error, "GitHub API returned HTTP 401");
+        assert!(!error.contains("sensitive-test-token"));
+        server.join().unwrap();
     }
 
     fn masked_snappy_crc(contents: &[u8]) -> u32 {
