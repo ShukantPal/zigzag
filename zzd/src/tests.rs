@@ -21,6 +21,7 @@ use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
+use crate::harness::{Delivery, HarnessSession};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -34,8 +35,9 @@ use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
-    agent_harness_config, agent_route, default_agent_worktree, parse_agent_create_request,
-    persisted_agent_config, restart_argv, restart_config, valid_agent_model,
+    agent_harness_config, agent_route, default_agent_worktree, dispatch_agent_message,
+    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
+    valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -2103,6 +2105,131 @@ fn agent_delete_terminal_agent_is_409() {
     assert_eq!(
         state.supervisor.registry.get("done-agent").unwrap().state,
         "succeeded"
+    );
+}
+
+#[test]
+fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
+    let (state, _state_path) = test_server();
+    for (id, harness, session_id) in [
+        ("restart-codex", "codex", "thread-1"),
+        ("restart-opencode", "opencode", "session-1"),
+    ] {
+        let mut record = agent_record(id);
+        record.harness = Some(harness.to_owned());
+        record.harness_session_id = Some(session_id.to_owned());
+        state.supervisor.registry.register(record).unwrap();
+    }
+
+    let mut codex_sessions = Vec::new();
+    let mut opencode_sessions = Vec::new();
+    crate::recover_native_agents(
+        &state.supervisor.registry,
+        |session_id| {
+            codex_sessions.push(session_id.to_owned());
+            Ok(())
+        },
+        |session_id| {
+            opencode_sessions.push(session_id.to_owned());
+            Ok(())
+        },
+    );
+
+    assert_eq!(codex_sessions, ["thread-1"]);
+    assert_eq!(opencode_sessions, ["session-1"]);
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("restart-codex")
+            .unwrap()
+            .state,
+        "running"
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("restart-opencode")
+            .unwrap()
+            .state,
+        "running"
+    );
+}
+
+#[test]
+fn failed_native_agent_interrupt_preserves_running_tracking() {
+    let (state, _state_path) = test_server();
+    let policy =
+        exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
+    for (id, harness) in [
+        ("codex-stop-failure", "codex"),
+        ("opencode-stop-failure", "opencode"),
+    ] {
+        let mut record = agent_record(id);
+        record.harness = Some(harness.to_owned());
+        record.harness_session_id = Some(format!("{harness}-session"));
+        state.supervisor.registry.register(record).unwrap();
+
+        let response = request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            &format!("/v1/agents/{id}"),
+            "",
+        );
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert_eq!(
+            response_json(response)
+                .object("error")
+                .and_then(Json::as_str),
+            Some("could_not_stop_agent")
+        );
+        assert_eq!(state.supervisor.registry.get(id).unwrap().state, "running");
+    }
+}
+
+struct MessageSession {
+    sent: Mutex<Vec<(String, Delivery)>>,
+    failure: bool,
+}
+
+impl HarnessSession for MessageSession {
+    fn send(&self, text: &str, delivery: Delivery) -> Result<(), String> {
+        if self.failure {
+            return Err("dispatch failed".to_owned());
+        }
+        self.sent.lock().unwrap().push((text.to_owned(), delivery));
+        Ok(())
+    }
+
+    fn interrupt(&self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn agent_message_dispatches_steer_and_queue_and_surfaces_send_failure() {
+    let session = MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    };
+    dispatch_agent_message(&session, "steer this", Delivery::Steer).unwrap();
+    dispatch_agent_message(&session, "queue this", Delivery::Queue).unwrap();
+    assert_eq!(
+        *session.sent.lock().unwrap(),
+        [
+            ("steer this".to_owned(), Delivery::Steer),
+            ("queue this".to_owned(), Delivery::Queue),
+        ]
+    );
+    let failed = MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: true,
+    };
+    assert_eq!(
+        dispatch_agent_message(&failed, "cannot send", Delivery::Queue).unwrap_err(),
+        "dispatch failed"
     );
 }
 

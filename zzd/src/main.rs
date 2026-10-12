@@ -118,41 +118,21 @@ fn run() -> Result<(), String> {
         .supervisor
         .registry
         .recover(recovered_agent_identity_matches)?;
-    let native_threads: Vec<_> = state
-        .supervisor
-        .registry
-        .list(Some("running"), None)
-        .into_iter()
-        .filter_map(|agent| {
-            agent
-                .harness_session_id
-                .clone()
-                .map(|thread_id| (agent, thread_id))
-        })
-        .collect();
-    for (agent, session_id) in native_threads {
-        let resumed = match agent.harness.as_deref() {
-            Some("opencode") => state
-                .supervisor
-                .opencode_server()
-                .and_then(|server| server.resume_session(&session_id)),
-            _ => state
+    recover_native_agents(
+        &state.supervisor.registry,
+        |session_id| {
+            state
                 .supervisor
                 .codex_server()
-                .and_then(|server| server.resume_thread(&session_id)),
-        };
-        if let Err(error) = resumed {
-            log::error!(
-                "could not resume {} session for agent {}: {error}",
-                agent.harness.as_deref().unwrap_or("Codex"),
-                agent.id
-            );
-            let _ = state
+                .and_then(|server| server.resume_thread(session_id))
+        },
+        |session_id| {
+            state
                 .supervisor
-                .registry
-                .transition(&agent.id, "lost_after_restart", None);
-        }
-    }
+                .opencode_server()
+                .and_then(|server| server.resume_session(session_id))
+        },
+    );
     // Re-apply SIGSTOP to agents that were paused before the restart: their
     // process groups may still be alive. Dead groups are left for the recover
     // pass above, which marks the agents honestly.
@@ -319,5 +299,35 @@ fn run() -> Result<(), String> {
     log::info!("zigzag startup complete");
     loop {
         thread::park();
+    }
+}
+
+fn recover_native_agents(
+    registry: &AgentRegistry,
+    mut resume_codex: impl FnMut(&str) -> Result<(), String>,
+    mut resume_opencode: impl FnMut(&str) -> Result<(), String>,
+) {
+    let native_agents: Vec<_> = registry
+        .list(Some("running"), None)
+        .into_iter()
+        .filter_map(|agent| {
+            agent
+                .harness_session_id
+                .clone()
+                .map(|session_id| (agent, session_id))
+        })
+        .collect();
+    for (agent, session_id) in native_agents {
+        let (harness, resume) = match agent.harness.as_deref() {
+            Some("opencode") => ("OpenCode", resume_opencode(&session_id)),
+            _ => ("Codex", resume_codex(&session_id)),
+        };
+        if let Err(error) = resume {
+            log::error!(
+                "could not resume {harness} session for agent {}: {error}",
+                agent.id
+            );
+            let _ = registry.transition(&agent.id, "lost_after_restart", None);
+        }
     }
 }

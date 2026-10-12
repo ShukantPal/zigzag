@@ -27,9 +27,7 @@ pub(crate) enum HarnessEvent {
 #[allow(dead_code)]
 pub(crate) trait HarnessSession: Send + Sync {
     fn send(&self, text: &str, delivery: Delivery) -> Result<(), String>;
-    fn answer(&self, request_id: &str, answer: Value) -> Result<(), String>;
     fn interrupt(&self) -> Result<(), String>;
-    fn events(&self) -> mpsc::Receiver<HarnessEvent>;
 }
 
 struct Shared {
@@ -52,7 +50,6 @@ struct OpenCodeShared {
     base_url: String,
     child: Mutex<Child>,
     sessions: Mutex<std::collections::HashSet<String>>,
-    subscribers: Mutex<HashMap<String, Vec<mpsc::Sender<HarnessEvent>>>>,
 }
 
 fn drain_opencode_pipe(pipe: impl std::io::Read + Send + 'static, label: &'static str) {
@@ -106,7 +103,6 @@ impl OpenCodeServer {
             base_url: format!("http://127.0.0.1:{port}"),
             child: Mutex::new(child),
             sessions: Mutex::new(std::collections::HashSet::new()),
-            subscribers: Mutex::new(HashMap::new()),
         });
         let server = Arc::new(Self { shared });
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -204,23 +200,11 @@ impl OpenCodeServer {
 
     pub(crate) fn resume_session(&self, session_id: &str) -> Result<(), String> {
         self.get(&format!("/api/session/{session_id}"))?;
-        let should_listen = self
-            .shared
+        self.shared
             .sessions
             .lock()
             .map_err(|_| "OpenCode session map poisoned")?
             .insert(session_id.to_owned());
-        self.shared
-            .subscribers
-            .lock()
-            .map_err(|_| "OpenCode subscriber map poisoned")?
-            .entry(session_id.to_owned())
-            .or_default();
-        if should_listen {
-            let shared = Arc::clone(&self.shared);
-            let session_id = session_id.to_owned();
-            thread::spawn(move || read_opencode_events(shared, session_id));
-        }
         Ok(())
     }
 
@@ -373,13 +357,6 @@ impl CodexServer {
         child.wait().map_err(|error| error.to_string())?;
         Ok(())
     }
-    pub(crate) fn has_active_turn(&self, thread_id: &str) -> bool {
-        self.shared
-            .turns
-            .lock()
-            .map(|turns| turns.contains_key(thread_id))
-            .unwrap_or(false)
-    }
     fn has_thread(&self, thread_id: &str) -> bool {
         self.shared
             .subscribers
@@ -436,6 +413,18 @@ impl CodexServer {
             server: Arc::clone(self),
             thread_id,
         })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn events(&self, thread_id: &str) -> mpsc::Receiver<HarnessEvent> {
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut subscribers) = self.shared.subscribers.lock() {
+            subscribers
+                .entry(thread_id.to_owned())
+                .or_default()
+                .push(tx);
+        }
+        rx
     }
 }
 
@@ -506,14 +495,6 @@ impl HarnessSession for CodexSession {
         }
         Ok(())
     }
-    fn answer(&self, request_id: &str, answer: Value) -> Result<(), String> {
-        self.server
-            .rpc(
-                "server/answer",
-                json!({"requestId":request_id,"answer":answer}),
-            )
-            .map(|_| ())
-    }
     fn interrupt(&self) -> Result<(), String> {
         let turn_id = self
             .server
@@ -530,16 +511,6 @@ impl HarnessSession for CodexSession {
                 json!({"threadId":self.thread_id,"turnId":turn_id}),
             )
             .map(|_| ())
-    }
-    fn events(&self) -> mpsc::Receiver<HarnessEvent> {
-        let (tx, rx) = mpsc::channel();
-        if let Ok(mut subscribers) = self.server.shared.subscribers.lock() {
-            subscribers
-                .entry(self.thread_id.clone())
-                .or_default()
-                .push(tx);
-        }
-        rx
     }
 }
 
@@ -579,10 +550,6 @@ impl HarnessSession for OpenCodeSession {
         Ok(())
     }
 
-    fn answer(&self, _request_id: &str, _answer: Value) -> Result<(), String> {
-        Err("OpenCode question replies are not implemented".to_owned())
-    }
-
     fn interrupt(&self) -> Result<(), String> {
         ureq::post(&format!(
             "{}/api/session/{}/interrupt",
@@ -591,49 +558,6 @@ impl HarnessSession for OpenCodeSession {
         .call()
         .map(|_| ())
         .map_err(|error| format!("OpenCode interrupt failed: {error}"))
-    }
-
-    fn events(&self) -> mpsc::Receiver<HarnessEvent> {
-        let (tx, rx) = mpsc::channel();
-        if let Ok(mut subscribers) = self.server.shared.subscribers.lock() {
-            subscribers
-                .entry(self.session_id.clone())
-                .or_default()
-                .push(tx);
-        }
-        rx
-    }
-}
-
-fn read_opencode_events(shared: Arc<OpenCodeShared>, session_id: String) {
-    let path = format!("/api/session/{session_id}/event");
-    loop {
-        let response = ureq::get(&format!("{}{path}", shared.base_url)).call();
-        if let Ok(response) = response {
-            let mut reader = BufReader::new(response.into_reader());
-            let mut line = String::new();
-            let mut data = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                if let Some(value) = line.strip_prefix("data:") {
-                    if !data.is_empty() {
-                        data.push('\n');
-                    }
-                    data.push_str(value.trim());
-                } else if line.trim().is_empty() && !data.is_empty() {
-                    if let Ok(value) = serde_json::from_str::<Value>(&data)
-                        && let Ok(mut subscribers) = shared.subscribers.lock()
-                        && let Some(list) = subscribers.get_mut(&session_id)
-                    {
-                        list.retain(|tx| {
-                            tx.send(HarnessEvent::Notification(value.clone())).is_ok()
-                        });
-                    }
-                    data.clear();
-                }
-                line.clear();
-            }
-        }
-        thread::sleep(Duration::from_secs(1));
     }
 }
 

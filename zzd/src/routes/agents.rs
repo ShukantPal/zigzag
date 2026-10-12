@@ -431,7 +431,7 @@ fn agent_message_request(
         },
         _ => return reply(stream, 501, error("harness_message_unsupported")),
     };
-    if let Err(message) = session.send(text, delivery) {
+    if let Err(message) = dispatch_agent_message(session.as_ref(), text, delivery) {
         log::warn!("agent message dispatch failed id={id}: {message}");
         return reply(stream, 503, error("harness_message_failed"));
     }
@@ -471,6 +471,69 @@ fn agent_message_request(
             ),
         ]),
     )
+}
+
+pub(crate) fn dispatch_agent_message(
+    session: &dyn crate::harness::HarnessSession,
+    text: &str,
+    delivery: crate::harness::Delivery,
+) -> Result<(), String> {
+    session.send(text, delivery)
+}
+
+#[cfg(not(test))]
+fn native_agent_record(
+    id: String,
+    task_id: &str,
+    execution_id: &str,
+    pid: i32,
+    worktree: &str,
+    request: &AgentCreateRequest,
+    harness: &str,
+    session_id: &str,
+) -> AgentRecord {
+    AgentRecord {
+        id,
+        task_id: task_id.to_owned(),
+        execution_id: execution_id.to_owned(),
+        leader_pid: pid,
+        process_group: pid,
+        process_identity: None,
+        worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
+        started_at: unix_timestamp(),
+        deadline_at: request.timeout_secs.map(|seconds| {
+            unix_timestamp()
+                .parse::<u64>()
+                .unwrap_or(0)
+                .saturating_add(seconds)
+                .to_string()
+        }),
+        command: match harness {
+            "codex" => "codex app-server thread",
+            "opencode" => "opencode serve session",
+            _ => unreachable!("native agent harness"),
+        }
+        .to_owned(),
+        state: "running".to_owned(),
+        paused_at: None,
+        exit_code: None,
+        log_degraded: false,
+        audit_degraded: false,
+        redacted: false,
+        stdout_next: 0,
+        stderr_next: 0,
+        stdout_dropped_before: 0,
+        stderr_dropped_before: 0,
+        log_next: 0,
+        log_dropped_before: 0,
+        first_output_at: None,
+        first_output_stream: None,
+        first_output_bytes: None,
+        restarted_from: None,
+        agent_config: None,
+        harness_session_id: Some(session_id.to_owned()),
+        harness: Some(harness.to_owned()),
+    }
 }
 
 /// Build the full transcript for an agent: record metadata, prompt,
@@ -1300,43 +1363,16 @@ fn create_codex_thread(
         Err(_) => return reply(stream, 500, error("could_not_create_agent")),
     };
     let pid = server.pid() as i32;
-    let record = AgentRecord {
-        id: id.clone(),
-        task_id: task_id.to_owned(),
-        execution_id: execution_id.to_owned(),
-        leader_pid: pid,
-        process_group: pid,
-        process_identity: None,
-        worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
-        started_at: unix_timestamp(),
-        deadline_at: request.timeout_secs.map(|seconds| {
-            unix_timestamp()
-                .parse::<u64>()
-                .unwrap_or(0)
-                .saturating_add(seconds)
-                .to_string()
-        }),
-        command: "codex app-server thread".to_owned(),
-        state: "running".to_owned(),
-        paused_at: None,
-        exit_code: None,
-        log_degraded: false,
-        audit_degraded: false,
-        redacted: false,
-        stdout_next: 0,
-        stderr_next: 0,
-        stdout_dropped_before: 0,
-        stderr_dropped_before: 0,
-        log_next: 0,
-        log_dropped_before: 0,
-        first_output_at: None,
-        first_output_stream: None,
-        first_output_bytes: None,
-        restarted_from: None,
-        agent_config: None,
-        harness_session_id: Some(thread_id.clone()),
-        harness: Some("codex".to_owned()),
-    };
+    let record = native_agent_record(
+        id.clone(),
+        task_id,
+        execution_id,
+        pid,
+        worktree,
+        request,
+        "codex",
+        &thread_id,
+    );
     if state.supervisor.registry.register(record).is_err() {
         let _ = server.session(thread_id.clone()).interrupt();
         return reply(stream, 500, error("could_not_persist_agent"));
@@ -1364,7 +1400,7 @@ fn create_codex_thread(
             ("thread_id".to_owned(), Json::String(thread_id.clone())),
         ]),
     ));
-    let events = server.session(thread_id.clone()).events();
+    let events = server.events(&thread_id);
     let store = Arc::clone(&state.store);
     let id_watch = id.clone();
     let task_watch = task_id.to_owned();
@@ -1472,43 +1508,16 @@ fn create_opencode_session(
         Err(_) => return reply(stream, 500, error("could_not_create_agent")),
     };
     let pid = server.pid() as i32;
-    let record = AgentRecord {
-        id: id.clone(),
-        task_id: task_id.to_owned(),
-        execution_id: execution_id.to_owned(),
-        leader_pid: pid,
-        process_group: pid,
-        process_identity: None,
-        worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
-        started_at: unix_timestamp(),
-        deadline_at: request.timeout_secs.map(|seconds| {
-            unix_timestamp()
-                .parse::<u64>()
-                .unwrap_or(0)
-                .saturating_add(seconds)
-                .to_string()
-        }),
-        command: "opencode serve session".to_owned(),
-        state: "running".to_owned(),
-        paused_at: None,
-        exit_code: None,
-        log_degraded: false,
-        audit_degraded: false,
-        redacted: false,
-        stdout_next: 0,
-        stderr_next: 0,
-        stdout_dropped_before: 0,
-        stderr_dropped_before: 0,
-        log_next: 0,
-        log_dropped_before: 0,
-        first_output_at: None,
-        first_output_stream: None,
-        first_output_bytes: None,
-        restarted_from: None,
-        agent_config: None,
-        harness_session_id: Some(session_id.clone()),
-        harness: Some("opencode".to_owned()),
-    };
+    let record = native_agent_record(
+        id.clone(),
+        task_id,
+        execution_id,
+        pid,
+        worktree,
+        request,
+        "opencode",
+        &session_id,
+    );
     if state.supervisor.registry.register(record).is_err() {
         let _ = server.session(session_id.clone()).interrupt();
         return reply(stream, 500, error("could_not_persist_agent"));
@@ -1985,10 +1994,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     {
         let interrupt_result = match harness {
             "codex" => match state.supervisor.codex_server() {
-                Ok(server) if server.has_active_turn(session_id) => {
-                    server.session(session_id.to_owned()).interrupt()
-                }
-                Ok(_) => Ok(()),
+                Ok(server) => server.session(session_id.to_owned()).interrupt(),
                 Err(message) => Err(message),
             },
             "opencode" => state
@@ -1997,10 +2003,18 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
                 .and_then(|server| server.session(session_id.to_owned()).interrupt()),
             _ => unreachable!(),
         };
-        if interrupt_result.is_err() {
-            log::warn!("could not interrupt {harness} session for agent {id}");
+        if let Err(message) = interrupt_result {
+            log::warn!("could not interrupt {harness} session for agent {id}: {message}");
+            return reply(stream, 503, error("could_not_stop_agent"));
         }
-        let _ = state.supervisor.registry.transition(id, "stopped", None);
+        if state
+            .supervisor
+            .registry
+            .transition(id, "stopped", None)
+            .is_err()
+        {
+            return reply(stream, 500, error("could_not_persist_agent_state"));
+        }
         return reply(
             stream,
             200,
