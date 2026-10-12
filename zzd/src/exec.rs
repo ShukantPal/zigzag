@@ -11,12 +11,15 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zz::{Json, parse_json};
 
 const KEYCHAIN_SERVICE: &str = "zigzag";
 const KEYCHAIN_ACCOUNT: &str = "exec-allowlist";
+const FILE_ALLOWLIST_ENV: &str = "ZIGZAG_EXEC_ALLOWLIST_FILE";
+static DEGRADED_POLICY_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Upper bound for one synchronous execution; the HTTP client must allow a
 /// slightly larger read timeout.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
@@ -568,6 +571,88 @@ pub fn load_policy() -> Result<Policy, String> {
     Policy::parse(&policy).map_err(|error| format!("invalid exec allowlist in keychain: {error}"))
 }
 
+/// Load the policy for HTTP exec/spawn. The Keychain remains authoritative
+/// in a GUI session; headless sessions and Keychain read failures use the
+/// explicitly configured file, or an empty deny-all policy.
+pub fn load_server_policy(gui_session_available: bool) -> Result<Policy, String> {
+    let keychain_result = gui_session_available.then(load_policy);
+    let file_path = std::env::var_os(FILE_ALLOWLIST_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let (policy, warning) = select_server_policy(
+        gui_session_available,
+        keychain_result,
+        file_path.as_deref(),
+        load_private_policy_file,
+    );
+    if let Some(warning) = warning
+        && !DEGRADED_POLICY_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        log::warn!("exec allowlist running in degraded mode: {warning}");
+    }
+    Ok(policy)
+}
+
+fn select_server_policy(
+    gui_session_available: bool,
+    keychain_result: Option<Result<Policy, String>>,
+    file_path: Option<&Path>,
+    load_file: impl FnOnce(&Path) -> Result<Policy, String>,
+) -> (Policy, Option<String>) {
+    let keychain_reason = if gui_session_available {
+        match keychain_result.expect("GUI session policy load must provide a Keychain result") {
+            Ok(policy) => return (policy, None),
+            Err(error) => error,
+        }
+    } else {
+        "no local macOS GUI login session for Keychain access".to_owned()
+    };
+    let (policy, fallback_reason) = match file_path {
+        Some(path) => match load_file(path) {
+            Ok(policy) => (policy, format!("using file allowlist {}", path.display())),
+            Err(error) => (
+                empty_policy(),
+                format!(
+                    "file allowlist {} could not be loaded ({error}); using deny-all policy",
+                    path.display()
+                ),
+            ),
+        },
+        None => (
+            empty_policy(),
+            "no file fallback configured; using deny-all policy".to_owned(),
+        ),
+    };
+    (
+        policy,
+        Some(format!("{keychain_reason}; {fallback_reason}")),
+    )
+}
+
+fn empty_policy() -> Policy {
+    Policy {
+        bins: BTreeMap::new(),
+    }
+}
+
+fn load_private_policy_file(path: &Path) -> Result<Policy, String> {
+    load_private_policy_file_for_uid(path, unsafe { libc::geteuid() })
+}
+
+fn load_private_policy_file_for_uid(path: &Path, expected_uid: u32) -> Result<Policy, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("path is not a regular file".to_owned());
+    }
+    if metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
+        return Err(
+            "file must be owned by the relay user and have mode 0600 or stricter".to_owned(),
+        );
+    }
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    Policy::parse(&contents).map_err(|error| format!("invalid policy: {error}"))
+}
+
 pub fn store_policy(policy: &Policy) -> Result<(), String> {
     keychain_entry()?
         .set_password(&policy.canonical_json())
@@ -676,6 +761,34 @@ fn drain_limited(mut pipe: impl Read) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static FILE_ALLOWLIST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_file_allowlist_env<T>(value: Option<&std::ffi::OsStr>, f: impl FnOnce() -> T) -> T {
+        let _lock = FILE_ALLOWLIST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(FILE_ALLOWLIST_ENV);
+        match value {
+            Some(value) => unsafe { std::env::set_var(FILE_ALLOWLIST_ENV, value) },
+            None => unsafe { std::env::remove_var(FILE_ALLOWLIST_ENV) },
+        }
+
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var(FILE_ALLOWLIST_ENV, value) },
+                    None => unsafe { std::env::remove_var(FILE_ALLOWLIST_ENV) },
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        f()
+    }
 
     fn policy(text: &str) -> Policy {
         Policy::parse(text).unwrap()
@@ -683,6 +796,138 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn private_policy_file(name: &str, contents: &str, mode: u32) -> PathBuf {
+        let dir = temp_bin_dir(&format!("policy-{name}"));
+        let path = dir.join("allowlist.json");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn policy_allows_ztool_run(policy: &Policy) -> bool {
+        policy.allowed_path("ztool", &args(&["run"])).is_some()
+    }
+
+    #[test]
+    fn load_server_policy_reads_configured_file_path_from_environment() {
+        let path = private_policy_file(
+            "loader-configured-path",
+            &bin_policy_json(Path::new("/bin/env-policy")),
+            0o600,
+        );
+
+        with_file_allowlist_env(path.as_os_str().into(), || {
+            let selected = load_server_policy(false).unwrap();
+            assert_eq!(
+                selected.allowed_path("ztool", &args(&["run"])),
+                Some("/bin/env-policy")
+            );
+        });
+    }
+
+    #[test]
+    fn load_server_policy_uses_deny_all_for_unset_or_empty_file_path() {
+        for value in [None, Some(std::ffi::OsStr::new(""))] {
+            with_file_allowlist_env(value, || {
+                let selected = load_server_policy(false).unwrap();
+                assert!(!policy_allows_ztool_run(&selected));
+            });
+        }
+    }
+
+    #[test]
+    fn headless_session_loads_a_valid_configured_private_file() {
+        let path = private_policy_file(
+            "headless-valid",
+            &bin_policy_json(Path::new("/bin/echo")),
+            0o600,
+        );
+        let (selected, warning) =
+            select_server_policy(false, None, Some(&path), load_private_policy_file);
+
+        assert!(policy_allows_ztool_run(&selected));
+        assert!(warning.unwrap().contains("using file allowlist"));
+    }
+
+    #[test]
+    fn invalid_private_file_conditions_select_deny_all() {
+        let dir = temp_bin_dir("policy-rejected");
+        let current_uid = unsafe { libc::geteuid() };
+        let cases = [
+            (
+                "wrong-owner",
+                bin_policy_json(Path::new("/bin/echo")),
+                0o600,
+                current_uid.wrapping_add(1),
+            ),
+            (
+                "permissive-mode",
+                bin_policy_json(Path::new("/bin/echo")),
+                0o640,
+                current_uid,
+            ),
+            (
+                "malformed-content",
+                "not json".to_owned(),
+                0o600,
+                current_uid,
+            ),
+        ];
+
+        for (name, contents, mode, expected_uid) in cases {
+            let path = dir.join(format!("{name}.json"));
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (selected, warning) = select_server_policy(false, None, Some(&path), |file| {
+                load_private_policy_file_for_uid(file, expected_uid)
+            });
+
+            assert!(!policy_allows_ztool_run(&selected), "{name} must deny all");
+            assert!(warning.unwrap().contains("using deny-all policy"), "{name}");
+        }
+    }
+
+    #[test]
+    fn successful_keychain_policy_takes_precedence_over_configured_file() {
+        let file_path = private_policy_file(
+            "keychain-precedence-file",
+            &bin_policy_json(Path::new("/bin/file-policy")),
+            0o600,
+        );
+        let keychain_policy = policy(&bin_policy_json(Path::new("/bin/keychain-policy")));
+        let (selected, warning) =
+            select_server_policy(true, Some(Ok(keychain_policy)), Some(&file_path), |_| {
+                panic!("file fallback must not be read when Keychain succeeds")
+            });
+
+        assert_eq!(
+            selected.allowed_path("ztool", &args(&["run"])),
+            Some("/bin/keychain-policy")
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn keychain_read_failure_selects_configured_file_fallback() {
+        let file_path = private_policy_file(
+            "keychain-failure-file",
+            &bin_policy_json(Path::new("/bin/file-policy")),
+            0o600,
+        );
+        let (selected, warning) = select_server_policy(
+            true,
+            Some(Err("simulated Keychain read failure".to_owned())),
+            Some(&file_path),
+            load_private_policy_file,
+        );
+
+        assert_eq!(
+            selected.allowed_path("ztool", &args(&["run"])),
+            Some("/bin/file-policy")
+        );
+        assert!(warning.unwrap().contains("simulated Keychain read failure"));
     }
 
     #[test]

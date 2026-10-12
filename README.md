@@ -77,7 +77,7 @@ Agent creation accepts an inline prompt or prompt-file path, project directory, 
 
 The relay token lives at `~/.codex/zigzag/zigzag.token`; keep it owner-readable only. `zzapi` reads it from `ZIGZAG_TOKEN_FILE` (or `--token-file`) and uses `ZIGZAG_HOSTNAME` to select the relay. For a remote client, use the Mac's Tailscale address and restrict port `8765` (and socket port `8766`, if used) with a Tailscale ACL.
 
-`/v1/exec` can run only binaries and argument prefixes in the relay's allowlist. The policy is stored in the macOS login Keychain, not a config file, and can only be read or changed from the Mac's GUI login session:
+`/v1/exec` can run only binaries and argument prefixes in the relay's allowlist. The macOS login Keychain is preferred. For headless or Keychain-unavailable deployments, set `ZIGZAG_EXEC_ALLOWLIST_FILE` in the daemon environment to a private JSON policy file; if neither source is available, the relay uses an empty deny-all policy and logs a warning. See [configuration and security](docs/configuration.md) for file ownership, permissions, and LaunchAgent setup. The Keychain policy can be read or changed from the Mac's GUI login session:
 
 ```sh
 zigzag config get-allowlist
