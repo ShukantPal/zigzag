@@ -258,12 +258,12 @@ pub(crate) fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval
                         ]);
                         match state.store.add(payload) {
                             Ok((_, false)) => {
-                                log::debug!("queued GitHub PR watchdog event for {repo}#{number}")
+                                log::debug!("queued GitHub PR watchdog event")
                             }
                             Ok((_, true)) => {}
-                            Err(_) => log::warn!(
-                                "could not persist GitHub PR watchdog event for {repo}#{number}"
-                            ),
+                            // These values come from the authenticated API
+                            // response, so keep them out of persistent logs.
+                            Err(_) => log::warn!("could not persist GitHub PR watchdog event"),
                         }
                     }
                 }
