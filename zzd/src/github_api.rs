@@ -179,9 +179,10 @@ fn attestation_bundles_at(
                 .get("bundle_url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "GitHub attestation is missing its bundle URL".to_owned())?;
-            let response = agent.get(url).call().map_err(|error| {
-                format!("could not download GitHub attestation bundle: {error}")
-            })?;
+            let response = agent
+                .get(url)
+                .call()
+                .map_err(|_| "could not download GitHub attestation bundle".to_owned())?;
             let mut bytes = Vec::new();
             response
                 .into_reader()
@@ -365,8 +366,10 @@ pub(crate) fn graphql(query: &str, variables: Value) -> Result<Value, String> {
         "graphql",
         &serde_json::json!({"query": query, "variables": variables}),
     )?;
-    if let Some(errors) = response.get("errors") {
-        return Err(format!("GitHub GraphQL request failed: {errors}"));
+    if response.get("errors").is_some() {
+        // The remote error body is untrusted and can contain sensitive
+        // request details; callers may persist this error in logs or status.
+        return Err("GitHub GraphQL request failed".to_owned());
     }
     response
         .get("data")

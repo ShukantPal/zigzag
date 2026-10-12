@@ -267,7 +267,9 @@ pub(crate) fn github_watch_loop(state: Arc<Server>, repos: Vec<String>, interval
                         }
                     }
                 }
-                Err(error) => log::warn!("GitHub PR watch for {repo} failed: {error}"),
+                // The API error may contain data derived from authenticated
+                // request details; keep it out of persistent logs.
+                Err(_) => log::warn!("GitHub PR watch for {repo} failed"),
             }
         }
         thread::sleep(interval);

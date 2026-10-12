@@ -352,14 +352,19 @@ impl Manager {
             // start-to-start cadence by its runtime; network requests below
             // are bounded so a stalled GitHub connection cannot stop the loop.
             loop {
-                if let Err(error) = self.check_and_apply(
-                    active_work.as_ref(),
-                    audit.as_ref(),
-                    &original_args,
-                    &secret_file,
-                    health_port,
-                ) {
-                    log::warn!("relay update check failed: {error}");
+                if self
+                    .check_and_apply(
+                        active_work.as_ref(),
+                        audit.as_ref(),
+                        &original_args,
+                        &secret_file,
+                        health_port,
+                    )
+                    .is_err()
+                {
+                    // Update errors can include diagnostics from authenticated
+                    // GitHub requests; never write them to persistent logs.
+                    log::warn!("relay update check failed");
                 }
                 std::thread::sleep(self.config.interval);
             }
