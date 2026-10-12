@@ -1,6 +1,8 @@
 //! Small authenticated GitHub API client shared by PR, comment, and review flows.
 
 use serde_json::Value;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -13,6 +15,20 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
+
+#[cfg(test)]
+thread_local! {
+    static API_ROOT_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn api_root() -> String {
+    #[cfg(test)]
+    if let Some(root) = API_ROOT_OVERRIDE.with(|root| root.borrow().clone()) {
+        return root;
+    }
+
+    API_ROOT.to_owned()
+}
 
 fn github_token() -> Result<String, String> {
     github_token_with_sources(
@@ -93,16 +109,6 @@ fn agent() -> Result<(ureq::Agent, String), String> {
     Ok((build_agent(), token))
 }
 
-#[cfg(test)]
-fn agent_with_auth_sources(
-    gh_token: Option<String>,
-    github_token: Option<String>,
-    config: Option<PathBuf>,
-) -> Result<(ureq::Agent, String), String> {
-    let token = github_token_with_sources(gh_token, github_token, config)?;
-    Ok((build_agent(), token))
-}
-
 fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .user_agent(concat!("zigzag/", env!("CARGO_PKG_VERSION")))
@@ -134,19 +140,11 @@ fn response_json(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
 }
 
 pub(crate) fn get(endpoint: &str) -> Result<Value, String> {
-    let (agent, token) = agent()?;
-    get_at(&agent, API_ROOT, endpoint, &token)
+    get_at_root(&api_root(), endpoint)
 }
 
-#[cfg(test)]
-fn get_with_auth_sources(
-    api_root: &str,
-    endpoint: &str,
-    gh_token: Option<String>,
-    github_token: Option<String>,
-    config: Option<PathBuf>,
-) -> Result<Value, String> {
-    let (agent, token) = agent_with_auth_sources(gh_token, github_token, config)?;
+fn get_at_root(api_root: &str, endpoint: &str) -> Result<Value, String> {
+    let (agent, token) = agent()?;
     get_at(&agent, api_root, endpoint, &token)
 }
 
@@ -638,6 +636,8 @@ mod tests {
 
     #[test]
     fn public_request_errors_do_not_expose_body_or_token() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -648,14 +648,19 @@ mod tests {
             write_response(&mut stream, "401 Unauthorized", "", body);
         });
 
-        let error = get_with_auth_sources(
-            &format!("http://{address}"),
-            "private",
-            Some("sensitive-test-token".to_owned()),
-            None,
-            None,
-        )
-        .unwrap_err();
+        let previous_token = std::env::var_os("GH_TOKEN");
+        unsafe { std::env::set_var("GH_TOKEN", "sensitive-test-token") };
+        API_ROOT_OVERRIDE.with(|root| {
+            *root.borrow_mut() = Some(format!("http://{address}"));
+        });
+        let result = get("private");
+        API_ROOT_OVERRIDE.with(|root| *root.borrow_mut() = None);
+        match previous_token {
+            Some(token) => unsafe { std::env::set_var("GH_TOKEN", token) },
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
+        }
+
+        let error = result.unwrap_err();
         assert_eq!(error, "GitHub API returned HTTP 401");
         assert!(!error.contains("sensitive-test-token"));
         server.join().unwrap();
