@@ -2162,28 +2162,27 @@ fn failed_native_agent_interrupt_preserves_running_tracking() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
-    for (id, harness) in [("opencode-stop-failure", "opencode")] {
-        let mut record = agent_record(id);
-        record.harness = Some(harness.to_owned());
-        record.harness_session_id = Some(format!("{harness}-session"));
-        state.supervisor.registry.register(record).unwrap();
+    let (id, harness) = ("opencode-stop-failure", "opencode");
+    let mut record = agent_record(id);
+    record.harness = Some(harness.to_owned());
+    record.harness_session_id = Some(format!("{harness}-session"));
+    state.supervisor.registry.register(record).unwrap();
 
-        let response = request_once(
-            Arc::clone(&state),
-            &policy,
-            "DELETE",
-            &format!("/v1/agents/{id}"),
-            "",
-        );
-        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
-        assert_eq!(
-            response_json(response)
-                .object("error")
-                .and_then(Json::as_str),
-            Some("could_not_stop_agent")
-        );
-        assert_eq!(state.supervisor.registry.get(id).unwrap().state, "running");
-    }
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        &format!("/v1/agents/{id}"),
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("error")
+            .and_then(Json::as_str),
+        Some("could_not_stop_agent")
+    );
+    assert_eq!(state.supervisor.registry.get(id).unwrap().state, "running");
 }
 
 struct MessageSession {

@@ -568,43 +568,6 @@ impl HarnessSession for OpenCodeSession {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{CodexServer, Shared};
-    use std::collections::{HashMap, VecDeque};
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::AtomicU64;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn interrupting_idle_codex_session_succeeds_without_rpc() {
-        let mut child = Command::new("/bin/cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let writer = child.stdin.take().unwrap();
-        let server = Arc::new(CodexServer {
-            shared: Arc::new(Shared {
-                writer: Mutex::new(writer),
-                child: Mutex::new(child),
-                pending: Mutex::new(HashMap::new()),
-                subscribers: Mutex::new(HashMap::new()),
-                turns: Mutex::new(HashMap::new()),
-                queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
-                next_id: AtomicU64::new(1),
-            }),
-        });
-
-        server
-            .session("completed-thread".to_owned())
-            .interrupt()
-            .unwrap();
-        server.stop().unwrap();
-    }
-}
-
 fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -668,5 +631,42 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err("app-server exited".to_owned()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexServer, Shared};
+    use std::collections::{HashMap, VecDeque};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn interrupting_idle_codex_session_succeeds_without_rpc() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let server = Arc::new(CodexServer {
+            shared: Arc::new(Shared {
+                writer: Mutex::new(writer),
+                child: Mutex::new(child),
+                pending: Mutex::new(HashMap::new()),
+                subscribers: Mutex::new(HashMap::new()),
+                turns: Mutex::new(HashMap::new()),
+                queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+                next_id: AtomicU64::new(1),
+            }),
+        });
+
+        server
+            .session("completed-thread".to_owned())
+            .interrupt()
+            .unwrap();
+        server.stop().unwrap();
     }
 }
