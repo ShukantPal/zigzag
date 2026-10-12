@@ -104,11 +104,10 @@ fn agent_with_auth_sources(
 }
 
 fn build_agent() -> ureq::Agent {
-    let agent = ureq::AgentBuilder::new()
+    ureq::AgentBuilder::new()
         .user_agent(concat!("zigzag/", env!("CARGO_PKG_VERSION")))
         .redirects(0)
-        .build();
-    agent
+        .build()
 }
 
 fn headers(request: ureq::Request, token: &str) -> ureq::Request {
