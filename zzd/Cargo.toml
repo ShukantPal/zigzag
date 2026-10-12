@@ -17,6 +17,5 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 ureq = { version = "2", features = ["json", "native-certs"] }
 url = "2"
-ureq = { version = "2", features = ["json", "native-certs"] }
 log = "0.4"
 env_logger = "0.11"
