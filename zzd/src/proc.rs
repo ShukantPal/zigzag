@@ -530,6 +530,14 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
                 if in_memory.contains(&agent.id) {
                     continue;
                 }
+                // Native harness agents are multiplexed sessions owned by a
+                // shared app-server, not child processes represented in the
+                // process table. Their durable session IDs are recovered by
+                // the harness adapter at startup; a PID probe would always
+                // misclassify them as exited.
+                if agent.harness_session_id.is_some() {
+                    continue;
+                }
                 sync_recovered_agent_output(&agent, &state.supervisor.registry, &state.store);
                 if recovered_agent_identity_matches(&agent) {
                     continue;
