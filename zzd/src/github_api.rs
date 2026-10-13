@@ -1,5 +1,6 @@
 //! Small authenticated GitHub API client shared by PR, comment, and review flows.
 
+use base64::Engine;
 use serde_json::Value;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -15,6 +16,19 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
+const KEYCHAIN_BASE64_PREFIX: &str = "go-keyring-base64:";
+
+fn unwrap_keychain_token(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    match raw.strip_prefix(KEYCHAIN_BASE64_PREFIX) {
+        Some(encoded) => base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .map(|token| token.trim().to_owned()),
+        None => Some(raw.to_owned()),
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -58,6 +72,19 @@ fn github_token_from_env(
     github_token: Option<String>,
     config: Option<PathBuf>,
 ) -> Result<String, String> {
+    github_token_from_env_with_keychain(gh_token, github_token, config, |account| {
+        keyring::Entry::new("gh:github.com", account)
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+    })
+}
+
+fn github_token_from_env_with_keychain(
+    gh_token: Option<String>,
+    github_token: Option<String>,
+    config: Option<PathBuf>,
+    mut get_password: impl FnMut(&str) -> Option<String>,
+) -> Result<String, String> {
     for token in [gh_token, github_token].into_iter().flatten() {
         if !token.trim().is_empty() {
             return Ok(token);
@@ -82,15 +109,13 @@ fn github_token_from_env(
         .and_then(|account| account.get("user"))
         .and_then(serde_yaml::Value::as_str);
     if let Some(user) = user
-        && let Ok(entry) = keyring::Entry::new("gh:github.com", user)
-        && let Ok(token) = entry.get_password()
-        && !token.trim().is_empty()
+        && let Some(token) = get_password(user).and_then(|token| unwrap_keychain_token(&token))
+        && !token.is_empty()
     {
         return Ok(token);
     }
-    if let Ok(entry) = keyring::Entry::new("gh:github.com", "")
-        && let Ok(token) = entry.get_password()
-        && !token.trim().is_empty()
+    if let Some(token) = get_password("").and_then(|token| unwrap_keychain_token(&token))
+        && !token.is_empty()
     {
         return Ok(token);
     }
@@ -677,6 +702,92 @@ mod tests {
             github_token_from_env(Some(" test ".into()), None, None).unwrap(),
             " test "
         );
+    }
+
+    #[test]
+    fn unwrap_keychain_token_decodes_prefixed_value() {
+        let expected = "ghp_fakePAT_for_tests_only_decode";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+        let raw = format!("{KEYCHAIN_BASE64_PREFIX}{encoded}");
+        assert_eq!(unwrap_keychain_token(&raw).as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn unwrap_keychain_token_passes_raw_value_through() {
+        let raw = "ghp_fakePAT_for_tests_only_raw";
+        assert_eq!(unwrap_keychain_token(raw).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn unwrap_keychain_token_fails_closed_for_invalid_prefixed_values() {
+        let raw = format!("{KEYCHAIN_BASE64_PREFIX}%%%invalid%%%");
+        assert_eq!(unwrap_keychain_token(&raw), None);
+        let non_utf8 = format!("{KEYCHAIN_BASE64_PREFIX}/w==");
+        assert_eq!(unwrap_keychain_token(&non_utf8), None);
+    }
+
+    #[test]
+    fn unwrap_keychain_token_trims_before_decoding_prefixed_values() {
+        let token = "ghp_fakePAT_for_tests_only_whitespace";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token);
+        let raw = format!(" \t{KEYCHAIN_BASE64_PREFIX}{encoded}\n ");
+        assert_eq!(unwrap_keychain_token(&raw).as_deref(), Some(token));
+    }
+
+    #[test]
+    fn unwrap_keychain_token_trims_whitespace_and_handles_empty_values() {
+        assert_eq!(
+            unwrap_keychain_token("  ghp_fakePAT_for_tests_only_trim\n").as_deref(),
+            Some("ghp_fakePAT_for_tests_only_trim")
+        );
+        assert_eq!(unwrap_keychain_token(" \t\n ").as_deref(), Some(""));
+        assert_eq!(unwrap_keychain_token("").as_deref(), Some(""));
+    }
+
+    fn keychain_test_config(label: &str) -> PathBuf {
+        static NEXT_CONFIG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_CONFIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let config = std::env::temp_dir().join(format!(
+            "zigzag-github-keychain-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("hosts.yml"),
+            "github.com:\n  - user: fake-user\n",
+        )
+        .unwrap();
+        config
+    }
+
+    #[test]
+    fn github_token_resolves_decoded_username_keyed_keychain_value() {
+        let config = keychain_test_config("username");
+        let token = "ghp_fakePAT_for_tests_only_username";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token);
+        let marked = format!("{KEYCHAIN_BASE64_PREFIX}{encoded}");
+        let resolved =
+            github_token_from_env_with_keychain(None, None, Some(config.clone()), |account| {
+                (account == "fake-user").then(|| marked.clone())
+            })
+            .unwrap();
+        assert_eq!(resolved, token);
+        std::fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn github_token_resolves_decoded_legacy_empty_account_keychain_value() {
+        let config = keychain_test_config("legacy");
+        let token = "ghp_fakePAT_for_tests_only_legacy";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token);
+        let marked = format!("{KEYCHAIN_BASE64_PREFIX}{encoded}");
+        let resolved =
+            github_token_from_env_with_keychain(None, None, Some(config.clone()), |account| {
+                (account.is_empty()).then(|| marked.clone())
+            })
+            .unwrap();
+        assert_eq!(resolved, token);
+        std::fs::remove_dir_all(config).unwrap();
     }
 
     fn masked_snappy_crc(contents: &[u8]) -> u32 {

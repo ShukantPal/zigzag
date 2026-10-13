@@ -2064,6 +2064,7 @@ dependencies = [
 name = "zigzag"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "env_logger",
  "jsonschema",
  "keyring",
