@@ -1,5 +1,6 @@
 //! Small authenticated GitHub API client shared by PR, comment, and review flows.
 
+use base64::Engine;
 use serde_json::Value;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -15,6 +16,20 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
 ];
+const KEYCHAIN_BASE64_PREFIX: &str = "go-keyring-base64:";
+
+fn unwrap_keychain_token(raw: &str) -> String {
+    let token = raw
+        .strip_prefix(KEYCHAIN_BASE64_PREFIX)
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .unwrap_or_else(|| raw.to_owned());
+    token.trim().to_owned()
+}
 
 #[cfg(test)]
 thread_local! {
@@ -84,15 +99,19 @@ fn github_token_from_env(
     if let Some(user) = user
         && let Ok(entry) = keyring::Entry::new("gh:github.com", user)
         && let Ok(token) = entry.get_password()
-        && !token.trim().is_empty()
     {
-        return Ok(token);
+        let token = unwrap_keychain_token(&token);
+        if !token.is_empty() {
+            return Ok(token);
+        }
     }
     if let Ok(entry) = keyring::Entry::new("gh:github.com", "")
         && let Ok(token) = entry.get_password()
-        && !token.trim().is_empty()
     {
-        return Ok(token);
+        let token = unwrap_keychain_token(&token);
+        if !token.is_empty() {
+            return Ok(token);
+        }
     }
     let token = host
         .and_then(|account| account.get("oauth_token"))
@@ -677,6 +696,36 @@ mod tests {
             github_token_from_env(Some(" test ".into()), None, None).unwrap(),
             " test "
         );
+    }
+
+    #[test]
+    fn unwrap_keychain_token_decodes_prefixed_value() {
+        let expected = "ghp_testplaceholder0000000000000000000000";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+        let raw = format!("{KEYCHAIN_BASE64_PREFIX}{encoded}");
+        assert_eq!(unwrap_keychain_token(&raw), expected);
+    }
+
+    #[test]
+    fn unwrap_keychain_token_passes_raw_value_through() {
+        let raw = "ghp_testplaceholder0000000000000000000000";
+        assert_eq!(unwrap_keychain_token(raw), raw);
+    }
+
+    #[test]
+    fn unwrap_keychain_token_falls_back_to_invalid_prefixed_value() {
+        let raw = format!("{KEYCHAIN_BASE64_PREFIX}%%%invalid%%%");
+        assert_eq!(unwrap_keychain_token(&raw), raw);
+    }
+
+    #[test]
+    fn unwrap_keychain_token_trims_whitespace_and_handles_empty_values() {
+        assert_eq!(
+            unwrap_keychain_token("  ghp_testplaceholder0000000000000000000000\n"),
+            "ghp_testplaceholder0000000000000000000000"
+        );
+        assert_eq!(unwrap_keychain_token(" \t\n "), "");
+        assert_eq!(unwrap_keychain_token(""), "");
     }
 
     fn masked_snappy_crc(contents: &[u8]) -> u32 {
