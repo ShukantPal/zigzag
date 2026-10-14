@@ -37,15 +37,15 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
     agent_harness_config, agent_post_request_with_session_resolver, agent_route,
     default_agent_worktree, dispatch_agent_message, handle_codex_notification,
-    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
-    valid_agent_model,
+    monitor_codex_events, parse_agent_create_request, persisted_agent_config, restart_argv,
+    restart_config, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
     cleanup_agent_worktree, configured_worktree_base, resolve_existing_worktree_path,
-    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch, worktree_create_plan,
-    worktree_delete_plan,
+    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
+    worktree_branch_checkout_path, worktree_create_plan, worktree_delete_plan,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -2163,6 +2163,89 @@ fn agent_delete_terminal_agent_is_409() {
 }
 
 #[test]
+fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_id() {
+    let (state, _state_path) = test_server();
+    let base = worktree_test_base("native-orphan-recovery");
+    let allowed_root = base.join("allowed");
+    std::fs::create_dir_all(&allowed_root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let worktree = allowed_root.join("codex-orphan");
+    agent_create_worktree(&repo, &worktree, "codex/orphan", &[]).unwrap();
+
+    let id = "a69b0e234eea56ab8cbf6747c4ecb951";
+    let mut record = agent_record(id);
+    record.task_id = "agent-21b8d189b242".to_owned();
+    record.execution_id = "exec-orphan".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("thread-orphan".to_owned());
+    record.worktree_path = Some(worktree.to_string_lossy().into_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log(id, "stdout", b"partial transcript: delta only\n")
+        .unwrap();
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    monitor_codex_events(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        id.to_owned(),
+        "agent-21b8d189b242".to_owned(),
+        "exec-orphan".to_owned(),
+        event_rx,
+    );
+    drop(event_tx);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state
+        .supervisor
+        .registry
+        .get(id)
+        .is_some_and(|agent| agent.state == "running")
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "lost_after_restart"
+    );
+
+    let policy = test_policy();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "GET",
+        "/v1/agents/agent-21b8d189b242/transcript",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("stdout")
+            .and_then(Json::as_str),
+        Some("partial transcript: delta only\n")
+    );
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/agent-21b8d189b242",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(state.supervisor.registry.get(id).unwrap().state, "stopped");
+    assert!(!worktree.exists(), "orphan worktree still holds the branch");
+    let checkout = worktree_branch_checkout_path(&repo, "codex/orphan").unwrap();
+    assert!(
+        checkout.is_none(),
+        "orphan branch is still checked out: {checkout:?}"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
 fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
     let (state, _state_path) = test_server();
     for (id, harness, session_id) in [
@@ -2327,7 +2410,17 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
             .state,
         "succeeded"
     );
-    let timeline = state.store.timeline("task-1").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let timeline = loop {
+        let timeline = state.store.timeline("task-1").unwrap();
+        let completed = timeline
+            .iter()
+            .any(|event| event.object("kind").and_then(Json::as_str) == Some("process_completed"));
+        if completed || std::time::Instant::now() >= deadline {
+            break timeline;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     let kinds: Vec<_> = timeline
         .iter()
         .filter_map(|event| event.object("kind").and_then(Json::as_str))
