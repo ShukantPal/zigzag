@@ -16,7 +16,7 @@ pub(crate) fn test_policy() -> exec::Policy {
 
 use crate::auth::authorized;
 use crate::config::{allowlist_file, is_get_allowlist, server_config, valid_github_repo};
-use crate::events::{relay_event_at, replay_recovered_lifecycle};
+use crate::events::{persist_event, relay_event, relay_event_at, replay_recovered_lifecycle};
 use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
@@ -771,6 +771,27 @@ fn recovery_replays_a_persisted_first_output_fact() {
     assert_eq!(kinds, ["process_spawned", "first_output"]);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(path.with_extension("audit"));
+}
+
+#[test]
+fn relay_event_persistence_returns_store_add_failure() {
+    let path = std::env::temp_dir().join(format!(
+        "zigzag-event-persist-failure-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    let store = Store::open(&path, 10).unwrap();
+    let stream_path = path.with_extension("stream");
+    std::fs::remove_dir_all(&stream_path).unwrap();
+    std::fs::write(&stream_path, b"block stream directory").unwrap();
+
+    let result = persist_event(
+        &store,
+        relay_event("test_event", "task", "execution", Json::Object(vec![])),
+    );
+
+    assert_eq!(result.unwrap_err(), "could not read durable event stream");
+    std::fs::remove_file(stream_path).unwrap();
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

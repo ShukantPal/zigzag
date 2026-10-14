@@ -1,5 +1,5 @@
 use crate::events::{
-    new_execution_id, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
+    new_execution_id, persist_event, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
 };
 use crate::exec;
 use crate::github::watch_agent_pr;
@@ -546,24 +546,30 @@ fn agent_message_request(
         log::warn!("agent message dispatch failed id={id}: {message}");
         return reply(stream, 503, error("harness_message_failed"));
     }
-    let _ = state.store.add(relay_event(
-        "agent_message_accepted",
-        &agent.task_id,
-        &agent.execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(agent.id.clone())),
-            (
-                "delivery".to_owned(),
-                Json::String(
-                    match delivery {
-                        crate::harness::Delivery::Steer => "steer",
-                        crate::harness::Delivery::Queue => "queue",
-                    }
-                    .to_owned(),
+    if let Err(store_error) = persist_event(
+        &state.store,
+        relay_event(
+            "agent_message_accepted",
+            &agent.task_id,
+            &agent.execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent.id.clone())),
+                (
+                    "delivery".to_owned(),
+                    Json::String(
+                        match delivery {
+                            crate::harness::Delivery::Steer => "steer",
+                            crate::harness::Delivery::Queue => "queue",
+                        }
+                        .to_owned(),
+                    ),
                 ),
-            ),
-        ]),
-    ));
+            ]),
+        ),
+    ) {
+        log::error!("could not persist accepted agent message id={id}: {store_error}");
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         202,
@@ -1728,15 +1734,20 @@ fn agent_create_request(
             )
         }
         Err(message) => {
-            let _ = state.store.add(relay_event(
-                "process_failed",
-                &task_id,
-                &execution_id,
-                Json::Object(vec![(
-                    "reason".to_owned(),
-                    Json::String("spawn_failed".to_owned()),
-                )]),
-            ));
+            if let Err(error) = persist_event(
+                &state.store,
+                relay_event(
+                    "process_failed",
+                    &task_id,
+                    &execution_id,
+                    Json::Object(vec![(
+                        "reason".to_owned(),
+                        Json::String("spawn_failed".to_owned()),
+                    )]),
+                ),
+            ) {
+                log::error!("could not persist agent spawn failure task_id={task_id}: {error}");
+            }
             log::error!("agent_create spawn failed for id={task_id}: {message}");
             reply(stream, 500, error("could_not_spawn_process"))
         }
@@ -1798,15 +1809,24 @@ fn create_codex_thread(
     {
         return reply(stream, 500, error("could_not_persist_agent_config"));
     }
-    let _ = state.store.add(relay_event(
-        "process_spawned",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(id.clone())),
-            ("thread_id".to_owned(), Json::String(thread_id.clone())),
-        ]),
-    ));
+    let event_persisted = match persist_event(
+        &state.store,
+        relay_event(
+            "process_spawned",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(id.clone())),
+                ("thread_id".to_owned(), Json::String(thread_id.clone())),
+            ]),
+        ),
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("could not persist spawned Codex agent id={id}: {error}");
+            false
+        }
+    };
     monitor_codex_events(
         Arc::clone(&state.supervisor.registry),
         Arc::clone(&state.store),
@@ -1815,6 +1835,9 @@ fn create_codex_thread(
         execution_id.to_owned(),
         events,
     );
+    if !event_persisted {
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         200,
@@ -2122,16 +2145,22 @@ fn create_opencode_session(
     {
         return reply(stream, 500, error("could_not_persist_agent_config"));
     }
-    let _ = state.store.add(relay_event(
-        "process_spawned",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(id.clone())),
-            ("session_id".to_owned(), Json::String(session_id)),
-            ("harness".to_owned(), Json::String("opencode".to_owned())),
-        ]),
-    ));
+    if let Err(store_error) = persist_event(
+        &state.store,
+        relay_event(
+            "process_spawned",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(id.clone())),
+                ("session_id".to_owned(), Json::String(session_id)),
+                ("harness".to_owned(), Json::String("opencode".to_owned())),
+            ]),
+        ),
+    ) {
+        log::error!("could not persist spawned OpenCode agent id={id}: {store_error}");
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         200,
