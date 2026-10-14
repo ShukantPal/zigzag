@@ -398,6 +398,67 @@ fn binary_agents_endpoints() {
     assert_eq!(status, 400, "bad agent query not rejected");
 }
 
+fn assert_codex_thread_start_model(requested_model: Option<&str>, expected_model: &str) {
+    let relay = TestRelay::start();
+    let codex_home = relay.dir.join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(codex_home.join("config.toml"), "model = \"gpt-6.1-sol\"\n").unwrap();
+
+    let codex = relay.dir.join("bin/codex");
+    std::fs::write(
+        &codex,
+        r##"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r initialized
+IFS= read -r thread_start
+printf '%s\n' "$thread_start" > "$HOME/thread-start.json"
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-model-test"}}}'
+IFS= read -r turn_start
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-model-test"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-model-test","turn":{"id":"turn-model-test","status":"completed"}}}'
+while IFS= read -r request; do :; done
+"##,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let mut body = serde_json::json!({
+        "prompt": "verify the thread model",
+        "project_dir": relay.dir,
+        "no_branch": true,
+        "no_auto_pr": true
+    });
+    if let Some(model) = requested_model {
+        body["model"] = serde_json::json!(model);
+    }
+    let (status, created) = relay.authed("POST", "/v1/agents", Some(&body.to_string()));
+    assert_eq!(status, 200, "agent create failed: {created}");
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(relay.dir.join("thread-start.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["method"], "thread/start");
+    assert_eq!(
+        request["params"]["cwd"],
+        std::fs::canonicalize(&relay.dir).unwrap().to_str().unwrap()
+    );
+    assert_eq!(request["params"]["model"], expected_model);
+}
+
+#[test]
+fn binary_codex_agent_uses_requested_model_for_thread() {
+    assert_codex_thread_start_model(Some("gpt-6-astra"), "gpt-6-astra");
+}
+
+#[test]
+fn binary_codex_agent_uses_default_model_when_omitted() {
+    assert_codex_thread_start_model(None, "gpt-6-luna");
+}
+
 #[test]
 fn binary_agent_remains_tracked_across_real_daemon_restart() {
     let mut relay = TestRelay::start();

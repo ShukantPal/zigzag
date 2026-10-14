@@ -323,8 +323,9 @@ impl CodexServer {
         agent_id: &str,
         cwd: &str,
         prompt: &str,
+        model: &str,
     ) -> Result<(String, mpsc::Receiver<HarnessEvent>), String> {
-        let response = self.rpc("thread/start", json!({"cwd":cwd}))?;
+        let response = self.rpc("thread/start", json!({"cwd":cwd,"model":model}))?;
         let thread_id = response
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -1531,7 +1532,7 @@ mod tests {
         let server = CodexServer { shared };
 
         let (thread_id, events) = server
-            .start_thread("agent-fast", "/tmp", "finish immediately")
+            .start_thread("agent-fast", "/tmp", "finish immediately", "gpt-6-luna")
             .unwrap();
         assert_eq!(thread_id, "thread-fast");
         let event = events
