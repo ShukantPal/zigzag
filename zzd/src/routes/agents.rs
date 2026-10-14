@@ -870,6 +870,17 @@ pub(crate) fn valid_agent_model(model: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
 }
 
+fn codex_approval_arg(approval: Option<&str>) -> &'static str {
+    match approval {
+        Some("suggest") => "--suggest",
+        Some("auto-edit") => "--auto-edit",
+        // Codex approval must stay mediated by the relay policy. A legacy
+        // full-auto request therefore runs with suggestion-level approvals.
+        Some("full-auto") => "--suggest",
+        _ => "--approve-for-me",
+    }
+}
+
 /// Build argv for each CLI. The child process working directory is configured
 /// separately so all harnesses operate against the selected worktree.
 pub(crate) fn agent_argv(
@@ -927,13 +938,7 @@ pub(crate) fn agent_argv(
             let mut args = vec![
                 "exec".into(),
                 "--json".into(),
-                match approval {
-                    "suggest" => "--suggest",
-                    "auto-edit" => "--auto-edit",
-                    "full-auto" => "--full-auto",
-                    _ => "--approve-for-me",
-                }
-                .into(),
+                codex_approval_arg(Some(approval)).into(),
                 "--skip-git-repo-check".into(),
             ];
             if !model.is_empty() {
@@ -1832,11 +1837,10 @@ pub(crate) fn restart_argv(
     session: Option<&str>,
 ) -> Result<Vec<String>, &'static str> {
     let approval = match config.approval_mode.as_deref() {
-        None => "--approve-for-me",
-        Some("suggest") => "--suggest",
-        Some("auto-edit") => "--auto-edit",
-        Some("full-auto") => "--full-auto",
-        Some(_) => return Err("invalid_approval_mode"),
+        Some(value) if !matches!(value, "suggest" | "auto-edit" | "full-auto") => {
+            return Err("invalid_approval_mode");
+        }
+        value => codex_approval_arg(value),
     };
     let mut args = vec![
         "exec".to_owned(),
@@ -2232,5 +2236,35 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
             return false;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod approval_mode_tests {
+    use super::{AgentRestartConfig, RestartMode, agent_argv, restart_argv};
+
+    #[test]
+    fn codex_full_auto_is_never_forwarded_to_the_cli() {
+        let args = agent_argv("codex", "", "full-auto", "/tmp/worktree", true, "task");
+        assert!(args.iter().any(|arg| arg == "--suggest"));
+        assert!(!args.iter().any(|arg| arg == "--full-auto"));
+
+        let restart = restart_argv(
+            &AgentRestartConfig {
+                prompt: "task".to_owned(),
+                worktree: "/tmp/worktree".to_owned(),
+                no_branch: false,
+                harness: "codex".to_owned(),
+                model: None,
+                approval_mode: Some("full-auto".to_owned()),
+                timeout_secs: None,
+            },
+            RestartMode::Fresh,
+            "task",
+            None,
+        )
+        .unwrap();
+        assert!(restart.iter().any(|arg| arg == "--suggest"));
+        assert!(!restart.iter().any(|arg| arg == "--full-auto"));
     }
 }

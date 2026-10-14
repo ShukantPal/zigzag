@@ -716,30 +716,11 @@ fn command_words(params: &Value) -> Option<Vec<String>> {
     }
 }
 
-fn approval_audit_operation(words: Option<&[String]>, params: &Value) -> String {
+fn approval_audit_operation(words: Option<&[String]>) -> String {
     let Some(words) = words else {
-        let raw = params
-            .get("command")
-            .map(Value::to_string)
-            .unwrap_or_else(|| "<missing command>".to_owned());
-        let lower = raw.to_ascii_lowercase();
-        return if [
-            "token",
-            "password",
-            "secret",
-            "credential",
-            "authorization",
-            "api_key",
-            "api-key",
-            ".env",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-        {
-            "<command redacted: credential-like content>".to_owned()
-        } else {
-            raw
-        };
+        // Invalid encodings may still contain credentials in unexpected
+        // positions, so never copy their raw contents into the audit log.
+        return "<command redacted: invalid command encoding>".to_owned();
     };
     let mut redact_next = false;
     words
@@ -763,7 +744,7 @@ fn approval_audit_operation(words: Option<&[String]>, params: &Value) -> String 
             }
             if sensitive_name && !lower.contains('=') {
                 redact_next = true;
-                return word.clone();
+                return "[REDACTED]".to_owned();
             }
             if sensitive_name && word.contains('=') {
                 return format!("{}=[REDACTED]", word.split_once('=').unwrap().0);
@@ -965,7 +946,7 @@ fn gh_create_for_own_branch(args: &[String], branch: &str) -> bool {
         // File inputs, repo overrides, web launch, and unknown flags fail closed.
         return false;
     }
-    head.is_none_or(|head| head == branch)
+    head.is_some_and(|head| head == branch)
 }
 
 fn network_command_is_allowlisted(words: &[String], branch: &str) -> bool {
@@ -1037,7 +1018,7 @@ fn command_approval(params: &Value, context: Option<&ApprovalContext>) -> Approv
         .as_ref()
         .map(|words| words.join(" "))
         .unwrap_or_default();
-    let operation = approval_audit_operation(words.as_deref(), params);
+    let operation = approval_audit_operation(words.as_deref());
     let Some(context) = context else {
         return decision(false, "unknown-agent-deny", operation);
     };
@@ -1675,7 +1656,7 @@ mod tests {
         assert!(network_push.allow, "{}", network_push.rule);
         let network_pr = command_approval(
             &serde_json::json!({
-                "command":["gh", "pr", "create", "--title", "relay policy"],
+                "command":["gh", "pr", "create", "--head", "codex/relay-approval-policy", "--title", "relay policy"],
                 "cwd":"/workspace/repo",
                 "networkApprovalContext":{"host":"github.com"}
             }),
@@ -1715,6 +1696,7 @@ mod tests {
             serde_json::json!(["gh", "pr", "close", "17"]),
             serde_json::json!(["gh", "pr", "delete", "17"]),
             serde_json::json!(["gh", "pr", "create", "--head", "codex/other-branch"]),
+            serde_json::json!(["gh", "pr", "create", "--title", "implicit current branch"]),
             serde_json::json!(["npm", "run", "deploy"]),
             serde_json::json!(["gh", "api", "repos/example/project/actions/se%63rets"]),
             serde_json::json!(["git", "branch", "-D", "old-branch"]),
@@ -1745,6 +1727,24 @@ mod tests {
         assert!(!result.allow);
         assert!(result.operation.contains("GH_TOKEN=[REDACTED]"));
         assert!(!result.operation.contains("ghp_example-secret-value"));
+
+        let header = command_approval(
+            &serde_json::json!({
+                "command":["gh", "api", "repos/example/project/issues", "-HAuthorization: Bearer ghp_example-secret-value"],
+                "cwd":"/workspace/repo"
+            }),
+            Some(&test_context()),
+        );
+        assert!(!header.operation.contains("ghp_example-secret-value"));
+
+        let malformed = command_approval(
+            &serde_json::json!({
+                "command":["echo", 7, "ghp_example-secret-value"],
+                "cwd":"/workspace/repo"
+            }),
+            Some(&test_context()),
+        );
+        assert!(!malformed.operation.contains("ghp_example-secret-value"));
     }
 
     #[test]
