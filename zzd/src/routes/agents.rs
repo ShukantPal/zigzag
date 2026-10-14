@@ -13,9 +13,8 @@ use crate::proc::{
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::configured_worktree_base;
 use crate::routes::worktrees::{
-    WorktreeError, agent_worktree_is_clean_and_pushed, cleanup_agent_worktree, git_output,
-    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
-    worktree_branch_checkout_path, worktree_branch_exists,
+    WorktreeError, git_output, resolve_new_worktree_path, resolve_worktree_repo,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_branch_exists,
 };
 #[cfg(not(test))]
 use crate::routes::worktrees::{canonical_worktree_roots, configured_worktree_repo_root};
@@ -2240,6 +2239,64 @@ pub(crate) fn delete_explicit_agent_with_trust(
     }))
 }
 
+/// Clean up a worktree after an explicit DELETE has stopped a live agent.
+/// Discovery failures retain the worktree, and cleanup rechecks registry
+/// attachments after any repository stop hook immediately before removal.
+pub(crate) fn cleanup_stopped_agent_worktree_with_trust(
+    registry: &zz::AgentRegistry,
+    agent: &AgentRecord,
+    watched_pr: Result<bool, String>,
+    roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
+) {
+    let Some(path) = agent.worktree_path.as_deref() else {
+        return;
+    };
+    let retain_for_pr = match watched_pr {
+        Ok(watched) => watched,
+        Err(error) => {
+            log::warn!(
+                "agent_stop PR discovery id={} failed: {error}; retaining worktree",
+                agent.id
+            );
+            true
+        }
+    };
+    if retain_for_pr {
+        log::info!(
+            "agent_stop id={}: retaining worktree for watched pull request",
+            agent.id
+        );
+        return;
+    }
+    let owner_id = agent.id.as_str();
+    match crate::routes::worktrees::agent_worktree_is_clean_and_pushed(path, roots) {
+        Ok(true) => match crate::routes::worktrees::cleanup_agent_worktree_with_registry_guard(
+            path,
+            roots,
+            trusted_repos,
+            registry,
+            owner_id,
+        ) {
+            Ok(()) => log::info!("agent_stop id={owner_id}: worktree cleaned up at {path}"),
+            Err(failure) => log::warn!(
+                "agent_stop id={owner_id}: worktree cleanup failed at {path}: {}",
+                failure.message
+            ),
+        },
+        Ok(false) => log::warn!(
+            "agent_stop id={owner_id}: retaining worktree at {path}; it is dirty, its branch tip is not on origin, or safety could not be verified"
+        ),
+        Err(failure) if failure.message == "worktree_path_not_found" => {
+            log::info!("agent_stop id={owner_id}: recorded worktree is already missing at {path}")
+        }
+        Err(failure) => log::warn!(
+            "agent_stop id={owner_id}: worktree safety check failed at {path}: {}; retaining worktree",
+            failure.message
+        ),
+    }
+}
+
 /// Completed agents remain inspectable for a day by default. Configure a
 /// longer or shorter positive retention window with ZIGZAG_AGENT_CLEANUP_TTL_SECS.
 const DEFAULT_AGENT_CLEANUP_TTL_SECS: u64 = 24 * 60 * 60;
@@ -2900,41 +2957,13 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         {
             return reply(stream, 500, error("could_not_persist_agent_state"));
         }
-        if let Some(path) = agent.worktree_path.as_deref() {
-            let watched_pr = match watch_agent_pr(&agent) {
-                Ok(watching) => watching,
-                Err(message) => {
-                    log::warn!("agent_stop PR discovery id={id} failed: {message}");
-                    false
-                }
-            };
-            if watched_pr {
-                log::info!("agent_stop id={id}: retaining worktree for watched pull request");
-            } else {
-                let roots = agent_worktree_roots();
-                match agent_worktree_is_clean_and_pushed(path, &roots) {
-                    Ok(true) => match cleanup_agent_worktree(path, &roots) {
-                        Ok(()) => log::info!("agent_stop id={id}: worktree cleaned up at {path}"),
-                        Err(failure) => log::warn!(
-                            "agent_stop id={id}: worktree cleanup failed at {path}: {}",
-                            failure.message
-                        ),
-                    },
-                    Ok(false) => log::warn!(
-                        "agent_stop id={id}: retaining worktree at {path}; it is dirty, its branch tip is not on origin, or safety could not be verified"
-                    ),
-                    Err(failure) if failure.message == "worktree_path_not_found" => {
-                        log::info!(
-                            "agent_stop id={id}: recorded worktree is already missing at {path}"
-                        )
-                    }
-                    Err(failure) => log::warn!(
-                        "agent_stop id={id}: worktree safety check failed at {path}: {}; retaining worktree",
-                        failure.message
-                    ),
-                }
-            }
-        }
+        cleanup_stopped_agent_worktree_with_trust(
+            &state.supervisor.registry,
+            &agent,
+            watch_agent_pr(&agent),
+            &agent_worktree_roots(),
+            &crate::routes::worktrees::trusted_hook_repos(),
+        );
         return reply(
             stream,
             200,
@@ -2950,13 +2979,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     }
     let pgid = agent.process_group;
     let worktree = agent.worktree_path.clone();
-    let watching_pr = match watch_agent_pr(&agent) {
-        Ok(watching) => watching,
-        Err(error) => {
-            log::warn!("agent_stop PR discovery id={id} failed: {error}");
-            false
-        }
-    };
+    let watching_pr = watch_agent_pr(&agent);
     // Security: never signal a process group that does not belong to this
     // registered agent. A stale record (PID/PGID reuse, or a leader that has
     // already exited) is treated as already dead: deregister without
@@ -2992,36 +3015,18 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         );
     }
     log::info!("agent_stop id={id} pgid={pgid} graceful={graceful}");
-    match &worktree {
-        Some(_path) if stopped && watching_pr => {
-            log::info!("agent_stop id={id}: retaining worktree for watched pull request")
-        }
-        Some(path) if stopped => {
-            let roots = agent_worktree_roots();
-            match agent_worktree_is_clean_and_pushed(path, &roots) {
-                Ok(true) => match cleanup_agent_worktree(path, &roots) {
-                    Ok(()) => log::info!("agent_stop id={id}: worktree cleaned up at {path}"),
-                    Err(failure) => log::warn!(
-                        "agent_stop id={id}: worktree cleanup failed at {path}: {}",
-                        failure.message
-                    ),
-                },
-                Ok(false) => log::warn!(
-                    "agent_stop id={id}: retaining worktree at {path}; it is dirty, its branch tip is not on origin, or safety could not be verified"
-                ),
-                Err(failure) if failure.message == "worktree_path_not_found" => {
-                    log::info!("agent_stop id={id}: recorded worktree is already missing at {path}")
-                }
-                Err(failure) => log::warn!(
-                    "agent_stop id={id}: worktree safety check failed at {path}: {}; retaining worktree",
-                    failure.message
-                ),
-            }
-        }
-        Some(path) => log::info!(
+    match (&worktree, stopped) {
+        (Some(_), true) => cleanup_stopped_agent_worktree_with_trust(
+            &state.supervisor.registry,
+            &agent,
+            watching_pr,
+            &agent_worktree_roots(),
+            &crate::routes::worktrees::trusted_hook_repos(),
+        ),
+        (Some(path), false) => log::info!(
             "agent_stop id={id}: worktree retained because process group is still running at {path}"
         ),
-        None => log::info!("agent_stop id={id}: no worktree recorded"),
+        (None, _) => log::info!("agent_stop id={id}: no worktree recorded"),
     }
     reply(
         stream,

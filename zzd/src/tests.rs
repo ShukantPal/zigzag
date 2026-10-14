@@ -39,7 +39,8 @@ use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
-    agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
+    agent_post_request_with_session_resolver, agent_route,
+    cleanup_stopped_agent_worktree_with_trust, default_agent_worktree,
     delete_explicit_agent_with_trust, delete_inactive_agent, delete_inactive_agent_with_trust,
     dispatch_agent_message, handle_codex_notification, monitor_codex_events,
     monitor_codex_events_to_path, parse_agent_cleanup_ttl, parse_agent_create_request,
@@ -1933,6 +1934,112 @@ fn explicit_delete_keeps_worktree_attached_to_another_live_agent() {
         .status()
         .unwrap();
     assert!(branch.success(), "live agent's branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_pr_discovery_failure_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) =
+        completed_worktree_fixture("live-delete-pr-error", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Err("GitHub discovery unavailable".to_owned()),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(
+        path.exists(),
+        "live-agent worktree was removed after discovery failed"
+    );
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-pr-error",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        branch.success(),
+        "live-agent branch was removed after discovery failed"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_keeps_worktree_attached_to_another_live_agent() {
+    let (repo, path, roots, registry, id) =
+        completed_worktree_fixture("live-delete-attached", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+    let mut other = agent_record("other-live-shutdown-agent");
+    other.state = "running".to_owned();
+    other.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(other).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(
+        path.exists(),
+        "worktree attached to another live agent was removed"
+    );
+    assert!(registry.get("other-live-shutdown-agent").is_some());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-attached",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "attached live-agent branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_removes_safe_unwatched_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("live-delete-clean", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(!path.exists(), "safe live-agent worktree was not removed");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "safe live-agent branch was not removed");
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
@@ -3891,7 +3998,7 @@ fn agent_delete_stops_a_paused_agent_before_returning() {
 }
 
 #[test]
-fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
+fn agent_delete_retains_worktree_when_live_agent_pr_discovery_fails() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
@@ -3973,7 +4080,10 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         state.supervisor.registry.get("delete-me").unwrap().state,
         "stopped"
     );
-    assert!(!worktree.exists(), "agent worktree was not removed");
+    assert!(
+        worktree.exists(),
+        "agent worktree was removed after PR discovery failed"
+    );
     let branch = Command::new("git")
         .args([
             "show-ref",
@@ -3984,7 +4094,10 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         .current_dir(&repo)
         .status()
         .unwrap();
-    assert!(!branch.success(), "agent branch was not deleted");
+    assert!(
+        branch.success(),
+        "agent branch was removed after PR discovery failed"
+    );
     assert!(
         !hooks.join("stop-ran").exists(),
         "repository hook ran without an explicit local trust decision"
