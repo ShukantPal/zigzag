@@ -2570,10 +2570,8 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
 fn manual_worktree_delete_handler_refuses_live_attachment_then_removes_worktree() {
     let base = worktree_test_base("manual-delete-handler");
     let repo = worktree_test_repo(&base);
-    let roots = crate::routes::worktrees::canonical_worktree_roots();
-    let allowed_root = roots
-        .first()
-        .expect("test requires a configured worktree root");
+    let roots = worktree_test_roots(&base);
+    let allowed_root = &roots[0];
     let worktree_parent = allowed_root.join(format!(
         "manual-delete-handler-{}",
         unique_handle(&HashMap::new()).unwrap()
@@ -2600,13 +2598,15 @@ fn manual_worktree_delete_handler_refuses_live_attachment_then_removes_worktree(
     let policy = test_policy();
     let request_body = format!(r#"{{"path":"{}"}}"#, path.display());
 
-    let response = request_once(
-        Arc::clone(&state),
-        &policy,
-        "DELETE",
-        "/v1/worktrees",
-        &request_body,
-    );
+    let response = crate::routes::worktrees::with_worktree_roots_for_test(&roots, || {
+        request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            "/v1/worktrees",
+            &request_body,
+        )
+    });
     assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
     assert_eq!(
         response_json(response).object("error"),
@@ -2622,13 +2622,15 @@ fn manual_worktree_delete_handler_refuses_live_attachment_then_removes_worktree(
         .registry
         .transition("manual-delete-live-agent", "stopped", None)
         .unwrap();
-    let response = request_once(
-        Arc::clone(&state),
-        &policy,
-        "DELETE",
-        "/v1/worktrees",
-        &request_body,
-    );
+    let response = crate::routes::worktrees::with_worktree_roots_for_test(&roots, || {
+        request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            "/v1/worktrees",
+            &request_body,
+        )
+    });
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert_eq!(
         response_json(response).object("removed"),

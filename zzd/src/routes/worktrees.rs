@@ -8,6 +8,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 static RELAY_DELETED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static WORKTREE_ROOTS_TEST_OVERRIDE: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
 use zz::{Json, parse_json};
 
 // --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
@@ -29,6 +33,11 @@ pub(crate) struct WorktreeError {
 /// Canonicalize each configured root, dropping roots that do not exist. An
 /// empty result rejects every path (fail closed).
 pub(crate) fn canonical_worktree_roots() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(roots) = WORKTREE_ROOTS_TEST_OVERRIDE.with(|roots| roots.borrow().clone()) {
+        return roots;
+    }
+
     let configured_roots = std::env::var_os("ZIGZAG_WORKTREE_ROOTS");
     let roots: Vec<PathBuf> = configured_roots
         .as_ref()
@@ -48,6 +57,21 @@ pub(crate) fn canonical_worktree_roots() -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn with_worktree_roots_for_test<T>(roots: &[PathBuf], action: impl FnOnce() -> T) -> T {
+    let roots = roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    let previous =
+        WORKTREE_ROOTS_TEST_OVERRIDE.with(|override_roots| override_roots.replace(Some(roots)));
+    let result = action();
+    WORKTREE_ROOTS_TEST_OVERRIDE.with(|override_roots| {
+        override_roots.replace(previous);
+    });
+    result
 }
 
 /// Base used for automatically selected agent worktrees. The explicit base
