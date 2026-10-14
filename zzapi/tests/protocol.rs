@@ -135,6 +135,103 @@ fn agents_create_reads_prompt_files_client_side_and_keeps_inline_text() {
 }
 
 #[test]
+fn agents_delete_calls_the_agent_delete_endpoint() {
+    let (port, server) = transcript_server([
+        r#"{"id":"agent-123","state":"orphaned"}"#,
+        r#"{"id":"agent-123","state":"orphaned"}"#,
+        r#"{"id":"agent-123","stopped":true,"worktree":null}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "delete",
+            "agent-123",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /v1/agents/agent-123 "));
+    assert!(requests[1].starts_with("GET /v1/agents/agent-123 "));
+    assert!(requests[2].starts_with("DELETE /v1/agents/agent-123 "));
+}
+
+#[test]
+fn agents_delete_refuses_a_running_agent_and_suggests_stop() {
+    let (port, server) = transcript_server([
+        r#"{"id":"agent-running","state":"running"}"#,
+        r#"{"id":"agent-running","state":"running"}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "delete",
+            "agent-running",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to delete running agent agent-running"));
+    assert!(stderr.contains("zzapi agents stop agent-running"));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.starts_with("DELETE "))
+    );
+}
+
+#[test]
+fn agents_delete_dry_run_describes_effects_without_deleting() {
+    let (port, server) = transcript_server([
+        r#"{"id":"agent-dry","state":"orphaned"}"#,
+        r#"{"id":"agent-dry","state":"orphaned"}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "delete",
+            "agent-dry",
+            "--dry-run",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("keeps the agent record"));
+    assert!(stdout.contains("watched pull request"));
+    assert!(stdout.contains("attempts to delete its branch"));
+    assert!(stdout.contains("No DELETE request was sent"));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.starts_with("DELETE "))
+    );
+}
+
+#[test]
 fn agents_continue_posts_authenticated_prompt_and_returns_turn_result() {
     let (port, server) = transcript_server([
         r#"{"id":"agent-1"}"#,

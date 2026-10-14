@@ -283,10 +283,21 @@ enum AgentsCmd {
         #[arg(long)]
         prompt: String,
     },
-    /// Gracefully stop an agent (leaves worktree)
+    /// Gracefully stop an agent through the relay (cleans up its worktree and may delete its branch)
     Stop {
         /// Agent handle (unique prefix accepted)
         id: String,
+    },
+    /// Delete an agent through the relay
+    #[command(
+        long_about = "Calls DELETE /v1/agents/{id}; refuses agents in the running state. After a successful stop, the relay retains the record and transitions it to stopped or killed. It removes the worktree unless it retains it for a watched pull request. Worktree cleanup attempts to delete the branch unless it is main/master, checked out elsewhere, or cleanup fails. A lost_after_restart agent has its worktree cleaned up and its record transitioned to stopped."
+    )]
+    Delete {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Show the relay effects without sending DELETE
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Read an agent's captured output
     Logs {
@@ -1177,6 +1188,43 @@ fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
     Ok(())
 }
 
+fn cmd_agents_delete(client: &Client, id: &str, dry_run: bool) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let agent = client.get(&format!("/v1/agents/{id}"), &[])?;
+    let state = s(&agent, "state");
+    if state == "running" {
+        return Err(Fail::Config(format!(
+            "refusing to delete running agent {id}; use `zzapi agents stop {id}` first"
+        )));
+    }
+
+    if dry_run {
+        println!("Dry run for agent {id} (state: {state}):");
+        println!("- The relay keeps the agent record and transitions it to stopped or killed.");
+        println!(
+            "- The relay removes the worktree after a successful stop, except when it retains the worktree for a watched pull request."
+        );
+        println!(
+            "- When it removes the worktree, it attempts to delete its branch unless it is main/master, checked out elsewhere, or worktree cleanup fails."
+        );
+        println!(
+            "- A lost_after_restart agent has its worktree cleaned up and its record transitioned to stopped."
+        );
+        println!("No DELETE request was sent.");
+        return Ok(());
+    }
+
+    let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
+    emit(client, &resp, || {
+        println!(
+            "delete completed for {} (stopped={})",
+            s(&resp, "id"),
+            s(&resp, "stopped")
+        );
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_agents_logs(
     client: &Client,
@@ -1822,6 +1870,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
             }
             AgentsCmd::Continue { id, prompt } => cmd_agents_continue(&client, &id, &prompt),
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
+            AgentsCmd::Delete { id, dry_run } => cmd_agents_delete(&client, &id, dry_run),
             AgentsCmd::Logs {
                 id,
                 stream,
