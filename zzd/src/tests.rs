@@ -2100,7 +2100,12 @@ fn ttl_sweep_deletes_expired_clean_pushed_worktree_and_keeps_branch() {
         .parse::<u64>()
         .unwrap();
 
-    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 1, 1), 1);
+    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 1, 1), 0);
+    assert!(
+        registry.get(&id).is_some(),
+        "cleanup ran at the TTL boundary"
+    );
+    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 2, 1), 1);
     assert!(!path.exists());
     assert!(registry.get(&id).is_none());
     let branch = Command::new("git")

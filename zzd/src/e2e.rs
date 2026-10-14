@@ -424,7 +424,7 @@ fn e2e_opencode_agent_create_cleans_transcript_after_registry_deletion() {
     assert_eq!(
         crate::routes::agents::sweep_inactive_agents_at(
             &state.supervisor.registry,
-            completed_at + 86_400,
+            completed_at + 86_401,
             86_400,
         ),
         1

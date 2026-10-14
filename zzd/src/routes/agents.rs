@@ -2200,7 +2200,7 @@ pub(crate) fn sweep_inactive_agents_at(
             );
             continue;
         };
-        if now.saturating_sub(completed_at) >= ttl_secs {
+        if now.saturating_sub(completed_at) > ttl_secs {
             expired.push(agent);
         }
     }
