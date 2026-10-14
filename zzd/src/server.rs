@@ -267,6 +267,9 @@ where
         ("POST", "/v1/spawn") => spawn_request(&mut stream, &state, request.body, load_policy()),
         ("POST", "/v1/worktrees") => worktree_create(&mut stream, request.body),
         ("DELETE", "/v1/worktrees") => worktree_delete(&mut stream, &state, request.body),
+        ("DELETE", "/v1/agents") => {
+            crate::routes::agents::agent_bulk_delete(&mut stream, &state, &request.target)
+        }
         ("GET", "/v1/providers") => providers_request(&mut stream),
         ("DELETE", path) => match agent_route("DELETE", path) {
             Some(AgentRoute::Status(id)) => agent_delete(&mut stream, &state, id),

@@ -186,25 +186,48 @@ pub(crate) fn agent_request(
     };
     match route {
         AgentRoute::List => {
-            let allowed = ["state", "task_id"];
+            let allowed = ["state", "task_id", "branch", "pr"];
             if values.keys().any(|key| !allowed.contains(&key.as_str())) {
                 return reply(stream, 400, error("invalid_agent_query"));
             }
-            let agents = state.supervisor.registry.list(
-                values.get("state").map(String::as_str),
-                values.get("task_id").map(String::as_str),
-            );
-            reply(
-                stream,
-                200,
-                Json::Object(vec![(
-                    "agents".to_owned(),
-                    Json::Array(agents.iter().map(AgentRecord::status_json).collect()),
-                )]),
-            )
+            let pr_details = match values.get("pr") {
+                Some(value) => match value.parse::<u64>().ok().and_then(resolve_pr_details) {
+                    Some(details) => Some(details),
+                    None => return reply(stream, 404, error("unknown_pull_request")),
+                },
+                None => None,
+            };
+            let pr_branch = pr_details.as_ref().map(|(_, branch)| branch.as_str());
+            let branch_filter = values.get("branch").map(String::as_str).or(pr_branch);
+            let agents = state
+                .supervisor
+                .registry
+                .list(None, values.get("task_id").map(String::as_str));
+            let agents: Vec<Json> = agents
+                .iter()
+                .filter_map(|agent| {
+                    let status = enriched_agent_status(state, agent);
+                    if values.get("state").is_some_and(|state_filter| {
+                        status.object("state").and_then(Json::as_str) != Some(state_filter.as_str())
+                    }) {
+                        return None;
+                    }
+                    if let Some(branch) = branch_filter
+                        && status.object("branch").and_then(Json::as_str) != Some(branch)
+                    {
+                        return None;
+                    }
+                    Some(status)
+                })
+                .collect();
+            let mut response = vec![("agents".to_owned(), Json::Array(agents))];
+            if let Some((repository, _)) = pr_details {
+                response.push(("repository".to_owned(), Json::String(repository)));
+            }
+            reply(stream, 200, Json::Object(response))
         }
         AgentRoute::Status(id) => match state.supervisor.registry.get(id) {
-            Some(agent) => reply(stream, 200, agent.status_json()),
+            Some(agent) => reply(stream, 200, enriched_agent_status(state, &agent)),
             None => reply(stream, 404, error("unknown_agent")),
         },
         AgentRoute::Logs(id) => {
@@ -274,10 +297,39 @@ pub(crate) fn agent_request(
                 Ok(value) => value,
                 Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
             };
+            if values
+                .keys()
+                .any(|key| !["after", "tail", "tail_items", "since"].contains(&key.as_str()))
+            {
+                return reply(stream, 400, error("invalid_transcript_query"));
+            }
+            let tail_items = match values
+                .get("tail_items")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
+            };
+            let since = match values
+                .get("since")
+                .map(|value| value.parse::<u64>())
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
+            };
+            if tail_items.is_some() && since.is_some() {
+                return reply(stream, 400, error("invalid_transcript_query"));
+            }
             let id = resolve_registered_agent_id(&state.supervisor.registry, id)
                 .unwrap_or_else(|| id.to_owned());
             match transcript_json(&state.supervisor.registry, &id, after, tail) {
-                Some(json) => reply(stream, 200, json),
+                Some(json) => reply(
+                    stream,
+                    200,
+                    select_transcript_items(json, tail_items, since),
+                ),
                 None => reply(stream, 404, error("unknown_agent")),
             }
         }
@@ -288,6 +340,353 @@ pub(crate) fn agent_request(
         | AgentRoute::Continue(_)
         | AgentRoute::Create => reply(stream, 404, error("not_found")),
     }
+}
+
+/// Bulk terminal-record cleanup. Selection is performed against the relay's
+/// registry so callers need one request regardless of the number of records.
+pub(crate) fn agent_bulk_delete(
+    stream: &mut TcpStream,
+    state: &Server,
+    target: &str,
+) -> Result<(), String> {
+    let values = match query(target) {
+        Ok(values) => values,
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let allowed = ["branch", "pr", "keep_last", "older_than", "dry_run"];
+    if values.keys().any(|key| !allowed.contains(&key.as_str()))
+        || values.contains_key("branch") == values.contains_key("pr")
+    {
+        return reply(stream, 400, error("invalid_agent_delete_query"));
+    }
+    let (branch, repository) = if let Some(branch) = values.get("branch") {
+        (branch.clone(), None)
+    } else {
+        let Some(number) = values.get("pr").and_then(|v| v.parse::<u64>().ok()) else {
+            return reply(stream, 400, error("invalid_agent_delete_query"));
+        };
+        let Some((repository, branch)) = resolve_pr_details(number) else {
+            return reply(stream, 404, error("unknown_pull_request"));
+        };
+        (branch, Some(repository))
+    };
+    let keep_last = match values
+        .get("keep_last")
+        .map(|v| v.parse::<usize>())
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(0),
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let older_than = match values
+        .get("older_than")
+        .map(|v| parse_duration(v))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let dry_run = match values.get("dry_run").map(String::as_str).unwrap_or("0") {
+        "0" => false,
+        "1" => true,
+        _ => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let cutoff = older_than.map(|duration| {
+        std::time::SystemTime::now()
+            .checked_sub(duration)
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let candidates = state.supervisor.registry.list(None, None);
+    let selected = select_bulk_delete_candidates(
+        candidates,
+        &branch,
+        repository.as_deref(),
+        cutoff,
+        keep_last,
+    );
+    let result = apply_bulk_delete(selected, dry_run, |agent| {
+        delete_explicit_agent_with_trust(
+            &state.supervisor.registry,
+            &agent.id,
+            watch_agent_pr(agent),
+            &agent_worktree_roots(),
+            &crate::routes::worktrees::trusted_hook_repos(),
+        )
+        .map(|effects| effects.is_some())
+    });
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("branch".into(), Json::String(branch)),
+            ("dry_run".into(), Json::Bool(dry_run)),
+            (
+                "deleted_count".into(),
+                Json::number(result.deleted.len() as u64),
+            ),
+            ("skipped_count".into(), Json::number(result.skipped)),
+            (
+                "deleted".into(),
+                Json::Array(result.deleted.into_iter().map(Json::String).collect()),
+            ),
+            (
+                "failures".into(),
+                Json::Array(result.failures.into_iter().map(Json::String).collect()),
+            ),
+        ]),
+    )
+}
+
+fn parse_duration(value: &str) -> Result<Duration, ()> {
+    let (number, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit()).ok_or(())?);
+    let amount = number.parse::<u64>().map_err(|_| ())?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
+        _ => return Err(()),
+    };
+    amount
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or(())
+}
+
+fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
+    let date = value.get(0..10)?;
+    let time = value.get(11..19)?;
+    let mut d = date.split('-');
+    let year = d.next()?.parse::<i64>().ok()?;
+    let month = d.next()?.parse::<i64>().ok()?;
+    let day = d.next()?.parse::<i64>().ok()?;
+    let mut t = time.split(':');
+    let hour = t.next()?.parse::<u64>().ok()?;
+    let minute = t.next()?.parse::<u64>().ok()?;
+    let second = t.next()?.parse::<u64>().ok()?;
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86400)?
+        .checked_add(hour * 3600 + minute * 60 + second)
+}
+
+fn parse_timestamp_epoch(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .or_else(|| parse_rfc3339_epoch(value))
+}
+
+fn select_bulk_delete_candidates(
+    candidates: Vec<AgentRecord>,
+    branch: &str,
+    repository: Option<&str>,
+    cutoff: Option<std::time::SystemTime>,
+    keep_last: usize,
+) -> Vec<AgentRecord> {
+    let mut candidates = candidates
+        .into_iter()
+        .filter(|agent| {
+            agent.status_json().object("branch").and_then(Json::as_str) == Some(branch)
+                && repository
+                    .is_none_or(|repository| agent_repository(agent).as_deref() == Some(repository))
+                && cutoff.is_none_or(|cutoff| {
+                    parse_timestamp_epoch(&agent.started_at).is_some_and(|epoch| {
+                        std::time::UNIX_EPOCH + Duration::from_secs(epoch) < cutoff
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        parse_timestamp_epoch(&b.started_at).cmp(&parse_timestamp_epoch(&a.started_at))
+    });
+    candidates.into_iter().skip(keep_last).collect()
+}
+
+struct BulkDeleteResult {
+    deleted: Vec<String>,
+    skipped: u64,
+    failures: Vec<String>,
+}
+
+fn apply_bulk_delete(
+    selected: Vec<AgentRecord>,
+    dry_run: bool,
+    mut delete: impl FnMut(&AgentRecord) -> Result<bool, String>,
+) -> BulkDeleteResult {
+    let mut result = BulkDeleteResult {
+        deleted: Vec::new(),
+        skipped: 0,
+        failures: Vec::new(),
+    };
+    for agent in selected {
+        if agent_is_live(&agent) {
+            result.skipped += 1;
+        } else if dry_run {
+            result.deleted.push(agent.id);
+        } else {
+            match delete(&agent) {
+                Ok(true) => result.deleted.push(agent.id),
+                Ok(false) => result.skipped += 1,
+                Err(_) => result.failures.push(agent.id),
+            }
+        }
+    }
+    result
+}
+
+fn agent_repository(agent: &AgentRecord) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_str(agent.agent_config.as_deref()?).ok()?;
+    let project_dir = config.get("project_dir")?.as_str()?;
+    let remote = git_output(Path::new(project_dir), &["remote", "get-url", "origin"]).ok()?;
+    crate::github::github_repository(&String::from_utf8_lossy(&remote.stdout))
+}
+
+fn enriched_agent_status(state: &Server, agent: &AgentRecord) -> Json {
+    // The registry is authoritative for lifecycle state. The app-server can
+    // retain an active-turn entry briefly after a stop or terminal result, so
+    // never let that stale entry make a completed record look running.
+    let active_turn = (!crate::routes::worktrees::agent_state_is_terminal(&agent.state))
+        .then(|| {
+            agent.harness_session_id.as_deref().and_then(|thread| {
+                state
+                    .supervisor
+                    .codex_app_server
+                    .lock()
+                    .ok()?
+                    .as_ref()?
+                    .active_turn_id(thread)
+            })
+        })
+        .flatten();
+    let in_flight = active_turn.is_some();
+    let mut status = agent.status_json();
+    if let Json::Object(ref mut fields) = status {
+        fields.push(("turn_in_flight".to_owned(), Json::Bool(in_flight)));
+        fields.push((
+            "current_turn_id".to_owned(),
+            active_turn.map(Json::String).unwrap_or(Json::Null),
+        ));
+        let activity = if in_flight {
+            Some(crate::events::relay_timestamp())
+        } else {
+            agent
+                .first_output_at
+                .clone()
+                .or_else(|| agent.completed_at.clone())
+                .or_else(|| Some(agent.started_at.clone()))
+        };
+        fields.push((
+            "last_activity_at".to_owned(),
+            activity.map(Json::String).unwrap_or(Json::Null),
+        ));
+    }
+    status
+}
+
+fn select_transcript_items(mut transcript: Json, tail: Option<usize>, since: Option<u64>) -> Json {
+    if let Json::Object(ref mut fields) = transcript {
+        for key in ["stdout", "stderr"] {
+            let Some((_, Json::String(text))) = fields.iter_mut().find(|(field, _)| field == key)
+            else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len() as u64;
+            let start = since
+                .map(|seq| usize::try_from(seq).unwrap_or(usize::MAX))
+                .unwrap_or_else(|| {
+                    tail.map(|count| lines.len().saturating_sub(count))
+                        .unwrap_or(0)
+                });
+            let selected = lines
+                .iter()
+                .skip(start)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            *text = if selected.is_empty() {
+                String::new()
+            } else {
+                selected + "\n"
+            };
+            fields.push((format!("{key}_next_sequence"), Json::number(total)));
+        }
+        let stdout_selected = fields
+            .iter()
+            .find(|(field, _)| field == "stdout")
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let stderr_selected = fields
+            .iter()
+            .find(|(field, _)| field == "stderr")
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if let Some((_, Json::Array(records))) =
+            fields.iter_mut().find(|(field, _)| field == "records")
+        {
+            for record in records {
+                let stream = record.object("stream").and_then(Json::as_str).unwrap_or("");
+                let text_key = match stream {
+                    "stdout" => "stdout",
+                    "stderr" => "stderr",
+                    _ => continue,
+                };
+                let selected = if text_key == "stdout" {
+                    &stdout_selected
+                } else {
+                    &stderr_selected
+                };
+                if let Json::Object(record_fields) = record
+                    && let Some((_, data)) =
+                        record_fields.iter_mut().find(|(field, _)| field == "data")
+                {
+                    *data = Json::String(selected.clone());
+                }
+            }
+        }
+    }
+    transcript
+}
+
+fn resolve_pr_details(number: u64) -> Option<(String, String)> {
+    let root = agent_worktree_repo_root();
+    let repository = git_output(&root, &["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|remote| {
+            crate::github::github_repository(&String::from_utf8_lossy(&remote.stdout))
+        });
+    if let Ok(watched) = crate::github::watched_prs() {
+        let mut matches = watched.iter().filter(|entry| {
+            entry.number == number
+                && repository
+                    .as_ref()
+                    .is_none_or(|repo| &entry.repository == repo)
+        });
+        if let Some(entry) = matches.next()
+            && matches.next().is_none()
+        {
+            return Some((entry.repository.clone(), entry.branch.clone()));
+        }
+    }
+    let repository = repository?;
+    crate::session::require_gui_login_session().ok()?;
+    let branch = crate::github_api::get(&format!("repos/{repository}/pulls/{number}"))
+        .ok()?
+        .pointer("/head/ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)?;
+    Some((repository, branch))
 }
 
 /// Handle POST requests to agent routes (create/pause/resume).
@@ -366,6 +765,11 @@ fn agent_continue_request(
     };
     let Some(agent) = state.supervisor.registry.get(id) else {
         return reply(stream, 404, error("unknown_agent"));
+    };
+    let _continuation_guard = match state.supervisor.registry.try_lock_continuation(id) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 409, error("agent_continue_in_progress")),
+        Err(_) => return reply(stream, 500, error("could_not_lock_agent_continuation")),
     };
     let interrupt = value
         .get("interrupt")
@@ -3204,5 +3608,210 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
             return false;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod agent_dx_tests {
+    use super::{
+        apply_bulk_delete, parse_duration, parse_rfc3339_epoch, parse_timestamp_epoch,
+        select_bulk_delete_candidates, select_transcript_items,
+    };
+    use std::process::Command;
+    use std::time::{Duration, UNIX_EPOCH};
+    use zz::{AgentRecord, Json};
+
+    fn record(id: &str, started_at: &str, state: &str, repo: Option<&str>) -> AgentRecord {
+        AgentRecord {
+            id: id.to_owned(),
+            task_id: id.to_owned(),
+            execution_id: id.to_owned(),
+            leader_pid: 0,
+            process_group: 0,
+            process_identity: None,
+            worktree_path: None,
+            started_at: started_at.to_owned(),
+            completed_at: None,
+            deadline_at: None,
+            command: String::new(),
+            state: state.to_owned(),
+            paused_at: None,
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: false,
+            redacted: false,
+            stdout_next: 0,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
+            restarted_from: None,
+            agent_config: Some(
+                serde_json::json!({
+                    "branch": "shared-branch",
+                    "project_dir": repo,
+                })
+                .to_string(),
+            ),
+            harness_session_id: None,
+            harness: None,
+        }
+    }
+
+    #[test]
+    fn transcript_tail_and_since_select_exclusive_item_sequences() {
+        let value = Json::Object(vec![
+            ("stdout".into(), Json::String("one\ntwo\nthree\n".into())),
+            ("stderr".into(), Json::String(String::new())),
+            (
+                "records".into(),
+                Json::Array(vec![Json::Object(vec![
+                    ("stream".into(), Json::String("stdout".into())),
+                    ("data".into(), Json::String("one\ntwo\nthree\n".into())),
+                ])]),
+            ),
+        ]);
+        let tail = select_transcript_items(value.clone(), Some(2), None);
+        assert_eq!(
+            tail.object("stdout").and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+        assert_eq!(
+            tail.object("records")
+                .and_then(|v| match v {
+                    Json::Array(items) => items.first(),
+                    _ => None,
+                })
+                .and_then(|v| v.object("data"))
+                .and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+        let since = select_transcript_items(value, None, Some(1));
+        assert_eq!(
+            since.object("stdout").and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+    }
+
+    #[test]
+    fn bulk_delete_durations_and_started_at_timestamps_parse() {
+        assert_eq!(parse_duration("7d").unwrap().as_secs(), 604800);
+        assert_eq!(parse_duration("12h").unwrap().as_secs(), 43200);
+        assert!(parse_duration("7x").is_err());
+        assert_eq!(parse_rfc3339_epoch("1970-01-02T00:00:00Z"), Some(86400));
+        assert_eq!(parse_timestamp_epoch("1760000000"), Some(1760000000));
+    }
+
+    #[test]
+    fn bulk_delete_age_and_keep_last_handle_unix_and_rfc3339_records() {
+        let candidates = vec![
+            record("unix-old", "1700000000", "succeeded", None),
+            record("rfc3339-middle", "2025-01-01T00:00:00Z", "succeeded", None),
+            record("unix-new", "1800000000", "succeeded", None),
+        ];
+        let cutoff = UNIX_EPOCH + Duration::from_secs(1720000000);
+        let aged = select_bulk_delete_candidates(
+            candidates.clone(),
+            "shared-branch",
+            None,
+            Some(cutoff),
+            0,
+        );
+        assert_eq!(
+            aged.iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["unix-old"]
+        );
+
+        let keep_last = select_bulk_delete_candidates(candidates, "shared-branch", None, None, 1);
+        assert_eq!(
+            keep_last
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rfc3339-middle", "unix-old"]
+        );
+    }
+
+    #[test]
+    fn bulk_delete_selection_scopes_same_branch_to_repository() {
+        let base = std::env::temp_dir().join(format!("agent-dx-repos-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        for (path, remote) in [
+            (&first, "https://github.com/owner/first.git"),
+            (&second, "https://github.com/owner/second.git"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .args(["remote", "add", "origin", remote])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let first_path = first.to_string_lossy().into_owned();
+        let second_path = second.to_string_lossy().into_owned();
+        let selected = select_bulk_delete_candidates(
+            vec![
+                record("first-agent", "1700000000", "succeeded", Some(&first_path)),
+                record(
+                    "second-agent",
+                    "1700000000",
+                    "succeeded",
+                    Some(&second_path),
+                ),
+            ],
+            "shared-branch",
+            Some("owner/first"),
+            None,
+            0,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first-agent"]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bulk_delete_dry_run_live_skip_and_failure_results_are_explicit() {
+        let selected = vec![
+            record("terminal", "1700000000", "succeeded", None),
+            record("live", "1700000000", "running", None),
+        ];
+        let mut delete_calls = 0;
+        let dry_run = apply_bulk_delete(selected.clone(), true, |_| {
+            delete_calls += 1;
+            Ok(true)
+        });
+        assert_eq!(delete_calls, 0, "dry-run must not mutate records");
+        assert_eq!(dry_run.deleted, ["terminal"]);
+        assert_eq!(dry_run.skipped, 1);
+
+        let failed =
+            apply_bulk_delete(selected, false, |_| Err("registry write failed".to_owned()));
+        assert!(failed.deleted.is_empty());
+        assert_eq!(failed.skipped, 1);
+        assert_eq!(failed.failures, ["terminal"]);
     }
 }

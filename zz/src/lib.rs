@@ -165,7 +165,24 @@ pub struct AgentRegistry {
     spool_dir: PathBuf,
     // Serializes durable attachment registration with guarded worktree removal.
     worktree_attachments: Mutex<()>,
+    continuations: Mutex<std::collections::HashSet<String>>,
     inner: Mutex<std::collections::BTreeMap<String, AgentRecord>>,
+}
+
+/// Exclusive in-process lease for one native-thread continuation. Prevents a
+/// second request from being queued behind a turn whose completion would
+/// otherwise mark the shared record terminal too early.
+pub struct AgentContinuationGuard<'a> {
+    registry: &'a AgentRegistry,
+    id: String,
+}
+
+impl Drop for AgentContinuationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.continuations.lock() {
+            active.remove(&self.id);
+        }
+    }
 }
 
 const AGENT_LOG_CAP: u64 = 32 * 1024 * 1024;
@@ -197,8 +214,26 @@ impl AgentRegistry {
             path,
             spool_dir,
             worktree_attachments: Mutex::new(()),
+            continuations: Mutex::new(std::collections::HashSet::new()),
             inner: Mutex::new(records),
         })
+    }
+
+    pub fn try_lock_continuation(
+        &self,
+        id: &str,
+    ) -> Result<Option<AgentContinuationGuard<'_>>, String> {
+        let mut active = self
+            .continuations
+            .lock()
+            .map_err(|_| "agent continuation lock poisoned".to_owned())?;
+        if !active.insert(id.to_owned()) {
+            return Ok(None);
+        }
+        Ok(Some(AgentContinuationGuard {
+            registry: self,
+            id: id.to_owned(),
+        }))
     }
 
     /// Hold this while checking for live worktree attachments and removing the

@@ -176,8 +176,8 @@ enum Commands {
     /// Read the relay event store
     Events {
         /// Sequence number to read from
-        #[arg(long, default_value_t = 0)]
-        after: u64,
+        #[arg(long)]
+        after: Option<u64>,
         /// Long-poll timeout in seconds (max 55)
         #[arg(long, default_value_t = 10)]
         timeout: u64,
@@ -187,6 +187,9 @@ enum Commands {
         /// Keep long-polling for new events
         #[arg(long)]
         follow: bool,
+        /// Resume from the last sequence saved by this CLI
+        #[arg(long, conflicts_with = "after")]
+        since_last: bool,
         #[command(subcommand)]
         command: Option<EventsCmd>,
     },
@@ -218,6 +221,12 @@ enum AgentsCmd {
         /// Filter by task id
         #[arg(long)]
         task_id: Option<String>,
+        /// Filter by branch name
+        #[arg(long, conflicts_with = "pr")]
+        branch: Option<String>,
+        /// Filter by pull request number
+        #[arg(long)]
+        pr: Option<u64>,
     },
     /// Show one agent's record
     Get {
@@ -285,14 +294,26 @@ enum AgentsCmd {
     ///
     /// Resume restores rollout conversation history, not exact mid-tool-call state.
     Continue {
-        /// Agent handle (unique prefix accepted)
-        id: String,
+        /// Agent handle (unique prefix accepted); omit when using --branch or --pr
+        id: Option<String>,
+        /// Target a live agent on this branch
+        #[arg(long, conflicts_with = "pr", required_unless_present_any = ["pr", "id"])]
+        branch: Option<String>,
+        /// Target a live agent for this pull request
+        #[arg(long, conflicts_with = "branch", required_unless_present_any = ["branch", "id"])]
+        pr: Option<u64>,
         /// Follow-up prompt text
         #[arg(long)]
         prompt: String,
         /// Interrupt the active turn before sending this prompt; terminal agents resume from their rollout by default
         #[arg(long)]
         interrupt: bool,
+    },
+    /// Summarize the live agent and GitHub checks for one pull request
+    Status {
+        /// Pull request number
+        #[arg(long)]
+        pr: u64,
     },
     /// Gracefully stop an agent (leaves worktree)
     Stop {
@@ -305,7 +326,19 @@ enum AgentsCmd {
     )]
     Delete {
         /// Agent handle (unique prefix accepted)
-        id: String,
+        id: Option<String>,
+        /// Delete matching agents on this branch
+        #[arg(long, conflicts_with = "pr")]
+        branch: Option<String>,
+        /// Delete matching agents associated with this pull request
+        #[arg(long, conflicts_with = "branch")]
+        pr: Option<u64>,
+        /// Keep this many newest matching agents
+        #[arg(long)]
+        keep_last: Option<usize>,
+        /// Only delete records older than this duration (e.g. 7d, 12h)
+        #[arg(long)]
+        older_than: Option<String>,
         /// Show the relay effects without sending DELETE
         #[arg(long)]
         dry_run: bool,
@@ -334,9 +367,12 @@ enum AgentsCmd {
     Transcript {
         /// Agent handle (unique prefix accepted)
         id: String,
-        /// Cap, in bytes, on newest transcript output
+        /// Return the newest N transcript items
         #[arg(long)]
         tail: Option<u64>,
+        /// Return transcript items after this sequence number
+        #[arg(long, conflicts_with = "tail")]
+        since: Option<u64>,
         /// Poll for and print newly appended transcript output
         #[arg(long)]
         follow: bool,
@@ -947,6 +983,8 @@ fn cmd_agents_list(
     client: &Client,
     state: Option<&str>,
     task_id: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<u64>,
 ) -> Result<(), Fail> {
     let mut q: Vec<(&str, String)> = Vec::new();
     if let Some(st) = state {
@@ -954,6 +992,12 @@ fn cmd_agents_list(
     }
     if let Some(t) = task_id {
         q.push(("task_id", t.to_string()));
+    }
+    if let Some(branch) = branch {
+        q.push(("branch", branch.to_string()));
+    }
+    if let Some(pr) = pr {
+        q.push(("pr", pr.to_string()));
     }
     let resp = client.get("/v1/agents", &q)?;
     emit(client, &resp, || {
@@ -1177,13 +1221,12 @@ fn cmd_agents_message(
     Ok(())
 }
 
-fn cmd_agents_continue(
+fn cmd_agents_continue_resolved(
     client: &Client,
     id: &str,
     prompt: &str,
     interrupt: bool,
 ) -> Result<(), Fail> {
-    let id = resolve_agent_target(client, id)?;
     let body = if interrupt {
         serde_json::json!({"prompt":prompt,"interrupt":true})
     } else {
@@ -1197,6 +1240,186 @@ fn cmd_agents_continue(
         }
     });
     Ok(())
+}
+
+fn cmd_agents_continue_target(
+    client: &Client,
+    id: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<u64>,
+    prompt: &str,
+    interrupt: bool,
+) -> Result<(), Fail> {
+    let target = match (id, branch, pr) {
+        (Some(id), None, None) => resolve_agent_target(client, id)?,
+        (None, Some(branch), None) => resolve_agent_target(client, branch)?,
+        (None, None, Some(pr)) => {
+            let response = client.get("/v1/agents", &[("pr", pr.to_string())])?;
+            let agents = response
+                .get("agents")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            select_live_agent_for_pr(pr, agents)?
+        }
+        _ => {
+            return Err(Fail::Config(
+                "provide an agent ID, --branch, or --pr".to_owned(),
+            ));
+        }
+    };
+    cmd_agents_continue_resolved(client, &target, prompt, interrupt)
+}
+
+fn cmd_agents_status(client: &Client, pr: u64) -> Result<(), Fail> {
+    let response = client.get("/v1/agents", &[("pr", pr.to_string())])?;
+    let agents = response
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let agent_id = select_agent_for_pr_status(pr, agents)?;
+    let agent = client.get(&format!("/v1/agents/{agent_id}"), &[])?;
+    let transcript = client.get(
+        &format!("/v1/agents/{agent_id}/transcript"),
+        &[("tail_items", "200".to_owned())],
+    )?;
+    let final_answer = transcript
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .and_then(last_final_answer)
+        .unwrap_or_default();
+    let repository = response
+        .get("repository")
+        .and_then(serde_json::Value::as_str)
+        .filter(|repository| !repository.is_empty())
+        .ok_or_else(|| {
+            Fail::Api(ApiError {
+                status: 404,
+                message: "could not resolve pull request repository".to_owned(),
+            })
+        })?;
+    let gh = client.post_with_timeout("/v1/exec", &serde_json::json!({"id":new_id(),"bin":"gh","args":["pr","view",pr.to_string(),"--repo",repository,"--json","headRefOid,statusCheckRollup,url,state,commits"]}), EXEC_CLIENT_TIMEOUT_SECS)?;
+    if !exec_succeeded(&gh) {
+        return Err(Fail::Api(ApiError {
+            status: 0,
+            message: "could not read pull request status".to_owned(),
+        }));
+    }
+    let github: serde_json::Value =
+        serde_json::from_str(s(&gh, "stdout").trim()).unwrap_or_default();
+    let last_commit = github
+        .get("commits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|commits| commits.last())
+        .cloned();
+    if client.json {
+        println!(
+            "{}",
+            serde_json::json!({"agent":agent,"last_final_answer":final_answer,"last_commit":last_commit,"pr":{"head_sha":github.get("headRefOid"),"state":github.get("state"),"url":github.get("url"),"checks":github.get("statusCheckRollup")}})
+        );
+    } else {
+        println!(
+            "agent: {} ({}) branch={} turn_in_flight={}",
+            s(&agent, "id"),
+            s(&agent, "state"),
+            s(&agent, "branch"),
+            s(&agent, "turn_in_flight")
+        );
+        println!(
+            "PR #{pr}: {} head={}",
+            s(&github, "state"),
+            s(&github, "headRefOid")
+        );
+        if let Some(commit) = last_commit.as_ref() {
+            println!(
+                "last commit: {} {}",
+                commit
+                    .pointer("oid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                commit
+                    .pointer("messageHeadline")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            );
+        }
+        println!(
+            "checks: {}",
+            github
+                .get("statusCheckRollup")
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default()
+        );
+        if !final_answer.is_empty() {
+            println!("\nlast final answer:\n{final_answer}");
+        }
+    }
+    Ok(())
+}
+
+fn select_agent_for_pr_status(pr: u64, agents: &[serde_json::Value]) -> Result<String, Fail> {
+    let running: Vec<&serde_json::Value> = agents
+        .iter()
+        .filter(|agent| agent.get("state").and_then(serde_json::Value::as_str) == Some("running"))
+        .collect();
+    let candidates = if running.is_empty() {
+        agents.iter().collect::<Vec<_>>()
+    } else {
+        running
+    };
+    match candidates.as_slice() {
+        [agent] => Ok(s(agent, "id")),
+        [] => Err(Fail::Api(ApiError {
+            status: 404,
+            message: format!("no agent found for PR #{pr}"),
+        })),
+        _ => Err(Fail::Config(format!(
+            "multiple agents found for PR #{pr}; specify an agent ID"
+        ))),
+    }
+}
+
+fn last_final_answer(transcript: &str) -> Option<String> {
+    transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| {
+            let item = record.get("item")?;
+            let kind = item.get("type")?.as_str()?;
+            if !matches!(kind, "agent_message" | "message") {
+                return None;
+            }
+            item.get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .next_back()
+}
+
+fn select_live_agent_for_pr(pr: u64, agents: &[serde_json::Value]) -> Result<String, ApiError> {
+    let running: Vec<&serde_json::Value> = agents
+        .iter()
+        .filter(|agent| agent.get("state").and_then(serde_json::Value::as_str) == Some("running"))
+        .collect();
+    match running.as_slice() {
+        [agent] => Ok(s(agent, "id")),
+        [] => Err(ApiError {
+            status: 404,
+            message: format!("no live agent for PR #{pr}"),
+        }),
+        _ => Err(ApiError {
+            status: 0,
+            message: format!(
+                "multiple live agents for PR #{pr}; specify an agent ID: {}",
+                running
+                    .iter()
+                    .map(|agent| s(agent, "id"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
 }
 
 fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
@@ -1276,6 +1499,66 @@ fn cmd_agents_delete(client: &Client, id: &str, dry_run: bool) -> Result<(), Fai
     Ok(())
 }
 
+fn cmd_agents_delete_bulk(
+    client: &Client,
+    id: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<u64>,
+    keep_last: Option<usize>,
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> Result<(), Fail> {
+    if let Some(id) = id {
+        if branch.is_some() || pr.is_some() || keep_last.is_some() || older_than.is_some() {
+            return Err(Fail::Config(
+                "bulk delete filters require --branch or --pr without an agent ID".to_owned(),
+            ));
+        }
+        return cmd_agents_delete(client, id, dry_run);
+    }
+    if branch.is_none() && pr.is_none() {
+        return Err(Fail::Config(
+            "provide an agent ID, --branch, or --pr".to_owned(),
+        ));
+    }
+    let mut query = Vec::new();
+    if let Some(branch) = branch {
+        query.push(("branch", branch.to_owned()));
+    }
+    if let Some(pr) = pr {
+        query.push(("pr", pr.to_string()));
+    }
+    if let Some(keep_last) = keep_last {
+        query.push(("keep_last", keep_last.to_string()));
+    }
+    if let Some(older_than) = older_than {
+        query.push(("older_than", older_than.to_owned()));
+    }
+    if dry_run {
+        query.push(("dry_run", "1".to_owned()));
+    }
+    let response = client.request("DELETE", "/v1/agents", &query, None, 1800)?;
+    emit(client, &response, || {
+        println!(
+            "{} agents (deleted={}, skipped={})",
+            if dry_run { "would delete" } else { "deleted" },
+            s(&response, "deleted_count"),
+            s(&response, "skipped_count")
+        );
+        if let Some(ids) = response
+            .get("deleted")
+            .and_then(serde_json::Value::as_array)
+        {
+            for id in ids {
+                if let Some(id) = id.as_str() {
+                    println!("  {id}");
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 fn agent_state_is_live_for_delete(state: &str) -> bool {
     matches!(state, "running" | "paused")
 }
@@ -1342,6 +1625,7 @@ fn cmd_agents_transcript(
     client: &Client,
     id: &str,
     tail: Option<u64>,
+    since: Option<u64>,
     follow: bool,
 ) -> Result<(), Fail> {
     let id = resolve_agent_id(client, id)?;
@@ -1351,7 +1635,12 @@ fn cmd_agents_transcript(
         if let Some(cursor) = previous.as_ref().and_then(transcript_cursor) {
             q.push(("after", cursor.to_string()));
         } else if let Some(tail) = tail {
-            q.push(("tail", tail.to_string()));
+            q.push(("tail_items", tail.to_string()));
+        }
+        if previous.is_none()
+            && let Some(since) = since
+        {
+            q.push(("since", since.to_string()));
         }
         let response = client.get(&format!("/v1/agents/{id}/transcript"), &q)?;
         if client.json {
@@ -1583,12 +1872,18 @@ fn cmd_proc_get(client: &Client, id: &str) -> Result<(), Fail> {
 
 fn cmd_events(
     client: &Client,
-    after: u64,
+    after: Option<u64>,
     timeout: u64,
     epoch: &str,
     follow: bool,
+    since_last: bool,
 ) -> Result<(), Fail> {
-    let mut after = after;
+    let cursor_path = events_cursor_path();
+    let mut after = if after.is_none() && (since_last || follow) {
+        read_event_cursor(&cursor_path).unwrap_or(0)
+    } else {
+        after.unwrap_or(0)
+    };
     let mut epoch = epoch.to_string();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -1623,12 +1918,38 @@ fn cmd_events(
             return Err(Fail::Command);
         }
         after = progress.after;
+        if since_last || follow {
+            write_event_cursor(&cursor_path, after)?;
+        }
         epoch = progress.epoch;
         if !follow {
             break;
         }
     }
     Ok(())
+}
+
+fn events_cursor_path() -> std::path::PathBuf {
+    std::env::var_os("ZIGZAG_EVENTS_CURSOR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".codex/zzapi-events.cursor"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".zzapi-events.cursor"))
+}
+
+fn read_event_cursor(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn write_event_cursor(path: &std::path::Path, cursor: u64) -> Result<(), Fail> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Fail::Config(format!("could not create event cursor directory: {e}")))?;
+    }
+    std::fs::write(path, cursor.to_string())
+        .map_err(|e| Fail::Config(format!("could not save event cursor: {e}")))
 }
 
 const MAX_SOCKET_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -1887,9 +2208,18 @@ fn run(cli: Cli) -> Result<(), Fail> {
             AdminCmd::CheckUpdate => cmd_admin_check_update(&client),
         },
         Commands::Agents { cmd } => match cmd {
-            AgentsCmd::List { state, task_id } => {
-                cmd_agents_list(&client, state.as_deref(), task_id.as_deref())
-            }
+            AgentsCmd::List {
+                state,
+                task_id,
+                branch,
+                pr,
+            } => cmd_agents_list(
+                &client,
+                state.as_deref(),
+                task_id.as_deref(),
+                branch.as_deref(),
+                pr,
+            ),
             AgentsCmd::Get { id } => cmd_agents_get(&client, &id),
             AgentsCmd::Create {
                 prompt: _,
@@ -1925,11 +2255,36 @@ fn run(cli: Cli) -> Result<(), Fail> {
             }
             AgentsCmd::Continue {
                 id,
+                branch,
+                pr,
                 prompt,
                 interrupt,
-            } => cmd_agents_continue(&client, &id, &prompt, interrupt),
+            } => cmd_agents_continue_target(
+                &client,
+                id.as_deref(),
+                branch.as_deref(),
+                pr,
+                &prompt,
+                interrupt,
+            ),
+            AgentsCmd::Status { pr } => cmd_agents_status(&client, pr),
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
-            AgentsCmd::Delete { id, dry_run } => cmd_agents_delete(&client, &id, dry_run),
+            AgentsCmd::Delete {
+                id,
+                branch,
+                pr,
+                keep_last,
+                older_than,
+                dry_run,
+            } => cmd_agents_delete_bulk(
+                &client,
+                id.as_deref(),
+                branch.as_deref(),
+                pr,
+                keep_last,
+                older_than.as_deref(),
+                dry_run,
+            ),
             AgentsCmd::Logs {
                 id,
                 stream,
@@ -1938,9 +2293,12 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 follow,
                 prefix,
             } => cmd_agents_logs(&client, &id, stream.as_deref(), after, tail, follow, prefix),
-            AgentsCmd::Transcript { id, tail, follow } => {
-                cmd_agents_transcript(&client, &id, tail, follow)
-            }
+            AgentsCmd::Transcript {
+                id,
+                tail,
+                since,
+                follow,
+            } => cmd_agents_transcript(&client, &id, tail, since, follow),
         },
         Commands::Status {
             once,
@@ -1989,10 +2347,11 @@ fn run(cli: Cli) -> Result<(), Fail> {
             timeout,
             epoch,
             follow,
+            since_last,
             command,
         } => match command {
             Some(EventsCmd::Stream { socket_port }) => cmd_events_stream(&client, socket_port),
-            None => cmd_events(&client, after, timeout, &epoch, follow),
+            None => cmd_events(&client, after, timeout, &epoch, follow, since_last),
         },
         Commands::ReviewGate { repo, pr } => cmd_review_gate(&client, &repo, pr),
     }
@@ -2076,6 +2435,68 @@ mod tests {
             Some(7)
         );
         assert_eq!(transcript_cursor(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn agent_dx_options_parse_for_tail_since_and_filters() {
+        let cli = Cli::try_parse_from(["zzapi", "agents", "transcript", "agent-1", "--tail", "5"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Agents {
+                cmd: AgentsCmd::Transcript { tail: Some(5), .. }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["zzapi", "agents", "transcript", "agent-1", "--since", "42"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Agents {
+                cmd: AgentsCmd::Transcript {
+                    since: Some(42),
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "zzapi", "agents", "list", "--state", "running", "--branch", "codex/x", "--pr", "5"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zzapi", "agents", "list", "--state", "running", "--branch", "codex/x"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zzapi", "agents", "continue", "--branch", "codex/x", "--prompt", "go"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["zzapi", "agents", "status", "--pr", "5"]).is_ok());
+        assert!(Cli::try_parse_from(["zzapi", "events", "--since-last"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["zzapi", "agents", "continue", "--pr", "5", "--prompt", "go"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "zzapi",
+                "agents",
+                "delete",
+                "--pr",
+                "5",
+                "--keep-last",
+                "2",
+                "--older-than",
+                "7d"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2316,6 +2737,28 @@ mod tests {
         let error =
             select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap_err();
         assert_eq!(error.message, "no live agent on branch \"feature/work\"");
+    }
+
+    #[test]
+    fn pr_target_reports_missing_and_ambiguous_live_agents() {
+        let no_live = serde_json::json!([
+            {"id":"old-agent", "state":"succeeded"}
+        ]);
+        assert_eq!(
+            select_live_agent_for_pr(135, no_live.as_array().unwrap())
+                .unwrap_err()
+                .message,
+            "no live agent for PR #135"
+        );
+
+        let ambiguous = serde_json::json!([
+            {"id":"agent-one", "state":"running"},
+            {"id":"agent-two", "state":"running"}
+        ]);
+        let error = select_live_agent_for_pr(135, ambiguous.as_array().unwrap()).unwrap_err();
+        assert!(error.message.contains("multiple live agents for PR #135"));
+        assert!(error.message.contains("agent-one"));
+        assert!(error.message.contains("agent-two"));
     }
 
     #[test]

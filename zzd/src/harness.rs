@@ -271,6 +271,10 @@ impl OpenCodeServer {
 }
 
 impl CodexServer {
+    pub(crate) fn active_turn_id(&self, thread_id: &str) -> Option<String> {
+        self.shared.turns.lock().ok()?.get(thread_id).cloned()
+    }
+
     pub(crate) fn start() -> Result<Arc<Self>, String> {
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
