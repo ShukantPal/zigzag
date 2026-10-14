@@ -17,7 +17,7 @@ use crate::secrets::{buildbuddy_get_invocation, buildbuddy_revoke, buildbuddy_st
 use crate::session::require_gui_login_session;
 use crate::update;
 use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -234,15 +234,12 @@ where
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
     let _request_guard = logging::begin_request(&request.method, request_path, &source);
-    let control_route = (request.method == "POST"
-        && (matches!(proc_route(request_path), Some(ProcRoute::Kill(_)))
-            || request_path == "/v1/secrets/buildbuddy"))
-        || (request.method == "DELETE" && request_path == "/v1/secrets/buildbuddy");
-    let Some(required_secret) = (if control_route {
-        state.control_secret.as_deref()
-    } else {
-        Some(state.secret.as_str())
-    }) else {
+    let Some(required_secret) = route_secret(
+        &request.method,
+        request_path,
+        &state.secret,
+        state.control_secret.as_deref(),
+    ) else {
         return reply(&mut stream, 404, error("not_found"));
     };
     if !authorized(
@@ -257,12 +254,11 @@ where
         reply(&mut stream, 401, error("unauthorized"))?;
         return Ok(());
     }
-    if control_route
-        && matches!(request_path, "/v1/secrets/buildbuddy")
-        && !stream
-            .peer_addr()
-            .is_ok_and(|address| address.ip().is_loopback())
-    {
+    let peer_ip = stream
+        .peer_addr()
+        .map(|address| address.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    if !secret_management_peer_allowed(&request.method, request_path, peer_ip) {
         reply(&mut stream, 403, error("local_access_required"))?;
         return Ok(());
     }
@@ -322,6 +318,32 @@ where
         },
         _ => reply(&mut stream, 404, error("not_found")),
     }
+}
+
+fn control_route(method: &str, path: &str) -> bool {
+    (method == "POST"
+        && (matches!(proc_route(path), Some(ProcRoute::Kill(_)))
+            || path == "/v1/secrets/buildbuddy"))
+        || (method == "DELETE" && path == "/v1/secrets/buildbuddy")
+}
+
+fn route_secret<'a>(
+    method: &str,
+    path: &str,
+    relay_secret: &'a str,
+    control_secret: Option<&'a str>,
+) -> Option<&'a str> {
+    if control_route(method, path) {
+        control_secret
+    } else {
+        Some(relay_secret)
+    }
+}
+
+fn secret_management_peer_allowed(method: &str, path: &str, peer: IpAddr) -> bool {
+    !((method == "POST" || method == "DELETE")
+        && path == "/v1/secrets/buildbuddy"
+        && !peer.is_loopback())
 }
 
 fn update_check_request(stream: &mut TcpStream, state: &Server) -> Result<(), String> {
@@ -422,4 +444,62 @@ pub(crate) fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Resul
         }
     };
     reply(stream, 200, read_json(result))
+}
+
+#[cfg(test)]
+mod secrets_auth_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn secret_mutations_need_control_bearer_and_invocation_reads_need_relay_bearer() {
+        let relay = "relay-token";
+        let control = "control-token";
+        for method in ["POST", "DELETE"] {
+            let secret = route_secret(method, "/v1/secrets/buildbuddy", relay, Some(control));
+            assert_eq!(secret, Some(control));
+            assert!(authorized("Bearer control-token", secret.unwrap()));
+            assert!(!authorized("Bearer relay-token", secret.unwrap()));
+            assert_eq!(
+                route_secret(method, "/v1/secrets/buildbuddy", relay, None),
+                None
+            );
+        }
+
+        let secret = route_secret(
+            "POST",
+            "/v1/secrets/buildbuddy/invocations",
+            relay,
+            Some(control),
+        )
+        .unwrap();
+        assert_eq!(secret, relay);
+        assert!(authorized("Bearer relay-token", secret));
+        assert!(!authorized("Bearer control-token", secret));
+    }
+
+    #[test]
+    fn secret_management_rejects_non_loopback_peers() {
+        let path = "/v1/secrets/buildbuddy";
+        assert!(secret_management_peer_allowed(
+            "POST",
+            path,
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        ));
+        assert!(secret_management_peer_allowed(
+            "DELETE",
+            path,
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        ));
+        assert!(!secret_management_peer_allowed(
+            "POST",
+            path,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))
+        ));
+        assert!(secret_management_peer_allowed(
+            "POST",
+            "/v1/secrets/buildbuddy/invocations",
+            IpAddr::V4(Ipv4Addr::new(100, 64, 1, 2))
+        ));
+    }
 }
