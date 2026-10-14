@@ -12,6 +12,7 @@ mod proc;
 mod provider;
 mod review_loop;
 mod routes;
+mod secrets;
 mod server;
 mod session;
 mod socket;

@@ -38,6 +38,9 @@ All routes require the relay bearer token unless specifically noted.
 | `GET /v1/agents/{id}/logs` | Bounded redacted stdout/stderr spool; supports cursor/tail/follow. |
 | `GET /v1/agents/{id}/transcript` | Transcript for API-created Codex agents, where available. |
 | `GET /v1/providers` | Available providers and supported models. |
+| `POST /v1/secrets/buildbuddy` | Store a BuildBuddy invocations-read API key in the GUI session's macOS Keychain; requires the control secret. |
+| `DELETE /v1/secrets/buildbuddy` | Revoke the stored BuildBuddy key; requires the control secret. |
+| `POST /v1/secrets/buildbuddy/invocations` | Fetch an invocation through the daemon and return an allowlisted metadata summary. |
 | `POST, DELETE /v1/worktrees` | Create/remove permitted worktrees. |
 | `GET /v1/review-gate?repository=&pull_request=` | Review, CI, and human-approval decision. |
 
@@ -54,6 +57,18 @@ worktree cleanup after stopping, except when a pull request is being watched.
 
 `openapi.yaml` documents wire formats but does not yet enumerate every
 implemented route; check `zzd/src/routes/` when they differ.
+
+The BuildBuddy secret is stored only in the login Keychain under a Zigzag
+service and purpose-specific account. Provisioning accepts `{ "token":
+"...", "expires_in_days": 30 }` (expiry defaults to 30 and is capped at 90).
+Provisioning and revocation require the distinct control bearer configured
+with `--control-secret-file` and a loopback connection, keeping credential
+submission local to the Mac. The token is never returned. The invocation proxy
+uses the normal relay bearer. It calls BuildBuddy's `GetInvocation`
+endpoint and returns only invocation ID, success, duration, command, action
+count, timestamps, exit code, and invocation status. It drops build metadata,
+workspace status, artifacts, logs, and unknown upstream fields. The BuildBuddy
+key should itself be created with read-only invocation scope.
 
 ## Worktrees and provider agents
 
