@@ -158,7 +158,7 @@ fn run() -> Result<(), String> {
     for agent in recovered {
         replay_recovered_lifecycle(&state.store, &agent)?;
     }
-    routes::agents::sweep_completed_agents(&state.supervisor.registry);
+    routes::agents::sweep_inactive_agents(&state.supervisor.registry);
     start_reaper(Arc::clone(&state));
     let mut review_loop_authoritative = false;
     match review_loop::default_config_path() {

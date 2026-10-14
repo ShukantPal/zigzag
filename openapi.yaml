@@ -779,17 +779,18 @@ paths:
                 $ref: '#/components/schemas/Error'
     delete:
       operationId: stopAgent
-      summary: Stop a live agent or delete a succeeded agent
+      summary: Stop a live agent or delete an inactive agent
       description: >
         For running process agents, stop the verified agent process group.
         Running Codex and OpenCode agents are interrupted through their
         harness session and this path does not clean their worktree. For a
-        succeeded agent, delete the durable agent record and run completion
-        cleanup: remove its linked worktree only when clean, fully pushed to
+        inactive agent, delete the durable agent record and run safe cleanup:
+        remove its linked worktree only when clean, fully pushed to
         its configured upstream, and unattached to another live agent. Keep
-        and log unsafe worktrees. Never delete the feature branch. The relay
-        applies the succeeded-agent deletion automatically at completion and
-        sweeps persisted succeeded records on startup.
+        and log unsafe worktrees. Treat an already missing worktree as absent.
+        Never delete the feature branch. The relay removes completed records
+        automatically at completion and sweeps persisted inactive records on
+        startup.
       security:
         - bearerAuth: []
       parameters:
@@ -801,7 +802,7 @@ paths:
             type: string
       responses:
         '200':
-          description: Agent stopped or completed agent record deleted.
+          description: Agent stopped or inactive agent record deleted.
           content:
             application/json:
               schema:

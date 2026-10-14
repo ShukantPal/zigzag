@@ -668,10 +668,10 @@ pub(crate) fn cleanup_agent_worktree_with_trust(
     Ok(())
 }
 
-/// Automatically remove a completed agent's worktree only when Git proves it
+/// Automatically remove an inactive agent's worktree only when Git proves it
 /// has no local changes and no commits ahead of its configured upstream.
 /// Agent branches are intentionally retained.
-pub(crate) fn cleanup_completed_agent_worktree(
+pub(crate) fn cleanup_inactive_agent_worktree(
     registry: &zz::AgentRegistry,
     agent_id: &str,
     roots: &[PathBuf],
@@ -683,9 +683,9 @@ pub(crate) fn cleanup_completed_agent_worktree(
     let Some(raw_path) = agent.worktree_path.as_deref() else {
         return;
     };
-    if agent.state != "succeeded" {
+    if matches!(agent.state.as_str(), "running" | "orphaned" | "paused") {
         log::info!(
-            "agent_worktree_cleanup kept agent={} path={}: agent is not completed (state={})",
+            "agent_worktree_cleanup kept agent={} path={}: agent is still live (state={})",
             agent.id,
             raw_path,
             agent.state
@@ -694,6 +694,14 @@ pub(crate) fn cleanup_completed_agent_worktree(
     }
     let path = match resolve_existing_worktree_path(raw_path, roots) {
         Ok(path) => path,
+        Err(error) if error.message == "worktree_path_not_found" => {
+            log::info!(
+                "agent_worktree_cleanup absent agent={} path={}: worktree path is already missing",
+                agent.id,
+                raw_path
+            );
+            return;
+        }
         Err(error) => {
             log::warn!(
                 "agent_worktree_cleanup kept agent={} path={}: {}",

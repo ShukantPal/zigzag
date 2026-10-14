@@ -33,7 +33,7 @@ All routes require the relay bearer token unless specifically noted.
 | `POST /v1/spawn`, `GET /v1/proc/{id}` | Compatibility background process launch/status. Spawn accepts optional safe `execution_id`. |
 | `POST /v1/proc/{id}/kill` | Legacy process-group kill; needs control secret and may be disabled. |
 | `GET, POST /v1/agents` | List durable agents or create a relay-native provider agent. |
-| `GET, DELETE /v1/agents/{id}` | Read lifecycle, stop a live agent, or delete a succeeded agent through safe completion cleanup. |
+| `GET, DELETE /v1/agents/{id}` | Read lifecycle, stop a live agent, or delete an inactive agent record through safe worktree cleanup. |
 | `POST /v1/agents/{id}/pause`, `/resume` | Stop/continue an agent process group. |
 | `GET /v1/agents/{id}/logs` | Bounded redacted stdout/stderr spool; supports cursor/tail/follow. |
 | `GET /v1/agents/{id}/transcript` | Transcript for API-created Codex agents, where available. |
@@ -41,14 +41,15 @@ All routes require the relay bearer token unless specifically noted.
 | `POST, DELETE /v1/worktrees` | Create/remove permitted worktrees. |
 | `GET /v1/review-gate?repository=&pull_request=` | Review, CI, and human-approval decision. |
 
-Successful agent completion removes the succeeded registry record automatically,
-including records left by earlier relay versions during startup. A linked
+Successful agent completion removes the registry record automatically, and
+startup sweeps inactive records left by earlier relay versions. A linked
 worktree is removed only when it is clean, its branch has no commits ahead of
 its configured upstream, and no other live agent record refers to it. Otherwise
-the relay retains the worktree and logs why. The branch is retained. A manual
-DELETE of a running Codex or OpenCode agent interrupts its session and returns
-without worktree cleanup; the generic process path performs legacy worktree
-cleanup after stopping, except when a pull request is being watched.
+the relay retains the worktree and logs why. Missing worktree paths are logged
+and treated as already absent. The branch is retained. A manual DELETE of a
+running Codex or OpenCode agent interrupts its session and returns without
+worktree cleanup; the generic process path performs legacy worktree cleanup
+after stopping, except when a pull request is being watched.
 
 `openapi.yaml` documents wire formats but does not yet enumerate every
 implemented route; check `zzd/src/routes/` when they differ.

@@ -163,7 +163,7 @@ pub(crate) fn update_proc_status_with_handle(
                 let completed_agent = registry.get(handle);
                 if state == "succeeded"
                     && let Err(error) =
-                        crate::routes::agents::delete_completed_agent(registry, handle)
+                        crate::routes::agents::delete_inactive_agent(registry, handle)
                 {
                     log::error!("completed agent deletion failed agent={handle}: {error}");
                 }

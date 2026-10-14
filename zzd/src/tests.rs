@@ -40,12 +40,13 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    delete_completed_agent, dispatch_agent_message, handle_codex_notification,
-    monitor_codex_events, monitor_codex_events_to_path, parse_agent_create_request,
-    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
-    sweep_completed_agents, transcript_json_with_sessions_dir, valid_agent_model,
+    delete_completed_agent, delete_inactive_agent, dispatch_agent_message,
+    handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
+    parse_agent_create_request, persisted_agent_config, repair_transcript_tail, restart_argv,
+    restart_config, sweep_completed_agents, sweep_inactive_agents,
+    transcript_json_with_sessions_dir, valid_agent_model,
 };
-};
+
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
@@ -1773,7 +1774,7 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
         "printf 'stopped\\n' >> \"$(dirname \"$0\")/stop.log\"\n",
     )
     .unwrap();
-    assert!(delete_completed_agent(&registry, &id).unwrap());
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
     assert!(!path.exists(), "clean pushed worktree was not removed");
     assert!(
         registry.get(&id).is_none(),
@@ -1801,7 +1802,7 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
 fn completed_dirty_worktree_is_kept() {
     let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
     std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
-    assert!(delete_completed_agent(&registry, &id).unwrap());
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
     assert!(path.exists(), "dirty worktree was removed");
     assert!(
         registry.get(&id).is_none(),
@@ -1828,7 +1829,7 @@ fn completed_worktree_with_unpushed_commits_is_kept() {
     };
     git(&["add", "pushed-later.txt"]);
     git(&["commit", "-m", "un-pushed work"]);
-    assert!(delete_completed_agent(&registry, &id).unwrap());
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
     assert!(path.exists(), "worktree with unpushed commit was removed");
     assert!(
         registry.get(&id).is_none(),
@@ -1844,7 +1845,7 @@ fn completed_worktree_with_another_live_agent_record_is_kept() {
     live.state = "running".to_owned();
     live.worktree_path = Some(path.to_string_lossy().into_owned());
     registry.register(live).unwrap();
-    assert!(delete_completed_agent(&registry, &id).unwrap());
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
     assert!(
         path.exists(),
         "worktree with a live agent record was removed"
@@ -2025,7 +2026,7 @@ fn worktree_hook_failures_are_logged_and_environment_is_scrubbed() {
 }
 
 #[test]
-fn startup_sweep_deletes_succeeded_backlog_records_only() {
+fn startup_sweep_deletes_inactive_backlog_records_only() {
     let (state, _) = test_server();
     let mut succeeded = agent_record("old-succeeded");
     succeeded.state = "succeeded".to_owned();
@@ -2034,9 +2035,9 @@ fn startup_sweep_deletes_succeeded_backlog_records_only() {
     failed.state = "failed".to_owned();
     state.supervisor.registry.register(failed).unwrap();
 
-    assert_eq!(sweep_completed_agents(&state.supervisor.registry), 1);
+    assert_eq!(sweep_inactive_agents(&state.supervisor.registry), 2);
     assert!(state.supervisor.registry.get("old-succeeded").is_none());
-    assert!(state.supervisor.registry.get("old-failed").is_some());
+    assert!(state.supervisor.registry.get("old-failed").is_none());
 }
 
 #[test]
@@ -2049,7 +2050,7 @@ fn completion_deletion_never_removes_the_main_worktree() {
     record.worktree_path = Some(repo.to_string_lossy().into_owned());
     registry.register(record).unwrap();
 
-    assert!(delete_completed_agent(&registry, "main-worktree-agent").unwrap());
+    assert!(delete_inactive_agent(&registry, "main-worktree-agent").unwrap());
     assert!(
         repo.exists(),
         "completion cleanup removed the main worktree"
@@ -3000,7 +3001,7 @@ fn agent_delete_unknown_agent_is_404() {
 }
 
 #[test]
-fn agent_delete_completed_agent_uses_safe_relay_deletion_flow() {
+fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
@@ -3018,6 +3019,37 @@ fn agent_delete_completed_agent_uses_safe_relay_deletion_flow() {
     let body = response_json(response);
     assert_eq!(body.object("deleted").and_then(Json::as_bool), Some(true));
     assert!(state.supervisor.registry.get("done-agent").is_none());
+}
+
+#[test]
+fn agent_delete_inactive_agent_with_missing_worktree_removes_record_without_400() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut record = agent_record("stale-failed-agent");
+    record.state = "failed".to_owned();
+    record.worktree_path = Some(
+        std::env::temp_dir()
+            .join("zigzag-missing-agent-worktree")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/stale-failed-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("stale-failed-agent")
+            .is_none()
+    );
 }
 
 #[test]
@@ -3093,12 +3125,18 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
         "",
     );
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert_eq!(state.supervisor.registry.get(id).unwrap().state, "stopped");
-    assert!(!worktree.exists(), "orphan worktree still holds the branch");
+    assert!(state.supervisor.registry.get(id).is_none());
+    assert!(
+        worktree.exists(),
+        "worktree without verified pushed state was removed"
+    );
     let checkout = worktree_branch_checkout_path(&repo, "codex/orphan").unwrap();
     assert!(
-        checkout.is_none(),
-        "orphan branch is still checked out: {checkout:?}"
+        checkout
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            == worktree.canonicalize().ok(),
+        "orphan worktree is no longer registered: {checkout:?}"
     );
     let _ = std::fs::remove_dir_all(base);
 }
@@ -3647,7 +3685,7 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     );
     let _ = std::fs::remove_dir_all(&base);
 
-    // A second DELETE of the now-terminal agent is a 409.
+    // A second DELETE removes the now-inactive durable record.
     let response = request_once(
         Arc::clone(&state),
         &policy,
@@ -3655,7 +3693,8 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         "/v1/agents/delete-me",
         "",
     );
-    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(state.supervisor.registry.get("delete-me").is_none());
 }
 
 #[test]
