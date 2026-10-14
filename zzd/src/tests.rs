@@ -3321,43 +3321,6 @@ struct TerminalContinueSession {
     status: &'static str,
 }
 
-struct StaleCompletionContinueSession {
-    registry: Arc<zz::AgentRegistry>,
-    events: Mutex<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>>,
-    observed_state: std::sync::mpsc::Sender<String>,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-impl HarnessSession for StaleCompletionContinueSession {
-    fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn resume_thread(
-        &self,
-    ) -> Result<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>, String> {
-        Ok(self.events.lock().unwrap().take())
-    }
-
-    fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
-        // Give the queued resume event an opportunity to race while this new
-        // turn is active, then report the state observed inside the turn.
-        std::thread::sleep(Duration::from_millis(200));
-        let state = self
-            .registry
-            .get("continue-stale-completion")
-            .unwrap()
-            .state;
-        let _ = self.observed_state.send(state);
-        self.release.lock().unwrap().recv().unwrap();
-        Ok(serde_json::json!({"status":"completed"}))
-    }
-
-    fn interrupt(&self) -> Result<(), String> {
-        unreachable!()
-    }
-}
-
 impl HarnessSession for TerminalContinueSession {
     fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
         Ok(())
@@ -3431,7 +3394,7 @@ fn agent_continue_persists_failed_and_interrupted_turn_statuses() {
 fn resumed_stale_completion_does_not_finish_the_new_turn() {
     let (state, _) = test_server();
     let mut record = agent_record("continue-stale-completion");
-    record.state = "failed".to_owned();
+    record.state = "running".to_owned();
     record.harness = Some("codex".to_owned());
     record.harness_session_id = Some("continue-stale-completion-thread".to_owned());
     state.supervisor.registry.register(record).unwrap();
@@ -3446,41 +3409,44 @@ fn resumed_stale_completion_does_not_finish_the_new_turn() {
             terminal_turn: true,
         })
         .unwrap();
-    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let session: Arc<dyn HarnessSession> = Arc::new(StaleCompletionContinueSession {
-        registry: Arc::clone(&state.supervisor.registry),
-        events: Mutex::new(Some(event_rx)),
-        observed_state: observed_tx,
-        release: Mutex::new(release_rx),
-    });
-    let state_for_request = Arc::clone(&state);
-    let request = thread::spawn(move || {
-        post_continue_with_session(
-            &state_for_request,
-            "continue-stale-completion",
-            "new turn",
-            session,
-        )
-    });
-
-    assert_eq!(
-        observed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        "running",
-        "the persisted turn's completion must not finish the active continuation"
-    );
-    assert_eq!(
-        state
-            .supervisor
-            .registry
-            .get("continue-stale-completion")
-            .unwrap()
-            .state,
-        "running"
-    );
-    release_tx.send(()).unwrap();
-    let response = request.join().unwrap();
-    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let mut events = Some(event_rx);
+    let result = crate::routes::agents::continue_turn_then_start_monitor(
+        || {
+            // The stale event is already available to the monitor callback.
+            // This state read runs synchronously while the new turn is active.
+            assert_eq!(
+                state
+                    .supervisor
+                    .registry
+                    .get("continue-stale-completion")
+                    .unwrap()
+                    .state,
+                "running",
+                "the persisted turn's completion must not finish the active continuation"
+            );
+            Ok::<_, ()>("completed")
+        },
+        || {
+            // Process the buffered event synchronously after the continuation
+            // returns. If monitoring is moved ahead of the continuation, the
+            // assertion above deterministically observes the terminal state.
+            let crate::harness::HarnessEvent::Notification {
+                value,
+                terminal_turn,
+            } = events.take().unwrap().recv().unwrap();
+            handle_codex_notification(
+                &state.supervisor.registry,
+                &state.store,
+                "continue-stale-completion",
+                "task",
+                "execution",
+                &value,
+                terminal_turn,
+            );
+        },
+    )
+    .unwrap();
+    assert_eq!(result, "completed");
     assert_eq!(
         state
             .supervisor

@@ -411,7 +411,38 @@ fn agent_continue_request(
         log::warn!("agent interrupt steering failed id={id}: {message}");
         return reply(stream, 503, error("harness_interrupt_failed"));
     }
-    let result = match session.continue_turn(prompt) {
+    let result = match continue_turn_then_start_monitor(
+        || {
+            let result = session.continue_turn(prompt)?;
+            let terminal = result
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("succeeded");
+            let terminal = match terminal {
+                "completed" | "succeeded" => "succeeded",
+                "failed" => "failed",
+                "interrupted" => "interrupted",
+                _ => "running",
+            };
+            let _ = state
+                .supervisor
+                .registry
+                .transition(id, terminal, agent.exit_code);
+            Ok::<_, String>(result)
+        },
+        || {
+            if let Some(events) = resumed_events {
+                let registry = Arc::clone(&state.supervisor.registry);
+                let store = Arc::clone(&state.store);
+                let agent_id = agent.id.clone();
+                let task_id = agent.task_id.clone();
+                let execution_id = agent.execution_id.clone();
+                thread::spawn(move || {
+                    monitor_codex_events(registry, store, agent_id, task_id, execution_id, events)
+                });
+            }
+        },
+    ) {
         Ok(result) => result,
         Err(message) if message == "agent_thread_unavailable" => {
             if !was_running {
@@ -433,38 +464,19 @@ fn agent_continue_request(
             return reply(stream, 503, error("harness_continue_failed"));
         }
     };
-    let terminal = result
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("succeeded");
-    let terminal = match terminal {
-        "completed" | "succeeded" => "succeeded",
-        "failed" => "failed",
-        "interrupted" => "interrupted",
-        _ => "running",
-    };
-    let _ = state
-        .supervisor
-        .registry
-        .transition(id, terminal, agent.exit_code);
-    // thread/resume can queue a synthetic turn/completed for the persisted
-    // latest terminal turn. Do not let that event race the state transition
-    // above and mark this newly resumed turn terminal. Keep the receiver
-    // buffered until continue_turn has returned, then start monitoring it.
-    if let Some(events) = resumed_events {
-        let registry = Arc::clone(&state.supervisor.registry);
-        let store = Arc::clone(&state.store);
-        let agent_id = agent.id.clone();
-        let task_id = agent.task_id.clone();
-        let execution_id = agent.execution_id.clone();
-        thread::spawn(move || {
-            monitor_codex_events(registry, store, agent_id, task_id, execution_id, events)
-        });
-    }
     let response =
         parse_json(&serde_json::json!({"agent_id": agent.id, "turn": result}).to_string())
             .map_err(|_| "could not serialize continuation result")?;
     reply(stream, 200, response)
+}
+
+pub(crate) fn continue_turn_then_start_monitor<T, E>(
+    continue_turn: impl FnOnce() -> Result<T, E>,
+    start_monitor: impl FnOnce(),
+) -> Result<T, E> {
+    let result = continue_turn()?;
+    start_monitor();
+    Ok(result)
 }
 
 fn resolve_agent_session(
