@@ -30,6 +30,20 @@ const INTERNAL: &str = "relay-update";
 const EVENT_PROMPT_LIMIT: usize = 100;
 const EVENT_LIMIT: usize = 10_000;
 const CODEX_TRANSCRIPT_LIMIT: usize = 16 * 1024 * 1024;
+const STATUS_STATES: &[&str] = &[
+    "not observed",
+    "running",
+    "succeeded",
+    "failed",
+    "interrupted",
+    "unexpected_exit",
+    "lost_after_restart",
+    "stopped",
+    "killed",
+    "finished",
+    "orphaned",
+    "paused",
+];
 #[derive(Clone, Default)]
 struct Execution {
     task: String,
@@ -437,6 +451,29 @@ fn resolve_selection(
     selected_id
         .and_then(|id| rows.iter().position(|row| row.id == id))
         .unwrap_or_else(|| previous_index.min(rows.len().saturating_sub(1)))
+}
+fn displayed_state(row: &Execution) -> &str {
+    if row.state.is_empty() {
+        "not observed"
+    } else {
+        &row.state
+    }
+}
+fn filter_rows(rows: Vec<Execution>, live_only: bool, state: Option<&str>) -> Vec<Execution> {
+    rows.into_iter()
+        .filter(|row| !live_only || !row.agent.is_empty())
+        .filter(|row| state.is_none_or(|state| displayed_state(row) == state))
+        .collect()
+}
+fn validate_state(state: &str) -> Result<(), Fail> {
+    if STATUS_STATES.contains(&state) {
+        Ok(())
+    } else {
+        Err(Fail::Config(format!(
+            "unknown status state '{state}' (valid states: {})",
+            STATUS_STATES.join(", ")
+        )))
+    }
 }
 fn snapshot(
     c: &Client,
@@ -1211,10 +1248,15 @@ pub(super) fn cmd_status(
     c: &Client,
     once: bool,
     all: bool,
+    live_only: bool,
+    state_filter: Option<&str>,
     interval: u64,
     task_root: Option<&str>,
     state_override: Option<&str>,
 ) -> Result<(), Fail> {
+    if let Some(state) = state_filter {
+        validate_state(state)?;
+    }
     let state = state_override
         .map(PathBuf::from)
         .unwrap_or_else(default_state);
@@ -1228,6 +1270,7 @@ pub(super) fn cmd_status(
         })
         .unwrap_or_else(|| home.join(".codex/dept"));
     let (rows, w, lost) = snapshot(c, &state, all)?;
+    let rows = filter_rows(rows, live_only, state_filter);
     if once {
         print_once(&rows, &w, &root, lost);
         return Ok(());
@@ -1402,7 +1445,7 @@ pub(super) fn cmd_status(
             let previous_agent = rows.get(selected).map(|row| row.agent.clone());
             match snapshot(c, &state, all) {
                 Ok((r, w, lo)) => {
-                    rows = r;
+                    rows = filter_rows(r, live_only, state_filter);
                     warnings = w;
                     lost = lo;
                     selected = resolve_selection(&rows, selected_id.as_deref(), selected);
@@ -1677,6 +1720,89 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter_fixture() -> Vec<Execution> {
+        vec![
+            Execution {
+                id: "live-running".into(),
+                state: "running".into(),
+                agent: "agent-1".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "live-succeeded".into(),
+                state: "succeeded".into(),
+                agent: "agent-2".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "historical-failed".into(),
+                state: "failed".into(),
+                ..Default::default()
+            },
+            Execution {
+                id: "historical-unobserved".into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn live_only_keeps_rows_with_registered_agent_ids() {
+        let rows = filter_rows(filter_fixture(), true, None);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["live-running", "live-succeeded"]
+        );
+    }
+
+    #[test]
+    fn state_filter_matches_displayed_state_including_not_observed() {
+        let rows = filter_rows(filter_fixture(), false, Some("not observed"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "historical-unobserved");
+
+        let rows = filter_rows(filter_fixture(), false, Some("failed"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "historical-failed");
+    }
+
+    #[test]
+    fn live_only_and_state_filters_compose_with_and() {
+        let rows = filter_rows(filter_fixture(), true, Some("succeeded"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "live-succeeded");
+
+        let rows = filter_rows(filter_fixture(), true, Some("failed"));
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn no_status_filters_preserve_all_rows_in_order() {
+        let original = filter_fixture();
+        let filtered = filter_rows(original.clone(), false, None);
+        assert_eq!(filtered.len(), original.len());
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            original
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_status_states_with_one_line_error() {
+        let error = validate_state("mysterious").unwrap_err();
+        let Fail::Config(message) = error else {
+            panic!("expected configuration error");
+        };
+        assert!(!message.contains('\n'));
+        assert!(message.starts_with("unknown status state 'mysterious'"));
+    }
 
     #[test]
     fn preserves_selected_execution_when_new_rows_are_inserted_before_it() {

@@ -120,6 +120,12 @@ enum Commands {
         /// Include relay-internal maintenance tasks
         #[arg(long)]
         all: bool,
+        /// Show only rows whose agent is still in the registry
+        #[arg(long)]
+        live_only: bool,
+        /// Show only rows in this state (running, succeeded, failed, not observed, ...)
+        #[arg(long)]
+        state: Option<String>,
         /// Refresh interval in seconds
         #[arg(long, default_value_t = 2)]
         interval: u64,
@@ -1855,6 +1861,8 @@ fn run(cli: Cli) -> Result<(), Fail> {
         Commands::Status {
             once,
             all,
+            live_only,
+            state,
             interval,
             task_root,
             state_file,
@@ -1862,6 +1870,8 @@ fn run(cli: Cli) -> Result<(), Fail> {
             &client,
             once,
             all,
+            live_only,
+            state.as_deref(),
             interval,
             task_root.as_deref(),
             state_file.as_deref(),
