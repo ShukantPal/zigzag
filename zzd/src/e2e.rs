@@ -162,8 +162,7 @@ fn e2e_spawn_to_completion_records_logs_and_events() {
         "proc never finished"
     );
 
-    // The agent record exists and is no longer running. The registry is
-    // keyed by proc handle (not task id).
+    // Completed records stay visible during the configured inspection window.
     let raw = request_once(
         Arc::clone(&state),
         &policy,
@@ -173,62 +172,30 @@ fn e2e_spawn_to_completion_records_logs_and_events() {
     );
     assert!(
         raw.starts_with("HTTP/1.1 200"),
-        "agent status failed: {raw}"
+        "completed record missing: {raw}"
     );
-    let agent = response_json(raw);
+    let completed_record = response_json(raw);
     assert_eq!(
-        agent.object("task_id").and_then(Json::as_str),
-        Some(id.as_str())
-    );
-    assert_ne!(
-        agent.object("state").and_then(Json::as_str),
-        Some("running"),
-        "agent still running after proc completed"
-    );
-
-    // Stdout made it into the log spool.
-    let raw = request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/logs?stream=stdout"),
-        "",
-    );
-    assert!(raw.starts_with("HTTP/1.1 200"), "logs failed: {raw}");
-    let logs = response_json(raw);
-    let stdout: String = json_array(logs.object("records").expect("logs missing records"))
-        .iter()
-        .filter_map(|record| record.object("data"))
-        .filter_map(Json::as_str)
-        .collect::<Vec<_>>()
-        .join("");
-    assert!(
-        stdout.contains("hello-e2e"),
-        "stdout missing from logs: {stdout}"
-    );
-
-    // Stderr is kept separate from stdout.
-    let raw = request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/logs?stream=stderr"),
-        "",
-    );
-    let logs = response_json(raw);
-    let stderr: String = json_array(logs.object("records").expect("logs missing records"))
-        .iter()
-        .filter_map(|record| record.object("data"))
-        .filter_map(Json::as_str)
-        .collect::<Vec<_>>()
-        .join("");
-    assert!(
-        stderr.contains("err-e2e"),
-        "stderr missing from logs: {stderr}"
+        completed_record.object("state").and_then(Json::as_str),
+        Some("succeeded")
     );
     assert!(
-        !stderr.contains("hello-e2e"),
-        "stdout leaked into stderr stream"
+        completed_record
+            .object("completed_at")
+            .and_then(Json::as_str)
+            .is_some()
+    );
+    assert!(
+        completed
+            .object("stdout")
+            .and_then(Json::as_str)
+            .is_some_and(|stdout| stdout.contains("hello-e2e"))
+    );
+    assert!(
+        completed
+            .object("stderr")
+            .and_then(Json::as_str)
+            .is_some_and(|stderr| stderr.contains("err-e2e") && !stderr.contains("hello-e2e"))
     );
 
     // The event stream recorded the completion (timeout=0: return immediately).
@@ -404,11 +371,10 @@ fn e2e_agent_no_branch_runs_in_project_without_worktree_or_checkout() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
-/// API-created OpenCode agents save their JSON event stream outside the
-/// bounded diagnostics spool, so it remains available through the transcript
-/// API.
+/// Completion preserves the record and artifacts until the TTL expires, then
+/// the relay sweep removes both.
 #[test]
-fn e2e_opencode_agent_create_persists_transcript_and_serves_it() {
+fn e2e_opencode_agent_create_cleans_transcript_after_registry_deletion() {
     let (state, _state_path) = test_server();
     let policy = test_policy();
     let id = unique_id("opencode-agent-transcript");
@@ -439,42 +405,38 @@ fn e2e_opencode_agent_create_persists_transcript_and_serves_it() {
         completed.object("exit_code").and_then(Json::as_u64),
         Some(0)
     );
-
     let transcript_path = agent_transcript_path(&handle).expect("valid agent transcript path");
-    let transcript = std::fs::read_to_string(&transcript_path)
-        .expect("API-created agent transcript was not persisted");
-    assert!(
-        transcript.contains("persisted-agent-output"),
-        "persisted transcript missing Codex output: {transcript}"
-    );
     let stderr_path = agent_stderr_path(&handle).expect("valid agent stderr path");
-    let stderr =
-        std::fs::read_to_string(&stderr_path).expect("API-created agent stderr was not persisted");
+    let completed_at = state
+        .supervisor
+        .registry
+        .get(&handle)
+        .unwrap()
+        .completed_at
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
     assert!(
-        stderr.contains("persisted-agent-stderr"),
-        "persisted stderr missing Codex diagnostics: {stderr}"
+        transcript_path.exists(),
+        "transcript should remain during TTL"
     );
-
-    let served = response_json(request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/transcript"),
-        "",
-    ));
+    assert!(stderr_path.exists(), "stderr should remain during TTL");
+    assert_eq!(
+        crate::routes::agents::sweep_inactive_agents_at(
+            &state.supervisor.registry,
+            completed_at + 86_401,
+            86_400,
+        ),
+        1
+    );
+    assert!(state.supervisor.registry.get(&handle).is_none());
     assert!(
-        served
-            .object("stdout")
-            .and_then(Json::as_str)
-            .is_some_and(|stdout| stdout.contains("persisted-agent-output")),
-        "transcript endpoint did not return persisted output: {served:?}"
+        !transcript_path.exists(),
+        "completed agent transcript was not cleaned up"
     );
     assert!(
-        served
-            .object("stderr")
-            .and_then(Json::as_str)
-            .is_some_and(|stderr| stderr.contains("persisted-agent-stderr")),
-        "transcript endpoint did not return persisted stderr: {served:?}"
+        !stderr_path.exists(),
+        "completed agent stderr file was not cleaned up"
     );
 
     let output = Command::new("git")
@@ -484,8 +446,6 @@ fn e2e_opencode_agent_create_persists_transcript_and_serves_it() {
         .expect("could not clean up agent test worktree");
     assert!(output.status.success());
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
-    std::fs::remove_file(transcript_path).expect("could not clean up agent transcript");
-    std::fs::remove_file(stderr_path).expect("could not clean up agent stderr");
 }
 
 /// Exercise the public agent/event command permutations through an
@@ -528,81 +488,47 @@ fn e2e_client_agent_commands_events_and_fake_codex() {
     // Poll through the compatibility process endpoint until the supervised
     // agent has completed.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
+    let completed_proc = loop {
         let (raw, proc) = client.call("GET", &format!("/v1/proc/{agent_id}"), "");
         assert!(raw.starts_with("HTTP/1.1 200"), "proc get failed: {raw}");
         if proc.object("running") == Some(&Json::Bool(false)) {
-            break;
+            break proc;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "fake Codex did not finish"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    };
+    assert!(
+        completed_proc
+            .object("stdout")
+            .and_then(Json::as_str)
+            .is_some_and(|stdout| stdout.contains("fake-codex stdout"))
+    );
+    assert!(
+        completed_proc
+            .object("stderr")
+            .and_then(Json::as_str)
+            .is_some_and(|stderr| stderr.contains("fake-codex stderr"))
+    );
 
     let (_, by_state) = client.call("GET", "/v1/agents?state=succeeded", "");
     let agents = json_array(by_state.object("agents").unwrap());
-    assert_eq!(agents.len(), 1);
     assert_eq!(
-        agents[0].object("id").and_then(Json::as_str),
-        Some(agent_id.as_str())
+        agents.len(),
+        1,
+        "completion must remain visible for TTL: {agents:?}"
     );
     let (_, by_task) = client.call("GET", &format!("/v1/agents?task_id={task_id}"), "");
     assert_eq!(json_array(by_task.object("agents").unwrap()).len(), 1);
     let (_, no_match) = client.call("GET", "/v1/agents?state=running", "");
     assert!(json_array(no_match.object("agents").unwrap()).is_empty());
 
-    let (raw, agent) = client.call("GET", &format!("/v1/agents/{agent_id}"), "");
-    assert!(raw.starts_with("HTTP/1.1 200"), "agent get failed: {raw}");
-    assert_eq!(
-        agent.object("task_id").and_then(Json::as_str),
-        Some(task_id.as_str())
-    );
-    assert_eq!(
-        agent.object("execution_id").and_then(Json::as_str),
-        Some(execution_id.as_str())
-    );
-    assert_eq!(
-        agent.object("state").and_then(Json::as_str),
-        Some("succeeded")
-    );
-
-    for (stream, expected, excluded) in [
-        ("stdout", "fake-codex stdout", "fake-codex stderr"),
-        ("stderr", "fake-codex stderr", "fake-codex stdout"),
-        ("both", "fake-codex stdout", ""),
-    ] {
-        let (_, logs) = client.call(
-            "GET",
-            &format!("/v1/agents/{agent_id}/logs?stream={stream}&follow=0"),
-            "",
-        );
-        let text = json_array(logs.object("records").unwrap())
-            .iter()
-            .filter_map(|record| record.object("data").and_then(Json::as_str))
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(
-            text.contains(expected),
-            "{stream} did not include output: {text}"
-        );
-        if !excluded.is_empty() {
-            assert!(
-                !text.contains(excluded),
-                "{stream} leaked other stream: {text}"
-            );
-        }
-    }
-
-    let (_, cursor_logs) = client.call(
-        "GET",
-        &format!("/v1/agents/{agent_id}/logs?stream=both&after=1&tail=1&follow=0"),
-        "",
-    );
+    let (raw, _) = client.call("GET", &format!("/v1/agents/{agent_id}"), "");
     assert!(
-        cursor_logs.object("next_cursor").is_some(),
-        "logs missing cursor: {cursor_logs:?}"
+        raw.starts_with("HTTP/1.1 200"),
+        "completed record missing: {raw}"
     );
 
     let event_body = format!(

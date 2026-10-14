@@ -32,7 +32,7 @@ use crate::http::{
 use crate::proc::{
     AgentSpawnDetails, COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
     agent_stderr_path, agent_transcript_path, process_group_running, process_identity, prune_procs,
-    recovered_agent_identity_matches, spawn_proc, unique_handle,
+    recovered_agent_identity_matches, remove_agent_output_files_from, spawn_proc, unique_handle,
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
@@ -40,11 +40,13 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    dispatch_agent_message, handle_codex_notification, monitor_codex_events,
-    monitor_codex_events_to_path, parse_agent_create_request, persisted_agent_config,
-    repair_transcript_tail, restart_argv, restart_config, transcript_json_with_sessions_dir,
-    valid_agent_model,
+    delete_inactive_agent, delete_inactive_agent_with_trust, dispatch_agent_message,
+    handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
+    parse_agent_cleanup_ttl, parse_agent_create_request, persisted_agent_config,
+    repair_transcript_tail, restart_argv, restart_config, sweep_inactive_agents_at,
+    transcript_json_with_sessions_dir, valid_agent_model,
 };
+
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
@@ -920,6 +922,7 @@ fn recovery_replays_a_persisted_first_output_fact() {
         process_identity: Some("test:1".to_owned()),
         worktree_path: None,
         started_at: "1".to_owned(),
+        completed_at: None,
         deadline_at: None,
         command: "sh -c".to_owned(),
         state: "orphaned".to_owned(),
@@ -1139,28 +1142,22 @@ fn detached_process_endpoints_authenticate_and_manage_process_trees() {
         completed.object("stdout"),
         Some(&Json::String("hello".to_owned()))
     );
-    // New diagnostics are read-only and use the same authenticated relay
-    // path; the legacy proc response above remains unchanged.
-    let agent = response_json(request_once(
+    // Completion retains the succeeded record for the inspection TTL.
+    let raw = request_once(
         Arc::clone(&state),
         &policy,
         "GET",
         &format!("/v1/agents/{handle}"),
         "",
-    ));
-    assert_eq!(agent.object("id"), Some(&Json::String(handle.clone())));
-    assert_eq!(
-        agent.object("state"),
-        Some(&Json::String("succeeded".to_owned()))
     );
-    let logs = response_json(request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/logs?stream=stdout&after=0"),
-        "",
-    ));
-    assert!(logs.to_json().contains("hello"));
+    assert!(
+        raw.starts_with("HTTP/1.1 200"),
+        "completed record missing: {raw}"
+    );
+    assert_eq!(
+        response_json(raw).object("state").and_then(Json::as_str),
+        Some("succeeded")
+    );
     let audit = state.store.timeline("echo").unwrap();
     let kinds: Vec<_> = audit
         .iter()
@@ -1730,6 +1727,155 @@ fn worktree_create_and_delete_roundtrip() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+fn completed_worktree_fixture(
+    prefix: &str,
+    push_branch: bool,
+) -> (PathBuf, PathBuf, Vec<PathBuf>, zz::AgentRegistry, String) {
+    let base = worktree_test_base(prefix);
+    let roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let id = format!("agent-{prefix}");
+    let branch = format!("codex/{prefix}");
+    let path = roots[0].join(&id);
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if push_branch {
+        let output = Command::new("git")
+            .args(["push", "--set-upstream", "origin", &branch])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
+    let mut record = agent_record(&id);
+    record.state = "succeeded".to_owned();
+    record.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(record).unwrap();
+    (repo, path, roots, registry, id)
+}
+
+#[test]
+fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-clean", true);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        "printf 'stopped\\n' >> \"$(dirname \"$0\")/stop.log\"\n",
+    )
+    .unwrap();
+    assert!(
+        delete_inactive_agent_with_trust(&registry, &id, &[repo.canonicalize().unwrap()],).unwrap()
+    );
+    assert!(!path.exists(), "clean pushed worktree was not removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/auto-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "automatic cleanup deleted the branch");
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("stop.log")).unwrap(),
+        "stopped\n"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_dirty_worktree_is_kept() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
+    std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(path.exists(), "dirty worktree was removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_worktree_with_unpushed_commits_is_kept() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-unpushed", true);
+    std::fs::write(path.join("pushed-later.txt"), "commit me").unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "pushed-later.txt"]);
+    git(&["commit", "-m", "un-pushed work"]);
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(path.exists(), "worktree with unpushed commit was removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_worktree_without_remote_upstream_is_kept() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-no-remote", false);
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(
+        path.exists(),
+        "worktree without a remote upstream was removed"
+    );
+    assert!(registry.get(&id).is_none());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_worktree_with_another_live_agent_record_is_kept() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-live", true);
+    let mut live = agent_record("other-live-agent");
+    live.state = "running".to_owned();
+    live.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(live).unwrap();
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(
+        path.exists(),
+        "worktree with a live agent record was removed"
+    );
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
+    assert!(registry.get("other-live-agent").is_some());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 #[test]
 fn manual_worktree_remove_runs_configured_delete_hook_after_relay_observes_it() {
     let base = worktree_test_base("wt-manual-hook");
@@ -1894,6 +2040,105 @@ fn worktree_hook_failures_are_logged_and_environment_is_scrubbed() {
             .any(|line| line.contains("worktree_hook name=repo-stop.sh could not run")),
         "invocation error warning missing: {logs:?}"
     );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn ttl_sweep_removes_expired_backlog_and_keeps_fresh_completion() {
+    let (state, _) = test_server();
+    let mut succeeded = agent_record("old-succeeded");
+    succeeded.state = "succeeded".to_owned();
+    succeeded.completed_at = Some("10".to_owned());
+    state.supervisor.registry.register(succeeded).unwrap();
+    let mut failed = agent_record("old-failed");
+    failed.state = "failed".to_owned();
+    failed.completed_at = Some("11".to_owned());
+    state.supervisor.registry.register(failed).unwrap();
+    let mut fresh = agent_record("fresh-succeeded");
+    fresh.state = "succeeded".to_owned();
+    fresh.completed_at = Some("99990".to_owned());
+    state.supervisor.registry.register(fresh).unwrap();
+    let mut legacy = agent_record("legacy-succeeded");
+    legacy.state = "succeeded".to_owned();
+    state.supervisor.registry.register(legacy).unwrap();
+
+    assert_eq!(
+        sweep_inactive_agents_at(&state.supervisor.registry, 100_000, 86_400),
+        2
+    );
+    assert!(state.supervisor.registry.get("old-succeeded").is_none());
+    assert!(state.supervisor.registry.get("old-failed").is_none());
+    assert!(state.supervisor.registry.get("fresh-succeeded").is_some());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("legacy-succeeded")
+            .unwrap()
+            .completed_at
+            .is_some()
+    );
+}
+
+#[test]
+fn cleanup_ttl_defaults_to_one_day_and_accepts_positive_override() {
+    assert_eq!(parse_agent_cleanup_ttl(None), 86_400);
+    assert_eq!(parse_agent_cleanup_ttl(Some("3600")), 3_600);
+    assert_eq!(parse_agent_cleanup_ttl(Some("0")), 86_400);
+    assert_eq!(parse_agent_cleanup_ttl(Some("invalid")), 86_400);
+}
+
+#[test]
+fn ttl_sweep_deletes_expired_clean_pushed_worktree_and_keeps_branch() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("ttl-auto-clean", true);
+    registry.transition(&id, "succeeded", None).unwrap();
+    let completed_at = registry
+        .get(&id)
+        .unwrap()
+        .completed_at
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+
+    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 1, 1), 0);
+    assert!(
+        registry.get(&id).is_some(),
+        "cleanup ran at the TTL boundary"
+    );
+    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 2, 1), 1);
+    assert!(!path.exists());
+    assert!(registry.get(&id).is_none());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/ttl-auto-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "TTL cleanup deleted the branch");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completion_deletion_never_removes_the_main_worktree() {
+    let base = worktree_test_base("auto-main-worktree");
+    let repo = worktree_test_repo(&base);
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
+    let mut record = agent_record("main-worktree-agent");
+    record.state = "succeeded".to_owned();
+    record.worktree_path = Some(repo.to_string_lossy().into_owned());
+    registry.register(record).unwrap();
+
+    assert!(delete_inactive_agent(&registry, "main-worktree-agent").unwrap());
+    assert!(
+        repo.exists(),
+        "completion cleanup removed the main worktree"
+    );
+    assert!(repo.join(".git").exists());
+    assert!(registry.get("main-worktree-agent").is_none());
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -2434,6 +2679,7 @@ fn agent_record(id: &str) -> AgentRecord {
         process_identity: None,
         worktree_path: None,
         started_at: "2026-10-09T00:00:00Z".to_owned(),
+        completed_at: None,
         deadline_at: None,
         command: "sleep 300".to_owned(),
         state: "running".to_owned(),
@@ -2704,7 +2950,8 @@ fn codex_rollout_rejects_matching_symlink_outside_sessions() {
 #[test]
 fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     let (state, _state_path) = test_server();
-    let mut record = agent_record("codex-completion-regression");
+    let id = "codex-completion-regression";
+    let mut record = agent_record(id);
     record.harness = Some("codex".to_owned());
     record.harness_session_id = Some("thread-completed".to_owned());
     state.supervisor.registry.register(record).unwrap();
@@ -2712,7 +2959,7 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     handle_codex_notification(
         &state.supervisor.registry,
         &state.store,
-        "codex-completion-regression",
+        id,
         "task-1",
         "exec-1",
         &serde_json::json!({
@@ -2722,15 +2969,13 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         true,
     );
 
-    assert_eq!(
-        state
-            .supervisor
-            .registry
-            .get("codex-completion-regression")
-            .unwrap()
-            .state,
-        "succeeded"
-    );
+    let completed = state
+        .supervisor
+        .registry
+        .get(id)
+        .expect("completion retains agent for TTL");
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -2748,6 +2993,25 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         .collect();
     assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
     assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+}
+
+#[test]
+fn completion_output_cleanup_removes_transcript_and_stderr_files() {
+    let home = worktree_test_base("agent-output-cleanup");
+    let id = "0123456789abcdef0123456789abcdef";
+    let transcript = home
+        .join(".zigzag/agents/codex")
+        .join(format!("{id}.jsonl"));
+    let stderr = transcript.with_extension("stderr");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "transcript output\n").unwrap();
+    std::fs::write(&stderr, "stderr output\n").unwrap();
+
+    remove_agent_output_files_from(id, &home);
+
+    assert!(!transcript.exists());
+    assert!(!stderr.exists());
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]
@@ -2840,7 +3104,7 @@ fn agent_delete_unknown_agent_is_404() {
 }
 
 #[test]
-fn agent_delete_terminal_agent_is_409() {
+fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
@@ -2854,16 +3118,40 @@ fn agent_delete_terminal_agent_is_409() {
         "/v1/agents/done-agent",
         "",
     );
-    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body = response_json(response);
-    assert_eq!(
-        body.object("error").and_then(Json::as_str),
-        Some("agent_not_running")
+    assert_eq!(body.object("deleted").and_then(Json::as_bool), Some(true));
+    assert!(state.supervisor.registry.get("done-agent").is_none());
+}
+
+#[test]
+fn agent_delete_inactive_agent_with_missing_worktree_removes_record_without_400() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut record = agent_record("stale-failed-agent");
+    record.state = "failed".to_owned();
+    record.worktree_path = Some(
+        std::env::temp_dir()
+            .join("zigzag-missing-agent-worktree")
+            .to_string_lossy()
+            .into_owned(),
     );
-    // The terminal record is untouched.
-    assert_eq!(
-        state.supervisor.registry.get("done-agent").unwrap().state,
-        "succeeded"
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/stale-failed-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("stale-failed-agent")
+            .is_none()
     );
 }
 
@@ -2876,6 +3164,7 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
     let repo = worktree_test_repo(&base);
     let worktree = allowed_root.join("codex-orphan");
     agent_create_worktree(&repo, &worktree, "codex/orphan", &[]).unwrap();
+    std::fs::write(worktree.join("preserve-me.txt"), "recover this work\n").unwrap();
 
     let id = "a69b0e234eea56ab8cbf6747c4ecb951";
     let mut record = agent_record(id);
@@ -2940,12 +3229,15 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
         "",
     );
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert_eq!(state.supervisor.registry.get(id).unwrap().state, "stopped");
-    assert!(!worktree.exists(), "orphan worktree still holds the branch");
+    assert!(state.supervisor.registry.get(id).is_none());
+    assert!(worktree.exists(), "dirty worktree was removed");
     let checkout = worktree_branch_checkout_path(&repo, "codex/orphan").unwrap();
     assert!(
-        checkout.is_none(),
-        "orphan branch is still checked out: {checkout:?}"
+        checkout
+            .as_deref()
+            .and_then(|path| path.canonicalize().ok())
+            == worktree.canonicalize().ok(),
+        "orphan worktree is no longer registered: {checkout:?}"
     );
     let _ = std::fs::remove_dir_all(base);
 }
@@ -3039,15 +3331,13 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
-        state
-            .supervisor
-            .registry
-            .get("recovered-codex-completion")
-            .unwrap()
-            .state,
-        "succeeded"
-    );
+    let completed = state
+        .supervisor
+        .registry
+        .get("recovered-codex-completion")
+        .unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -3106,15 +3396,13 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
-        state
-            .supervisor
-            .registry
-            .get("recovered-codex-terminal-at-resume")
-            .unwrap()
-            .state,
-        "succeeded"
-    );
+    let completed = state
+        .supervisor
+        .registry
+        .get("recovered-codex-terminal-at-resume")
+        .unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -3498,7 +3786,7 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     );
     let _ = std::fs::remove_dir_all(&base);
 
-    // A second DELETE of the now-terminal agent is a 409.
+    // A second DELETE removes the now-inactive durable record.
     let response = request_once(
         Arc::clone(&state),
         &policy,
@@ -3506,7 +3794,8 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         "/v1/agents/delete-me",
         "",
     );
-    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(state.supervisor.registry.get("delete-me").is_none());
 }
 
 #[test]

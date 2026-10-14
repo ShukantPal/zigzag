@@ -653,6 +653,7 @@ mod tests {
                 process_identity: None,
                 worktree_path: None,
                 started_at: "0".to_owned(),
+                completed_at: None,
                 deadline_at: None,
                 command: "test".to_owned(),
                 state: "running".to_owned(),

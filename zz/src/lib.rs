@@ -23,9 +23,12 @@ pub struct AgentRecord {
     /// when the operating system reuses a numeric process identifier.
     pub process_identity: Option<String>,
     /// Filesystem path of the agent's worktree, when the agent was created
-    /// with one. Deleting an agent never removes its worktree.
+    /// with one. Completion removes it only when the relay verifies it is safe.
     pub worktree_path: Option<String>,
     pub started_at: String,
+    /// Unix timestamp recorded when the relay first observed a terminal state.
+    /// Missing only on records written by older relay versions.
+    pub completed_at: Option<String>,
     pub deadline_at: Option<String>,
     pub command: String,
     pub state: String,
@@ -78,6 +81,13 @@ impl AgentRecord {
                             .and_then(Json::as_str)
                             .map(str::to_owned)
                     })
+                    .map(Json::String)
+                    .unwrap_or(Json::Null),
+            ),
+            (
+                "completed_at".to_owned(),
+                self.completed_at
+                    .clone()
                     .map(Json::String)
                     .unwrap_or(Json::Null),
             ),
@@ -236,17 +246,68 @@ impl AgentRegistry {
         let Some(old) = entries.get(id) else {
             return Ok(None);
         };
-        if old.state == state && old.exit_code == exit_code {
+        if old.state == state
+            && old.exit_code == exit_code
+            && (old.completed_at.is_some() || !is_terminal_agent_state(state))
+        {
             return Ok(Some(old.clone()));
         }
         let mut updated = entries.clone();
         let entry = updated.get_mut(id).expect("entry cloned");
         entry.state = state.to_owned();
         entry.exit_code = exit_code;
+        entry.completed_at = if is_terminal_agent_state(state) {
+            entry
+                .completed_at
+                .clone()
+                .or_else(|| Some(unix_timestamp()))
+        } else {
+            None
+        };
         let result = entry.clone();
         self.save(&updated)?;
         *entries = updated;
         Ok(Some(result))
+    }
+
+    /// Mark a legacy terminal record's first observed completion time. Such a
+    /// record receives a full TTL inspection window before automatic cleanup.
+    pub fn ensure_completed_at(&self, id: &str) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(old) = entries.get(id) else {
+            return Ok(None);
+        };
+        if old.completed_at.is_some() || !is_terminal_agent_state(&old.state) {
+            return Ok(Some(old.clone()));
+        }
+        let mut updated = entries.clone();
+        let entry = updated.get_mut(id).expect("entry cloned");
+        entry.completed_at = Some(unix_timestamp());
+        let result = entry.clone();
+        self.save(&updated)?;
+        *entries = updated;
+        Ok(Some(result))
+    }
+
+    /// Remove an agent through the relay's durable registry API. The new
+    /// snapshot is persisted before the in-memory record disappears.
+    pub fn deregister(&self, id: &str) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(record) = entries.get(id).cloned() else {
+            return Ok(None);
+        };
+        let mut updated = entries.clone();
+        updated.remove(id);
+        self.save(&updated)?;
+        *entries = updated;
+        let _ = fs::remove_file(self.log_path(id));
+        Ok(Some(record))
     }
 
     /// Persist the first observed byte so a transient archive failure can be
@@ -656,6 +717,14 @@ fn agent_json(entry: &AgentRecord) -> Json {
             Json::String(entry.started_at.clone()),
         ),
         (
+            "completed_at".to_owned(),
+            entry
+                .completed_at
+                .clone()
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        ),
+        (
             "deadline_at".to_owned(),
             entry
                 .deadline_at
@@ -853,6 +922,7 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
             Some(Json::Number(value)) => value.clone(),
             _ => return Err(err("started_at", "expected string or number")),
         },
+        completed_at: optional_string("completed_at")?,
         deadline_at: optional_string("deadline_at")?,
         command: text("command")?,
         state: text("state")?,
@@ -878,6 +948,30 @@ fn decode_agent_record(value: &Json, agent_id: &str) -> Result<AgentRecord, Stri
         harness: optional_string("harness")?,
     };
     Ok(record)
+}
+
+/// Terminal states that represent a completed agent process. Kept in the
+/// shared registry crate so completion timestamps and cleanup use one policy.
+pub fn is_terminal_agent_state(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded"
+            | "failed"
+            | "interrupted"
+            | "unexpected_exit"
+            | "lost_after_restart"
+            | "stopped"
+            | "killed"
+            | "finished"
+    )
+}
+
+fn unix_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn redact(text: &mut String) -> bool {
@@ -1908,6 +2002,7 @@ mod tests {
             process_identity: Some("test:42".to_owned()),
             worktree_path: None,
             started_at: "1".to_owned(),
+            completed_at: None,
             deadline_at: None,
             command: "codex exec".to_owned(),
             state: "running".to_owned(),
@@ -2093,6 +2188,7 @@ mod tests {
             process_identity: None,
             worktree_path: None,
             started_at: "2026-10-08T00:00:00Z".to_owned(),
+            completed_at: None,
             deadline_at: None,
             command: "echo".to_owned(),
             state: "running".to_owned(),

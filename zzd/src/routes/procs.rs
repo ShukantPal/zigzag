@@ -160,22 +160,28 @@ pub(crate) fn update_proc_status_with_handle(
             }
             if registry.transition(handle, state, entry.exit_code).is_ok() {
                 entry.finished_at = Some(Instant::now());
-                if let Some(agent) = registry.get(handle) {
-                    let watch_agent = agent.clone();
-                    let _ = std::thread::Builder::new()
-                        .name(format!("zigzag-watch-pr-{}", &handle[..8]))
-                        .spawn(move || {
-                            if let Err(error) = crate::github::watch_agent_pr(&watch_agent) {
-                                log::warn!("agent completion PR discovery failed: {error}");
-                            }
-                        });
-                }
-                if state == "succeeded"
-                    && let Some(agent) = registry.get(handle)
-                {
-                    let _ = std::thread::Builder::new()
-                        .name(format!("zigzag-auto-pr-{}", &handle[..8]))
-                        .spawn(move || auto_create_pr_if_needed(&agent));
+                let completed_agent = registry.get(handle);
+                if let Some(agent) = completed_agent {
+                    if agent
+                        .worktree_path
+                        .as_deref()
+                        .is_some_and(|path| std::path::Path::new(path).is_dir())
+                    {
+                        let watch_agent = agent.clone();
+                        let _ = std::thread::Builder::new()
+                            .name(format!("zigzag-watch-pr-{}", &handle[..8]))
+                            .spawn(move || {
+                                if let Err(error) = crate::github::watch_agent_pr(&watch_agent) {
+                                    log::warn!("agent completion PR discovery failed: {error}");
+                                }
+                            });
+                    }
+                    if state == "succeeded" {
+                        let auto_pr_agent = agent.clone();
+                        let _ = std::thread::Builder::new()
+                            .name(format!("zigzag-auto-pr-{}", &handle[..8]))
+                            .spawn(move || auto_create_pr_if_needed(&auto_pr_agent));
+                    }
                 }
             } else {
                 let _ = registry.mark_audit_degraded(handle);
@@ -222,7 +228,7 @@ fn auto_create_pr_if_needed(agent: &zz::AgentRecord) {
             "origin",
             &format!("refs/heads/{branch}"),
         ])
-        .current_dir(worktree)
+        .current_dir(repo)
         .output();
     match pushed {
         Ok(output) if output.status.success() => {}

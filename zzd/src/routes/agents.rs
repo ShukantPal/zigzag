@@ -616,6 +616,7 @@ fn native_agent_record(
         process_identity: None,
         worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
         started_at: unix_timestamp(),
+        completed_at: None,
         deadline_at: request.timeout_secs.map(|seconds| {
             unix_timestamp()
                 .parse::<u64>()
@@ -2110,6 +2111,130 @@ pub(crate) fn handle_codex_notification(
     }
 }
 
+fn agent_is_live(agent: &AgentRecord) -> bool {
+    !crate::routes::worktrees::agent_state_is_terminal(&agent.state)
+}
+
+/// Run inactive-agent deletion through the relay's durable lifecycle: safely
+/// clean the worktree when eligible, then remove the registry record. An unsafe
+/// worktree stays on disk and is logged by the cleanup helper.
+pub(crate) fn delete_inactive_agent(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+) -> Result<bool, String> {
+    delete_inactive_agent_with_trust(
+        registry,
+        agent_id,
+        &crate::routes::worktrees::trusted_hook_repos(),
+    )
+}
+
+pub(crate) fn delete_inactive_agent_with_trust(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+    trusted_repos: &[PathBuf],
+) -> Result<bool, String> {
+    let Some(agent) = registry.get(agent_id) else {
+        return Ok(false);
+    };
+    if agent_is_live(&agent) {
+        return Ok(false);
+    }
+    crate::routes::worktrees::cleanup_inactive_agent_worktree_with_trust(
+        registry,
+        agent_id,
+        &agent_worktree_roots(),
+        trusted_repos,
+    );
+    if registry.deregister(agent_id)?.is_some() {
+        crate::proc::remove_agent_output_files(agent_id);
+        log::info!("inactive agent record deleted agent={agent_id}");
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Completed agents remain inspectable for a day by default. Configure a
+/// longer or shorter positive retention window with ZIGZAG_AGENT_CLEANUP_TTL_SECS.
+const DEFAULT_AGENT_CLEANUP_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn agent_cleanup_ttl_secs() -> u64 {
+    parse_agent_cleanup_ttl(
+        std::env::var("ZIGZAG_AGENT_CLEANUP_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn parse_agent_cleanup_ttl(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_AGENT_CLEANUP_TTL_SECS)
+}
+
+pub(crate) fn sweep_inactive_agents(registry: &zz::AgentRegistry) -> usize {
+    let now = unix_timestamp().parse::<u64>().unwrap_or_default();
+    sweep_inactive_agents_at(registry, now, agent_cleanup_ttl_secs())
+}
+
+pub(crate) fn sweep_inactive_agents_at(
+    registry: &zz::AgentRegistry,
+    now: u64,
+    ttl_secs: u64,
+) -> usize {
+    let mut expired = Vec::new();
+    for mut agent in registry.list(None, None) {
+        if agent_is_live(&agent) {
+            continue;
+        }
+        if agent.completed_at.is_none() {
+            match registry.ensure_completed_at(&agent.id) {
+                Ok(Some(updated)) => agent = updated,
+                Ok(None) => continue,
+                Err(error) => {
+                    log::error!(
+                        "could not timestamp legacy completed agent {}: {error}",
+                        agent.id
+                    );
+                    continue;
+                }
+            }
+        }
+        let Some(completed_at) = agent
+            .completed_at
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            log::warn!(
+                "keeping completed agent={} with invalid completion timestamp",
+                agent.id
+            );
+            continue;
+        };
+        if now.saturating_sub(completed_at) > ttl_secs {
+            expired.push(agent);
+        }
+    }
+    let mut deleted = 0;
+    for agent in expired {
+        match delete_inactive_agent(registry, &agent.id) {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(error) => log::error!(
+                "startup inactive agent deletion failed agent={}: {error}",
+                agent.id
+            ),
+        }
+    }
+    log::info!(
+        "expired inactive agent sweep deleted {deleted} records (ttl={}s)",
+        ttl_secs
+    );
+    deleted
+}
+
 #[cfg(not(test))]
 fn create_opencode_session(
     stream: &mut TcpStream,
@@ -2624,39 +2749,25 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     let Some(agent) = state.supervisor.registry.get(&id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
-    if agent.state == "lost_after_restart" {
-        if let Some(path) = agent.worktree_path.as_deref() {
-            match cleanup_agent_worktree(path, &agent_worktree_roots()) {
-                Ok(()) => log::info!("agent_delete id={id}: stale worktree cleaned up at {path}"),
-                Err(failure) => {
-                    log::warn!(
-                        "agent_delete id={id}: stale worktree cleanup failed: {}",
-                        failure.message
-                    );
-                    return reply(stream, failure.code, error(failure.message));
-                }
-            }
-        }
-        if state
-            .supervisor
-            .registry
-            .transition(&id, "stopped", None)
-            .is_err()
-        {
-            return reply(stream, 500, error("could_not_persist_agent_state"));
-        }
-        return reply(
-            stream,
-            200,
-            Json::Object(vec![
-                ("id".to_owned(), Json::String(id)),
-                ("stopped".to_owned(), Json::Bool(true)),
-                (
-                    "worktree".to_owned(),
-                    agent.worktree_path.map(Json::String).unwrap_or(Json::Null),
-                ),
-            ]),
-        );
+    if !agent_is_live(&agent) {
+        let worktree = agent.worktree_path.clone();
+        return match delete_inactive_agent(&state.supervisor.registry, &id) {
+            Ok(true) => reply(
+                stream,
+                200,
+                Json::Object(vec![
+                    ("id".to_owned(), Json::String(id)),
+                    ("stopped".to_owned(), Json::Bool(true)),
+                    ("deleted".to_owned(), Json::Bool(true)),
+                    (
+                        "worktree".to_owned(),
+                        worktree.map(Json::String).unwrap_or(Json::Null),
+                    ),
+                ]),
+            ),
+            Ok(false) => reply(stream, 409, error("agent_still_live")),
+            Err(_) => reply(stream, 500, error("could_not_delete_agent")),
+        };
     }
     if !matches!(agent.state.as_str(), "running" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));

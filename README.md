@@ -65,7 +65,7 @@ All routes below require `Authorization: Bearer <token>`.
 | Continue an existing Codex thread | `POST /v1/agents/{id}/continue` · `zzapi agents continue ID|BRANCH --prompt TEXT` |
 | List agents (filter by state or task) | `GET /v1/agents` · `zzapi agents list [--state running] [--task-id ID]` |
 | Get agent details | `GET /v1/agents/{id}` · `zzapi agents get ID` |
-| Stop an agent | `DELETE /v1/agents/{id}` · `zzapi agents stop ID` |
+| Stop an agent / remove a completed agent | `DELETE /v1/agents/{id}` · `zzapi agents stop ID` |
 | Pause / resume an agent | `POST /v1/agents/{id}/pause` and `/resume` · `zzapi agents pause|resume ID` |
 | Read captured output | `GET /v1/agents/{id}/logs` · `zzapi agents logs ID [--follow]` |
 | Run a synchronous allowlisted command | `POST /v1/exec` · `zzapi exec --bin NAME --args ...` |

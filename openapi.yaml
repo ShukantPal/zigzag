@@ -779,13 +779,19 @@ paths:
                 $ref: '#/components/schemas/Error'
     delete:
       operationId: stopAgent
-      summary: Stop an agent gracefully
+      summary: Stop a live agent or delete an inactive agent
       description: >
-        Send SIGTERM to the agent's process group, wait a grace period, then
-        SIGKILL. Deregisters the agent but leaves its worktree in place. Only
-        touches agent-owned processes: the PID is verified against the agent
-        registry. Implemented in a parallel PR; this documents the intended
-        contract.
+        For running process agents, stop the verified agent process group.
+        Running Codex and OpenCode agents are interrupted through their
+        harness session and this path does not clean their worktree. For a
+        inactive agent, delete the durable agent record and run safe cleanup:
+        remove its linked worktree only when clean, fully pushed to
+        its configured upstream, and unattached to another live agent. Keep
+        and log unsafe worktrees. Treat an already missing worktree as absent.
+        Never delete the feature branch. The relay removes completed records
+        automatically at completion and sweeps persisted inactive records on
+        startup. Lifecycle deletion also removes the agent's transcript and
+        stderr files.
       security:
         - bearerAuth: []
       parameters:
@@ -797,7 +803,7 @@ paths:
             type: string
       responses:
         '200':
-          description: Agent stopped.
+          description: Agent stopped or inactive agent record deleted.
           content:
             application/json:
               schema:
@@ -810,6 +816,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '404':
           description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Agent is not in a deletable lifecycle state.
           content:
             application/json:
               schema:

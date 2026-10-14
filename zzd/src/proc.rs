@@ -51,18 +51,21 @@ pub(crate) struct AgentSpawnDetails {
     pub(crate) deadline_at: Option<String>,
 }
 
-/// Durable JSONL transcript for an API-created agent.
+/// JSONL transcript for an API-created agent.
 ///
 /// This is deliberately independent of the agent registry's bounded
-/// diagnostics spool: users need the complete Codex event stream after the
-/// process has exited or the relay has restarted.
+/// diagnostics spool so output remains available while the agent is active or
+/// recoverable after a relay restart. Successful lifecycle deletion removes it.
 pub(crate) fn agent_transcript_path(agent_id: &str) -> Option<PathBuf> {
+    agent_transcript_path_in(agent_id, Path::new(&std::env::var_os("HOME")?))
+}
+
+fn agent_transcript_path_in(agent_id: &str, home: &Path) -> Option<PathBuf> {
     if agent_id.len() != 32 || !agent_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     Some(
-        PathBuf::from(std::env::var_os("HOME")?)
-            .join(".zigzag/agents/codex")
+        home.join(".zigzag/agents/codex")
             .join(format!("{agent_id}.jsonl")),
     )
 }
@@ -74,6 +77,42 @@ pub(crate) fn agent_transcript_path(agent_id: &str) -> Option<PathBuf> {
 pub(crate) fn agent_stderr_path(agent_id: &str) -> Option<PathBuf> {
     let transcript = agent_transcript_path(agent_id)?;
     Some(transcript.with_extension("stderr"))
+}
+
+/// Remove the durable output artifacts for an agent after its relay record is
+/// deleted. Missing artifacts are normal; other failures are logged so they
+/// can be recovered manually from the relay logs.
+pub(crate) fn remove_agent_output_files(agent_id: &str) {
+    let paths = [agent_transcript_path(agent_id), agent_stderr_path(agent_id)];
+    remove_agent_output_paths(agent_id, paths);
+}
+
+#[cfg(test)]
+pub(crate) fn remove_agent_output_files_from(agent_id: &str, home: &Path) {
+    let transcript = agent_transcript_path_in(agent_id, home);
+    let paths = [
+        transcript.clone(),
+        transcript.map(|path| path.with_extension("stderr")),
+    ];
+    remove_agent_output_paths(agent_id, paths);
+}
+
+fn remove_agent_output_paths(agent_id: &str, paths: [Option<PathBuf>; 2]) {
+    for path in paths.into_iter().flatten() {
+        match fs::remove_file(&path) {
+            Ok(()) => log::info!(
+                "agent_output_cleanup removed agent={} path={}",
+                agent_id,
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "agent_output_cleanup kept agent={} path={}: {error}",
+                agent_id,
+                path.display()
+            ),
+        }
+    }
 }
 
 fn create_agent_output(path: PathBuf) -> Result<File, String> {
@@ -194,6 +233,7 @@ pub(crate) fn spawn_proc(
         process_identity: Some(process_identity),
         worktree_path: details.worktree_path,
         started_at: unix_timestamp(),
+        completed_at: None,
         deadline_at: details.deadline_at,
         command: format!(
             "{} {}",
@@ -507,6 +547,7 @@ pub(crate) fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant
 }
 pub(crate) fn start_reaper(state: Arc<Server>) {
     thread::spawn(move || {
+        let mut cleanup_tick = 0_u16;
         loop {
             let mut in_memory = std::collections::HashSet::new();
             if let Ok(mut entries) = state.supervisor.procs.lock() {
@@ -579,6 +620,11 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
                 .supervisor
                 .registry
                 .prune(unix_timestamp().parse().unwrap_or_default());
+            cleanup_tick = cleanup_tick.wrapping_add(1);
+            if cleanup_tick >= 300 {
+                cleanup_tick = 0;
+                crate::routes::agents::sweep_inactive_agents(&state.supervisor.registry);
+            }
             thread::sleep(Duration::from_millis(200));
         }
     });
