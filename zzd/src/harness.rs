@@ -1265,8 +1265,7 @@ fn reconcile_started_turn(shared: &Shared, thread_id: &str, turn_id: &str) {
 mod tests {
     use super::{
         ApprovalContext, CodexServer, HarnessEvent, QueuedTurn, Shared, approval_audit_line,
-        approval_response,
-        command_approval,
+        approval_response, command_approval,
     };
     use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
@@ -1345,6 +1344,7 @@ mod tests {
             printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-queue","turn":{"id":"turn-active","status":"completed"}}}'
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
             IFS= read -r queued
+            case "$queued" in *'"text":"queued prompt"'*) ;; *) exit 3 ;; esac
             printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-queue","turn":{"id":"turn-next","status":"completed","output":"queued done"}}}'
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-next"}}}'
         "#;
@@ -1471,6 +1471,7 @@ mod tests {
             turns: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::<String, VecDeque<QueuedTurn>>::new()),
             completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             approval_contexts: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
@@ -1521,6 +1522,7 @@ mod tests {
             turns: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::<String, VecDeque<QueuedTurn>>::new()),
             completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             approval_contexts: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
