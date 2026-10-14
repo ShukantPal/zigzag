@@ -115,7 +115,7 @@ The registry reaper records terminal exit. On relay restart, the daemon verifies
 
 ### Event and completion model
 
-The live store in `events.json` is durable but bounded. Posting the same `id` is idempotent only while that event is retained; consumers must deduplicate. `GET /v1/events` returns `epoch`, `reset`, `lost`, `events`, and `next`. Consumers pass `next` as `after` and echo `epoch`; `reset` means the store was replaced and `lost` means the requested sequence was evicted.
+The live store in `events.json` uses a bounded in-memory cache backed by append-only JSONL segments in `events.stream/`. Each event segment is synced before acceptance; whole files expire 30 days after creation. Posting the same `id` is idempotent while its segment is retained. `GET /v1/events` returns `epoch`, `reset`, `lost`, `events`, and `next`. Consumers pass `next` as `after` and echo `epoch`; `reset` means the store was replaced and `lost` means the requested sequence is outside the retained file window or otherwise unavailable.
 
 Schema-v1 lifecycle facts use `id`, `task_id`, `execution_id`, `kind`, `source`, `occurred_at`, `clock`, and object `payload`. Accepted sources are `vm-department`, `mac-relay`, and `vm-poller`. Facts with an execution ID are also appended to per-execution JSONL audit logs in `events.audit/`; that archive is independent from live retention, capped at 20 MiB total, and removes oldest execution logs first. It excludes prompts, command arguments, and raw output.
 
@@ -249,6 +249,7 @@ The Rust review loop can replace the VM side when enabled in `~/.zigzag/config.y
 | --- | --- |
 | `~/.codex/zigzag/zigzag.token` | Relay bearer token, private mode 0600. Never log it. |
 | `~/.codex/zigzag/events.json` | Bounded durable live event store. |
+| `~/.codex/zigzag/events.stream/` | Append-only relay event segments; whole files expire after 30 days. |
 | `~/.codex/zigzag/events.audit/` | Per-execution append-only JSONL archive; independent bounded retention. |
 | `~/.codex/zigzag/events.agents.json` | Durable agent registry derived from the configured state-file name. |
 | `~/.codex/zigzag/events.agents.agent-logs/` | Owner-only agent stdout/stderr spools (bounded). |

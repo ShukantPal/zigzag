@@ -33,7 +33,7 @@ or copy the relay token.
 | `/v1/exec` hangs or policy load fails | Restart from a GUI session; Keychain is unavailable/nonfunctional under SSH. |
 | `denied` from exec/spawn | Adjust policy only through GUI-session `zigzag config`; do not weaken the allowlist blindly. |
 | `orphaned` agent | Inspect process/output deliberately; relay lost pipe attachment, not necessarily the process. |
-| Log gap or events `lost`/`reset` | Rebuild from audit/registry; missing bounded-spool or live-event data is not recoverable there. |
+| Log gap or events `lost`/`reset` | Log gaps can reflect bounded stdout/stderr spool retention. Event `lost` means the cursor is older than the 30-day event-file retention or files are unavailable; `reset` means the store epoch changed. |
 | Review round `attention` | Inspect reviewer results, correct dispatch/config, and seed a new exact-head round. |
 | Gate fails despite model approvals | Use the gate report; satisfy CI, lens, current-head, and human approval requirements. |
 

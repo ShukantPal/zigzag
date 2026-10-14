@@ -1842,25 +1842,69 @@ pub(crate) fn monitor_codex_events(
     execution_id: String,
     events: std::sync::mpsc::Receiver<HarnessEvent>,
 ) {
+    monitor_codex_events_to_path(
+        registry,
+        store,
+        agent_id.clone(),
+        task_id,
+        execution_id,
+        events,
+        agent_transcript_path(&agent_id),
+    );
+}
+
+pub(crate) fn monitor_codex_events_to_path(
+    registry: Arc<zz::AgentRegistry>,
+    store: Arc<zz::Store>,
+    agent_id: String,
+    task_id: String,
+    execution_id: String,
+    events: std::sync::mpsc::Receiver<HarnessEvent>,
+    transcript: Option<std::path::PathBuf>,
+) {
     thread::spawn(move || {
-        let transcript = agent_transcript_path(&agent_id);
         while let Ok(event) = events.recv() {
             let HarnessEvent::Notification {
                 value,
                 terminal_turn,
             } = event;
             if let Some(path) = transcript.as_ref() {
-                if let Some(parent) = path.parent()
-                    && let Err(error) = std::fs::create_dir_all(parent)
-                {
-                    log::warn!("could not create agent transcript directory: {error}");
-                } else if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(file, "{}", value);
+                let line = value.to_string() + "\n";
+                let mut last_warning = std::time::Instant::now();
+                let mut warned = false;
+                loop {
+                    let result = (|| -> std::io::Result<()> {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        repair_transcript_tail(path)?;
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)?;
+                        file.write_all(line.as_bytes())?;
+                        file.sync_data()?;
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            if !warned || last_warning.elapsed() >= Duration::from_secs(5) {
+                                log::warn!(
+                                    "could not append agent transcript {}; retrying: {error}",
+                                    path.display()
+                                );
+                                last_warning = std::time::Instant::now();
+                                warned = true;
+                            }
+                            // Keep the notification owned by this monitor and
+                            // stop draining later notifications until its durable
+                            // append succeeds. This applies backpressure instead
+                            // of silently dropping transcript records.
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    }
                 }
             }
             handle_codex_notification(
@@ -1888,8 +1932,9 @@ pub(crate) fn monitor_codex_events(
             {
                 let _ = registry.mark_audit_degraded(&agent_id);
             }
-            if store
-                .add(relay_event(
+            persist_monitor_event(
+                &store,
+                relay_event(
                     "process_failed",
                     &task_id,
                     &execution_id,
@@ -1900,13 +1945,46 @@ pub(crate) fn monitor_codex_events(
                             Json::String("harness_event_stream_closed".to_owned()),
                         ),
                     ]),
-                ))
-                .is_err()
-            {
-                let _ = registry.mark_audit_degraded(&agent_id);
-            }
+                ),
+            );
         }
     });
+}
+
+fn persist_monitor_event(store: &zz::Store, event: Json) {
+    let mut last_warning = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        match store.add(event.clone()) {
+            Ok(_) => return,
+            Err(error) => {
+                if !warned || last_warning.elapsed() >= Duration::from_secs(5) {
+                    log::warn!("could not persist Codex monitor event; retrying: {error}");
+                    last_warning = std::time::Instant::now();
+                    warned = true;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+pub(crate) fn repair_transcript_tail(path: &Path) -> std::io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let valid_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_len as u64)?;
+    file.sync_data()
 }
 
 pub(crate) fn handle_codex_notification(
@@ -1922,29 +2000,35 @@ pub(crate) fn handle_codex_notification(
         .get("method")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let _ = store.add(relay_event(
-        "agent_harness_event",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
-            ("method".to_owned(), Json::String(method.to_owned())),
-        ]),
-    ));
+    persist_monitor_event(
+        store,
+        relay_event(
+            "agent_harness_event",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                ("method".to_owned(), Json::String(method.to_owned())),
+            ]),
+        ),
+    );
     if method == "turn/completed" {
         let turn_status = value
             .pointer("/params/turn/status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("completed");
-        let _ = store.add(relay_event(
-            "agent_turn_completed",
-            task_id,
-            execution_id,
-            Json::Object(vec![
-                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
-                ("state".to_owned(), Json::String(turn_status.to_owned())),
-            ]),
-        ));
+        persist_monitor_event(
+            store,
+            relay_event(
+                "agent_turn_completed",
+                task_id,
+                execution_id,
+                Json::Object(vec![
+                    ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                    ("state".to_owned(), Json::String(turn_status.to_owned())),
+                ]),
+            ),
+        );
 
         let terminal_state = match turn_status {
             "completed" => Some(("succeeded", "process_completed")),
@@ -1960,8 +2044,9 @@ pub(crate) fn handle_codex_notification(
         {
             match registry.transition(agent_id, state, None) {
                 Ok(Some(_)) => {
-                    if store
-                        .add(relay_event(
+                    persist_monitor_event(
+                        store,
+                        relay_event(
                             kind,
                             task_id,
                             execution_id,
@@ -1969,11 +2054,8 @@ pub(crate) fn handle_codex_notification(
                                 ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
                                 ("state".to_owned(), Json::String(state.to_owned())),
                             ]),
-                        ))
-                        .is_err()
-                    {
-                        let _ = registry.mark_audit_degraded(agent_id);
-                    }
+                        ),
+                    );
                 }
                 _ => {
                     let _ = registry.mark_audit_degraded(agent_id);

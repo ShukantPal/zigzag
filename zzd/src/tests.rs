@@ -21,7 +21,7 @@ use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
-use crate::harness::{Delivery, HarnessSession, resumed_completion_event};
+use crate::harness::{Delivery, HarnessEvent, HarnessSession, resumed_completion_event};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -37,8 +37,9 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
     agent_harness_config, agent_post_request_with_session_resolver, agent_route,
     default_agent_worktree, dispatch_agent_message, handle_codex_notification,
-    monitor_codex_events, parse_agent_create_request, persisted_agent_config, restart_argv,
-    restart_config, transcript_json_with_sessions_dir, valid_agent_model,
+    monitor_codex_events, monitor_codex_events_to_path, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    transcript_json_with_sessions_dir, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -2355,6 +2356,75 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         .collect();
     assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
     assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+}
+
+#[test]
+fn monitor_retries_append_failure_and_drains_queued_delta_on_channel_close() {
+    let (state, state_path) = test_server();
+    let transcript = state_path.with_extension("codex.jsonl");
+    std::fs::create_dir(&transcript).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    monitor_codex_events_to_path(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        "monitor-close-agent".to_owned(),
+        "task-monitor-close".to_owned(),
+        "exec-monitor-close".to_owned(),
+        rx,
+        Some(transcript.clone()),
+    );
+    tx.send(HarnessEvent::Notification {
+        value: serde_json::json!({
+            "method":"item/agentMessage.delta",
+            "params":{"itemId":"item-1","delta":"kept-after-close"}
+        }),
+        terminal_turn: false,
+    })
+    .unwrap();
+    drop(tx);
+    thread::sleep(Duration::from_millis(150));
+    std::fs::remove_dir(&transcript).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut contents = String::new();
+    while !contents.contains("kept-after-close") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        contents = std::fs::read_to_string(&transcript).unwrap_or_default();
+    }
+    assert!(contents.contains("item/agentMessage.delta"));
+    assert!(contents.contains("kept-after-close"));
+    let events_deadline = Instant::now() + Duration::from_secs(2);
+    let mut events = state.store.read(0, "", Duration::ZERO).unwrap();
+    while !events.events.iter().any(|event| {
+        event.payload.object("kind").and_then(Json::as_str) == Some("agent_harness_event")
+    }) && Instant::now() < events_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+        events = state.store.read(0, "", Duration::ZERO).unwrap();
+    }
+    assert!(events.events.iter().any(|event| {
+        event.payload.object("kind").and_then(Json::as_str) == Some("agent_harness_event")
+    }));
+    drop(state);
+    let _ = std::fs::remove_file(transcript);
+    let _ = std::fs::remove_dir_all(state_path.with_extension("stream"));
+    let _ = std::fs::remove_dir_all(state_path.with_extension("audit"));
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(state_path.with_extension("agents"));
+}
+
+#[test]
+fn transcript_repair_truncates_only_an_unterminated_tail() {
+    let (state, state_path) = test_server();
+    let transcript = state_path.with_extension("partial-transcript.jsonl");
+    std::fs::write(&transcript, b"{\"complete\":true}\n{incomplete").unwrap();
+    repair_transcript_tail(&transcript).unwrap();
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        b"{\"complete\":true}\n"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(transcript);
 }
 
 #[test]
