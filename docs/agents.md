@@ -37,13 +37,23 @@ app-server sessions because signaling their shared process would affect every
 agent in the domain.
 
 `POST /v1/agents/{id}/continue` accepts `{ "prompt": "..." }` and returns
-only after the Codex follow-up turn completes. If another turn is active, the
-prompt is queued behind it; requests are not interrupted or discarded. A
-missing, unresumable, or non-running agent returns an error and never creates
-a replacement thread. This is the synchronous continuation path exposed by
-`zzapi agents continue <id> --prompt TEXT`; use agent completion tracking to
-decide when to call it. It uses the same bearer-token authentication as agent
-creation.
+only after the Codex follow-up turn completes. On a running agent, the default
+queues the prompt behind its active turn. `{ "interrupt": true }` instead
+interrupts the active turn first, then sends the prompt as the next turn; this
+requires a running agent. The CLI equivalent is
+`zzapi agents continue <id> --prompt TEXT --interrupt`.
+
+On a finished, interrupted, or otherwise non-running Codex agent, the same
+endpoint resumes the existing thread from its on-disk rollout, then sends the
+prompt as a new turn and updates the existing agent record. It never creates a
+replacement thread. If the rollout is missing, corrupt, or cannot be resumed,
+the endpoint returns HTTP 409 with `agent_transcript_unavailable` and leaves the
+record unchanged. Resume restores conversation history from the rollout, not
+exact mid-tool-call execution state. If a turn stopped during a tool call,
+resume starts at the last completed item and the agent re-derives its place from
+the branch and transcript. `--interrupt` cannot be combined with resume; it
+returns HTTP 409 for a non-running agent. These operations use the same
+bearer-token authentication as agent creation.
 
 The shared live-session budget defaults to four Codex threads and OpenCode
 sessions across a daemon domain. Set `ZIGZAG_MAX_LIVE_AGENT_THREADS` before

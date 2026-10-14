@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 RUNNER_PATH = Path(__file__).with_name("opencode-launch")
@@ -312,7 +313,11 @@ class OpenCodeLaunchTests(unittest.TestCase):
                 self.set_state(mode)
                 if mode == "timeout":
                     runner.PROCESS_TIMEOUT_SECONDS = 0.1
-                self.assertEqual(runner.main(["run", "--task-dir", str(self.task)]), expected_code)
+                    with patch.object(runner, "available_free_zen_models", return_value={"big-pickle", "muse-spark-1.3-contributor-free"}):
+                        result = runner.main(["run", "--task-dir", str(self.task)])
+                else:
+                    result = runner.main(["run", "--task-dir", str(self.task)])
+                self.assertEqual(result, expected_code)
                 if expected_error:
                     self.assertIn(expected_error, self.usage()["stream_error"])
                 self.assertEqual(self.usage()["timed_out"], mode == "timeout")

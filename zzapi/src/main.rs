@@ -275,13 +275,18 @@ enum AgentsCmd {
         #[arg(long, conflicts_with = "steer", required_unless_present = "steer")]
         queue: Option<String>,
     },
-    /// Send a follow-up turn to an existing Codex thread and wait for its result
+    /// Continue a Codex thread, resuming terminal agents from their rollout
+    ///
+    /// Resume restores rollout conversation history, not exact mid-tool-call state.
     Continue {
         /// Agent handle (unique prefix accepted)
         id: String,
         /// Follow-up prompt text
         #[arg(long)]
         prompt: String,
+        /// Interrupt the active turn before sending this prompt; terminal agents resume from their rollout by default
+        #[arg(long)]
+        interrupt: bool,
     },
     /// Gracefully stop an agent (leaves worktree)
     Stop {
@@ -1155,9 +1160,18 @@ fn cmd_agents_message(
     Ok(())
 }
 
-fn cmd_agents_continue(client: &Client, id: &str, prompt: &str) -> Result<(), Fail> {
+fn cmd_agents_continue(
+    client: &Client,
+    id: &str,
+    prompt: &str,
+    interrupt: bool,
+) -> Result<(), Fail> {
     let id = resolve_agent_target(client, id)?;
-    let body = serde_json::json!({"prompt":prompt});
+    let body = if interrupt {
+        serde_json::json!({"prompt":prompt,"interrupt":true})
+    } else {
+        serde_json::json!({"prompt":prompt})
+    };
     let response = client.post_with_timeout(&format!("/v1/agents/{id}/continue"), &body, 1800)?;
     emit(client, &response, || {
         println!("follow-up turn completed for {}", s(&response, "agent_id"));
@@ -1820,7 +1834,11 @@ fn run(cli: Cli) -> Result<(), Fail> {
             AgentsCmd::Message { id, steer, queue } => {
                 cmd_agents_message(&client, &id, steer.as_deref(), queue.as_deref())
             }
-            AgentsCmd::Continue { id, prompt } => cmd_agents_continue(&client, &id, &prompt),
+            AgentsCmd::Continue {
+                id,
+                prompt,
+                interrupt,
+            } => cmd_agents_continue(&client, &id, &prompt, interrupt),
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
             AgentsCmd::Logs {
                 id,
@@ -2147,6 +2165,18 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["zzapi", "agents", "continue", "abc"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "zzapi",
+                "agents",
+                "continue",
+                "abc",
+                "--prompt",
+                "follow up",
+                "--interrupt"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
