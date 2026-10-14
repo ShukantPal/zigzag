@@ -1,4 +1,4 @@
-use crate::session::{is_tailscale_ipv4, require_gui_login_session};
+use crate::session::{is_tailscale_ipv4, require_interactive_gui_login_session};
 use crate::update;
 use crate::{comment_router, exec};
 use std::collections::BTreeSet;
@@ -188,7 +188,7 @@ pub(crate) fn valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 pub(crate) fn run_config(arguments: &[String]) -> Result<(), String> {
-    require_gui_login_session()?;
+    require_interactive_gui_login_session()?;
     if arguments.first().map(String::as_str) == Some("allowlist") {
         return run_allowlist(&arguments[1..]);
     }

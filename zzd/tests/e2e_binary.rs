@@ -510,6 +510,25 @@ fn binary_exec_and_spawn_deny_without_gui_session() {
 }
 
 #[test]
+fn binary_config_refuses_policy_access_without_foreground_terminal() {
+    // Relay-launched commands get stdin as /dev/null, even when the daemon
+    // itself belongs to the owner's GUI security session. Refuse before any
+    // Keychain access so a worker cannot update policy through the CLI.
+    for arguments in [
+        vec!["config", "allowlist", "add", "git"],
+        vec!["config", "set-allowlist", "--file", "/unused/policy.json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zigzag"))
+            .args(arguments)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("foreground local terminal"));
+    }
+}
+
+#[test]
 fn binary_proc_kill_requires_control_secret() {
     // This relay was started without --control-secret-file, so the kill
     // route must 404 rather than accept the main secret.

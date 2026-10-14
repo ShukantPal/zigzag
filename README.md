@@ -94,7 +94,7 @@ zigzag config allowlist add git --args status --short --args diff --stat
 zigzag config allowlist remove git
 ```
 
-Each `--args` group is a permitted argument prefix; if omitted, the entry permits only running the binary with no arguments. `gh` entries also require one or more `--repo OWNER/REPO` scopes. These commands read and write the same Keychain policy and require the local GUI login session. `set-allowlist --file PATH` remains available for replacing the complete policy. The first Keychain access may prompt for permission; review the binary before granting it. See [configuration and security](docs/configuration.md) and the [Mac installation guide](launchd/INSTALL.md).
+Each `--args` group is a permitted argument prefix; if omitted, the entry permits only running the binary with no arguments. `gh` entries also require one or more `--repo OWNER/REPO` scopes. These commands read and write the same Keychain policy and require the local GUI login session plus a foreground terminal. Relay-launched commands have stdin detached, so they cannot use the CLI to update policy. `set-allowlist --file PATH` remains available for replacing the complete policy under the same check. The first Keychain access may prompt for permission; review the binary before granting it. See [configuration and security](docs/configuration.md) and the [Mac installation guide](launchd/INSTALL.md).
 
 ## Development
 
