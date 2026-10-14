@@ -653,16 +653,21 @@ fn worktree_delete_plan_with_guard(
 
 /// Remove an agent's worktree and delete its branch when it is safe to do so.
 /// This is best-effort from the API because the process has already stopped.
-pub(crate) fn cleanup_agent_worktree(raw: &str, roots: &[PathBuf]) -> Result<(), WorktreeError> {
-    cleanup_agent_worktree_with_trust(raw, roots, &trusted_hook_repos())
+pub(crate) fn cleanup_agent_worktree(
+    raw: &str,
+    roots: &[PathBuf],
+    registry: &zz::AgentRegistry,
+) -> Result<(), WorktreeError> {
+    cleanup_agent_worktree_with_trust(raw, roots, &trusted_hook_repos(), registry)
 }
 
 pub(crate) fn cleanup_agent_worktree_with_trust(
     raw: &str,
     roots: &[PathBuf],
     trusted_repos: &[PathBuf],
+    registry: &zz::AgentRegistry,
 ) -> Result<(), WorktreeError> {
-    cleanup_agent_worktree_inner(raw, roots, trusted_repos, None)
+    cleanup_agent_worktree_inner(raw, roots, trusted_repos, registry, "")
 }
 
 pub(crate) fn cleanup_agent_worktree_with_registry_guard(
@@ -672,37 +677,31 @@ pub(crate) fn cleanup_agent_worktree_with_registry_guard(
     registry: &zz::AgentRegistry,
     owner_id: &str,
 ) -> Result<(), WorktreeError> {
-    cleanup_agent_worktree_inner(raw, roots, trusted_repos, Some((registry, owner_id)))
+    cleanup_agent_worktree_inner(raw, roots, trusted_repos, registry, owner_id)
 }
 
 fn cleanup_agent_worktree_inner(
     raw: &str,
     roots: &[PathBuf],
     trusted_repos: &[PathBuf],
-    live_agent_guard: Option<(&zz::AgentRegistry, &str)>,
+    registry: &zz::AgentRegistry,
+    owner_id: &str,
 ) -> Result<(), WorktreeError> {
     // Keep registration out from the guarded recheck through branch cleanup.
     // This closes the gap between `git worktree remove` and deleting its branch.
-    let _attachment_guard = match live_agent_guard {
-        Some((registry, _)) => {
-            Some(
-                registry
-                    .lock_worktree_attachments()
-                    .map_err(|_| WorktreeError {
-                        code: 500,
-                        message: "worktree_git_failed",
-                    })?,
-            )
-        }
-        None => None,
-    };
+    let _attachment_guard = registry
+        .lock_worktree_attachments()
+        .map_err(|_| WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        })?;
     let path = resolve_existing_worktree_path(raw, roots)?;
     let repo = worktree_repo(&path)?;
     let branch_output = git_output(&path, &["branch", "--show-current"])?;
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
-    worktree_delete_plan_with_guard(raw, roots, &[], trusted_repos, live_agent_guard)?;
+    worktree_delete_plan_with_guard(raw, roots, &[], trusted_repos, Some((registry, owner_id)))?;
     if branch.is_empty() || matches!(branch.as_str(), "main" | "master") {
         return Ok(());
     }
@@ -891,23 +890,23 @@ pub(crate) fn cleanup_inactive_agent_worktree_with_trust(
         );
         return;
     };
-    if worktree_has_live_agent(registry, &path, &agent.id) {
-        log::warn!(
+    let path_text = path.to_string_lossy().into_owned();
+    let removed = remove_inactive_worktree_if_unattached(registry, &agent.id, &path, || {
+        run_worktree_hook_with_trust(&repo, &path, "repo-stop.sh", false, trusted_repos);
+        git_output(&repo, &["worktree", "remove", &path_text])
+    });
+    match removed {
+        Ok(None) => log::warn!(
             "agent_worktree_cleanup kept agent={} path={}: another live agent record is attached",
             agent.id,
             path.display()
-        );
-        return;
-    }
-    let path_text = path.to_string_lossy().into_owned();
-    run_worktree_hook_with_trust(&repo, &path, "repo-stop.sh", false, trusted_repos);
-    match git_output(&repo, &["worktree", "remove", &path_text]) {
-        Ok(output) if output.status.success() => log::info!(
+        ),
+        Ok(Some(output)) if output.status.success() => log::info!(
             "agent_worktree_cleanup removed agent={} path={} branch_retained=true",
             agent.id,
             path.display()
         ),
-        Ok(output) => log::warn!(
+        Ok(Some(output)) => log::warn!(
             "agent_worktree_cleanup kept agent={} path={}: git worktree remove failed: {}",
             agent.id,
             path.display(),
@@ -920,6 +919,24 @@ pub(crate) fn cleanup_inactive_agent_worktree_with_trust(
             error.message
         ),
     }
+}
+
+pub(crate) fn remove_inactive_worktree_if_unattached(
+    registry: &zz::AgentRegistry,
+    owner_id: &str,
+    path: &Path,
+    remove: impl FnOnce() -> Result<std::process::Output, WorktreeError>,
+) -> Result<Option<std::process::Output>, WorktreeError> {
+    let _attachment_guard = registry
+        .lock_worktree_attachments()
+        .map_err(|_| WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        })?;
+    if worktree_has_live_agent(registry, path, owner_id) {
+        return Ok(None);
+    }
+    remove().map(Some)
 }
 
 pub(crate) fn agent_state_is_terminal(state: &str) -> bool {

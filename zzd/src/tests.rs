@@ -52,9 +52,10 @@ use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
     cleanup_agent_worktree_with_trust, configured_worktree_base, discover_worktrees,
-    handle_deleted_worktrees_with_trust, resolve_existing_worktree_path, resolve_new_worktree_path,
-    resolve_worktree_repo, run_worktree_hook_using_shell, run_worktree_hook_with_trust,
-    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan_with_trust,
+    handle_deleted_worktrees_with_trust, remove_inactive_worktree_if_unattached,
+    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
+    run_worktree_hook_using_shell, run_worktree_hook_with_trust, valid_worktree_branch,
+    worktree_branch_checkout_path, worktree_create_plan_with_trust,
     worktree_delete_plan_with_trust,
 };
 use crate::server::{
@@ -2014,38 +2015,72 @@ fn live_agent_delete_keeps_worktree_attached_to_another_live_agent() {
 }
 
 #[test]
-fn agent_registration_waits_for_guarded_worktree_removal_lock() {
-    let registry_path = std::env::temp_dir().join(format!(
-        "zigzag-attachment-lock-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
-    let removal_guard = registry.lock_worktree_attachments().unwrap();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
-    let registering_registry = Arc::clone(&registry);
-    let join = thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        let result = registering_registry.register(agent_record("new-live-agent"));
-        registered_tx.send(result).unwrap();
+fn ttl_worktree_removal_serializes_concurrent_agent_registration() {
+    let (repo, path, _roots, registry, owner_id) =
+        completed_worktree_fixture("ttl-lock-race", true);
+    let registry = Arc::new(registry);
+    let (remove_ready_tx, remove_ready_rx) = std::sync::mpsc::channel();
+    let (allow_remove_tx, allow_remove_rx) = std::sync::mpsc::channel();
+    let removing_registry = Arc::clone(&registry);
+    let removing_path = path.clone();
+    let removing_repo = repo.clone();
+    let registering_path = path.clone();
+    let removal = thread::spawn(move || {
+        remove_inactive_worktree_if_unattached(
+            &removing_registry,
+            &owner_id,
+            &removing_path,
+            || {
+                remove_ready_tx.send(()).unwrap();
+                allow_remove_rx.recv().unwrap();
+                Command::new("git")
+                    .args(["worktree", "remove"])
+                    .arg(&removing_path)
+                    .current_dir(&removing_repo)
+                    .output()
+                    .map_err(|_| crate::routes::worktrees::WorktreeError {
+                        code: 500,
+                        message: "worktree_git_failed",
+                    })
+            },
+        )
     });
 
-    started_rx.recv().unwrap();
+    remove_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let registering_registry = Arc::clone(&registry);
+    let (registration_started_tx, registration_started_rx) = std::sync::mpsc::channel();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let registering = thread::spawn(move || {
+        let mut record = agent_record("concurrent-live-agent");
+        record.state = "running".to_owned();
+        record.worktree_path = Some(registering_path.to_string_lossy().into_owned());
+        registration_started_tx.send(()).unwrap();
+        registered_tx
+            .send(registering_registry.register(record))
+            .unwrap();
+    });
+    registration_started_rx.recv().unwrap();
     assert!(
         matches!(
             registered_rx.recv_timeout(Duration::from_millis(50)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ),
-        "agent registration passed the guarded removal lock"
+        "registration passed the production TTL removal critical section"
     );
-    drop(removal_guard);
+
+    allow_remove_tx.send(()).unwrap();
+    let output = removal.join().unwrap().unwrap().unwrap();
+    assert!(output.status.success(), "git worktree remove failed");
     registered_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(2))
         .unwrap()
         .unwrap();
-    join.join().unwrap();
-    assert!(registry.get("new-live-agent").is_some());
+    registering.join().unwrap();
+    assert!(!path.exists(), "TTL removal did not complete");
+    assert!(registry.get("concurrent-live-agent").is_some());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
 #[test]
@@ -2440,10 +2475,12 @@ fn agent_worktree_cleanup_runs_stop_hook_and_deletes_feature_branch() {
     .unwrap();
 
     let roots = vec![std::env::temp_dir().canonicalize().unwrap()];
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
     cleanup_agent_worktree_with_trust(
         worktree.to_str().unwrap(),
         &roots,
         &[repo.canonicalize().unwrap()],
+        &registry,
     )
     .unwrap();
     assert!(!worktree.exists());
