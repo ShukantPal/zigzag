@@ -16,12 +16,12 @@ pub(crate) fn test_policy() -> exec::Policy {
 
 use crate::auth::authorized;
 use crate::config::{allowlist_file, is_get_allowlist, server_config, valid_github_repo};
-use crate::events::{relay_event_at, replay_recovered_lifecycle};
+use crate::events::{persist_event, relay_event, relay_event_at, replay_recovered_lifecycle};
 use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
-use crate::harness::{Delivery, HarnessSession, resumed_completion_event};
+use crate::harness::{Delivery, HarnessEvent, HarnessSession, resumed_completion_event};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -37,15 +37,16 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
     agent_harness_config, agent_post_request_with_session_resolver, agent_route,
     default_agent_worktree, dispatch_agent_message, handle_codex_notification,
-    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
-    valid_agent_model,
+    monitor_codex_events, monitor_codex_events_to_path, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    transcript_json_with_sessions_dir, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
     cleanup_agent_worktree, configured_worktree_base, resolve_existing_worktree_path,
-    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch, worktree_create_plan,
-    worktree_delete_plan,
+    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
+    worktree_branch_checkout_path, worktree_create_plan, worktree_delete_plan,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -770,6 +771,27 @@ fn recovery_replays_a_persisted_first_output_fact() {
     assert_eq!(kinds, ["process_spawned", "first_output"]);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(path.with_extension("audit"));
+}
+
+#[test]
+fn relay_event_persistence_returns_store_add_failure() {
+    let path = std::env::temp_dir().join(format!(
+        "zigzag-event-persist-failure-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    let store = Store::open(&path, 10).unwrap();
+    let stream_path = path.with_extension("stream");
+    std::fs::remove_dir_all(&stream_path).unwrap();
+    std::fs::write(&stream_path, b"block stream directory").unwrap();
+
+    let result = persist_event(
+        &store,
+        relay_event("test_event", "task", "execution", Json::Object(vec![])),
+    );
+
+    assert_eq!(result.unwrap_err(), "could not read durable event stream");
+    std::fs::remove_file(stream_path).unwrap();
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -1889,6 +1911,10 @@ fn agent_route_selects_create_only_for_post_collection() {
         agent_route("POST", "/v1/agents/abc/messages"),
         Some(AgentRoute::Message("abc"))
     ));
+    assert!(matches!(
+        agent_route("POST", "/v1/agents/abc/continue"),
+        Some(AgentRoute::Continue("abc"))
+    ));
     assert!(agent_route("GET", "/v1/agents/abc/messages").is_some());
 }
 
@@ -2063,6 +2089,249 @@ fn agent_record(id: &str) -> AgentRecord {
 }
 
 #[test]
+fn transcript_uses_codex_rollout_when_relay_transcript_is_missing_by_agent_and_task_id() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f4";
+    let mut record = agent_record("a69b0e23");
+    record.task_id = "rollout-task".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-transcript-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(
+        &rollout,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"assistant-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"rollout answer\"}]}}\n"
+        ),
+    )
+    .unwrap();
+
+    for lookup in ["a69b0e23", "rollout-task"] {
+        let transcript = transcript_json_with_sessions_dir(
+            &state.supervisor.registry,
+            lookup,
+            0,
+            None,
+            Some(sessions.clone()),
+        )
+        .expect("transcript should be available");
+        let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+        assert!(stdout.contains("rollout answer"), "{stdout}");
+        assert!(stdout.contains("thread.started"), "{stdout}");
+        assert!(stdout.contains("turn.started"), "{stdout}");
+        assert!(!stdout.contains("relay-only"), "{stdout}");
+    }
+
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[test]
+fn transcript_prefers_rollout_exclusively_and_reports_invalid_rollout_lines() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f5";
+    let mut record = agent_record("rollout-exclusive");
+    record.task_id = "rollout-exclusive-task".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-exclusive", "stdout", b"relay-only content\n")
+        .unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-exclusive-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(
+        &rollout,
+        concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"assistant-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"rollout-only content\"}]}}\n",
+            "not valid JSON\n",
+            "{\"type\":\"future_record\",\"payload\":{\"text\":\"unrecognized rollout content\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-exclusive",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("rollout-only content"), "{stdout}");
+    assert!(!stdout.contains("relay-only content"), "{stdout}");
+    assert!(stdout.contains("transcript.diagnostic"), "{stdout}");
+    assert!(stdout.contains("unrecognized rollout content"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[test]
+fn unreadable_matching_codex_rollout_reports_gap_without_relay_fallback() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f9";
+    let mut record = agent_record("rollout-unreadable");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-unreadable", "stdout", b"wrong relay transcript\n")
+        .unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-unreadable-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(&rollout, [b'{', 0xff, b'}', b'\n']).unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-unreadable",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .expect("transcript should expose the unreadable rollout gap");
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("transcript.diagnostic"), "{stdout}");
+    assert!(stdout.contains("could not be read"), "{stdout}");
+    assert!(!stdout.contains("wrong relay transcript"), "{stdout}");
+    assert_eq!(transcript.object("log_degraded"), Some(&Json::Bool(true)));
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[test]
+fn transcript_ambiguous_task_id_is_rejected() {
+    let (state, _state_path) = test_server();
+    for (id, text) in [
+        ("ambiguous-first", "first-agent-secret"),
+        ("ambiguous-second", "second-agent-secret"),
+    ] {
+        let mut record = agent_record(id);
+        record.task_id = "shared-retried-task".to_owned();
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some("01a138f4-c546-7ca0-bece-deba1ab4a5f6".to_owned());
+        state.supervisor.registry.register(record).unwrap();
+        state
+            .supervisor
+            .registry
+            .append_log(id, "stdout", text.as_bytes())
+            .unwrap();
+    }
+    assert!(
+        transcript_json_with_sessions_dir(
+            &state.supervisor.registry,
+            "shared-retried-task",
+            0,
+            None,
+            None,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn codex_transcript_falls_back_to_relay_when_rollout_is_missing() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f8";
+    let mut record = agent_record("rollout-missing");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-missing", "stdout", b"relay fallback output\n")
+        .unwrap();
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-missing-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-missing",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("relay fallback output"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_rollout_rejects_matching_symlink_outside_sessions() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f7";
+    let mut record = agent_record("rollout-symlink");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-symlink", "stdout", b"relay fallback\n")
+        .unwrap();
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-symlink-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let outside = sessions.with_extension("outside.jsonl");
+    std::fs::write(&outside, "outside-secret\n").unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl")),
+    )
+    .unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-symlink",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("relay fallback"), "{stdout}");
+    assert!(!stdout.contains("outside-secret"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+    std::fs::remove_file(outside).unwrap();
+}
+
+#[test]
 fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     let (state, _state_path) = test_server();
     let mut record = agent_record("codex-completion-regression");
@@ -2112,6 +2381,75 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
 }
 
 #[test]
+fn monitor_retries_append_failure_and_drains_queued_delta_on_channel_close() {
+    let (state, state_path) = test_server();
+    let transcript = state_path.with_extension("codex.jsonl");
+    std::fs::create_dir(&transcript).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    monitor_codex_events_to_path(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        "monitor-close-agent".to_owned(),
+        "task-monitor-close".to_owned(),
+        "exec-monitor-close".to_owned(),
+        rx,
+        Some(transcript.clone()),
+    );
+    tx.send(HarnessEvent::Notification {
+        value: serde_json::json!({
+            "method":"item/agentMessage.delta",
+            "params":{"itemId":"item-1","delta":"kept-after-close"}
+        }),
+        terminal_turn: false,
+    })
+    .unwrap();
+    drop(tx);
+    thread::sleep(Duration::from_millis(150));
+    std::fs::remove_dir(&transcript).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut contents = String::new();
+    while !contents.contains("kept-after-close") && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        contents = std::fs::read_to_string(&transcript).unwrap_or_default();
+    }
+    assert!(contents.contains("item/agentMessage.delta"));
+    assert!(contents.contains("kept-after-close"));
+    let events_deadline = Instant::now() + Duration::from_secs(2);
+    let mut events = state.store.read(0, "", Duration::ZERO).unwrap();
+    while !events.events.iter().any(|event| {
+        event.payload.object("kind").and_then(Json::as_str) == Some("agent_harness_event")
+    }) && Instant::now() < events_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+        events = state.store.read(0, "", Duration::ZERO).unwrap();
+    }
+    assert!(events.events.iter().any(|event| {
+        event.payload.object("kind").and_then(Json::as_str) == Some("agent_harness_event")
+    }));
+    drop(state);
+    let _ = std::fs::remove_file(transcript);
+    let _ = std::fs::remove_dir_all(state_path.with_extension("stream"));
+    let _ = std::fs::remove_dir_all(state_path.with_extension("audit"));
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_file(state_path.with_extension("agents"));
+}
+
+#[test]
+fn transcript_repair_truncates_only_an_unterminated_tail() {
+    let (state, state_path) = test_server();
+    let transcript = state_path.with_extension("partial-transcript.jsonl");
+    std::fs::write(&transcript, b"{\"complete\":true}\n{incomplete").unwrap();
+    repair_transcript_tail(&transcript).unwrap();
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        b"{\"complete\":true}\n"
+    );
+    drop(state);
+    let _ = std::fs::remove_file(transcript);
+}
+
+#[test]
 fn agent_delete_unknown_agent_is_404() {
     let (state, _state_path) = test_server();
     let policy =
@@ -2157,6 +2495,89 @@ fn agent_delete_terminal_agent_is_409() {
         state.supervisor.registry.get("done-agent").unwrap().state,
         "succeeded"
     );
+}
+
+#[test]
+fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_id() {
+    let (state, _state_path) = test_server();
+    let base = worktree_test_base("native-orphan-recovery");
+    let allowed_root = base.join("allowed");
+    std::fs::create_dir_all(&allowed_root).unwrap();
+    let repo = worktree_test_repo(&base);
+    let worktree = allowed_root.join("codex-orphan");
+    agent_create_worktree(&repo, &worktree, "codex/orphan", &[]).unwrap();
+
+    let id = "a69b0e234eea56ab8cbf6747c4ecb951";
+    let mut record = agent_record(id);
+    record.task_id = "agent-21b8d189b242".to_owned();
+    record.execution_id = "exec-orphan".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("thread-orphan".to_owned());
+    record.worktree_path = Some(worktree.to_string_lossy().into_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log(id, "stdout", b"partial transcript: delta only\n")
+        .unwrap();
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    monitor_codex_events(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        id.to_owned(),
+        "agent-21b8d189b242".to_owned(),
+        "exec-orphan".to_owned(),
+        event_rx,
+    );
+    drop(event_tx);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state
+        .supervisor
+        .registry
+        .get(id)
+        .is_some_and(|agent| agent.state == "running")
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "lost_after_restart"
+    );
+
+    let policy = test_policy();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "GET",
+        "/v1/agents/agent-21b8d189b242/transcript",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("stdout")
+            .and_then(Json::as_str),
+        Some("partial transcript: delta only\n")
+    );
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/agent-21b8d189b242",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(state.supervisor.registry.get(id).unwrap().state, "stopped");
+    assert!(!worktree.exists(), "orphan worktree still holds the branch");
+    let checkout = worktree_branch_checkout_path(&repo, "codex/orphan").unwrap();
+    assert!(
+        checkout.is_none(),
+        "orphan branch is still checked out: {checkout:?}"
+    );
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -2324,7 +2745,17 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
             .state,
         "succeeded"
     );
-    let timeline = state.store.timeline("task-1").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let timeline = loop {
+        let timeline = state.store.timeline("task-1").unwrap();
+        let completed = timeline
+            .iter()
+            .any(|event| event.object("kind").and_then(Json::as_str) == Some("process_completed"));
+        if completed || std::time::Instant::now() >= deadline {
+            break timeline;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     let kinds: Vec<_> = timeline
         .iter()
         .filter_map(|event| event.object("kind").and_then(Json::as_str))
@@ -2378,6 +2809,140 @@ impl HarnessSession for MessageSession {
     fn interrupt(&self) -> Result<(), String> {
         unreachable!()
     }
+
+    fn continue_turn(&self, text: &str) -> Result<serde_json::Value, String> {
+        self.send(text, Delivery::Queue)?;
+        Ok(serde_json::json!({"status":"completed","output":"follow-up-result"}))
+    }
+}
+
+fn post_continue_with_session(
+    state: &Server,
+    id: &str,
+    prompt: &str,
+    session: Arc<dyn HarnessSession>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    agent_post_request_with_session_resolver(
+        &mut stream,
+        state,
+        AgentRoute::Continue(id),
+        serde_json::json!({"prompt":prompt})
+            .to_string()
+            .into_bytes(),
+        move |_, _, _| Ok(Arc::clone(&session)),
+    )
+    .unwrap();
+    drop(stream);
+    client.join().unwrap()
+}
+
+#[test]
+fn agent_continue_on_idle_thread_returns_followup_result() {
+    let (state, _state_path) = test_server();
+    let id = "continue-idle";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let session = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    });
+
+    let response =
+        post_continue_with_session(&state, id, "address review feedback", session.clone());
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("turn")
+            .and_then(|turn| turn.object("output"))
+            .and_then(Json::as_str),
+        Some("follow-up-result")
+    );
+    assert_eq!(
+        session.sent.lock().unwrap().as_slice(),
+        [("address review feedback".to_owned(), Delivery::Queue)]
+    );
+}
+
+#[test]
+fn agent_continue_missing_or_dead_agent_fails_without_creating_a_record() {
+    let (state, _state_path) = test_server();
+    let mut record = agent_record("continue-dead");
+    record.state = "succeeded".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let before = state.supervisor.registry.list(None, None).len();
+    let session: Arc<dyn HarnessSession> = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    });
+    let dead = post_continue_with_session(&state, "continue-dead", "follow up", session.clone());
+    assert!(dead.starts_with("HTTP/1.1 409"), "{dead}");
+    let missing = post_continue_with_session(&state, "no-such-agent", "follow up", session);
+    assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+    assert_eq!(state.supervisor.registry.list(None, None).len(), before);
+}
+
+struct InProgressContinueSession {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl HarnessSession for InProgressContinueSession {
+    fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(serde_json::json!({"status":"completed"}))
+    }
+
+    fn interrupt(&self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn agent_continue_waits_for_its_turn_when_another_turn_is_in_progress() {
+    let (state, _state_path) = test_server();
+    let id = "continue-in-progress";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let state = Arc::clone(&state);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let session: Arc<dyn HarnessSession> = Arc::new(InProgressContinueSession {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    });
+    let request =
+        thread::spawn(move || post_continue_with_session(&state, id, "queued follow-up", session));
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("continuation was not dispatched");
+    assert!(
+        !request.is_finished(),
+        "HTTP response returned before turn completion"
+    );
+    release_tx.send(()).unwrap();
+    assert!(request.join().unwrap().starts_with("HTTP/1.1 200"));
 }
 
 #[test]

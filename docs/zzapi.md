@@ -18,6 +18,7 @@ zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
 zzapi agents create (--prompt TEXT | --prompt-file PATH) --project-dir DIR
+zzapi agents continue ID --prompt TEXT
                     (--branch BRANCH | --no-branch | --pr NUMBER)
                     [--worktree PATH] [--harness codex|gemini|opencode|antigravity|agy]
                     [--model MODEL]

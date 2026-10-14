@@ -884,6 +884,83 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/agents/{id}/continue:
+    post:
+      operationId: continueAgent
+      summary: Continue an existing Codex thread
+      description: >
+        Send a follow-up prompt to the Codex thread already associated with
+        this running agent and wait for that turn's result. If a turn is in
+        progress, the follow-up queues behind it; it does not interrupt or
+        replace that turn. Missing or unresumable threads fail with 409 and
+        never create an agent or thread. This endpoint requires the same
+        bearer token as agent creation. Orchestrators should use completion
+        tracking to know when a thread is done before dispatching a follow-up.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Agent handle.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              additionalProperties: false
+              properties:
+                prompt:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Follow-up turn completed; `turn` contains the app-server result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agent_id, turn]
+                properties:
+                  agent_id:
+                    type: string
+                  turn:
+                    type: object
+                    additionalProperties: true
+        '400':
+          description: Invalid prompt body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown agent handle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Agent is not running or its existing thread is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Harness failed while sending or waiting for the follow-up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /v1/agents/{id}/logs:
     get:
       operationId: getAgentLogs

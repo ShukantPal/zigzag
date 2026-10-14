@@ -1054,176 +1054,188 @@ pub struct ReadResult {
 pub struct Store {
     path: PathBuf,
     limit: usize,
-    audit: AuditStore,
+    stream: EventStream,
     inner: Mutex<Inner>,
     changed: Condvar,
 }
 
-/// Append-only execution archives.  They deliberately do not share the
-/// delivery queue's retention policy: queue eviction is normal live-polling
-/// behaviour, whereas these files answer historical timing questions.
-const AUDIT_CAP_BYTES: u64 = 20 * 1024 * 1024;
+/// Primary event stream limits. Timeline queries read these same retained
+/// segments, while delivery queue eviction remains an in-memory concern.
+const EVENT_STREAM_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+const EVENT_STREAM_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-struct AuditStore {
+/// The append-only source of truth for relay events. The in-memory deque is
+/// only a hot cache; readers fall back to these retained segments whenever
+/// their cursor predates the cache window.
+struct EventStream {
     directory: PathBuf,
+    initialized: bool,
     lock: Mutex<()>,
 }
 
-impl AuditStore {
+impl EventStream {
     fn open(state_path: &Path) -> Result<Self, String> {
-        let directory = state_path.with_extension("audit");
+        let directory = state_path.with_extension("stream");
         fs::create_dir_all(&directory)
-            .map_err(|_| "could not initialize execution audit store".to_owned())?;
+            .map_err(|_| "could not initialize durable event stream".to_owned())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
         }
+        let initialized = directory.join("initialized").exists();
         Ok(Self {
             directory,
+            initialized,
             lock: Mutex::new(()),
         })
     }
 
-    fn append(&self, event: &Event) -> Result<(), String> {
-        let Some(execution_id) = event
-            .payload
-            .object("execution_id")
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(());
-        };
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| "execution audit lock poisoned".to_owned())?;
-        let path = self
-            .directory
-            .join(format!("{}.jsonl", audit_filename(execution_id)));
-        if fs::read_to_string(&path).ok().is_some_and(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| parse_json(line).ok())
-                .any(|existing| {
-                    existing.object("id").and_then(Json::as_str) == Some(event.id.as_str())
-                })
-        }) {
-            return Ok(());
+    fn mark_initialized(&self) -> Result<(), String> {
+        let marker = self.directory.join("initialized");
+        if !marker.exists() {
+            create_private(&marker)
+                .map_err(|_| "could not initialize durable event stream".to_owned())?;
         }
-        let line = event.response_json().to_json() + "\n";
-        let result = (|| -> std::io::Result<()> {
-            if !path.exists() {
-                let _ = create_private(&path)?;
-            }
-            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-            file.write_all(line.as_bytes())?;
-            file.sync_data()?;
-            Ok(())
-        })();
-        result.map_err(|_| "could_not_persist_execution_audit".to_owned())?;
-        self.prune()?;
         Ok(())
     }
 
-    fn events_for_task(&self, task_id: &str) -> Result<Vec<Json>, String> {
+    fn files(&self) -> Result<Vec<PathBuf>, String> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&self.directory)
+            .map_err(|_| "could not read durable event stream".to_owned())?
+        {
+            let entry = entry.map_err(|_| "could not read durable event stream".to_owned())?;
+            if entry
+                .file_type()
+                .map_err(|_| "could not inspect durable event stream".to_owned())?
+                .is_file()
+                && entry.file_name().to_string_lossy().ends_with(".jsonl")
+            {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    fn read_all(&self) -> Result<Vec<Event>, String> {
         let _guard = self
             .lock
             .lock()
-            .map_err(|_| "execution audit lock poisoned".to_owned())?;
+            .map_err(|_| "event stream lock poisoned".to_owned())?;
         let mut events = Vec::new();
-        for entry in fs::read_dir(&self.directory)
-            .map_err(|_| "could not read execution audit store".to_owned())?
-        {
-            let entry = entry.map_err(|_| "could not read execution audit store".to_owned())?;
-            if !entry
-                .file_type()
-                .map_err(|_| "could not read execution audit store".to_owned())?
-                .is_file()
-            {
-                continue;
+        for path in self.files()? {
+            repair_incomplete_tail(&path)?;
+            let contents = fs::read_to_string(path)
+                .map_err(|_| "could not read durable event segment".to_owned())?;
+            for line in contents.lines() {
+                let value =
+                    parse_json(line).map_err(|_| "invalid durable event segment".to_owned())?;
+                events.push(decode_event(&value)?);
             }
-            let contents = fs::read_to_string(entry.path())
-                .map_err(|_| "could not read execution audit log".to_owned())?;
-            events.extend(
-                contents
-                    .lines()
-                    .filter_map(|line| parse_json(line).ok())
-                    .filter(|event| {
-                        event.object("task_id").and_then(Json::as_str) == Some(task_id)
-                    }),
-            );
         }
-        events.sort_by(|left, right| {
-            left.object("received_at")
-                .and_then(Json::as_str)
-                .cmp(&right.object("received_at").and_then(Json::as_str))
-                .then_with(|| {
-                    left.object("sequence")
-                        .and_then(Json::as_u64)
-                        .cmp(&right.object("sequence").and_then(Json::as_u64))
-                })
-        });
+        events.sort_by_key(|event| event.sequence);
         Ok(events)
     }
 
-    fn prune(&self) -> Result<(), String> {
-        let mut files = Vec::new();
-        let mut total = 0u64;
-        for entry in fs::read_dir(&self.directory)
-            .map_err(|_| "could not read execution audit store".to_owned())?
+    fn append(&self, event: &Event) -> Result<(), String> {
         {
-            let entry = entry.map_err(|_| "could not read execution audit store".to_owned())?;
-            let metadata = entry
-                .metadata()
-                .map_err(|_| "could not read execution audit store".to_owned())?;
-            if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
-                let oldest = fs::read_to_string(entry.path())
-                    .ok()
-                    .and_then(|contents| {
-                        contents
-                            .lines()
-                            .next()
-                            .and_then(|line| parse_json(line).ok())
-                    })
-                    .and_then(|event| {
-                        event
-                            .object("received_at")
-                            .and_then(Json::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| {
-                        metadata
-                            .modified()
-                            .ok()
-                            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                            .map(|time| format!("{:020}", time.as_secs()))
-                            .unwrap_or_default()
-                    });
-                files.push((oldest, entry.path(), metadata.len()));
+            let _guard = self
+                .lock
+                .lock()
+                .map_err(|_| "event stream lock poisoned".to_owned())?;
+            let files = self.files()?;
+            let path = if let Some(path) = files.last().filter(|path| {
+                let fresh = segment_created_at(path)
+                    .and_then(|created| SystemTime::now().duration_since(created).ok())
+                    .is_some_and(|age| age < EVENT_STREAM_RETENTION);
+                fresh
+                    && fs::metadata(path)
+                        .map(|metadata| metadata.len() < EVENT_STREAM_SEGMENT_BYTES)
+                        .unwrap_or(false)
+            }) {
+                path.clone()
+            } else {
+                let created = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.directory.join(format!(
+                    "segment-{:020}-{created:010}.jsonl",
+                    event.sequence
+                ))
+            };
+            let line = event.response_json().to_json() + "\n";
+            if !path.exists() {
+                create_private(&path)
+                    .map_err(|_| "could not create durable event segment".to_owned())?;
             }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|_| "could not open durable event segment".to_owned())?;
+            file.write_all(line.as_bytes())
+                .map_err(|_| "could not append durable event".to_owned())?;
+            file.sync_data()
+                .map_err(|_| "could not sync durable event".to_owned())?;
         }
-        files.sort_by_key(|(oldest, path, _)| (oldest.clone(), path.clone()));
-        for (_, path, length) in files {
-            if total <= AUDIT_CAP_BYTES {
-                break;
+        // Retention cleanup is maintenance, not part of the append commit:
+        // inability to delete an expired segment must not reject a durable
+        // event or make callers retry it under a new sequence.
+        let _ = self.prune(SystemTime::now());
+        Ok(())
+    }
+
+    fn prune(&self, now: SystemTime) -> Result<(), String> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| "event stream lock poisoned".to_owned())?;
+        let cutoff = now
+            .checked_sub(EVENT_STREAM_RETENTION)
+            .unwrap_or(UNIX_EPOCH);
+        for path in self.files()? {
+            let metadata = fs::metadata(&path)
+                .map_err(|_| "could not inspect durable event segment".to_owned())?;
+            let created = segment_created_at(&path).or_else(|| metadata.modified().ok());
+            if created.is_some_and(|created| created < cutoff) {
+                fs::remove_file(path)
+                    .map_err(|_| "could not prune expired event segment".to_owned())?;
             }
-            fs::remove_file(path)
-                .map_err(|_| "could not prune execution audit store".to_owned())?;
-            total = total.saturating_sub(length);
         }
         Ok(())
     }
 }
 
-fn audit_filename(execution_id: &str) -> String {
-    execution_id
-        .as_bytes()
+/// A process can fail during `write_all` before an event is committed. Remove
+/// only an unterminated final JSONL record so it cannot poison later appends;
+/// every complete newline-terminated event remains untouched.
+fn repair_incomplete_tail(path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|_| "could not read durable event segment".to_owned())?;
+    if bytes.last() == Some(&b'\n') || bytes.is_empty() {
+        return Ok(());
+    }
+    let valid_len = bytes
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|_| "could not repair durable event segment".to_owned())?;
+    file.set_len(valid_len as u64)
+        .and_then(|_| file.sync_data())
+        .map_err(|_| "could not repair durable event segment".to_owned())
 }
+
+fn segment_created_at(path: &Path) -> Option<SystemTime> {
+    let name = path.file_stem()?.to_str()?;
+    let seconds = name.split('-').nth(2)?.parse::<u64>().ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
 static TEMPORARY_FILE_SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Inner {
     epoch: String,
@@ -1237,8 +1249,10 @@ impl Store {
             return Err("max-events must be greater than zero".to_owned());
         }
         let path = path.into();
-        let inner = match fs::read_to_string(&path) {
-            Ok(contents) => decode_state(&contents, limit)?,
+        let mut persisted = match fs::read_to_string(&path) {
+            // Import must see the complete legacy snapshot even if the new
+            // live cache limit is smaller than the snapshot's event count.
+            Ok(contents) => decode_state(&contents, usize::MAX)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Inner {
                 epoch: new_epoch(),
                 next_sequence: 1,
@@ -1251,8 +1265,55 @@ impl Store {
                 ));
             }
         };
+        let stream = EventStream::open(&path)?;
+        stream.prune(SystemTime::now())?;
+        let mut archived = stream.read_all()?;
+        if !stream.initialized {
+            // Keep the snapshot as the recovery source until every event has
+            // been imported and verified. If opening was interrupted earlier,
+            // resume by skipping only exact events already present.
+            for event in &persisted.events {
+                match archived
+                    .iter()
+                    .find(|existing| existing.id == event.id || existing.sequence == event.sequence)
+                {
+                    Some(existing) if existing == event => {}
+                    Some(_) => return Err("legacy event stream import conflict".to_owned()),
+                    None => {
+                        stream.append(event)?;
+                        archived.push(event.clone());
+                    }
+                }
+            }
+            archived = stream.read_all()?;
+            for event in &persisted.events {
+                if !archived.iter().any(|existing| existing == event) {
+                    return Err("legacy event stream import verification failed".to_owned());
+                }
+            }
+            stream.mark_initialized()?;
+        }
+        let mut inner = if !archived.is_empty() {
+            let mut events: VecDeque<Event> = archived.iter().rev().take(limit).cloned().collect();
+            events.make_contiguous().reverse();
+            Inner {
+                epoch: persisted.epoch,
+                next_sequence: archived
+                    .last()
+                    .map_or(1, |event| event.sequence.saturating_add(1)),
+                events,
+            }
+        } else {
+            if stream.initialized {
+                persisted.events.clear();
+            }
+            persisted
+        };
+        if inner.next_sequence == 0 {
+            inner.next_sequence = 1;
+        }
         Ok(Self {
-            audit: AuditStore::open(&path)?,
+            stream,
             path,
             limit,
             inner: Mutex::new(inner),
@@ -1270,6 +1331,14 @@ impl Store {
         if let Some(existing) = inner.events.iter().find(|event| event.id == id) {
             return Ok((existing.clone(), true));
         }
+        if let Some(existing) = self
+            .stream
+            .read_all()?
+            .into_iter()
+            .find(|event| event.id == id)
+        {
+            return Ok((existing, true));
+        }
         // Do not expose a new event until its complete state has been made
         // durable. A failed write must leave retries eligible to be accepted.
         let mut updated = Inner {
@@ -1285,13 +1354,15 @@ impl Store {
         };
         // Archive the exact envelope (including relay sequence/receipt time)
         // before making it observable through the bounded delivery queue.
-        self.audit.append(&event)?;
+        self.stream.append(&event)?;
         updated.next_sequence += 1;
         updated.events.push_back(event.clone());
         if updated.events.len() > self.limit {
             updated.events.pop_front();
         }
-        self.save(&updated)?;
+        // The snapshot only seeds the hot cache and preserves the epoch for
+        // legacy clients. Segment append above is the durability boundary.
+        let _ = self.save(&updated);
         *inner = updated;
         self.changed.notify_all();
         Ok((event, false))
@@ -1299,7 +1370,13 @@ impl Store {
 
     /// Reads the durable archive; this intentionally ignores the live queue.
     pub fn timeline(&self, task_id: &str) -> Result<Vec<Json>, String> {
-        self.audit.events_for_task(task_id)
+        Ok(self
+            .stream
+            .read_all()?
+            .into_iter()
+            .filter(|event| event.payload.object("task_id").and_then(Json::as_str) == Some(task_id))
+            .map(|event| event.response_json())
+            .collect())
     }
 
     pub fn read(
@@ -1329,21 +1406,38 @@ impl Store {
                 break;
             }
         }
-        let first = inner
+        let cached_first = inner
             .events
             .front()
             .map_or(inner.next_sequence, |event| event.sequence);
-        let lost = after < first.saturating_sub(1);
+        let (events, lost) = if after.saturating_add(1) < cached_first {
+            let archived = self.stream.read_all()?;
+            let first = archived
+                .first()
+                .map_or(inner.next_sequence, |event| event.sequence);
+            (
+                archived
+                    .into_iter()
+                    .filter(|event| event.sequence > after)
+                    .collect(),
+                after < first.saturating_sub(1),
+            )
+        } else {
+            (
+                inner
+                    .events
+                    .iter()
+                    .filter(|event| event.sequence > after)
+                    .cloned()
+                    .collect(),
+                false,
+            )
+        };
         Ok(ReadResult {
             epoch: inner.epoch.clone(),
             reset,
             lost,
-            events: inner
-                .events
-                .iter()
-                .filter(|event| event.sequence > after)
-                .cloned()
-                .collect(),
+            events,
             next: inner.next_sequence - 1,
         })
     }
@@ -1569,6 +1663,43 @@ fn state_json(inner: &Inner) -> Json {
             ),
         ),
     ])
+}
+
+fn decode_event(value: &Json) -> Result<Event, String> {
+    let Json::Object(fields) = value else {
+        return Err("invalid durable event: expected object".to_owned());
+    };
+    let sequence = value
+        .object("sequence")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| "invalid durable event sequence".to_owned())?;
+    let id = value
+        .object("id")
+        .and_then(Json::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "invalid durable event id".to_owned())?
+        .to_owned();
+    let received_at = value
+        .object("received_at")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "invalid durable event received_at".to_owned())?
+        .to_owned();
+    let payload = Json::Object(
+        fields
+            .iter()
+            .filter(|(key, _)| key != "sequence" && key != "received_at")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    if !matches!(payload.object("id"), Some(Json::String(_))) {
+        return Err("invalid durable event payload".to_owned());
+    }
+    Ok(Event {
+        sequence,
+        id,
+        received_at,
+        payload,
+    })
 }
 
 fn decode_state(contents: &str, limit: usize) -> Result<Inner, String> {
@@ -2092,7 +2223,7 @@ mod tests {
         let store = Store::open(&file, 1).unwrap();
         store.add(audit_event("one", "task_dispatched")).unwrap();
         store.add(audit_event("two", "poll_started")).unwrap();
-        assert_eq!(store.read(0, "", Duration::ZERO).unwrap().events.len(), 1);
+        assert_eq!(store.read(0, "", Duration::ZERO).unwrap().events.len(), 2);
         let timeline = store.timeline("task-1").unwrap();
         assert_eq!(timeline.len(), 2);
         assert_eq!(
@@ -2104,7 +2235,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_audit_reopens_and_keeps_execution_files_separate() {
+    fn timeline_reopens_from_the_primary_event_stream() {
         let file = path("execution-reopen");
         let store = Store::open(&file, 10).unwrap();
         store.add(audit_event("one", "task_dispatched")).unwrap();
@@ -2120,12 +2251,53 @@ mod tests {
         drop(store);
         let reopened = Store::open(&file, 10).unwrap();
         assert_eq!(reopened.timeline("task-1").unwrap().len(), 2);
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn interrupted_legacy_import_resumes_without_gaps_or_duplicates() {
+        let file = path("legacy-import-resume");
+        let first = Event {
+            sequence: 1,
+            id: "legacy-one".to_owned(),
+            received_at: "2026-10-01T00:00:00.000Z".to_owned(),
+            payload: audit_event("legacy-one", "task_dispatched"),
+        };
+        let second = Event {
+            sequence: 2,
+            id: "legacy-two".to_owned(),
+            received_at: "2026-10-01T00:00:01.000Z".to_owned(),
+            payload: audit_event("legacy-two", "poll_started"),
+        };
+        let snapshot = Inner {
+            epoch: "legacy-epoch".to_owned(),
+            next_sequence: 3,
+            events: VecDeque::from([first.clone(), second.clone()]),
+        };
+        fs::write(&file, state_json(&snapshot).to_json()).unwrap();
+
+        // Model a process stopping after it durably appends only the first
+        // legacy event, before writing the initialization marker.
+        let stream = EventStream::open(&file).unwrap();
+        stream.append(&first).unwrap();
+        drop(stream);
+
+        let reopened = Store::open(&file, 1).unwrap();
+        let archived = reopened.stream.read_all().unwrap();
+        assert_eq!(archived, vec![first.clone(), second.clone()]);
         assert_eq!(
-            fs::read_dir(file.with_extension("audit")).unwrap().count(),
+            reopened.read(0, "", Duration::ZERO).unwrap().events.len(),
             2
         );
+        drop(reopened);
+
+        let reopened_again = Store::open(&file, 1).unwrap();
+        assert_eq!(
+            reopened_again.stream.read_all().unwrap(),
+            vec![first, second]
+        );
         let _ = fs::remove_file(&file);
-        let _ = fs::remove_dir_all(file.with_extension("audit"));
+        let _ = fs::remove_dir_all(file.with_extension("stream"));
     }
 
     #[test]
@@ -2156,48 +2328,36 @@ mod tests {
     }
 
     #[test]
-    fn failed_live_state_save_does_not_duplicate_audit_on_retry() {
+    fn live_state_snapshot_failure_does_not_hide_durable_event() {
         let file = path("audit-retry");
         let store = Store::open(&file, 10).unwrap();
         fs::create_dir(&file).unwrap();
         let payload = audit_event("retry", "task_dispatched");
-        assert!(store.add(payload.clone()).is_err());
+        assert!(store.add(payload.clone()).is_ok());
         fs::remove_dir(&file).unwrap();
-        assert!(store.add(payload).is_ok());
+        assert!(store.add(payload).unwrap().1);
+        assert_eq!(store.read(0, "", Duration::ZERO).unwrap().events.len(), 1);
         assert_eq!(store.timeline("task-1").unwrap().len(), 1);
         let _ = fs::remove_file(&file);
         let _ = fs::remove_dir_all(file.with_extension("audit"));
     }
 
     #[test]
-    fn audit_retention_prunes_the_oldest_execution_first() {
-        let file = path("audit-cap");
-        let store = Store::open(&file, 1).unwrap();
-        let mut first = audit_event("first", "task_dispatched");
-        let mut second = audit_event("second", "task_dispatched");
-        let blob = Json::String("x".repeat((AUDIT_CAP_BYTES / 2 + 1024) as usize));
-        for (event, execution_id) in [(&mut first, "old"), (&mut second, "new")] {
-            if let Json::Object(fields) = event {
-                for (name, value) in fields {
-                    if name == "execution_id" {
-                        *value = Json::String(execution_id.to_owned());
-                    }
-                    if name == "payload" {
-                        *value = Json::Object(vec![("blob".to_owned(), blob.clone())]);
-                    }
-                }
-            }
-        }
-        store.add(first).unwrap();
-        store.add(second).unwrap();
-        let retained = store.timeline("task-1").unwrap();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(
-            retained[0].object("execution_id").and_then(Json::as_str),
-            Some("new")
-        );
+    fn timeline_stays_consistent_when_legacy_audit_path_is_unwritable() {
+        let file = path("audit-write-failure");
+        let store = Store::open(&file, 10).unwrap();
+        // An old independent audit writer would fail against this path. The
+        // timeline now reads the same durable stream that accepts the event.
+        fs::write(file.with_extension("audit"), "blocked").unwrap();
+        let (accepted, duplicate) = store
+            .add(audit_event("audit-failure", "task_dispatched"))
+            .unwrap();
+        assert!(!duplicate);
+        let timeline = store.timeline("task-1").unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0], accepted.response_json());
         let _ = fs::remove_file(&file);
-        let _ = fs::remove_dir_all(file.with_extension("audit"));
+        let _ = fs::remove_file(file.with_extension("audit"));
     }
 
     #[test]
@@ -2232,22 +2392,107 @@ mod tests {
     }
 
     #[test]
-    fn bounded_queue_marks_eviction_as_lost() {
+    fn bounded_cache_overflow_reads_every_event_from_durable_stream() {
         let file = path("eviction");
         let store = Store::open(&file, 2).unwrap();
         store.add(event("one")).unwrap();
         store.add(event("two")).unwrap();
         store.add(event("three")).unwrap();
         let result = store.read(0, "", Duration::ZERO).unwrap();
-        assert!(result.lost);
+        assert!(!result.lost);
         assert_eq!(
             result
                 .events
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![1, 2, 3]
         );
+        assert!(store.stream.files().unwrap().iter().any(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("segment-00000000000000000001-")
+        }));
+        let _ = fs::remove_dir_all(file.with_extension("stream"));
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn durable_stream_reopens_after_relay_restart_and_late_reader_gets_item_start() {
+        let file = path("stream-restart");
+        let first_store = Store::open(&file, 1).unwrap();
+        first_store.add(event("item-start")).unwrap();
+        first_store.add(event("item-delta")).unwrap();
+        let epoch = first_store.read(0, "", Duration::ZERO).unwrap().epoch;
+        drop(first_store);
+
+        let restarted = Store::open(&file, 1).unwrap();
+        let late = restarted.read(0, &epoch, Duration::ZERO).unwrap();
+        assert!(!late.reset);
+        assert!(!late.lost);
+        assert_eq!(
+            late.events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item-start", "item-delta"]
+        );
+        drop(restarted);
+        let _ = fs::remove_dir_all(file.with_extension("stream"));
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn retention_gc_removes_whole_segments_without_reimporting_snapshot() {
+        let file = path("stream-retention");
+        let store = Store::open(&file, 10).unwrap();
+        store.add(event("retained-before-gc")).unwrap();
+        let epoch = store.read(0, "", Duration::ZERO).unwrap().epoch;
+        let future = SystemTime::now() + EVENT_STREAM_RETENTION + Duration::from_secs(2);
+        store.stream.prune(future).unwrap();
+        assert!(store.stream.files().unwrap().is_empty());
+        drop(store);
+
+        let reopened = Store::open(&file, 10).unwrap();
+        let expired = reopened.read(0, &epoch, Duration::ZERO).unwrap();
+        assert!(expired.lost);
+        assert!(expired.events.is_empty());
+        assert_eq!(expired.next, 1);
+        drop(reopened);
+        let _ = fs::remove_dir_all(file.with_extension("stream"));
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn restart_repairs_only_an_uncommitted_partial_segment_tail() {
+        let file = path("stream-partial-tail");
+        let store = Store::open(&file, 10).unwrap();
+        store.add(event("complete")).unwrap();
+        let segment = store.stream.files().unwrap().pop().unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"{\"id\":\"partial")
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&file, 10).unwrap();
+        assert_eq!(
+            reopened.read(0, "", Duration::ZERO).unwrap().events.len(),
+            1
+        );
+        reopened.add(event("next")).unwrap();
+        assert_eq!(
+            reopened.read(0, "", Duration::ZERO).unwrap().events.len(),
+            2
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(file.with_extension("stream"));
+        let _ = fs::remove_dir_all(file.with_extension("audit"));
         let _ = fs::remove_file(file);
     }
 
@@ -2270,24 +2515,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_persist_does_not_accept_or_expose_event() {
+    fn stream_append_failure_does_not_expose_event() {
         let parent = path("read-only-directory");
         fs::create_dir(&parent).unwrap();
         let store = Store::open(parent.join("events.json"), 10).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
-        }
+        let stream_dir = parent.join("events.stream");
+        fs::rename(&stream_dir, parent.join("stream-backup")).unwrap();
+        fs::write(&stream_dir, "block stream directory").unwrap();
         assert!(store.add(event("not-durable")).is_err());
-        let result = store.read(0, "", Duration::ZERO).unwrap();
-        assert!(result.events.is_empty());
-        assert_eq!(result.next, 0);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        drop(store);
         let _ = fs::remove_dir_all(parent);
     }
 

@@ -1,5 +1,5 @@
 use crate::events::{
-    new_execution_id, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
+    new_execution_id, persist_event, random_hex_128, relay_event, relay_timestamp, unix_timestamp,
 };
 use crate::exec;
 use crate::github::watch_agent_pr;
@@ -137,6 +137,7 @@ pub(crate) enum AgentRoute<'a> {
     Pause(&'a str),
     Resume(&'a str),
     Message(&'a str),
+    Continue(&'a str),
 }
 
 /// POST-only route: `/v1/agents/{id}/restart`.
@@ -168,6 +169,9 @@ pub(crate) fn agent_route<'a>(method: &'a str, path: &'a str) -> Option<AgentRou
     }
     if let Some(id) = rest.strip_suffix("/messages") {
         return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Message(id));
+    }
+    if let Some(id) = rest.strip_suffix("/continue") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Continue(id));
     }
     (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
 }
@@ -271,7 +275,9 @@ pub(crate) fn agent_request(
                 Ok(value) => value,
                 Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
             };
-            match transcript_json(&state.supervisor.registry, id, after, tail) {
+            let id = resolve_registered_agent_id(&state.supervisor.registry, id)
+                .unwrap_or_else(|| id.to_owned());
+            match transcript_json(&state.supervisor.registry, &id, after, tail) {
                 Some(json) => reply(stream, 200, json),
                 None => reply(stream, 404, error("unknown_agent")),
             }
@@ -280,6 +286,7 @@ pub(crate) fn agent_request(
         AgentRoute::Pause(_)
         | AgentRoute::Resume(_)
         | AgentRoute::Message(_)
+        | AgentRoute::Continue(_)
         | AgentRoute::Create => reply(stream, 404, error("not_found")),
     }
 }
@@ -313,8 +320,75 @@ where
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
         AgentRoute::Message(id) => agent_message_request(stream, state, id, body, &resolve_session),
+        AgentRoute::Continue(id) => {
+            agent_continue_request(stream, state, id, body, &resolve_session)
+        }
         _ => reply(stream, 404, error("not_found")),
     }
+}
+
+fn agent_continue_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    id: &str,
+    body: Vec<u8>,
+    resolve_session: &impl Fn(
+        &Server,
+        &str,
+        &str,
+    )
+        -> Result<Arc<dyn crate::harness::HarnessSession>, (u16, &'static str)>,
+) -> Result<(), String> {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return reply(stream, 400, error("invalid_agent_continue_request")),
+    };
+    let Some(object) = value.as_object() else {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    };
+    if object.keys().any(|key| key != "prompt") {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    }
+    let Some(prompt) = value
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+    else {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    };
+    let Some(agent) = state.supervisor.registry.get(id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if agent.state != "running" {
+        return reply(stream, 409, error("agent_not_running"));
+    }
+    let (Some(harness), Some(session_id)) = (
+        agent.harness.as_deref(),
+        agent.harness_session_id.as_deref(),
+    ) else {
+        return reply(stream, 409, error("agent_not_interactive"));
+    };
+    if harness != "codex" {
+        return reply(stream, 501, error("harness_continue_unsupported"));
+    }
+    let session = match resolve_session(state, harness, session_id) {
+        Ok(session) => session,
+        Err((status, code)) => return reply(stream, status, error(code)),
+    };
+    let result = match session.continue_turn(prompt) {
+        Ok(result) => result,
+        Err(message) if message == "agent_thread_unavailable" => {
+            return reply(stream, 409, error("agent_thread_unavailable"));
+        }
+        Err(message) => {
+            log::warn!("agent continuation failed id={id}: {message}");
+            return reply(stream, 503, error("harness_continue_failed"));
+        }
+    };
+    let response =
+        parse_json(&serde_json::json!({"agent_id": agent.id, "turn": result}).to_string())
+            .map_err(|_| "could not serialize continuation result")?;
+    reply(stream, 200, response)
 }
 
 fn resolve_agent_session(
@@ -472,24 +546,30 @@ fn agent_message_request(
         log::warn!("agent message dispatch failed id={id}: {message}");
         return reply(stream, 503, error("harness_message_failed"));
     }
-    let _ = state.store.add(relay_event(
-        "agent_message_accepted",
-        &agent.task_id,
-        &agent.execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(agent.id.clone())),
-            (
-                "delivery".to_owned(),
-                Json::String(
-                    match delivery {
-                        crate::harness::Delivery::Steer => "steer",
-                        crate::harness::Delivery::Queue => "queue",
-                    }
-                    .to_owned(),
+    if let Err(store_error) = persist_event(
+        &state.store,
+        relay_event(
+            "agent_message_accepted",
+            &agent.task_id,
+            &agent.execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent.id.clone())),
+                (
+                    "delivery".to_owned(),
+                    Json::String(
+                        match delivery {
+                            crate::harness::Delivery::Steer => "steer",
+                            crate::harness::Delivery::Queue => "queue",
+                        }
+                        .to_owned(),
+                    ),
                 ),
-            ),
-        ]),
-    ));
+            ]),
+        ),
+    ) {
+        log::error!("could not persist accepted agent message id={id}: {store_error}");
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         202,
@@ -579,8 +659,62 @@ fn transcript_json(
     after: u64,
     tail: Option<usize>,
 ) -> Option<Json> {
-    let agent = registry.get(id)?;
-    let logs = agent_logs_json(registry, id, "both", after, tail)?;
+    transcript_json_with_sessions_dir(
+        registry,
+        id,
+        after,
+        tail,
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".codex/sessions")),
+    )
+}
+
+pub(crate) fn transcript_json_with_sessions_dir(
+    registry: &zz::AgentRegistry,
+    id: &str,
+    after: u64,
+    tail: Option<usize>,
+    sessions_dir: Option<std::path::PathBuf>,
+) -> Option<Json> {
+    let agent = if let Some(agent) = registry.get(id) {
+        Some(agent)
+    } else {
+        let mut matches = registry.list(None, Some(id)).into_iter();
+        match (matches.next(), matches.next()) {
+            (Some(agent), None) => Some(agent),
+            (Some(_), Some(_)) => return None,
+            (None, _) => None,
+        }
+    };
+    let Some(agent) = agent else {
+        return orphan_transcript_json(id, after, tail);
+    };
+    let rollout = (agent.harness.as_deref() == Some("codex"))
+        .then_some(agent.harness_session_id.as_deref())
+        .flatten()
+        .zip(sessions_dir.as_deref())
+        .and_then(|(thread_id, sessions)| codex_rollout_transcript(sessions, thread_id));
+    let (logs, log_degraded) = match rollout {
+        Some(Ok(rollout)) => (
+            transcript_logs_from_text(&rollout, after, tail, &agent, false),
+            false,
+        ),
+        Some(Err(())) => (
+            transcript_logs_from_text(
+                &codex_rollout_unreadable_diagnostic(),
+                after,
+                tail,
+                &agent,
+                true,
+            ),
+            true,
+        ),
+        None => (
+            agent_logs_json(registry, &agent.id, "both", after, tail)?,
+            false,
+        ),
+    };
 
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
@@ -640,8 +774,254 @@ fn transcript_json(
             "next_cursor".to_owned(),
             logs.object("next_cursor")?.clone(),
         ),
-        ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
+        (
+            "log_degraded".to_owned(),
+            Json::Bool(agent.log_degraded || log_degraded),
+        ),
     ]))
+}
+
+/// When the durable registry record is absent or unreadable but the output
+/// files survived, preserve the transcript instead of turning a read into
+/// `unknown_agent`. This response intentionally contains only fields that
+/// can be recovered from those files.
+fn orphan_transcript_json(id: &str, after: u64, tail: Option<usize>) -> Option<Json> {
+    fn read(path: Option<PathBuf>, after: u64, tail: Option<usize>) -> Option<String> {
+        let text = std::fs::read_to_string(path?).ok()?;
+        let start = usize::try_from(after).ok()?.min(text.len());
+        let mut start = start;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut text = text[start..].to_owned();
+        if let Some(limit) = tail
+            && text.len() > limit
+        {
+            let mut start = text.len() - limit;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text = text[start..].to_owned();
+        }
+        Some(text)
+    }
+    let stdout = read(agent_transcript_path(id), after, tail);
+    let stderr = read(agent_stderr_path(id), after, tail);
+    if stdout.is_none() && stderr.is_none() {
+        return None;
+    }
+    let next_cursor = agent_transcript_path(id)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Some(Json::Object(vec![
+        ("id".to_owned(), Json::String(id.to_owned())),
+        ("task_id".to_owned(), Json::Null),
+        ("execution_id".to_owned(), Json::Null),
+        ("command".to_owned(), Json::Null),
+        (
+            "state".to_owned(),
+            Json::String("lost_after_restart".to_owned()),
+        ),
+        ("started_at".to_owned(), Json::Null),
+        ("exit_code".to_owned(), Json::Null),
+        ("prompt".to_owned(), Json::Null),
+        ("last_message".to_owned(), Json::Null),
+        (
+            "stdout".to_owned(),
+            Json::String(stdout.unwrap_or_default()),
+        ),
+        (
+            "stderr".to_owned(),
+            Json::String(stderr.unwrap_or_default()),
+        ),
+        ("next_cursor".to_owned(), Json::number(next_cursor)),
+        ("log_degraded".to_owned(), Json::Bool(true)),
+    ]))
+}
+
+/// Resolve a transcript route by agent ID, with task ID support for the
+/// single-record case. Task IDs can be retried, so an ambiguous task ID is
+/// deliberately not guessed.
+fn resolve_registered_agent_id(registry: &zz::AgentRegistry, id_or_task: &str) -> Option<String> {
+    if registry.get(id_or_task).is_some() {
+        return Some(id_or_task.to_owned());
+    }
+    let mut matches = registry
+        .list(None, Some(id_or_task))
+        .into_iter()
+        .map(|agent| agent.id);
+    let id = matches.next()?;
+    matches.next().is_none().then_some(id)
+}
+
+/// Read the durable Codex app-server rollout for a thread. Rollout records are
+/// translated to the same item/lifecycle JSONL model used by the transcript UI.
+fn codex_rollout_transcript(
+    sessions: &std::path::Path,
+    thread_id: &str,
+) -> Option<Result<String, ()>> {
+    if thread_id.is_empty()
+        || !thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let sessions = sessions.canonicalize().ok()?;
+    let suffix = format!("-{thread_id}.jsonl");
+    for year in std::fs::read_dir(&sessions).ok()?.flatten() {
+        if !year.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for month in std::fs::read_dir(year.path()).ok()?.flatten() {
+            if !month.file_type().ok()?.is_dir() {
+                continue;
+            }
+            for day in std::fs::read_dir(month.path()).ok()?.flatten() {
+                if !day.file_type().ok()?.is_dir() {
+                    continue;
+                }
+                for file in std::fs::read_dir(day.path()).ok()?.flatten() {
+                    let name = file.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("rollout-") && name.ends_with(&suffix) {
+                        if !file.file_type().ok()?.is_file() {
+                            continue;
+                        }
+                        let path = file.path().canonicalize().ok()?;
+                        if !path.starts_with(&sessions) {
+                            continue;
+                        }
+                        return Some(
+                            std::fs::read_to_string(path)
+                                .map(|source| normalize_codex_rollout(&source))
+                                .map_err(|_| ()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn codex_rollout_unreadable_diagnostic() -> String {
+    serde_json::json!({
+        "type": "transcript.diagnostic",
+        "message": "matching Codex rollout could not be read; transcript content is unavailable",
+    })
+    .to_string()
+        + "\n"
+}
+
+fn normalize_codex_rollout(source: &str) -> String {
+    use serde_json::{Value, json};
+    let mut output = String::new();
+    for (index, line) in source.lines().enumerate() {
+        let normalized = match serde_json::from_str::<Value>(line) {
+            Err(error) => json!({
+                "type": "transcript.diagnostic",
+                "line": index + 1,
+                "message": format!("malformed rollout JSON: {error}"),
+                "raw": line,
+            }),
+            Ok(record) => {
+                let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+                let payload = record.get("payload").cloned().unwrap_or(Value::Null);
+                match kind {
+                    "response_item" => {
+                        let mut item = payload;
+                        if item.get("type").and_then(Value::as_str) == Some("message")
+                            && item.get("role").and_then(Value::as_str) == Some("assistant")
+                        {
+                            item["type"] = Value::String("agent_message".into());
+                            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                                let text = content
+                                    .iter()
+                                    .filter_map(|part| {
+                                        (part.get("type").and_then(Value::as_str)
+                                            == Some("output_text"))
+                                        .then(|| part.get("text").and_then(Value::as_str))
+                                        .flatten()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                if !text.is_empty() {
+                                    item["text"] = Value::String(text);
+                                }
+                            }
+                        }
+                        json!({"type":"item.completed","item":item})
+                    }
+                    "event_msg" => {
+                        let event = payload
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("event");
+                        let lifecycle = match event {
+                            "task_started" | "turn_started" => "turn.started",
+                            "task_complete" | "turn_complete" => "turn.completed",
+                            _ => event,
+                        };
+                        json!({"type":lifecycle})
+                    }
+                    "session_meta" => json!({"type":"thread.started"}),
+                    _ => json!({
+                        "type": "transcript.diagnostic",
+                        "line": index + 1,
+                        "message": "unrecognized rollout record",
+                        "record_type": kind,
+                        "record": record,
+                    }),
+                }
+            }
+        };
+        if index > 0 {
+            output.push('\n');
+        }
+        output.push_str(&normalized.to_string());
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output
+}
+
+fn transcript_logs_from_text(
+    text: &str,
+    after: u64,
+    tail: Option<usize>,
+    agent: &zz::AgentRecord,
+    log_degraded: bool,
+) -> Json {
+    let start = if after == 0 {
+        tail.filter(|limit| text.len() > *limit)
+            .map_or(0, |limit| text.len() - limit)
+    } else {
+        usize::try_from(after).unwrap_or(usize::MAX).min(text.len())
+    };
+    let mut start = start;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let data = &text[start..];
+    let records = if data.is_empty() {
+        Vec::new()
+    } else {
+        vec![Json::Object(vec![
+            ("stream".into(), Json::String("stdout".into())),
+            ("cursor".into(), Json::number(start as u64)),
+            ("data".into(), Json::String(data.to_owned())),
+        ])]
+    };
+    Json::Object(vec![
+        ("records".into(), Json::Array(records)),
+        ("next_cursor".into(), Json::number(text.len() as u64)),
+        ("dropped_before".into(), Json::number(0)),
+        ("complete".into(), Json::Bool(agent.state != "running")),
+        ("log_degraded".into(), Json::Bool(log_degraded)),
+    ])
 }
 
 /// Read agent logs from the ordered diagnostics spool, falling back to durable
@@ -1359,15 +1739,20 @@ fn agent_create_request(
             )
         }
         Err(message) => {
-            let _ = state.store.add(relay_event(
-                "process_failed",
-                &task_id,
-                &execution_id,
-                Json::Object(vec![(
-                    "reason".to_owned(),
-                    Json::String("spawn_failed".to_owned()),
-                )]),
-            ));
+            if let Err(error) = persist_event(
+                &state.store,
+                relay_event(
+                    "process_failed",
+                    &task_id,
+                    &execution_id,
+                    Json::Object(vec![(
+                        "reason".to_owned(),
+                        Json::String("spawn_failed".to_owned()),
+                    )]),
+                ),
+            ) {
+                log::error!("could not persist agent spawn failure task_id={task_id}: {error}");
+            }
             log::error!("agent_create spawn failed for id={task_id}: {message}");
             reply(stream, 500, error("could_not_spawn_process"))
         }
@@ -1430,15 +1815,24 @@ fn create_codex_thread(
     {
         return reply(stream, 500, error("could_not_persist_agent_config"));
     }
-    let _ = state.store.add(relay_event(
-        "process_spawned",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(id.clone())),
-            ("thread_id".to_owned(), Json::String(thread_id.clone())),
-        ]),
-    ));
+    let event_persisted = match persist_event(
+        &state.store,
+        relay_event(
+            "process_spawned",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(id.clone())),
+                ("thread_id".to_owned(), Json::String(thread_id.clone())),
+            ]),
+        ),
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("could not persist spawned Codex agent id={id}: {error}");
+            false
+        }
+    };
     monitor_codex_events(
         Arc::clone(&state.supervisor.registry),
         Arc::clone(&state.store),
@@ -1447,6 +1841,9 @@ fn create_codex_thread(
         execution_id.to_owned(),
         events,
     );
+    if !event_persisted {
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         200,
@@ -1474,25 +1871,69 @@ pub(crate) fn monitor_codex_events(
     execution_id: String,
     events: std::sync::mpsc::Receiver<HarnessEvent>,
 ) {
+    monitor_codex_events_to_path(
+        registry,
+        store,
+        agent_id.clone(),
+        task_id,
+        execution_id,
+        events,
+        agent_transcript_path(&agent_id),
+    );
+}
+
+pub(crate) fn monitor_codex_events_to_path(
+    registry: Arc<zz::AgentRegistry>,
+    store: Arc<zz::Store>,
+    agent_id: String,
+    task_id: String,
+    execution_id: String,
+    events: std::sync::mpsc::Receiver<HarnessEvent>,
+    transcript: Option<std::path::PathBuf>,
+) {
     thread::spawn(move || {
-        let transcript = agent_transcript_path(&agent_id);
         while let Ok(event) = events.recv() {
             let HarnessEvent::Notification {
                 value,
                 terminal_turn,
             } = event;
             if let Some(path) = transcript.as_ref() {
-                if let Some(parent) = path.parent()
-                    && let Err(error) = std::fs::create_dir_all(parent)
-                {
-                    log::warn!("could not create agent transcript directory: {error}");
-                } else if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(file, "{}", value);
+                let line = value.to_string() + "\n";
+                let mut last_warning = std::time::Instant::now();
+                let mut warned = false;
+                loop {
+                    let result = (|| -> std::io::Result<()> {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        repair_transcript_tail(path)?;
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)?;
+                        file.write_all(line.as_bytes())?;
+                        file.sync_data()?;
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => break,
+                        Err(error) => {
+                            if !warned || last_warning.elapsed() >= Duration::from_secs(5) {
+                                log::warn!(
+                                    "could not append agent transcript {}; retrying: {error}",
+                                    path.display()
+                                );
+                                last_warning = std::time::Instant::now();
+                                warned = true;
+                            }
+                            // Keep the notification owned by this monitor and
+                            // stop draining later notifications until its durable
+                            // append succeeds. This applies backpressure instead
+                            // of silently dropping transcript records.
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    }
                 }
             }
             handle_codex_notification(
@@ -1505,7 +1946,74 @@ pub(crate) fn monitor_codex_events(
                 terminal_turn,
             );
         }
+        // The app-server event stream is the only live handle for a native
+        // Codex thread. A disconnected stream has no process-table reaper to
+        // notice the missing worker, so turn a still-running record into an
+        // honest restartable terminal state before the worktree remains
+        // attached indefinitely.
+        if registry
+            .get(&agent_id)
+            .is_some_and(|agent| agent.state == "running")
+        {
+            if registry
+                .transition(&agent_id, "lost_after_restart", None)
+                .is_err()
+            {
+                let _ = registry.mark_audit_degraded(&agent_id);
+            }
+            persist_monitor_event(
+                &store,
+                relay_event(
+                    "process_failed",
+                    &task_id,
+                    &execution_id,
+                    Json::Object(vec![
+                        ("agent_id".to_owned(), Json::String(agent_id.clone())),
+                        (
+                            "reason".to_owned(),
+                            Json::String("harness_event_stream_closed".to_owned()),
+                        ),
+                    ]),
+                ),
+            );
+        }
     });
+}
+
+fn persist_monitor_event(store: &zz::Store, event: Json) {
+    let mut last_warning = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        match store.add(event.clone()) {
+            Ok(_) => return,
+            Err(error) => {
+                if !warned || last_warning.elapsed() >= Duration::from_secs(5) {
+                    log::warn!("could not persist Codex monitor event; retrying: {error}");
+                    last_warning = std::time::Instant::now();
+                    warned = true;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+pub(crate) fn repair_transcript_tail(path: &Path) -> std::io::Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let valid_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_len as u64)?;
+    file.sync_data()
 }
 
 pub(crate) fn handle_codex_notification(
@@ -1521,29 +2029,35 @@ pub(crate) fn handle_codex_notification(
         .get("method")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let _ = store.add(relay_event(
-        "agent_harness_event",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
-            ("method".to_owned(), Json::String(method.to_owned())),
-        ]),
-    ));
+    persist_monitor_event(
+        store,
+        relay_event(
+            "agent_harness_event",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                ("method".to_owned(), Json::String(method.to_owned())),
+            ]),
+        ),
+    );
     if method == "turn/completed" {
         let turn_status = value
             .pointer("/params/turn/status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("completed");
-        let _ = store.add(relay_event(
-            "agent_turn_completed",
-            task_id,
-            execution_id,
-            Json::Object(vec![
-                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
-                ("state".to_owned(), Json::String(turn_status.to_owned())),
-            ]),
-        ));
+        persist_monitor_event(
+            store,
+            relay_event(
+                "agent_turn_completed",
+                task_id,
+                execution_id,
+                Json::Object(vec![
+                    ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                    ("state".to_owned(), Json::String(turn_status.to_owned())),
+                ]),
+            ),
+        );
 
         let terminal_state = match turn_status {
             "completed" => Some(("succeeded", "process_completed")),
@@ -1559,8 +2073,9 @@ pub(crate) fn handle_codex_notification(
         {
             match registry.transition(agent_id, state, None) {
                 Ok(Some(_)) => {
-                    if store
-                        .add(relay_event(
+                    persist_monitor_event(
+                        store,
+                        relay_event(
                             kind,
                             task_id,
                             execution_id,
@@ -1568,11 +2083,8 @@ pub(crate) fn handle_codex_notification(
                                 ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
                                 ("state".to_owned(), Json::String(state.to_owned())),
                             ]),
-                        ))
-                        .is_err()
-                    {
-                        let _ = registry.mark_audit_degraded(agent_id);
-                    }
+                        ),
+                    );
                 }
                 _ => {
                     let _ = registry.mark_audit_degraded(agent_id);
@@ -1639,16 +2151,22 @@ fn create_opencode_session(
     {
         return reply(stream, 500, error("could_not_persist_agent_config"));
     }
-    let _ = state.store.add(relay_event(
-        "process_spawned",
-        task_id,
-        execution_id,
-        Json::Object(vec![
-            ("agent_id".to_owned(), Json::String(id.clone())),
-            ("session_id".to_owned(), Json::String(session_id)),
-            ("harness".to_owned(), Json::String("opencode".to_owned())),
-        ]),
-    ));
+    if let Err(store_error) = persist_event(
+        &state.store,
+        relay_event(
+            "process_spawned",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(id.clone())),
+                ("session_id".to_owned(), Json::String(session_id)),
+                ("harness".to_owned(), Json::String("opencode".to_owned())),
+            ]),
+        ),
+    ) {
+        log::error!("could not persist spawned OpenCode agent id={id}: {store_error}");
+        return reply(stream, 500, error("could_not_persist_event"));
+    }
     reply(
         stream,
         200,
@@ -2083,9 +2601,46 @@ pub(crate) fn agent_restart_request(
 /// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
 /// group, remove its worktree, and deregister it.
 pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
-    let Some(agent) = state.supervisor.registry.get(id) else {
+    let Some(id) = resolve_registered_agent_id(&state.supervisor.registry, id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
+    let Some(agent) = state.supervisor.registry.get(&id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if agent.state == "lost_after_restart" {
+        if let Some(path) = agent.worktree_path.as_deref() {
+            match cleanup_agent_worktree(path, &agent_worktree_roots()) {
+                Ok(()) => log::info!("agent_delete id={id}: stale worktree cleaned up at {path}"),
+                Err(failure) => {
+                    log::warn!(
+                        "agent_delete id={id}: stale worktree cleanup failed: {}",
+                        failure.message
+                    );
+                    return reply(stream, failure.code, error(failure.message));
+                }
+            }
+        }
+        if state
+            .supervisor
+            .registry
+            .transition(&id, "stopped", None)
+            .is_err()
+        {
+            return reply(stream, 500, error("could_not_persist_agent_state"));
+        }
+        return reply(
+            stream,
+            200,
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(id)),
+                ("stopped".to_owned(), Json::Bool(true)),
+                (
+                    "worktree".to_owned(),
+                    agent.worktree_path.map(Json::String).unwrap_or(Json::Null),
+                ),
+            ]),
+        );
+    }
     if !matches!(agent.state.as_str(), "running" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));
     }
@@ -2112,7 +2667,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         if state
             .supervisor
             .registry
-            .transition(id, "stopped", None)
+            .transition(&id, "stopped", None)
             .is_err()
         {
             return reply(stream, 500, error("could_not_persist_agent_state"));
@@ -2145,7 +2700,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     // signalling. The pgid > 0 guard keeps kill(-pgid, ..) from ever
     // resolving to the relay's own process group on a corrupt record.
     let (stopped, graceful) = if pgid > 0 && recovered_agent_identity_matches(&agent) {
-        stop_process_group(id, pgid, &state.supervisor)
+        stop_process_group(&id, pgid, &state.supervisor)
     } else {
         (true, true)
     };
@@ -2153,13 +2708,13 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         // Mark any live proc-table entry finished so the reaper does not
         // overwrite the terminal state with its own exit classification.
         if let Ok(mut table) = state.supervisor.procs.lock()
-            && let Some(entry) = table.get_mut(id)
+            && let Some(entry) = table.get_mut(&id)
         {
             let _ = entry.child.try_wait();
             entry.finished_at = Some(Instant::now());
         }
         let terminal = if graceful { "stopped" } else { "killed" };
-        let _ = state.supervisor.registry.transition(id, terminal, None);
+        let _ = state.supervisor.registry.transition(&id, terminal, None);
     } else {
         log::error!(
             "agent_stop id={id} pgid={pgid}: process group survived SIGKILL; left registered"

@@ -275,6 +275,14 @@ enum AgentsCmd {
         #[arg(long, conflicts_with = "steer", required_unless_present = "steer")]
         queue: Option<String>,
     },
+    /// Send a follow-up turn to an existing Codex thread and wait for its result
+    Continue {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Follow-up prompt text
+        #[arg(long)]
+        prompt: String,
+    },
     /// Gracefully stop an agent (leaves worktree)
     Stop {
         /// Agent handle (unique prefix accepted)
@@ -1088,6 +1096,19 @@ fn cmd_agents_message(
     Ok(())
 }
 
+fn cmd_agents_continue(client: &Client, id: &str, prompt: &str) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let body = serde_json::json!({"prompt":prompt});
+    let response = client.post_with_timeout(&format!("/v1/agents/{id}/continue"), &body, 1800)?;
+    emit(client, &response, || {
+        println!("follow-up turn completed for {}", s(&response, "agent_id"));
+        if let Some(turn) = response.get("turn") {
+            println!("{}", serde_json::to_string_pretty(turn).unwrap_or_default());
+        }
+    });
+    Ok(())
+}
+
 fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
     let id = resolve_agent_id(client, id)?;
     let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
@@ -1740,6 +1761,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
             AgentsCmd::Message { id, steer, queue } => {
                 cmd_agents_message(&client, &id, steer.as_deref(), queue.as_deref())
             }
+            AgentsCmd::Continue { id, prompt } => cmd_agents_continue(&client, &id, &prompt),
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
             AgentsCmd::Logs {
                 id,
@@ -2050,6 +2072,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn agent_continue_requires_id_and_prompt() {
+        assert!(
+            Cli::try_parse_from([
+                "zzapi",
+                "agents",
+                "continue",
+                "abc",
+                "--prompt",
+                "follow up"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["zzapi", "agents", "continue", "abc"]).is_err());
     }
 
     #[cfg(unix)]

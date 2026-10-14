@@ -15,6 +15,7 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
+    "tmaproduction.blob.core.windows.net",
 ];
 const KEYCHAIN_BASE64_PREFIX: &str = "go-keyring-base64:";
 
@@ -280,7 +281,7 @@ fn attestation_bundles_at(
                 .take(32 * 1024 * 1024)
                 .read_to_end(&mut bytes)
                 .map_err(|error| format!("could not read GitHub attestation bundle: {error}"))?;
-            decode_snappy_frame(&bytes)
+            decode_snappy_bundle(&bytes)
         })
         .collect()
 }
@@ -407,13 +408,20 @@ fn bundle_redirect_target(current: &str, location: &str) -> Result<String, Strin
     Ok(target)
 }
 
-fn decode_snappy_frame(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn decode_snappy_bundle(bytes: &[u8]) -> Result<Vec<u8>, String> {
     const IDENTIFIER: &[u8] = b"\xff\x06\x00\x00sNaPpY";
     if bytes.first().is_some_and(|byte| *byte == b'{') {
         return Ok(bytes.to_vec());
     }
     if !bytes.starts_with(IDENTIFIER) {
-        return Err("GitHub attestation bundle has an unsupported encoding".to_owned());
+        let decoded_length = snap::raw::decompress_len(bytes)
+            .map_err(|_| "GitHub attestation bundle has an unsupported encoding".to_owned())?;
+        if decoded_length > 32 * 1024 * 1024 {
+            return Err("GitHub attestation bundle exceeded its size limit".to_owned());
+        }
+        return snap::raw::Decoder::new()
+            .decompress_vec(bytes)
+            .map_err(|_| "GitHub attestation bundle has an invalid Snappy block".to_owned());
     }
     let mut output = Vec::new();
     let mut position = IDENTIFIER.len();
@@ -650,13 +658,90 @@ mod tests {
         frame.extend([0x00, (block.len() + 4) as u8, 0, 0]);
         frame.extend(masked_snappy_crc(b"ok").to_le_bytes());
         frame.extend(block);
-        assert_eq!(decode_snappy_frame(&frame).unwrap(), b"ok");
+        assert_eq!(decode_snappy_bundle(&frame).unwrap(), b"ok");
 
         let mut uncompressed = identifier.to_vec();
         uncompressed.extend([0x01, 0x06, 0, 0]);
         uncompressed.extend(masked_snappy_crc(b"ok").to_le_bytes());
         uncompressed.extend(b"ok");
-        assert_eq!(decode_snappy_frame(&uncompressed).unwrap(), b"ok");
+        assert_eq!(decode_snappy_bundle(&uncompressed).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn github_snappy_bundle_fixture_verifies_and_tampering_fails() {
+        use std::process::Command;
+
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let artifact = std::fs::read(fixture_dir.join("github-attestation-manifest.json")).unwrap();
+        let encoded = std::fs::read(fixture_dir.join("github-attestation-bundle.json.sn")).unwrap();
+        let decoded = decode_snappy_bundle(&encoded).unwrap();
+        let manifest: Value = serde_json::from_slice(&artifact).unwrap();
+        let commit = manifest["commit"].as_str().unwrap();
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("trust/sigstore-trusted-root.json");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zigzag-attestation-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let artifact_path = temp_dir.join("manifest.json");
+        let valid_bundle_path = temp_dir.join("bundle.json");
+        std::fs::write(&artifact_path, artifact).unwrap();
+        std::fs::write(&valid_bundle_path, &decoded).unwrap();
+
+        let verify = |bundle: &std::path::Path| {
+            Command::new("gh")
+                .args([
+                    "attestation",
+                    "verify",
+                    artifact_path.to_str().unwrap(),
+                    "--bundle",
+                    bundle.to_str().unwrap(),
+                    "--repo",
+                    "ShukantPal/zigzag",
+                    "--signer-workflow",
+                    "ShukantPal/zigzag/.github/workflows/ci.yml",
+                    "--source-ref",
+                    "refs/heads/main",
+                    "--source-digest",
+                    commit,
+                    "--predicate-type",
+                    "https://slsa.dev/provenance/v1",
+                    "--custom-trusted-root",
+                    root.to_str().unwrap(),
+                ])
+                .output()
+                .expect("GitHub CLI is required to run the attestation fixture test")
+        };
+
+        let valid = verify(&valid_bundle_path);
+        assert!(
+            valid.status.success(),
+            "real GitHub attestation fixture did not verify: {}",
+            String::from_utf8_lossy(&valid.stderr)
+        );
+
+        let mut tampered: Value = serde_json::from_slice(&decoded).unwrap();
+        let signature = tampered["dsseEnvelope"]["signatures"][0]["sig"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let replacement = if signature.starts_with('A') { 'B' } else { 'A' };
+        tampered["dsseEnvelope"]["signatures"][0]["sig"] =
+            format!("{replacement}{}", &signature[1..]).into();
+        let tampered_bundle_path = temp_dir.join("tampered-bundle.json");
+        std::fs::write(
+            &tampered_bundle_path,
+            serde_json::to_vec(&tampered).unwrap(),
+        )
+        .unwrap();
+        let tampered_result = verify(&tampered_bundle_path);
+        assert!(tampered_result.status.code().is_some_and(|code| code != 0));
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
@@ -850,12 +935,21 @@ mod tests {
             "https://github.com.attacker.example/bundle",
             "https://user@github.com/bundle",
             "https://anything.blob.core.windows.net/bundle",
+            "https://evil.blob.core.windows.net/bundle",
+            "https://tmaproduction.evil.com/bundle",
+            "https://user:password@tmaproduction.blob.core.windows.net/bundle",
             "https://api.github.com:8443/bundle",
+            "https://tmaproduction.blob.core.windows.net:8443/bundle",
             "https://productionresultssa19.blob.core.windows.net:8443/bundle",
         ] {
             assert!(validate_bundle_url(unsafe_url, GITHUB_BUNDLE_HOSTS).is_err());
         }
         assert!(validate_bundle_url("https://api.github.com/bundle", GITHUB_BUNDLE_HOSTS).is_ok());
+        assert!(validate_bundle_url(
+            "https://tmaproduction.blob.core.windows.net/attestations/1369377226/2026/10/13/55302578.json.sn?sig=redacted",
+            GITHUB_BUNDLE_HOSTS,
+        )
+        .is_ok());
         assert!(
             bundle_redirect_target("https://api.github.com/bundle", "http://127.0.0.1/").is_err()
         );

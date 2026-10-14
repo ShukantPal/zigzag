@@ -43,8 +43,10 @@ share an execution ID.
 
 ## Status and completion
 
-The relay stores bounded live events plus a separate per-execution audit
-archive. `zzapi status` presents relay state and event history. An event is not
+The relay stores events in append-only, 30-day JSONL segments and keeps a
+bounded in-memory cache for live polling. Readers fall back to the files when
+their cursor predates the cache. A separate per-execution audit archive keeps
+schema-v1 lifecycle facts. `zzapi status` presents relay state and event history. An event is not
 proof of completion: inspect the agent or process terminal state and final
 output. Use `zzapi events` to read the retained feed or `zzapi events stream`
 for live delivery; event commands do not launch tasks.

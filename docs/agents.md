@@ -36,6 +36,15 @@ native harness. Stop remains session-scoped. Pause/resume are unavailable for
 app-server sessions because signaling their shared process would affect every
 agent in the domain.
 
+`POST /v1/agents/{id}/continue` accepts `{ "prompt": "..." }` and returns
+only after the Codex follow-up turn completes. If another turn is active, the
+prompt is queued behind it; requests are not interrupted or discarded. A
+missing, unresumable, or non-running agent returns an error and never creates
+a replacement thread. This is the synchronous continuation path exposed by
+`zzapi agents continue <id> --prompt TEXT`; use agent completion tracking to
+decide when to call it. It uses the same bearer-token authentication as agent
+creation.
+
 The shared live-session budget defaults to four Codex threads and OpenCode
 sessions across a daemon domain. Set `ZIGZAG_MAX_LIVE_AGENT_THREADS` before
 starting the daemon to tune it for the machine; it must be a positive integer.
@@ -72,10 +81,14 @@ requested cursor, the bounded spool has irretrievably lost earlier output.
 
 ## Event delivery
 
-`events.json` is durable but bounded. A duplicate event ID is idempotent only
-while retained, so consumers must deduplicate. Long-poll reads return `epoch`,
-`reset`, `lost`, `events`, and `next`: pass `next` as `after`, preserve epoch,
-rebuild a projection on `reset`, and treat `lost` as eviction.
+`events.json` keeps a bounded in-memory cache backed by append-only JSONL
+segments in `events.stream/`. Segments are synced before an event is reported
+accepted, and whole segments are garbage-collected 30 days after creation. A
+reader whose cursor predates the cache reads the retained segments, so cache
+eviction does not set `lost`. A duplicate event ID remains idempotent while its
+segment is retained. Long-poll reads return `epoch`, `reset`, `lost`, `events`,
+and `next`: pass `next` as `after`, preserve epoch, rebuild a projection on
+`reset`, and treat `lost` as an expired or otherwise unavailable file window.
 
 Schema-v1 facts contain `id`, `task_id`, `execution_id`, `kind`, `source`,
 `occurred_at`, `clock`, and object `payload`. Facts with an execution ID are
@@ -90,6 +103,7 @@ for whether a process exited.
 | --- | --- |
 | `~/.codex/zigzag/zigzag.token` | Bearer token, mode 0600; never log it. |
 | `~/.codex/zigzag/events.json` | Bounded durable live-event store. |
+| `~/.codex/zigzag/events.stream/` | Append-only event segments; whole files expire after 30 days. |
 | `~/.codex/zigzag/events.audit/` | Per-execution append-only audit JSONL. |
 | `~/.codex/zigzag/events.agents.json` | Durable relay agent registry. |
 | `~/.codex/zigzag/events.agents.agent-logs/` | Owner-only bounded stdout/stderr spools. |

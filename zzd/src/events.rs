@@ -73,6 +73,12 @@ pub(crate) fn relay_event_at(
         ("payload".to_owned(), payload),
     ])
 }
+
+/// Persist a relay event without hiding a failed append from the caller.
+pub(crate) fn persist_event(store: &Store, event: Json) -> Result<(), String> {
+    store.add(event).map(|_| ())
+}
+
 pub(crate) fn persist_first_output(store: &Store, agent: &AgentRecord) -> Result<(), String> {
     let Some(occurred_at) = agent.first_output_at.clone() else {
         return Ok(());

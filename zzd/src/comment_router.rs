@@ -1141,7 +1141,7 @@ mod tests {
                 .unwrap()
                 .events
                 .len(),
-            1
+            2
         );
         let _ = std::fs::remove_dir_all(base);
     }

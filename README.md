@@ -62,6 +62,7 @@ All routes below require `Authorization: Bearer <token>`.
 | Operation | Endpoint / CLI |
 | --- | --- |
 | Create a supervised Codex agent | `POST /v1/agents` · `zzapi agents create --prompt TEXT --project-dir DIR --branch BRANCH` |
+| Continue an existing Codex thread | `POST /v1/agents/{id}/continue` · `zzapi agents continue ID --prompt TEXT` |
 | List agents (filter by state or task) | `GET /v1/agents` · `zzapi agents list [--state running] [--task-id ID]` |
 | Get agent details | `GET /v1/agents/{id}` · `zzapi agents get ID` |
 | Stop an agent | `DELETE /v1/agents/{id}` · `zzapi agents stop ID` |
@@ -71,7 +72,7 @@ All routes below require `Authorization: Bearer <token>`.
 | Post events or read the retained event stream | `POST /v1/events`, `GET /v1/events?after=...&epoch=...&timeout=...` · `zzapi events [--follow]` |
 | Stream events and agent output interactively | Authenticated bidirectional TCP socket · `zzapi events stream` |
 
-Agent creation accepts an inline prompt or prompt-file path, project directory, branch, and optional worktree, model, approval mode, and timeout. The relay records lifecycle state and bounded stdout/stderr logs; stopping an agent leaves its worktree in place. Events are retained in a bounded durable queue, so consumers should use cursors and deduplicate by event ID. See [agents and events](docs/agents.md), [zzapi](docs/zzapi.md), and [relay API details](docs/relay.md).
+Agent creation accepts an inline prompt or prompt-file path, project directory, branch, and optional worktree, model, approval mode, and timeout. The relay records lifecycle state and bounded stdout/stderr logs; stopping an agent leaves its worktree in place. Events are stored in append-only segments for 30 days, with the configured in-memory queue serving as a cache; consumers should use cursors and deduplicate by event ID. See [agents and events](docs/agents.md), [zzapi](docs/zzapi.md), and [relay API details](docs/relay.md).
 
 ## Configuration and security
 
