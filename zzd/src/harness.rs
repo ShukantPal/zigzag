@@ -21,7 +21,7 @@ pub(crate) enum Delivery {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum HarnessEvent {
-    Notification(Value),
+    Notification { value: Value, terminal_turn: bool },
 }
 
 #[allow(dead_code)]
@@ -301,7 +301,7 @@ impl CodexServer {
         agent_id: &str,
         cwd: &str,
         prompt: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, mpsc::Receiver<HarnessEvent>), String> {
         let response = self.rpc("thread/start", json!({"cwd":cwd}))?;
         let thread_id = response
             .pointer("/thread/id")
@@ -309,12 +309,17 @@ impl CodexServer {
             .or_else(|| response.pointer("/threadId").and_then(Value::as_str))
             .ok_or("app-server thread/start returned no thread ID")?
             .to_owned();
+        // Attach the listener before turn/start. A short turn can complete
+        // before turn/start returns, so subscribing in the caller afterward
+        // would silently drop its completion notification.
+        let (event_tx, event_rx) = mpsc::channel();
         self.shared
             .subscribers
             .lock()
             .map_err(|_| "session event map poisoned")?
             .entry(thread_id.clone())
-            .or_default();
+            .or_default()
+            .push(event_tx);
         let worktree = std::fs::canonicalize(cwd).unwrap_or_else(|_| std::path::PathBuf::from(cwd));
         self.shared
             .approval_contexts
@@ -339,7 +344,7 @@ impl CodexServer {
                 .insert(thread_id.clone(), turn_id.to_owned());
         }
         let _ = agent_id;
-        Ok(thread_id)
+        Ok((thread_id, event_rx))
     }
 
     pub(crate) fn resume_thread(&self, thread_id: &str) -> Result<(), String> {
@@ -433,18 +438,6 @@ impl CodexServer {
             server: Arc::clone(self),
             thread_id,
         })
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn events(&self, thread_id: &str) -> mpsc::Receiver<HarnessEvent> {
-        let (tx, rx) = mpsc::channel();
-        if let Ok(mut subscribers) = self.shared.subscribers.lock() {
-            subscribers
-                .entry(thread_id.to_owned())
-                .or_default()
-                .push(tx);
-        }
-        rx
     }
 }
 
@@ -971,6 +964,7 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                 value.pointer("/params/threadId").and_then(Value::as_str)
             {
                 let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                let mut terminal_turn = method != "turn/completed";
                 if method == "turn/started" {
                     if let Some(turn_id) = value.pointer("/params/turn/id").and_then(Value::as_str)
                         && let Ok(mut turns) = shared.turns.lock()
@@ -984,6 +978,7 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                     let next = shared.queued.lock().ok().and_then(|mut queued| {
                         queued.get_mut(thread_id).and_then(VecDeque::pop_front)
                     });
+                    terminal_turn = next.is_none();
                     if let Some(text) = next {
                         let shared = Arc::clone(&shared);
                         let thread_id = thread_id.to_owned();
@@ -1004,7 +999,13 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                 if let Ok(mut map) = shared.subscribers.lock()
                     && let Some(list) = map.get_mut(thread_id)
                 {
-                    list.retain(|tx| tx.send(HarnessEvent::Notification(value.clone())).is_ok());
+                    list.retain(|tx| {
+                        tx.send(HarnessEvent::Notification {
+                            value: value.clone(),
+                            terminal_turn,
+                        })
+                        .is_ok()
+                    });
                 }
             }
         }
@@ -1020,13 +1021,15 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalContext, CodexServer, Shared, approval_audit_line, approval_response,
+        ApprovalContext, CodexServer, HarnessEvent, Shared, approval_audit_line, approval_response,
         command_approval,
     };
+    use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
     use std::process::{Command, Stdio};
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn interrupting_idle_codex_session_succeeds_without_rpc() {
@@ -1054,6 +1057,57 @@ mod tests {
             .session("completed-thread".to_owned())
             .interrupt()
             .unwrap();
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn codex_completion_during_turn_start_is_buffered_for_the_subscriber() {
+        let script = r#"
+            IFS= read -r _thread_start
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-fast"}}}'
+            IFS= read -r _turn_start
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fast","turn":{"status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-fast"}}}'
+        "#;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let shared = Arc::new(Shared {
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            pending: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+            approval_contexts: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        });
+        let reader_shared = Arc::clone(&shared);
+        thread::spawn(move || super::read_messages(stdout, reader_shared));
+        let server = CodexServer { shared };
+
+        let (thread_id, events) = server
+            .start_thread("agent-fast", "/tmp", "finish immediately")
+            .unwrap();
+        assert_eq!(thread_id, "thread-fast");
+        let event = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let HarnessEvent::Notification {
+            value,
+            terminal_turn,
+        } = event;
+        assert!(terminal_turn);
+        assert_eq!(
+            value.get("method").and_then(Value::as_str),
+            Some("turn/completed")
+        );
         server.stop().unwrap();
     }
 

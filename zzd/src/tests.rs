@@ -36,8 +36,9 @@ use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
     agent_harness_config, agent_post_request_with_session_resolver, agent_route,
-    default_agent_worktree, dispatch_agent_message, parse_agent_create_request,
-    persisted_agent_config, restart_argv, restart_config, valid_agent_model,
+    default_agent_worktree, dispatch_agent_message, handle_codex_notification,
+    parse_agent_create_request, persisted_agent_config, restart_argv, restart_config,
+    valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -2058,6 +2059,45 @@ fn agent_record(id: &str) -> AgentRecord {
         harness_session_id: None,
         harness: None,
     }
+}
+
+#[test]
+fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
+    let (state, _state_path) = test_server();
+    let mut record = agent_record("codex-completion-regression");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("thread-completed".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    handle_codex_notification(
+        &state.supervisor.registry,
+        &state.store,
+        "codex-completion-regression",
+        "task-1",
+        "exec-1",
+        &serde_json::json!({
+            "method":"turn/completed",
+            "params":{"threadId":"thread-completed","turn":{"status":"completed"}}
+        }),
+        true,
+    );
+
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("codex-completion-regression")
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    let timeline = state.store.timeline("task-1").unwrap();
+    let kinds: Vec<_> = timeline
+        .iter()
+        .filter_map(|event| event.object("kind").and_then(Json::as_str))
+        .collect();
+    assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
+    assert!(kinds.contains(&"process_completed"), "{kinds:?}");
 }
 
 #[test]

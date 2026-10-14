@@ -1385,8 +1385,8 @@ fn create_codex_thread(
             return reply(stream, 503, error("could_not_start_app_server"));
         }
     };
-    let thread_id = match server.start_thread(task_id, worktree, prompt) {
-        Ok(id) => id,
+    let (thread_id, events) = match server.start_thread(task_id, worktree, prompt) {
+        Ok(result) => result,
         Err(message) => {
             log::error!("could not start codex thread: {message}");
             return reply(stream, 503, error("could_not_start_agent_thread"));
@@ -1432,15 +1432,18 @@ fn create_codex_thread(
             ("thread_id".to_owned(), Json::String(thread_id.clone())),
         ]),
     ));
-    let events = server.events(&thread_id);
     let store = Arc::clone(&state.store);
     let id_watch = id.clone();
     let task_watch = task_id.to_owned();
     let execution_watch = execution_id.to_owned();
+    let registry = Arc::clone(&state.supervisor.registry);
     thread::spawn(move || {
         let transcript = agent_transcript_path(&id_watch);
         while let Ok(event) = events.recv() {
-            let crate::harness::HarnessEvent::Notification(value) = event;
+            let crate::harness::HarnessEvent::Notification {
+                value,
+                terminal_turn,
+            } = event;
             if let Some(path) = transcript.as_ref() {
                 if let Some(parent) = path.parent()
                     && let Err(error) = std::fs::create_dir_all(parent)
@@ -1455,39 +1458,15 @@ fn create_codex_thread(
                     let _ = writeln!(file, "{}", value);
                 }
             }
-            let method = value
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let _ = store.add(relay_event(
-                "agent_harness_event",
+            handle_codex_notification(
+                &registry,
+                &store,
+                &id_watch,
                 &task_watch,
                 &execution_watch,
-                Json::Object(vec![
-                    ("agent_id".to_owned(), Json::String(id_watch.clone())),
-                    ("method".to_owned(), Json::String(method.to_owned())),
-                ]),
-            ));
-            if method == "turn/completed" {
-                let _ = store.add(relay_event(
-                    "agent_turn_completed",
-                    &task_watch,
-                    &execution_watch,
-                    Json::Object(vec![
-                        ("agent_id".to_owned(), Json::String(id_watch.clone())),
-                        (
-                            "state".to_owned(),
-                            Json::String(
-                                value
-                                    .pointer("/params/turn/status")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("completed")
-                                    .to_owned(),
-                            ),
-                        ),
-                    ]),
-                ));
-            }
+                &value,
+                terminal_turn,
+            );
         }
     });
     reply(
@@ -1507,6 +1486,80 @@ fn create_codex_thread(
             ("working_dir".to_owned(), Json::String(worktree.to_owned())),
         ]),
     )
+}
+
+pub(crate) fn handle_codex_notification(
+    registry: &zz::AgentRegistry,
+    store: &zz::Store,
+    agent_id: &str,
+    task_id: &str,
+    execution_id: &str,
+    value: &serde_json::Value,
+    terminal_turn: bool,
+) {
+    let method = value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let _ = store.add(relay_event(
+        "agent_harness_event",
+        task_id,
+        execution_id,
+        Json::Object(vec![
+            ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+            ("method".to_owned(), Json::String(method.to_owned())),
+        ]),
+    ));
+    if method == "turn/completed" {
+        let turn_status = value
+            .pointer("/params/turn/status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("completed");
+        let _ = store.add(relay_event(
+            "agent_turn_completed",
+            task_id,
+            execution_id,
+            Json::Object(vec![
+                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                ("state".to_owned(), Json::String(turn_status.to_owned())),
+            ]),
+        ));
+
+        let terminal_state = match turn_status {
+            "completed" => Some(("succeeded", "process_completed")),
+            "failed" => Some(("failed", "process_failed")),
+            "interrupted" => Some(("interrupted", "process_failed")),
+            _ => None,
+        };
+        if terminal_turn
+            && let Some((state, kind)) = terminal_state
+            && registry
+                .get(agent_id)
+                .is_some_and(|agent| agent.state == "running")
+        {
+            match registry.transition(agent_id, state, None) {
+                Ok(Some(_)) => {
+                    if store
+                        .add(relay_event(
+                            kind,
+                            task_id,
+                            execution_id,
+                            Json::Object(vec![
+                                ("agent_id".to_owned(), Json::String(agent_id.to_owned())),
+                                ("state".to_owned(), Json::String(state.to_owned())),
+                            ]),
+                        ))
+                        .is_err()
+                    {
+                        let _ = registry.mark_audit_degraded(agent_id);
+                    }
+                }
+                _ => {
+                    let _ = registry.mark_audit_degraded(agent_id);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(test))]
