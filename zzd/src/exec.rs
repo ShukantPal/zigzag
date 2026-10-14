@@ -53,10 +53,10 @@ struct BinaryIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BinPolicy {
-    path: String,
-    commands: Vec<Vec<String>>,
-    gh_read_repos: BTreeSet<String>,
+pub(crate) struct BinPolicy {
+    pub(crate) path: String,
+    pub(crate) commands: Vec<Vec<String>>,
+    pub(crate) gh_read_repos: BTreeSet<String>,
     /// `None` when the path did not resolve at load time; spawning is then
     /// refused outright instead of trusting whatever appears later.
     identity: Option<BinaryIdentity>,
@@ -165,8 +165,8 @@ impl Policy {
         let fields = object_fields(&json, "policy")?;
         require_only(fields, &["bins"], "policy")?;
         let bins = match field(fields, "bins") {
-            Some(Json::Object(bins)) if !bins.is_empty() => bins,
-            _ => return Err("policy bins must be a non-empty object".to_owned()),
+            Some(Json::Object(bins)) => bins,
+            _ => return Err("policy bins must be an object".to_owned()),
         };
         let mut parsed = BTreeMap::new();
         for (name, value) in bins {
@@ -195,9 +195,6 @@ impl Policy {
                 let Json::Array(prefix) = command else {
                     return Err(format!("binary {name} command prefix must be an array"));
                 };
-                if prefix.is_empty() {
-                    return Err(format!("binary {name} command prefix must not be empty"));
-                }
                 let prefix = prefix
                     .iter()
                     .map(|argument| argument.as_str().filter(|argument| !argument.is_empty()))
@@ -288,12 +285,80 @@ impl Policy {
         Json::Object(vec![("bins".to_owned(), Json::Object(bins))]).to_json()
     }
 
+    pub(crate) fn entry(&self, name: &str) -> Option<&BinPolicy> {
+        self.bins.get(name)
+    }
+
+    pub(crate) fn add_entry(
+        &mut self,
+        name: String,
+        path: String,
+        commands: Vec<Vec<String>>,
+        gh_read_repos: BTreeSet<String>,
+    ) -> Result<(), String> {
+        if !valid_bin_name(&name) {
+            return Err(format!("invalid binary name: {name}"));
+        }
+        if self.bins.contains_key(&name) {
+            return Err(format!("binary {name} is already allowlisted"));
+        }
+        if !Path::new(&path).is_absolute() {
+            return Err(format!("binary {name} path must be absolute and non-empty"));
+        }
+        if commands.is_empty()
+            || commands
+                .iter()
+                .flatten()
+                .any(|argument| argument.is_empty())
+        {
+            return Err("argument prefixes must contain non-empty strings".to_owned());
+        }
+        if name == "gh" && gh_read_repos.is_empty() {
+            return Err("adding gh requires at least one --repo OWNER/REPO".to_owned());
+        }
+        if name != "gh" && !gh_read_repos.is_empty() {
+            return Err("--repo is only supported when adding gh".to_owned());
+        }
+        if let Some(repo) = gh_read_repos.iter().find(|repo| !valid_github_repo(repo)) {
+            return Err(format!("invalid GitHub repository name: {repo}"));
+        }
+        self.bins.insert(
+            name,
+            BinPolicy {
+                identity: resolve_binary_identity(&path),
+                path,
+                commands,
+                gh_read_repos,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remove_entry(&mut self, name: &str) -> Result<(), String> {
+        self.bins
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| format!("binary {name} is not allowlisted"))
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &BinPolicy)> {
+        self.bins
+            .iter()
+            .map(|(name, policy)| (name.as_str(), policy))
+    }
+
     /// Pure allowlist predicate: does the policy allow these args? The
     /// returned path is the *configured* path, unverified. Anything that
     /// spawns must go through `verified_path` instead.
     pub fn allowed_path(&self, bin: &str, args: &[String]) -> Option<&str> {
         let policy = self.bins.get(bin)?;
-        (policy.commands.iter().any(|prefix| args.starts_with(prefix))
+        (policy.commands.iter().any(|prefix| {
+            if prefix.is_empty() {
+                args.is_empty()
+            } else {
+                args.starts_with(prefix)
+            }
+        })
             // `gh api` defaults to GET, but its flexible flags can otherwise
             // turn a superficially read-only allowlist prefix into a write.
             // Keep the policy useful for per-PR reads while making the
@@ -444,7 +509,7 @@ fn valid_github_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn valid_github_repo(value: &str) -> bool {
+pub(crate) fn valid_github_repo(value: &str) -> bool {
     let Some((owner, repo)) = value.split_once('/') else {
         return false;
     };
@@ -504,7 +569,7 @@ fn require_allowed(fields: &[(String, Json)], allowed: &[&str], name: &str) -> R
     Ok(())
 }
 
-fn valid_bin_name(name: &str) -> bool {
+pub(crate) fn valid_bin_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
@@ -932,12 +997,10 @@ mod tests {
     fn policy_rejects_bad_schemas() {
         for text in [
             r#"{}"#,
-            r#"{"bins":{}}"#,
             r#"{"bins":{"Jules":{"path":"/bin/echo","commands":[["x"]]}}}"#,
             r#"{"bins":{"jules":{"path":"relative/jules","commands":[["x"]]}}}"#,
             r#"{"bins":{"jules":{"path":"","commands":[["x"]]}}}"#,
             r#"{"bins":{"jules":{"path":"/bin/echo","commands":[]}}}"#,
-            r#"{"bins":{"jules":{"path":"/bin/echo","commands":[[]]}}}"#,
             r#"{"bins":{"jules":{"path":"/bin/echo","commands":[[""]]}}}"#,
             r#"{"bins":{"jules":{"path":"/bin/echo","commands":[[7]]}}}"#,
         ] {

@@ -85,7 +85,16 @@ zigzag config get-allowlist
 zigzag config set-allowlist --file /path/to/policy.json
 ```
 
-The JSON policy maps binary names to absolute paths and permitted argv prefixes. `set-allowlist` replaces the complete policy. The first Keychain access may prompt for permission; review the binary before granting it. See [configuration and security](docs/configuration.md) and the [Mac installation guide](launchd/INSTALL.md).
+The JSON policy maps binary names to absolute paths and permitted argv prefixes. `set-allowlist` replaces the complete policy. For routine edits, the CLI can list, inspect, add, and remove entries without writing JSON:
+
+```sh
+zigzag config allowlist list
+zigzag config allowlist show git
+zigzag config allowlist add git --args status --short --args diff --stat
+zigzag config allowlist remove git
+```
+
+Each `--args` group is a permitted argument prefix; if omitted, the entry permits only running the binary with no arguments. `gh` entries also require one or more `--repo OWNER/REPO` scopes. These commands read and write the same Keychain policy and require the local GUI login session. `set-allowlist --file PATH` remains available for replacing the complete policy. The first Keychain access may prompt for permission; review the binary before granting it. See [configuration and security](docs/configuration.md) and the [Mac installation guide](launchd/INSTALL.md).
 
 ## Development
 
