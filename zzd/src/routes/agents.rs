@@ -2101,6 +2101,13 @@ pub(crate) fn handle_codex_notification(
                             ]),
                         ),
                     );
+                    if state == "succeeded" {
+                        crate::routes::worktrees::cleanup_completed_agent_worktree(
+                            registry,
+                            agent_id,
+                            &crate::routes::worktrees::canonical_worktree_roots(),
+                        );
+                    }
                 }
                 _ => {
                     let _ = registry.mark_audit_degraded(agent_id);

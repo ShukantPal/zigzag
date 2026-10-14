@@ -667,6 +667,208 @@ pub(crate) fn cleanup_agent_worktree_with_trust(
     }
     Ok(())
 }
+
+/// Automatically remove a completed agent's worktree only when Git proves it
+/// has no local changes and no commits ahead of its configured upstream.
+/// Agent branches are intentionally retained.
+pub(crate) fn cleanup_completed_agent_worktree(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+    roots: &[PathBuf],
+) {
+    let Some(agent) = registry.get(agent_id) else {
+        log::warn!("agent_worktree_cleanup kept agent={agent_id}: agent record missing");
+        return;
+    };
+    let Some(raw_path) = agent.worktree_path.as_deref() else {
+        return;
+    };
+    if agent.state != "succeeded" {
+        log::info!(
+            "agent_worktree_cleanup kept agent={} path={}: agent is not completed (state={})",
+            agent.id,
+            raw_path,
+            agent.state
+        );
+        return;
+    }
+    let path = match resolve_existing_worktree_path(raw_path, roots) {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: {}",
+                agent.id,
+                raw_path,
+                error.message
+            );
+            return;
+        }
+    };
+    if let Ok(repo) = worktree_repo(&path)
+        && std::fs::canonicalize(&repo).ok().as_ref() == Some(&path)
+    {
+        log::error!(
+            "agent_worktree_cleanup kept agent={} path={}: refusing to remove main worktree",
+            agent.id,
+            path.display()
+        );
+        return;
+    }
+
+    if worktree_has_live_agent(registry, &path, &agent.id) {
+        log::warn!(
+            "agent_worktree_cleanup kept agent={} path={}: another live agent record is attached",
+            agent.id,
+            path.display()
+        );
+        return;
+    }
+
+    match git_output(
+        &path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    ) {
+        Ok(output) if output.status.success() && output.stdout.is_empty() => {}
+        Ok(output) if output.status.success() => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: working tree is dirty",
+                agent.id,
+                path.display()
+            );
+            return;
+        }
+        Ok(output) => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: git status failed: {}",
+                agent.id,
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: {}",
+                agent.id,
+                path.display(),
+                error.message
+            );
+            return;
+        }
+    }
+
+    let upstream = git_output(
+        &path,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+    let upstream = match upstream {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: branch has no configured upstream; pushed state cannot be verified",
+                agent.id,
+                path.display()
+            );
+            return;
+        }
+    };
+    let ahead = git_output(
+        &path,
+        &["rev-list", "--count", &format!("{upstream}..HEAD")],
+    );
+    match ahead {
+        Ok(output) if output.status.success() => {
+            let count = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>();
+            if count != Ok(0) {
+                log::warn!(
+                    "agent_worktree_cleanup kept agent={} path={}: branch has unpushed commits",
+                    agent.id,
+                    path.display()
+                );
+                return;
+            }
+        }
+        Ok(output) => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: could not verify pushed commits against {upstream}: {}",
+                agent.id,
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return;
+        }
+        Err(error) => {
+            log::warn!(
+                "agent_worktree_cleanup kept agent={} path={}: {}",
+                agent.id,
+                path.display(),
+                error.message
+            );
+            return;
+        }
+    }
+
+    let Ok(repo) = worktree_repo(&path) else {
+        log::warn!(
+            "agent_worktree_cleanup kept agent={} path={}: cannot resolve repository",
+            agent.id,
+            path.display()
+        );
+        return;
+    };
+    if worktree_has_live_agent(registry, &path, &agent.id) {
+        log::warn!(
+            "agent_worktree_cleanup kept agent={} path={}: another live agent record is attached",
+            agent.id,
+            path.display()
+        );
+        return;
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    run_worktree_hook(&repo, &path, "repo-stop.sh");
+    match git_output(&repo, &["worktree", "remove", &path_text]) {
+        Ok(output) if output.status.success() => log::info!(
+            "agent_worktree_cleanup removed agent={} path={} branch_retained=true",
+            agent.id,
+            path.display()
+        ),
+        Ok(output) => log::warn!(
+            "agent_worktree_cleanup kept agent={} path={}: git worktree remove failed: {}",
+            agent.id,
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => log::warn!(
+            "agent_worktree_cleanup kept agent={} path={}: {}",
+            agent.id,
+            path.display(),
+            error.message
+        ),
+    }
+}
+
+fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: &str) -> bool {
+    registry.list(None, None).iter().any(|other| {
+        other.id != owner_id
+            && matches!(other.state.as_str(), "running" | "orphaned" | "paused")
+            && other
+                .worktree_path
+                .as_deref()
+                .and_then(|other_path| std::fs::canonicalize(other_path).ok())
+                .as_deref()
+                == Some(path)
+    })
+}
+
 pub(crate) fn worktree_request_fields(
     body: &[u8],
     allowed: &[&str],

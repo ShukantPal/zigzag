@@ -48,11 +48,12 @@ use crate::routes::agents::{
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    cleanup_agent_worktree_with_trust, configured_worktree_base, discover_worktrees,
-    handle_deleted_worktrees_with_trust, resolve_existing_worktree_path, resolve_new_worktree_path,
-    resolve_worktree_repo, run_worktree_hook_using_shell, run_worktree_hook_with_trust,
-    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan_with_trust,
-    worktree_delete_plan_with_trust,
+    cleanup_agent_worktree, cleanup_agent_worktree_with_trust, cleanup_completed_agent_worktree,
+    configured_worktree_base, discover_worktrees, handle_deleted_worktrees_with_trust,
+    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
+    run_worktree_hook_using_shell, run_worktree_hook_with_trust, valid_worktree_branch,
+    worktree_branch_checkout_path, worktree_create_plan, worktree_create_plan_with_trust,
+    worktree_delete_plan, worktree_delete_plan_with_trust,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -1728,6 +1729,124 @@ fn worktree_create_and_delete_roundtrip() {
     worktree_delete_plan_with_trust(wt2.to_str().unwrap(), &roots, &[], &trusted).unwrap();
     assert!(worktree_delete_plan_with_trust(wt2.to_str().unwrap(), &roots, &[], &trusted).is_err());
     let _ = std::fs::remove_dir_all(&base);
+}
+
+fn completed_worktree_fixture(
+    prefix: &str,
+    push_branch: bool,
+) -> (PathBuf, PathBuf, Vec<PathBuf>, zz::AgentRegistry, String) {
+    let base = worktree_test_base(prefix);
+    let roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let id = format!("agent-{prefix}");
+    let branch = format!("codex/{prefix}");
+    let path = roots[0].join(&id);
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if push_branch {
+        let output = Command::new("git")
+            .args(["push", "--set-upstream", "origin", &branch])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
+    let mut record = agent_record(&id);
+    record.state = "succeeded".to_owned();
+    record.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(record).unwrap();
+    (repo, path, roots, registry, id)
+}
+
+#[test]
+fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-clean", true);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        "printf 'stopped\\n' >> \"$(dirname \"$0\")/stop.log\"\n",
+    )
+    .unwrap();
+    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(!path.exists(), "clean pushed worktree was not removed");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/auto-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "automatic cleanup deleted the branch");
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("stop.log")).unwrap(),
+        "stopped\n"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_dirty_worktree_is_kept() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
+    std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
+    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(path.exists(), "dirty worktree was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_worktree_with_unpushed_commits_is_kept() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-unpushed", true);
+    std::fs::write(path.join("pushed-later.txt"), "commit me").unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["add", "pushed-later.txt"]);
+    git(&["commit", "-m", "un-pushed work"]);
+    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(path.exists(), "worktree with unpushed commit was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn completed_worktree_with_another_live_agent_record_is_kept() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-live", true);
+    let mut live = agent_record("other-live-agent");
+    live.state = "running".to_owned();
+    live.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(live).unwrap();
+    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(
+        path.exists(),
+        "worktree with a live agent record was removed"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
 #[test]

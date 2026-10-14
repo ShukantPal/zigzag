@@ -160,6 +160,13 @@ pub(crate) fn update_proc_status_with_handle(
             }
             if registry.transition(handle, state, entry.exit_code).is_ok() {
                 entry.finished_at = Some(Instant::now());
+                if state == "succeeded" {
+                    crate::routes::worktrees::cleanup_completed_agent_worktree(
+                        registry,
+                        handle,
+                        &crate::routes::worktrees::canonical_worktree_roots(),
+                    );
+                }
                 if let Some(agent) = registry.get(handle) {
                     let watch_agent = agent.clone();
                     let _ = std::thread::Builder::new()
