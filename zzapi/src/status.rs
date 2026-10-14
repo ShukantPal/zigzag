@@ -1688,7 +1688,13 @@ mod tests {
         );
         let items = parse_codex_transcript(data);
         assert_eq!(items.len(), 3);
-        assert!(items[0].diagnostic.as_deref().unwrap().contains("Unknown event: turn/futureUpdate"));
+        assert!(
+            items[0]
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("Unknown event: turn/futureUpdate")
+        );
         assert_eq!(
             transcript_label(&items[1]).0,
             "Unknown event: mcpServer/futureStatus"
@@ -1704,9 +1710,9 @@ mod tests {
     #[test]
     fn reconciles_message_deltas_that_precede_their_item() {
         let items = parse_codex_transcript(concat!(
-            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"hello \"}}\\n",
-            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"world\"}}\\n",
-            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"msg-1\",\"type\":\"agentMessage\",\"text\":\"\"}}}\\n",
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"hello \"}}\n",
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"world\"}}\n",
+            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"msg-1\",\"type\":\"agentMessage\",\"text\":\"\"}}}\n",
         ));
         assert_eq!(items.len(), 1);
         assert_eq!(s(&items[0].item, "text"), "hello world");
