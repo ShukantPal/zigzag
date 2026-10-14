@@ -249,7 +249,16 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
         .expect("agent create response missing id")
         .to_owned();
     assert!(worktree.exists(), "agent worktree was not created");
-
+    let pushed = Command::new("git")
+        .args(["push", "--set-upstream", "origin", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .expect("could not push test agent branch");
+    assert!(
+        pushed.status.success(),
+        "could not push test agent branch: {}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
     let listed = response_json(request_once(
         Arc::clone(&state),
         &policy,
@@ -308,10 +317,12 @@ fn e2e_agent_create_list_pause_resume_delete_without_exec_policy() {
         "agent was not stopped after delete: {stopped:?}"
     );
 
+    assert!(worktree.exists(), "dirty agent worktree should be retained");
     assert!(
-        !worktree.exists(),
-        "agent delete did not clean up its worktree"
+        worktree.join(".codex-prompt.md").exists(),
+        "the dirty generated prompt file was unexpectedly removed"
     );
+    std::fs::remove_dir_all(&worktree).expect("could not clean up fake agent worktree");
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
 }
 
