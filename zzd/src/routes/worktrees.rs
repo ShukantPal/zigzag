@@ -683,9 +683,9 @@ pub(crate) fn cleanup_inactive_agent_worktree(
     let Some(raw_path) = agent.worktree_path.as_deref() else {
         return;
     };
-    if matches!(agent.state.as_str(), "running" | "orphaned" | "paused") {
+    if !agent_state_is_terminal(&agent.state) {
         log::info!(
-            "agent_worktree_cleanup kept agent={} path={}: agent is still live (state={})",
+            "agent_worktree_cleanup kept agent={} path={}: agent state is not terminal (state={})",
             agent.id,
             raw_path,
             agent.state
@@ -765,18 +765,19 @@ pub(crate) fn cleanup_inactive_agent_worktree(
         }
     }
 
-    let upstream = git_output(
-        &path,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    );
+    let upstream = git_output(&path, &["rev-parse", "--symbolic-full-name", "@{upstream}"]);
     let upstream = match upstream {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            let upstream = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !upstream.starts_with("refs/remotes/") {
+                log::warn!(
+                    "agent_worktree_cleanup kept agent={} path={}: upstream {upstream} is not a remote-tracking branch",
+                    agent.id,
+                    path.display()
+                );
+                return;
+            }
+            upstream
         }
         _ => {
             log::warn!(
@@ -864,10 +865,24 @@ pub(crate) fn cleanup_inactive_agent_worktree(
     }
 }
 
+pub(crate) fn agent_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "succeeded"
+            | "failed"
+            | "interrupted"
+            | "unexpected_exit"
+            | "lost_after_restart"
+            | "stopped"
+            | "killed"
+            | "finished"
+    )
+}
+
 fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: &str) -> bool {
     registry.list(None, None).iter().any(|other| {
         other.id != owner_id
-            && matches!(other.state.as_str(), "running" | "orphaned" | "paused")
+            && !agent_state_is_terminal(&other.state)
             && other
                 .worktree_path
                 .as_deref()

@@ -1839,6 +1839,18 @@ fn completed_worktree_with_unpushed_commits_is_kept() {
 }
 
 #[test]
+fn completed_worktree_without_remote_upstream_is_kept() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-no-remote", false);
+    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(
+        path.exists(),
+        "worktree without a remote upstream was removed"
+    );
+    assert!(registry.get(&id).is_none());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn completed_worktree_with_another_live_agent_record_is_kept() {
     let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-live", true);
     let mut live = agent_record("other-live-agent");

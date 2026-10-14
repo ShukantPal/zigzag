@@ -2116,7 +2116,7 @@ pub(crate) fn handle_codex_notification(
 }
 
 fn agent_is_live(agent: &AgentRecord) -> bool {
-    matches!(agent.state.as_str(), "running" | "orphaned" | "paused")
+    !crate::routes::worktrees::agent_state_is_terminal(&agent.state)
 }
 
 /// Run inactive-agent deletion through the relay's durable lifecycle: safely
