@@ -56,23 +56,30 @@ Worktree routes canonicalize paths, permit only `/private/tmp` or
 `/Users/shukant/.codex/worktrees`, reject traversal, and will not remove a
 live agent's worktree. Stopping an agent deliberately does not clean it up.
 
-Worktree deletion runs the owning repository's optional
-`.zigzag/repo-stop.sh <absolute-worktree-path>` hook before relay-initiated
-removal. A two-second relay poll also watches configured worktree roots and
-runs the same hook after it observes a manual `git worktree remove`. Manual
-removals are observable only for worktrees the relay saw before deletion; a
-worktree removed before the first scan or while the relay is stopped cannot be
-recovered. The hook runs from the repository root after manual removal and
-receives `ZIGZAG_WORKTREE_PATH`, `ZIGZAG_WORKTREE_REPO`, and
-`ZIGZAG_WORKTREE_OBSERVED=1` for relay-observed deletions.
+### Worktree deletion hook contract
 
-The default hook removes only the Bazel output base whose directory name is
-the MD5 of the deleted worktree path under known default per-user output roots
-(Linux XDG cache, modern macOS cache, and legacy macOS `/private/var/tmp`).
-The matching output base must also contain an `execroot` symlink to that exact
-worktree path. Custom Bazel output roots and output bases without that
-ownership evidence are left alone. The hook verifies the target is the owning
-repository's exact Git worktree, or, after removal, that the relay observed
-that exact path/repository pair (or Git still marks it prunable). Unverified
-paths are refused and logged. Git's shared install base and repository cache
-are outside the selected output base and are never targeted.
+A repository registers its deletion hook by placing a shell script at
+`<repository-root>/.zigzag/repo-stop.sh`. The relay finds the owning repository
+from the Git worktree metadata; it does not read or execute hook scripts from
+the worktree being deleted. If the file is absent, there is no deletion hook
+to run.
+
+For relay-initiated deletion, the relay runs the hook before removing the
+worktree. A two-second poll of configured worktree roots also detects manual
+`git worktree remove` operations for worktrees the relay observed before
+deletion, then runs the same hook. A manual removal before the relay's first
+scan or while it is stopped cannot be detected.
+
+The relay invokes the script through `sh`, passing the absolute worktree path
+as its first argument. `ZIGZAG_WORKTREE_PATH` is the same absolute path;
+`ZIGZAG_WORKTREE_REPO` is the owning repository root.
+`ZIGZAG_WORKTREE_OBSERVED` is `0` for relay-initiated deletion and `1`
+when the relay watcher detected a manual deletion. The working directory is
+the worktree while it still exists, and the owning repository root after a
+manual removal.
+
+Hooks are best-effort: a nonzero exit does not cancel worktree deletion. The
+relay logs each invoked hook's name, target, exit status, stdout, and stderr;
+nonzero exits and invocation errors are logged as warnings. Repositories own
+the behavior and safety of their hook scripts. Zigzag does not ship
+repository-specific deletion cleanup.
