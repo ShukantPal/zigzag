@@ -348,8 +348,14 @@ impl CodexServer {
     }
 
     pub(crate) fn resume_thread(&self, thread_id: &str) -> Result<(), String> {
-        self.rpc("thread/resume", json!({"threadId":thread_id}))
-            .map(|_| ())
+        let response = self.rpc("thread/resume", json!({"threadId":thread_id}))?;
+        if let Some(event) = resumed_completion_event(thread_id, &response)
+            && let Ok(mut subscribers) = self.shared.subscribers.lock()
+            && let Some(list) = subscribers.get_mut(thread_id)
+        {
+            list.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
+        Ok(())
     }
 
     /// Subscribe before resuming so notifications emitted during the resume
@@ -456,6 +462,30 @@ impl CodexServer {
             thread_id,
         })
     }
+}
+
+/// Build the same event consumed by the notification monitor when resume
+/// returns an idle thread whose latest persisted turn is terminal.
+pub(crate) fn resumed_completion_event(thread_id: &str, response: &Value) -> Option<HarnessEvent> {
+    if response
+        .pointer("/thread/status/type")
+        .and_then(Value::as_str)
+        != Some("idle")
+    {
+        return None;
+    }
+    let turn = response.pointer("/thread/turns")?.as_array()?.last()?;
+    matches!(
+        turn.get("status").and_then(Value::as_str),
+        Some("completed" | "failed" | "interrupted")
+    )
+    .then(|| HarnessEvent::Notification {
+        value: json!({
+            "method":"turn/completed",
+            "params":{"threadId":thread_id,"turn":turn}
+        }),
+        terminal_turn: true,
+    })
 }
 
 struct CodexSession {
@@ -1124,6 +1154,56 @@ mod tests {
         assert_eq!(
             value.get("method").and_then(Value::as_str),
             Some("turn/completed")
+        );
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn codex_resume_reconciles_a_persisted_terminal_turn() {
+        let script = r#"
+            IFS= read -r _resume
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-finished","status":{"type":"idle"},"turns":[{"id":"turn-finished","status":"completed"}]}}}'
+            IFS= read -r _stop
+        "#;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let shared = Arc::new(Shared {
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            pending: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+            approval_contexts: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        });
+        let reader_shared = Arc::clone(&shared);
+        thread::spawn(move || super::read_messages(stdout, reader_shared));
+        let server = CodexServer { shared };
+
+        let events = server.subscribe_thread("thread-finished").unwrap();
+        server.resume_thread("thread-finished").unwrap();
+        let HarnessEvent::Notification {
+            value,
+            terminal_turn,
+        } = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(terminal_turn);
+        assert_eq!(
+            value.get("method").and_then(Value::as_str),
+            Some("turn/completed")
+        );
+        assert_eq!(
+            value.pointer("/params/turn/status").and_then(Value::as_str),
+            Some("completed")
         );
         server.stop().unwrap();
     }

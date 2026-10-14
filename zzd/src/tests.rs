@@ -21,7 +21,7 @@ use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
-use crate::harness::{Delivery, HarnessSession};
+use crate::harness::{Delivery, HarnessSession, resumed_completion_event};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -2267,6 +2267,63 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
+    let kinds: Vec<_> = timeline
+        .iter()
+        .filter_map(|event| event.object("kind").and_then(Json::as_str))
+        .collect();
+    assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
+    assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+}
+
+#[test]
+fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
+    let (state, _state_path) = test_server();
+    let mut record = agent_record("recovered-codex-terminal-at-resume");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("thread-already-finished".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    crate::recover_native_agents(
+        &state.supervisor.registry,
+        &state.store,
+        |session_id| {
+            assert_eq!(session_id, "thread-already-finished");
+            let response = serde_json::json!({
+                "thread": {
+                    "id":"thread-already-finished",
+                    "status":{"type":"idle"},
+                    "turns":[{"id":"turn-finished","status":"completed"}]
+                }
+            });
+            let event = resumed_completion_event(session_id, &response)
+                .expect("resume response has a persisted terminal turn");
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(event).unwrap();
+            Ok(rx)
+        },
+        |_| panic!("OpenCode callback should not run for a Codex agent"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while state
+        .supervisor
+        .registry
+        .get("recovered-codex-terminal-at-resume")
+        .is_some_and(|agent| agent.state == "running")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("recovered-codex-terminal-at-resume")
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    let timeline = state.store.timeline("task-1").unwrap();
     let kinds: Vec<_> = timeline
         .iter()
         .filter_map(|event| event.object("kind").and_then(Json::as_str))
