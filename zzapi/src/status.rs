@@ -773,7 +773,7 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 let mut raw = event;
                 if let Some((delta, events)) = pending_deltas.remove(&key) {
                     append_agent_message_delta(&mut item, &delta);
-                    raw = Value::Array(std::iter::once(raw).chain(events).collect());
+                    raw = Value::Array(events.into_iter().chain(std::iter::once(raw)).collect());
                 }
                 items.push(TranscriptItem {
                     id: key,
@@ -2005,9 +2005,9 @@ mod tests {
         assert_eq!(s(&items[0].item, "text"), "hello world");
         let raw = items[0].raw.as_array().unwrap();
         assert_eq!(raw.len(), 3);
-        assert_eq!(raw[0]["method"], "item/started");
-        assert_eq!(raw[1]["params"]["delta"], "hello ");
-        assert_eq!(raw[2]["params"]["delta"], "world");
+        assert_eq!(raw[0]["params"]["delta"], "hello ");
+        assert_eq!(raw[1]["params"]["delta"], "world");
+        assert_eq!(raw[2]["method"], "item/started");
     }
 
     #[test]
