@@ -2122,16 +2122,29 @@ pub(crate) fn delete_inactive_agent(
     registry: &zz::AgentRegistry,
     agent_id: &str,
 ) -> Result<bool, String> {
+    delete_inactive_agent_with_trust(
+        registry,
+        agent_id,
+        &crate::routes::worktrees::trusted_hook_repos(),
+    )
+}
+
+pub(crate) fn delete_inactive_agent_with_trust(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+    trusted_repos: &[PathBuf],
+) -> Result<bool, String> {
     let Some(agent) = registry.get(agent_id) else {
         return Ok(false);
     };
     if agent_is_live(&agent) {
         return Ok(false);
     }
-    crate::routes::worktrees::cleanup_inactive_agent_worktree(
+    crate::routes::worktrees::cleanup_inactive_agent_worktree_with_trust(
         registry,
         agent_id,
         &agent_worktree_roots(),
+        trusted_repos,
     );
     if registry.deregister(agent_id)?.is_some() {
         crate::proc::remove_agent_output_files(agent_id);

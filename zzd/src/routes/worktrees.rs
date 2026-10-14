@@ -671,10 +671,11 @@ pub(crate) fn cleanup_agent_worktree_with_trust(
 /// Automatically remove an inactive agent's worktree only when Git proves it
 /// has no local changes and no commits ahead of its configured upstream.
 /// Agent branches are intentionally retained.
-pub(crate) fn cleanup_inactive_agent_worktree(
+pub(crate) fn cleanup_inactive_agent_worktree_with_trust(
     registry: &zz::AgentRegistry,
     agent_id: &str,
     roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
 ) {
     let Some(agent) = registry.get(agent_id) else {
         log::warn!("agent_worktree_cleanup kept agent={agent_id}: agent record missing");
@@ -843,7 +844,7 @@ pub(crate) fn cleanup_inactive_agent_worktree(
         return;
     }
     let path_text = path.to_string_lossy().into_owned();
-    run_worktree_hook(&repo, &path, "repo-stop.sh");
+    run_worktree_hook_with_trust(&repo, &path, "repo-stop.sh", false, trusted_repos);
     match git_output(&repo, &["worktree", "remove", &path_text]) {
         Ok(output) if output.status.success() => log::info!(
             "agent_worktree_cleanup removed agent={} path={} branch_retained=true",

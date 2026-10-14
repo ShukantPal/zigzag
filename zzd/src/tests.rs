@@ -40,23 +40,21 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    delete_completed_agent, delete_inactive_agent, dispatch_agent_message,
+    delete_inactive_agent, delete_inactive_agent_with_trust, dispatch_agent_message,
     handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
     parse_agent_cleanup_ttl, parse_agent_create_request, persisted_agent_config,
-    repair_transcript_tail, restart_argv, restart_config, sweep_completed_agents,
-    sweep_inactive_agents, sweep_inactive_agents_at, transcript_json_with_sessions_dir,
-    valid_agent_model,
+    repair_transcript_tail, restart_argv, restart_config, sweep_inactive_agents_at,
+    transcript_json_with_sessions_dir, valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    cleanup_agent_worktree, cleanup_agent_worktree_with_trust, cleanup_completed_agent_worktree,
-    configured_worktree_base, discover_worktrees, handle_deleted_worktrees_with_trust,
-    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
-    run_worktree_hook_using_shell, run_worktree_hook_with_trust, valid_worktree_branch,
-    worktree_branch_checkout_path, worktree_create_plan, worktree_create_plan_with_trust,
-    worktree_delete_plan, worktree_delete_plan_with_trust,
+    cleanup_agent_worktree_with_trust, configured_worktree_base, discover_worktrees,
+    handle_deleted_worktrees_with_trust, resolve_existing_worktree_path, resolve_new_worktree_path,
+    resolve_worktree_repo, run_worktree_hook_using_shell, run_worktree_hook_with_trust,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan_with_trust,
+    worktree_delete_plan_with_trust,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -1780,7 +1778,9 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
         "printf 'stopped\\n' >> \"$(dirname \"$0\")/stop.log\"\n",
     )
     .unwrap();
-    assert!(delete_inactive_agent(&registry, &id).unwrap());
+    assert!(
+        delete_inactive_agent_with_trust(&registry, &id, &[repo.canonicalize().unwrap()],).unwrap()
+    );
     assert!(!path.exists(), "clean pushed worktree was not removed");
     assert!(
         registry.get(&id).is_none(),
