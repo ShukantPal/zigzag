@@ -257,18 +257,219 @@ fn agents_continue_posts_authenticated_prompt_and_returns_turn_result() {
         .env("ZIGZAG_TOKEN", "test-token")
         .output()
         .unwrap();
+    let requests = server.join().unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "{}\nrequests={requests:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let requests = server.join().unwrap();
     assert!(requests[0].starts_with("GET /v1/agents/agent-1 HTTP/1.1\r\n"));
     assert!(requests[0].contains("Authorization: Bearer test-token\r\n"));
     assert!(requests[1].starts_with("POST /v1/agents/agent-1/continue HTTP/1.1\r\n"));
     assert!(requests[1].contains("Authorization: Bearer test-token\r\n"));
     assert!(requests[1].contains(r#"{"prompt":"address review feedback"}"#));
     assert!(String::from_utf8_lossy(&output.stdout).contains("\"turn\""));
+}
+
+#[test]
+fn built_binary_continues_the_live_agent_selected_by_branch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let responses = [
+            (404, r#"{"error":"unknown_agent"}"#),
+            (200, r#"{"agents":[]}"#),
+            (
+                200,
+                r#"{"agents":[{"id":"agent-1","branch":"feature/x","state":"running"}]}"#,
+            ),
+            (
+                200,
+                r#"{"agent_id":"agent-1","turn":{"status":"completed"}}"#,
+            ),
+        ];
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 2048];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request);
+                    let expected = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")?.parse::<usize>().ok()
+                        })
+                        .unwrap_or(0);
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    if request.len() >= header_end + expected {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            requests.push(String::from_utf8(request).unwrap());
+        }
+        requests
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "continue",
+            "--branch",
+            "feature/x",
+            "--prompt",
+            "resume work",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nrequests={requests:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(requests[0].starts_with("GET /v1/agents/feature/x "));
+    assert!(requests[1].starts_with("GET /v1/agents "));
+    assert!(requests[2].starts_with("GET /v1/agents "));
+    assert!(requests[3].starts_with("POST /v1/agents/agent-1/continue "));
+    assert!(requests[3].contains("\"prompt\":\"resume work\""));
+}
+
+#[test]
+fn list_branch_filter_is_sent_to_the_relay() {
+    let (port, server) = transcript_server([r#"{"agents":[]}"#]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "list",
+            "--state",
+            "running",
+            "--branch",
+            "feature/x",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let request = server.join().unwrap().remove(0);
+    assert!(
+        request.starts_with("GET /v1/agents?state=running&branch=feature%2Fx "),
+        "{request}"
+    );
+}
+
+#[test]
+fn bulk_delete_uses_one_relay_request_with_selection_policy() {
+    let (port, server) = transcript_server([
+        r#"{"branch":"feature/x","dry_run":true,"deleted_count":2,"skipped_count":1,"deleted":["a","b"],"failures":[]}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "delete",
+            "--branch",
+            "feature/x",
+            "--keep-last",
+            "1",
+            "--older-than",
+            "7d",
+            "--dry-run",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = server.join().unwrap().remove(0);
+    assert!(
+        request.starts_with(
+            "DELETE /v1/agents?branch=feature%2Fx&keep_last=1&older_than=7d&dry_run=1 "
+        ),
+        "{request}"
+    );
+}
+
+#[test]
+fn events_since_last_reads_and_advances_the_cli_cursor_file() {
+    let (port, server) =
+        transcript_server([r#"{"epoch":"epoch-1","next":9,"events":[],"lost":false}"#]);
+    let cursor = std::env::temp_dir().join(format!("zzapi-cursor-{}", std::process::id()));
+    std::fs::write(&cursor, "7").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "events",
+            "--since-last",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .env("ZIGZAG_EVENTS_CURSOR", &cursor)
+        .output()
+        .unwrap();
+    let request = server.join().unwrap().remove(0);
+    let saved = std::fs::read_to_string(&cursor).unwrap();
+    std::fs::remove_file(cursor).unwrap();
+    assert!(output.status.success());
+    assert!(request.starts_with("GET /v1/events?after=7&"), "{request}");
+    assert_eq!(saved, "9");
+}
+
+#[test]
+fn pr_status_combines_agent_transcript_and_repository_scoped_github_status() {
+    let (port, server) = transcript_server([
+        r#"{"repository":"owner/repo","agents":[{"id":"agent-1","state":"running"}]}"#,
+        r#"{"id":"agent-1","branch":"feature/x","state":"running","turn_in_flight":true,"current_turn_id":"turn-9","last_activity_at":"2026-10-14T12:00:00Z"}"#,
+        r#"{"stdout":"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"answer\"}}\n","stderr":""}"#,
+        r#"{"exit_code":0,"stdout":"{\"headRefOid\":\"abc123\",\"statusCheckRollup\":[],\"url\":\"https://github.com/owner/repo/pull/5\",\"state\":\"OPEN\",\"commits\":[{\"oid\":\"abc123\",\"messageHeadline\":\"last commit\"}]}"}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "--json",
+            "agents",
+            "status",
+            "--pr",
+            "5",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/agents?pr=5 "));
+    assert!(requests[1].starts_with("GET /v1/agents/agent-1 "));
+    assert!(requests[2].starts_with("GET /v1/agents/agent-1/transcript?tail_items=200 "));
+    assert!(requests[3].contains("\"pr\",\"view\",\"5\",\"--repo\",\"owner/repo\""));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["agent"]["turn_in_flight"], true);
+    assert_eq!(result["last_final_answer"], "answer");
+    assert_eq!(result["pr"]["head_sha"], "abc123");
 }
 
 #[test]
@@ -435,7 +636,9 @@ fn transcript_uses_the_endpoint_tail_query_and_renders_sections() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
     assert!(requests[0].starts_with("GET /v1/agents/agent-1 HTTP/1.1\r\n"));
-    assert!(requests[1].starts_with("GET /v1/agents/agent-1/transcript?tail=128 HTTP/1.1\r\n"));
+    assert!(
+        requests[1].starts_with("GET /v1/agents/agent-1/transcript?tail_items=128 HTTP/1.1\r\n")
+    );
     assert!(requests[1].contains("Authorization: Bearer test-token\r\n"));
     assert!(stdout.contains("--- prompt ---\nFix it\n"));
     assert!(stdout.contains("--- last message ---\nDone\n"));

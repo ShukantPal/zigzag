@@ -186,25 +186,48 @@ pub(crate) fn agent_request(
     };
     match route {
         AgentRoute::List => {
-            let allowed = ["state", "task_id"];
+            let allowed = ["state", "task_id", "branch", "pr"];
             if values.keys().any(|key| !allowed.contains(&key.as_str())) {
                 return reply(stream, 400, error("invalid_agent_query"));
             }
-            let agents = state.supervisor.registry.list(
-                values.get("state").map(String::as_str),
-                values.get("task_id").map(String::as_str),
-            );
-            reply(
-                stream,
-                200,
-                Json::Object(vec![(
-                    "agents".to_owned(),
-                    Json::Array(agents.iter().map(AgentRecord::status_json).collect()),
-                )]),
-            )
+            let pr_details = match values.get("pr") {
+                Some(value) => match value.parse::<u64>().ok().and_then(resolve_pr_details) {
+                    Some(details) => Some(details),
+                    None => return reply(stream, 404, error("unknown_pull_request")),
+                },
+                None => None,
+            };
+            let pr_branch = pr_details.as_ref().map(|(_, branch)| branch.as_str());
+            let branch_filter = values.get("branch").map(String::as_str).or(pr_branch);
+            let agents = state
+                .supervisor
+                .registry
+                .list(None, values.get("task_id").map(String::as_str));
+            let agents: Vec<Json> = agents
+                .iter()
+                .filter_map(|agent| {
+                    let status = enriched_agent_status(state, agent);
+                    if values.get("state").is_some_and(|state_filter| {
+                        status.object("state").and_then(Json::as_str) != Some(state_filter.as_str())
+                    }) {
+                        return None;
+                    }
+                    if let Some(branch) = branch_filter {
+                        if status.object("branch").and_then(Json::as_str) != Some(branch) {
+                            return None;
+                        }
+                    }
+                    Some(status)
+                })
+                .collect();
+            let mut response = vec![("agents".to_owned(), Json::Array(agents))];
+            if let Some((repository, _)) = pr_details {
+                response.push(("repository".to_owned(), Json::String(repository)));
+            }
+            reply(stream, 200, Json::Object(response))
         }
         AgentRoute::Status(id) => match state.supervisor.registry.get(id) {
-            Some(agent) => reply(stream, 200, agent.status_json()),
+            Some(agent) => reply(stream, 200, enriched_agent_status(state, &agent)),
             None => reply(stream, 404, error("unknown_agent")),
         },
         AgentRoute::Logs(id) => {
@@ -274,10 +297,39 @@ pub(crate) fn agent_request(
                 Ok(value) => value,
                 Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
             };
+            if values
+                .keys()
+                .any(|key| !["after", "tail", "tail_items", "since"].contains(&key.as_str()))
+            {
+                return reply(stream, 400, error("invalid_transcript_query"));
+            }
+            let tail_items = match values
+                .get("tail_items")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
+            };
+            let since = match values
+                .get("since")
+                .map(|value| value.parse::<u64>())
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
+            };
+            if tail_items.is_some() && since.is_some() {
+                return reply(stream, 400, error("invalid_transcript_query"));
+            }
             let id = resolve_registered_agent_id(&state.supervisor.registry, id)
                 .unwrap_or_else(|| id.to_owned());
             match transcript_json(&state.supervisor.registry, &id, after, tail) {
-                Some(json) => reply(stream, 200, json),
+                Some(json) => reply(
+                    stream,
+                    200,
+                    select_transcript_items(json, tail_items, since),
+                ),
                 None => reply(stream, 404, error("unknown_agent")),
             }
         }
@@ -288,6 +340,299 @@ pub(crate) fn agent_request(
         | AgentRoute::Continue(_)
         | AgentRoute::Create => reply(stream, 404, error("not_found")),
     }
+}
+
+/// Bulk terminal-record cleanup. Selection is performed against the relay's
+/// registry so callers need one request regardless of the number of records.
+pub(crate) fn agent_bulk_delete(
+    stream: &mut TcpStream,
+    state: &Server,
+    target: &str,
+) -> Result<(), String> {
+    let values = match query(target) {
+        Ok(values) => values,
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let allowed = ["branch", "pr", "keep_last", "older_than", "dry_run"];
+    if values.keys().any(|key| !allowed.contains(&key.as_str()))
+        || values.contains_key("branch") == values.contains_key("pr")
+    {
+        return reply(stream, 400, error("invalid_agent_delete_query"));
+    }
+    let branch = if let Some(branch) = values.get("branch") {
+        branch.clone()
+    } else {
+        let Some(number) = values.get("pr").and_then(|v| v.parse::<u64>().ok()) else {
+            return reply(stream, 400, error("invalid_agent_delete_query"));
+        };
+        let Some(branch) = resolve_pr_branch(number) else {
+            return reply(stream, 404, error("unknown_pull_request"));
+        };
+        branch
+    };
+    let keep_last = match values
+        .get("keep_last")
+        .map(|v| v.parse::<usize>())
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(0),
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let older_than = match values
+        .get("older_than")
+        .map(|v| parse_duration(v))
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let dry_run = match values.get("dry_run").map(String::as_str).unwrap_or("0") {
+        "0" => false,
+        "1" => true,
+        _ => return reply(stream, 400, error("invalid_agent_delete_query")),
+    };
+    let cutoff = older_than.map(|duration| {
+        std::time::SystemTime::now()
+            .checked_sub(duration)
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let mut candidates: Vec<AgentRecord> = state
+        .supervisor
+        .registry
+        .list(None, None)
+        .into_iter()
+        .filter(|agent| {
+            agent.status_json().object("branch").and_then(Json::as_str) == Some(branch.as_str())
+                && cutoff.is_none_or(|cutoff| {
+                    parse_rfc3339_epoch(&agent.started_at).is_some_and(|epoch| {
+                        std::time::UNIX_EPOCH + Duration::from_secs(epoch) < cutoff
+                    })
+                })
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    let selected = candidates.into_iter().skip(keep_last).collect::<Vec<_>>();
+    let mut deleted = Vec::new();
+    let mut skipped = 0u64;
+    let mut failures = Vec::new();
+    for agent in selected {
+        if agent_is_live(&agent) {
+            skipped += 1;
+            continue;
+        }
+        if dry_run {
+            deleted.push(agent.id);
+            continue;
+        }
+        match delete_explicit_agent_with_trust(
+            &state.supervisor.registry,
+            &agent.id,
+            watch_agent_pr(&agent),
+            &agent_worktree_roots(),
+            &crate::routes::worktrees::trusted_hook_repos(),
+        ) {
+            Ok(Some(_)) => deleted.push(agent.id),
+            Ok(None) => skipped += 1,
+            Err(_) => failures.push(Json::String(agent.id)),
+        }
+    }
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("branch".into(), Json::String(branch)),
+            ("dry_run".into(), Json::Bool(dry_run)),
+            ("deleted_count".into(), Json::number(deleted.len() as u64)),
+            ("skipped_count".into(), Json::number(skipped)),
+            (
+                "deleted".into(),
+                Json::Array(deleted.into_iter().map(Json::String).collect()),
+            ),
+            ("failures".into(), Json::Array(failures)),
+        ]),
+    )
+}
+
+fn parse_duration(value: &str) -> Result<Duration, ()> {
+    let (number, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit()).ok_or(())?);
+    let amount = number.parse::<u64>().map_err(|_| ())?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
+        _ => return Err(()),
+    };
+    amount
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or(())
+}
+
+fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
+    let date = value.get(0..10)?;
+    let time = value.get(11..19)?;
+    let mut d = date.split('-');
+    let year = d.next()?.parse::<i64>().ok()?;
+    let month = d.next()?.parse::<i64>().ok()?;
+    let day = d.next()?.parse::<i64>().ok()?;
+    let mut t = time.split(':');
+    let hour = t.next()?.parse::<u64>().ok()?;
+    let minute = t.next()?.parse::<u64>().ok()?;
+    let second = t.next()?.parse::<u64>().ok()?;
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86400)?
+        .checked_add(hour * 3600 + minute * 60 + second)
+}
+
+fn enriched_agent_status(state: &Server, agent: &AgentRecord) -> Json {
+    let active_turn = agent.harness_session_id.as_deref().and_then(|thread| {
+        state
+            .supervisor
+            .codex_app_server
+            .lock()
+            .ok()?
+            .as_ref()?
+            .active_turn_id(thread)
+    });
+    let in_flight = active_turn.is_some();
+    let mut status = agent.status_json();
+    if let Json::Object(ref mut fields) = status {
+        if active_turn.is_some() {
+            if let Some((_, value)) = fields.iter_mut().find(|(key, _)| key == "state") {
+                *value = Json::String("running".to_owned());
+            }
+        }
+        fields.push(("turn_in_flight".to_owned(), Json::Bool(in_flight)));
+        fields.push((
+            "current_turn_id".to_owned(),
+            active_turn.map(Json::String).unwrap_or(Json::Null),
+        ));
+        let activity = if in_flight {
+            Some(crate::events::relay_timestamp())
+        } else {
+            agent
+                .first_output_at
+                .clone()
+                .or_else(|| agent.completed_at.clone())
+                .or_else(|| Some(agent.started_at.clone()))
+        };
+        fields.push((
+            "last_activity_at".to_owned(),
+            activity.map(Json::String).unwrap_or(Json::Null),
+        ));
+    }
+    status
+}
+
+fn select_transcript_items(mut transcript: Json, tail: Option<usize>, since: Option<u64>) -> Json {
+    if let Json::Object(ref mut fields) = transcript {
+        for key in ["stdout", "stderr"] {
+            let Some((_, Json::String(text))) = fields.iter_mut().find(|(field, _)| field == key)
+            else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len() as u64;
+            let start = since
+                .map(|seq| usize::try_from(seq).unwrap_or(usize::MAX))
+                .unwrap_or_else(|| {
+                    tail.map(|count| lines.len().saturating_sub(count))
+                        .unwrap_or(0)
+                });
+            let selected = lines
+                .iter()
+                .skip(start)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            *text = if selected.is_empty() {
+                String::new()
+            } else {
+                selected + "\n"
+            };
+            fields.push((format!("{key}_next_sequence"), Json::number(total)));
+        }
+        let stdout_selected = fields
+            .iter()
+            .find(|(field, _)| field == "stdout")
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let stderr_selected = fields
+            .iter()
+            .find(|(field, _)| field == "stderr")
+            .and_then(|(_, value)| value.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if let Some((_, Json::Array(records))) =
+            fields.iter_mut().find(|(field, _)| field == "records")
+        {
+            for record in records {
+                let stream = record.object("stream").and_then(Json::as_str).unwrap_or("");
+                let text_key = match stream {
+                    "stdout" => "stdout",
+                    "stderr" => "stderr",
+                    _ => continue,
+                };
+                let selected = if text_key == "stdout" {
+                    &stdout_selected
+                } else {
+                    &stderr_selected
+                };
+                if let Json::Object(record_fields) = record
+                    && let Some((_, data)) =
+                        record_fields.iter_mut().find(|(field, _)| field == "data")
+                {
+                    *data = Json::String(selected.clone());
+                }
+            }
+        }
+    }
+    transcript
+}
+
+fn resolve_pr_branch(number: u64) -> Option<String> {
+    resolve_pr_details(number).map(|(_, branch)| branch)
+}
+
+fn resolve_pr_details(number: u64) -> Option<(String, String)> {
+    let root = agent_worktree_repo_root();
+    let repository = git_output(&root, &["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|remote| {
+            crate::github::github_repository(&String::from_utf8_lossy(&remote.stdout))
+        });
+    if let Ok(watched) = crate::github::watched_prs() {
+        let mut matches = watched.iter().filter(|entry| {
+            entry.number == number
+                && repository
+                    .as_ref()
+                    .is_none_or(|repo| &entry.repository == repo)
+        });
+        if let Some(entry) = matches.next() {
+            if matches.next().is_none() {
+                return Some((entry.repository.clone(), entry.branch.clone()));
+            }
+        }
+    }
+    let repository = repository?;
+    crate::session::require_gui_login_session().ok()?;
+    let branch = crate::github_api::get(&format!("repos/{repository}/pulls/{number}"))
+        .ok()?
+        .pointer("/head/ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)?;
+    Some((repository, branch))
 }
 
 /// Handle POST requests to agent routes (create/pause/resume).
@@ -3170,5 +3515,54 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
             return false;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod agent_dx_tests {
+    use super::{parse_duration, parse_rfc3339_epoch, select_transcript_items};
+    use zz::Json;
+
+    #[test]
+    fn transcript_tail_and_since_select_exclusive_item_sequences() {
+        let value = Json::Object(vec![
+            ("stdout".into(), Json::String("one\ntwo\nthree\n".into())),
+            ("stderr".into(), Json::String(String::new())),
+            (
+                "records".into(),
+                Json::Array(vec![Json::Object(vec![
+                    ("stream".into(), Json::String("stdout".into())),
+                    ("data".into(), Json::String("one\ntwo\nthree\n".into())),
+                ])]),
+            ),
+        ]);
+        let tail = select_transcript_items(value.clone(), Some(2), None);
+        assert_eq!(
+            tail.object("stdout").and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+        assert_eq!(
+            tail.object("records")
+                .and_then(|v| match v {
+                    Json::Array(items) => items.first(),
+                    _ => None,
+                })
+                .and_then(|v| v.object("data"))
+                .and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+        let since = select_transcript_items(value, None, Some(1));
+        assert_eq!(
+            since.object("stdout").and_then(Json::as_str),
+            Some("two\nthree\n")
+        );
+    }
+
+    #[test]
+    fn bulk_delete_durations_and_started_at_timestamps_parse() {
+        assert_eq!(parse_duration("7d").unwrap().as_secs(), 604800);
+        assert_eq!(parse_duration("12h").unwrap().as_secs(), 43200);
+        assert!(parse_duration("7x").is_err());
+        assert_eq!(parse_rfc3339_epoch("1970-01-02T00:00:00Z"), Some(86400));
     }
 }
