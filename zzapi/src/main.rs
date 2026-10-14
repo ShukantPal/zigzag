@@ -120,6 +120,12 @@ enum Commands {
         /// Include relay-internal maintenance tasks
         #[arg(long)]
         all: bool,
+        /// Show only rows whose agent is still in the registry
+        #[arg(long)]
+        live_only: bool,
+        /// Show only rows in this state (running, succeeded, failed, not observed, ...)
+        #[arg(long)]
+        state: Option<String>,
         /// Refresh interval in seconds
         #[arg(long, default_value_t = 2)]
         interval: u64,
@@ -1855,16 +1861,22 @@ fn run(cli: Cli) -> Result<(), Fail> {
         Commands::Status {
             once,
             all,
+            live_only,
+            state,
             interval,
             task_root,
             state_file,
         } => status::cmd_status(
             &client,
-            once,
-            all,
-            interval,
-            task_root.as_deref(),
-            state_file.as_deref(),
+            status::StatusOptions {
+                once,
+                all,
+                live_only,
+                state_filter: state.as_deref(),
+                interval,
+                task_root: task_root.as_deref(),
+                state_override: state_file.as_deref(),
+            },
         ),
         Commands::Worktrees { cmd } => match cmd {
             WorktreesCmd::Create { path, branch, repo } => {
