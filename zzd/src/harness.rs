@@ -794,16 +794,12 @@ fn git_push_targets_own_branch(args: &[String], branch: &str) -> bool {
     if rest.len() != 2 || rest[0] != "origin" || rest[1].starts_with([':', '+']) {
         return false;
     }
-    let destination = rest[1]
-        .rsplit_once(':')
-        .map_or(rest[1].as_str(), |(_, destination)| destination)
-        .strip_prefix("refs/heads/")
-        .unwrap_or_else(|| {
-            rest[1]
-                .rsplit_once(':')
-                .map_or(rest[1].as_str(), |(_, destination)| destination)
-        });
-    destination == branch
+    let is_own_branch_ref =
+        |reference: &str| reference == branch || reference == format!("refs/heads/{branch}");
+    match rest[1].split_once(':') {
+        Some((source, destination)) => is_own_branch_ref(source) && is_own_branch_ref(destination),
+        None => is_own_branch_ref(&rest[1]),
+    }
 }
 
 fn mktemp_is_tmp_scoped(args: &[String]) -> bool {
@@ -1611,6 +1607,15 @@ mod tests {
             ),
             (
                 serde_json::json!([
+                    "git",
+                    "push",
+                    "origin",
+                    "codex/relay-approval-policy:codex/relay-approval-policy"
+                ]),
+                "own-branch-git-push-allow",
+            ),
+            (
+                serde_json::json!([
                     "gh",
                     "pr",
                     "create",
@@ -1681,6 +1686,19 @@ mod tests {
             serde_json::json!(["git", "push", "origin", "main"]),
             serde_json::json!(["git", "push", "--force-with-lease", "origin", "main"]),
             serde_json::json!(["git", "push", "origin", "codex/other-branch"]),
+            serde_json::json!(["git", "push", "origin", "main:codex/relay-approval-policy"]),
+            serde_json::json!([
+                "git",
+                "push",
+                "origin",
+                "codex/other-branch:codex/relay-approval-policy"
+            ]),
+            serde_json::json!([
+                "git",
+                "push",
+                "origin",
+                "refs/heads/main:refs/heads/codex/relay-approval-policy"
+            ]),
             serde_json::json!([
                 "git",
                 "push",
