@@ -14,7 +14,7 @@ use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::routes::worktrees::configured_worktree_base;
 use crate::routes::worktrees::{
     WorktreeError, cleanup_agent_worktree, git_output, resolve_new_worktree_path,
-    resolve_worktree_repo, run_worktree_hook, valid_worktree_branch, worktree_branch_checkout_path,
+    resolve_worktree_repo, valid_worktree_branch, worktree_branch_checkout_path,
     worktree_branch_exists,
 };
 #[cfg(not(test))]
@@ -1355,6 +1355,22 @@ pub(crate) fn agent_create_worktree(
     branch: &str,
     agents: &[AgentRecord],
 ) -> Result<PathBuf, AgentWorktreeFailure> {
+    agent_create_worktree_with_trust(
+        repo,
+        path,
+        branch,
+        agents,
+        &crate::routes::worktrees::trusted_hook_repos(),
+    )
+}
+
+pub(crate) fn agent_create_worktree_with_trust(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    agents: &[AgentRecord],
+    trusted_repos: &[PathBuf],
+) -> Result<PathBuf, AgentWorktreeFailure> {
     let validation = AgentWorktreeFailure::Validation;
     if !git_output(repo, &["rev-parse", "--git-dir"])
         .map_err(validation)?
@@ -1417,7 +1433,13 @@ pub(crate) fn agent_create_worktree(
         "agent_create worktree path={} branch={branch}",
         path.display()
     );
-    run_worktree_hook(repo, path, "repo-start.sh");
+    crate::routes::worktrees::run_worktree_hook_with_trust(
+        repo,
+        path,
+        "repo-start.sh",
+        false,
+        trusted_repos,
+    );
     Ok(path.to_path_buf())
 }
 

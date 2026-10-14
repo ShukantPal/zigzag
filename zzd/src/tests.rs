@@ -34,20 +34,22 @@ use crate::proc::{
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
 use crate::routes::agents::{
-    AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree, agent_harness_bin,
-    agent_harness_config, agent_post_request_with_session_resolver, agent_route,
-    default_agent_worktree, dispatch_agent_message, handle_codex_notification,
-    monitor_codex_events, monitor_codex_events_to_path, parse_agent_create_request,
-    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
-    transcript_json_with_sessions_dir, valid_agent_model,
+    AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
+    agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
+    agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
+    dispatch_agent_message, handle_codex_notification, monitor_codex_events,
+    monitor_codex_events_to_path, parse_agent_create_request, persisted_agent_config,
+    repair_transcript_tail, restart_argv, restart_config, transcript_json_with_sessions_dir,
+    valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    cleanup_agent_worktree, configured_worktree_base, discover_worktrees, handle_deleted_worktrees,
-    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
-    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan,
-    worktree_delete_plan,
+    cleanup_agent_worktree_with_trust, configured_worktree_base, discover_worktrees,
+    handle_deleted_worktrees_with_trust, resolve_existing_worktree_path, resolve_new_worktree_path,
+    resolve_worktree_repo, run_worktree_hook_using_shell, run_worktree_hook_with_trust,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan_with_trust,
+    worktree_delete_plan_with_trust,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -63,7 +65,29 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+struct HookTestLogger;
+impl log::Log for HookTestLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata())
+            && let Ok(mut logs) = TEST_LOGS.get_or_init(|| Mutex::new(Vec::new())).lock()
+        {
+            logs.push(format!("{}", record.args()));
+        }
+    }
+    fn flush(&self) {}
+}
+static HOOK_TEST_LOGGER: HookTestLogger = HookTestLogger;
+fn hook_test_logs() -> &'static Mutex<Vec<String>> {
+    let _ = log::set_logger(&HOOK_TEST_LOGGER);
+    log::set_max_level(log::LevelFilter::Warn);
+    TEST_LOGS.get_or_init(|| Mutex::new(Vec::new()))
+}
 use std::thread;
 use std::time::{Duration, Instant};
 use zz::{AgentRecord, AgentRegistry, Json, Store, parse_json};
@@ -1473,7 +1497,14 @@ fn worktree_create_and_delete_roundtrip() {
     let roots = vec![wt_root.canonicalize().unwrap()];
     let repo_root = base.canonicalize().unwrap();
     let plan = |path: &str, branch: &str| {
-        worktree_create_plan(path, branch, repo.to_str().unwrap(), &roots, &repo_root)
+        worktree_create_plan_with_trust(
+            path,
+            branch,
+            repo.to_str().unwrap(),
+            &roots,
+            &repo_root,
+            &[repo.canonicalize().unwrap()],
+        )
     };
 
     // Create on a new branch.
@@ -1503,13 +1534,16 @@ fn worktree_create_and_delete_roundtrip() {
     // A live agent attached to the worktree blocks deletion.
     let agent_command = format!("codex exec --cd {}", wt.display());
     let agents: Vec<(&str, &str)> = vec![("running", agent_command.as_str())];
-    let err = worktree_delete_plan(wt.to_str().unwrap(), &roots, &agents).unwrap_err();
+    let trusted = [repo.canonicalize().unwrap()];
+    let err = worktree_delete_plan_with_trust(wt.to_str().unwrap(), &roots, &agents, &trusted)
+        .unwrap_err();
     assert_eq!((err.code, err.message), (409, "worktree_in_use"));
     assert!(wt.exists(), "refused delete must leave the worktree alone");
 
     // A finished agent does not block.
     let agents: Vec<(&str, &str)> = vec![("succeeded", agent_command.as_str())];
-    let response = worktree_delete_plan(wt.to_str().unwrap(), &roots, &agents).unwrap();
+    let response =
+        worktree_delete_plan_with_trust(wt.to_str().unwrap(), &roots, &agents, &trusted).unwrap();
     assert_eq!(response.object("removed"), Some(&Json::Bool(true)));
     assert!(!wt.exists());
     let hook_log = std::fs::read_to_string(hooks.join("hook.log")).unwrap();
@@ -1536,8 +1570,8 @@ fn worktree_create_and_delete_roundtrip() {
     assert!(wt2.join(".git").exists());
 
     // Deleting a path that is gone fails instead of claiming success.
-    worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).unwrap();
-    assert!(worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).is_err());
+    worktree_delete_plan_with_trust(wt2.to_str().unwrap(), &roots, &[], &trusted).unwrap();
+    assert!(worktree_delete_plan_with_trust(wt2.to_str().unwrap(), &roots, &[], &trusted).is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -1583,7 +1617,7 @@ fn manual_worktree_remove_runs_configured_delete_hook_after_relay_observes_it() 
         String::from_utf8_lossy(&removed.stderr)
     );
     let current = discover_worktrees(&roots);
-    handle_deleted_worktrees(&observed, &current);
+    handle_deleted_worktrees_with_trust(&observed, &current, &[repo.canonicalize().unwrap()]);
     assert_eq!(
         std::fs::read_to_string(hook_dir.join("manual-hook.log")).unwrap(),
         format!(
@@ -1592,6 +1626,118 @@ fn manual_worktree_remove_runs_configured_delete_hook_after_relay_observes_it() 
             target.display(),
             repo.canonicalize().unwrap().display()
         )
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn worktree_hooks_require_explicit_trust_and_allowlist_is_exact() {
+    let base = worktree_test_base("wt-hook-trust");
+    let repo = worktree_test_repo(&base).canonicalize().unwrap();
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let marker = hooks.join("ran");
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        format!("touch '{}'\n", marker.display()),
+    )
+    .unwrap();
+
+    run_worktree_hook_with_trust(&repo, &repo, "repo-stop.sh", false, &[]);
+    assert!(!marker.exists(), "untrusted repository hook was executed");
+    run_worktree_hook_with_trust(
+        &repo,
+        &repo,
+        "repo-stop.sh",
+        false,
+        std::slice::from_ref(&repo),
+    );
+    assert!(
+        marker.exists(),
+        "explicitly trusted repository hook did not run"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn missing_worktree_hook_is_a_noop() {
+    let base = worktree_test_base("wt-hook-missing");
+    let repo = worktree_test_repo(&base).canonicalize().unwrap();
+    let hook = format!("missing-{}.sh", std::process::id());
+    hook_test_logs().lock().unwrap().clear();
+    run_worktree_hook_with_trust(&repo, &repo, &hook, false, std::slice::from_ref(&repo));
+    assert!(
+        hook_test_logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| !line.contains(&hook)),
+        "missing hook should be ignored without attempting invocation"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn worktree_hook_failures_are_logged_and_environment_is_scrubbed() {
+    let base = worktree_test_base("wt-hook-failure");
+    let repo = worktree_test_repo(&base).canonicalize().unwrap();
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let env_dump = hooks.join("env.txt");
+    std::fs::write(
+        hooks.join("repo-stop.sh"),
+        format!("env > '{}'\nexit 23\n", env_dump.display()),
+    )
+    .unwrap();
+    hook_test_logs().lock().unwrap().clear();
+    run_worktree_hook_with_trust(
+        &repo,
+        &repo,
+        "repo-stop.sh",
+        false,
+        std::slice::from_ref(&repo),
+    );
+    let env = std::fs::read_to_string(env_dump).unwrap();
+    for entry in env.lines() {
+        let key = entry.split('=').next().unwrap_or_default();
+        assert!(
+            matches!(
+                key,
+                "PATH"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "ZIGZAG_WORKTREE_PATH"
+                    | "ZIGZAG_WORKTREE_REPO"
+                    | "ZIGZAG_WORKTREE_OBSERVED"
+                    | "PWD"
+                    | "SHLVL"
+                    | "_"
+            ),
+            "unexpected child environment variable: {key}"
+        );
+    }
+    assert!(!env.contains("ZIGZAG_TRUSTED_HOOK_REPOS"));
+    let logs = hook_test_logs().lock().unwrap().clone();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("worktree_hook name=repo-stop.sh failed")),
+        "nonzero exit warning missing: {logs:?}"
+    );
+
+    hook_test_logs().lock().unwrap().clear();
+    run_worktree_hook_using_shell(
+        &repo,
+        &repo,
+        "repo-stop.sh",
+        false,
+        std::slice::from_ref(&repo),
+        Path::new("/missing/zigzag-test-shell"),
+    );
+    let logs = hook_test_logs().lock().unwrap().clone();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("worktree_hook name=repo-stop.sh could not run")),
+        "invocation error warning missing: {logs:?}"
     );
     let _ = std::fs::remove_dir_all(base);
 }
@@ -1610,10 +1756,22 @@ fn agent_worktree_cleanup_runs_stop_hook_and_deletes_feature_branch() {
     )
     .unwrap();
     let worktree = worktree_root.join("feature-cleanup");
-    agent_create_worktree(&repo, &worktree, "feature-cleanup", &[]).unwrap();
+    agent_create_worktree_with_trust(
+        &repo,
+        &worktree,
+        "feature-cleanup",
+        &[],
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap();
 
     let roots = vec![std::env::temp_dir().canonicalize().unwrap()];
-    cleanup_agent_worktree(worktree.to_str().unwrap(), &roots).unwrap();
+    cleanup_agent_worktree_with_trust(
+        worktree.to_str().unwrap(),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap();
     assert!(!worktree.exists());
     assert_eq!(
         std::fs::read_to_string(hooks.join("stop-ran")).unwrap(),
@@ -3180,9 +3338,8 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         .unwrap();
     assert!(!branch.success(), "agent branch was not deleted");
     assert!(
-        std::fs::read_to_string(hooks.join("stop-ran"))
-            .unwrap()
-            .contains("stopped\n")
+        !hooks.join("stop-ran").exists(),
+        "repository hook ran without an explicit local trust decision"
     );
     let _ = std::fs::remove_dir_all(&base);
 

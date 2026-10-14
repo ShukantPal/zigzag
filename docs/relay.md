@@ -58,11 +58,24 @@ live agent's worktree. Stopping an agent deliberately does not clean it up.
 
 ### Worktree deletion hook contract
 
-A repository registers its deletion hook by placing a shell script at
+A repository may provide lifecycle scripts at
+`<repository-root>/.zigzag/repo-start.sh` and
 `<repository-root>/.zigzag/repo-stop.sh`. The relay finds the owning repository
-from the Git worktree metadata; it does not read or execute hook scripts from
-the worktree being deleted. If the file is absent, there is no deletion hook
-to run.
+from Git worktree metadata; it does not read hooks from the worktree being
+deleted. Missing scripts are ignored.
+
+**Trust is an explicit local operator decision.** The relay executes no
+repository hook unless that repository's canonical root appears in the
+`ZIGZAG_TRUSTED_HOOK_REPOS` environment variable supplied to the relay. This is
+a platform path list (colon-separated on macOS/Linux); configure it in the
+relay's local service environment, for example:
+`ZIGZAG_TRUSTED_HOOK_REPOS=/Users/me/Workspace/project-a:/Users/me/Workspace/project-b`.
+An unset, empty, invalid, or nonmatching list skips the hook and writes a
+warning. Trust applies to the repository root and therefore to both start and
+stop hooks it contains, including hooks reached by the manual-deletion watcher.
+The relay trusts the operator's local configuration, not a declaration made
+inside the repository. Review the repository and its hook scripts before
+adding its canonical root.
 
 For relay-initiated deletion, the relay runs the hook before removing the
 worktree. A two-second poll of configured worktree roots also detects manual
@@ -70,8 +83,15 @@ worktree. A two-second poll of configured worktree roots also detects manual
 deletion, then runs the same hook. A manual removal before the relay's first
 scan or while it is stopped cannot be detected.
 
-The relay invokes the script through `sh`, passing the absolute worktree path
-as its first argument. `ZIGZAG_WORKTREE_PATH` is the same absolute path;
+The relay invokes the script through `/bin/sh`, passing the absolute worktree
+path as its first argument. It clears the daemon environment and sets only
+`PATH=/usr/bin:/bin`, `LANG=C`, `LC_ALL=C`, and the documented hook variables;
+shells may also set `PWD`, `SHLVL`, and `_`. This keeps unrelated daemon tokens and secrets out of
+the child environment. The hook still runs as the relay's logged-in user, with
+that user's filesystem permissions and access to resources available through
+the OS (including the user keychain). Environment scrubbing is not a sandbox:
+trusted hooks must be treated as local code running with the relay user's
+privileges. `ZIGZAG_WORKTREE_PATH` is the same absolute path;
 `ZIGZAG_WORKTREE_REPO` is the owning repository root.
 `ZIGZAG_WORKTREE_OBSERVED` is `0` for relay-initiated deletion and `1`
 when the relay watcher detected a manual deletion. The working directory is
