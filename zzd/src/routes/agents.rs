@@ -495,23 +495,25 @@ fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
 }
 
 fn enriched_agent_status(state: &Server, agent: &AgentRecord) -> Json {
-    let active_turn = agent.harness_session_id.as_deref().and_then(|thread| {
-        state
-            .supervisor
-            .codex_app_server
-            .lock()
-            .ok()?
-            .as_ref()?
-            .active_turn_id(thread)
-    });
+    // The registry is authoritative for lifecycle state. The app-server can
+    // retain an active-turn entry briefly after a stop or terminal result, so
+    // never let that stale entry make a completed record look running.
+    let active_turn = (!crate::routes::worktrees::agent_state_is_terminal(&agent.state))
+        .then(|| {
+            agent.harness_session_id.as_deref().and_then(|thread| {
+                state
+                    .supervisor
+                    .codex_app_server
+                    .lock()
+                    .ok()?
+                    .as_ref()?
+                    .active_turn_id(thread)
+            })
+        })
+        .flatten();
     let in_flight = active_turn.is_some();
     let mut status = agent.status_json();
     if let Json::Object(ref mut fields) = status {
-        if active_turn.is_some()
-            && let Some((_, value)) = fields.iter_mut().find(|(key, _)| key == "state")
-        {
-            *value = Json::String("running".to_owned());
-        }
         fields.push(("turn_in_flight".to_owned(), Json::Bool(in_flight)));
         fields.push((
             "current_turn_id".to_owned(),
