@@ -894,7 +894,15 @@ fn read_bounded_transcript_file(
         after.min(size)
     };
     file.seek(SeekFrom::Start(start)).ok()?;
+    let mut mid_record = false;
     if start > 0 {
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous).ok()?;
+        mid_record = previous[0] != b'\n';
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    if mid_record {
         let mut byte = [0u8; 1];
         let mut skipped = 0usize;
         while skipped < limit && file.read(&mut byte).ok()? == 1 {

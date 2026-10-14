@@ -3187,6 +3187,49 @@ fn durable_and_orphan_transcript_fallbacks_read_only_bounded_file_windows() {
 }
 
 #[test]
+fn durable_transcript_cursor_preserves_boundary_records_and_skips_mid_record() {
+    let (state, _state_path) = test_server();
+    let id = "bounded-cursor-file";
+    state
+        .supervisor
+        .registry
+        .register(agent_record(id))
+        .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "zigzag-transcript-cursor-{}-{}.jsonl",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let text = "first-record\nsecond-record\nthird-record\n";
+    std::fs::write(&path, text).unwrap();
+
+    let read_after = |after| {
+        let response = agent_logs_json_from_paths(
+            &state.supervisor.registry,
+            id,
+            "stdout",
+            after,
+            None,
+            Some(path.clone()),
+            None,
+        )
+        .unwrap();
+        let Json::Array(records) = response.object("records").unwrap() else {
+            panic!("records array expected");
+        };
+        records[0]
+            .object("data")
+            .and_then(Json::as_str)
+            .unwrap()
+            .to_owned()
+    };
+    let boundary_cursor = "first-record\n".len() as u64;
+    assert_eq!(read_after(boundary_cursor), "second-record\nthird-record\n");
+    assert_eq!(read_after(boundary_cursor + 3), "third-record\n");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn transcript_uses_codex_rollout_when_relay_transcript_is_missing_by_agent_and_task_id() {
     let (state, _state_path) = test_server();
     let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f4";
