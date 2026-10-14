@@ -218,7 +218,7 @@ fn agents_delete_dry_run_describes_effects_without_deleting() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("keeps the agent record"));
+    assert!(stdout.contains("retains its agent record"));
     assert!(stdout.contains("watched pull request"));
     assert!(stdout.contains("attempts to delete its branch"));
     assert!(stdout.contains("No DELETE request was sent"));

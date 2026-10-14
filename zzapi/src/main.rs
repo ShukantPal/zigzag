@@ -283,7 +283,7 @@ enum AgentsCmd {
         #[arg(long)]
         prompt: String,
     },
-    /// Stop a live agent; terminal agents have their record and worktree cleaned up
+    /// Gracefully stop an agent (leaves worktree)
     Stop {
         /// Agent handle (unique prefix accepted)
         id: String,
@@ -836,18 +836,24 @@ fn resolve_agent_id(client: &Client, prefix: &str) -> Result<String, ApiError> {
         Err(_) => {}
     }
     let resp = client.get("/v1/agents", &[])?;
-    let matches: Vec<String> = resp
+    let agents = resp
         .get("agents")
-        .and_then(|a| a.as_array())
-        .map(|agents| {
-            agents
-                .iter()
-                .filter_map(|a| a.get("id").and_then(|i| i.as_str()))
-                .filter(|id| id.starts_with(prefix))
-                .map(|id| id.to_string())
-                .collect()
-        })
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or_default();
+    resolve_agent_id_from_list(prefix, agents)
+}
+
+fn resolve_agent_id_from_list(
+    prefix: &str,
+    agents: &[serde_json::Value],
+) -> Result<String, ApiError> {
+    let matches: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| agent.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| id.starts_with(prefix))
+        .map(str::to_owned)
+        .collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
         0 => Err(ApiError {
@@ -862,6 +868,59 @@ fn resolve_agent_id(client: &Client, prefix: &str) -> Result<String, ApiError> {
                     .iter()
                     .take(5)
                     .map(|m| m.chars().take(12).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
+}
+
+/// Resolve an existing ID or unique ID prefix first, then an exact branch name.
+/// Branch targets only select running agents so a stale registry entry can
+/// never make a follow-up appear to succeed.
+fn resolve_agent_target(client: &Client, target: &str) -> Result<String, ApiError> {
+    match resolve_agent_id(client, target) {
+        Ok(id) => return Ok(id),
+        Err(error) if error.status == 404 => {}
+        Err(error) => return Err(error),
+    }
+
+    let response = client.get("/v1/agents", &[])?;
+    let agents = response
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    select_live_agent_for_branch(target, agents)
+}
+
+fn select_live_agent_for_branch(
+    branch: &str,
+    agents: &[serde_json::Value],
+) -> Result<String, ApiError> {
+    let matches: Vec<&serde_json::Value> = agents
+        .iter()
+        .filter(|agent| agent.get("branch").and_then(serde_json::Value::as_str) == Some(branch))
+        .collect();
+    let running: Vec<&serde_json::Value> = matches
+        .iter()
+        .copied()
+        .filter(|agent| agent.get("state").and_then(serde_json::Value::as_str) == Some("running"))
+        .collect();
+
+    match running.as_slice() {
+        [agent] => Ok(s(agent, "id")),
+        [] => Err(ApiError {
+            status: 404,
+            message: format!("no live agent on branch {branch:?}"),
+        }),
+        _ => Err(ApiError {
+            status: 0,
+            message: format!(
+                "multiple live agents on branch {branch:?}; specify an agent ID: {}",
+                running
+                    .iter()
+                    .map(|agent| format!("{} ({})", s(agent, "id"), s(agent, "state")))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1086,7 +1145,7 @@ fn cmd_agents_message(
     steer: Option<&str>,
     queue: Option<&str>,
 ) -> Result<(), Fail> {
-    let id = resolve_agent_id(client, id)?;
+    let id = resolve_agent_target(client, id)?;
     let (text, delivery) = match (steer, queue) {
         (Some(text), None) => (text, "steer"),
         (None, Some(text)) => (text, "queue"),
@@ -1108,7 +1167,7 @@ fn cmd_agents_message(
 }
 
 fn cmd_agents_continue(client: &Client, id: &str, prompt: &str) -> Result<(), Fail> {
-    let id = resolve_agent_id(client, id)?;
+    let id = resolve_agent_target(client, id)?;
     let body = serde_json::json!({"prompt":prompt});
     let response = client.post_with_timeout(&format!("/v1/agents/{id}/continue"), &body, 1800)?;
     emit(client, &response, || {
@@ -2180,6 +2239,70 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["zzapi", "agents", "continue", "abc"]).is_err());
+    }
+
+    #[test]
+    fn branch_target_prefers_the_running_agent_over_stale_matches() {
+        let agents = serde_json::json!([
+            {"id":"old-agent", "branch":"feature/work", "state":"completed"},
+            {"id":"live-agent", "branch":"feature/work", "state":"running"}
+        ]);
+        assert_eq!(
+            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap(),
+            "live-agent"
+        );
+    }
+
+    #[test]
+    fn branch_target_reports_ambiguous_live_agents_with_their_ids() {
+        let agents = serde_json::json!([
+            {"id":"agent-one", "branch":"feature/work", "state":"running"},
+            {"id":"agent-two", "branch":"feature/work", "state":"running"}
+        ]);
+        let error =
+            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap_err();
+        assert!(error.message.contains("multiple live agents on branch"));
+        assert!(error.message.contains("agent-one"));
+        assert!(error.message.contains("agent-two"));
+    }
+
+    #[test]
+    fn branch_target_without_a_running_agent_fails_clearly() {
+        let agents = serde_json::json!([
+            {"id":"old-agent", "branch":"feature/work", "state":"completed"}
+        ]);
+        let error =
+            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap_err();
+        assert_eq!(error.message, "no live agent on branch \"feature/work\"");
+    }
+
+    #[test]
+    fn agent_id_exact_prefix_and_ambiguous_prefix_resolution_is_preserved() {
+        let agents = serde_json::json!([
+            {"id":"agent-123456"},
+            {"id":"agent-987654"}
+        ]);
+        let agents = agents.as_array().unwrap();
+        assert_eq!(
+            resolve_agent_id_from_list("agent-123456", agents).unwrap(),
+            "agent-123456"
+        );
+        assert_eq!(
+            resolve_agent_id_from_list("agent-123", agents).unwrap(),
+            "agent-123456"
+        );
+        assert_eq!(
+            resolve_agent_id_from_list("agent-", agents)
+                .unwrap_err()
+                .message,
+            "ambiguous prefix \"agent-\" matches 2 agents: agent-123456, agent-987654"
+        );
+        assert_eq!(
+            resolve_agent_id_from_list("missing", agents)
+                .unwrap_err()
+                .message,
+            "unknown_agent"
+        );
     }
 
     #[cfg(unix)]

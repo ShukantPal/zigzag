@@ -813,12 +813,14 @@ it merely SIGCONTs a paused current process group.
 zzapi agents stop ID_OR_UNIQUE_PREFIX
 ```
 
-Calls `DELETE /v1/agents/{id}`. This gracefully stops then may force-kill the
-native process group. The relay keeps the record and transitions it to
-`stopped` or `killed`. It removes the worktree after a successful stop unless
-the worktree is retained for a watched pull request. Worktree cleanup also
-attempts to delete its branch unless it is `main`/`master`, checked out
-elsewhere, or cleanup fails.
+Calls `DELETE /v1/agents/{id}`. For a live agent, the relay gracefully stops
+then may force-kill the verified process group and retains the record in its
+terminal state. A paused process is resumed before shutdown. After a successful
+stop, safe worktree cleanup runs only when the tree is clean and its branch tip
+matches its upstream; watched pull requests and unsafe or unverifiable trees
+are retained. Cleanup uses the repository stop hook and removes the branch
+only when safe. Completed records remain available until the configured agent
+cleanup TTL expires.
 
 ### `zzapi agents delete`
 
@@ -826,14 +828,16 @@ elsewhere, or cleanup fails.
 zzapi agents delete ID_OR_UNIQUE_PREFIX [--dry-run]
 ```
 
-Calls `DELETE /v1/agents/{id}` and refuses agents in the `running` state (use
-`zzapi agents stop` first). The relay keeps the record and transitions it to
-`stopped` or `killed`; it removes the worktree after a successful stop unless
-the worktree is retained for a watched pull request. Worktree cleanup also
-attempts to delete its branch unless it is `main`/`master`, checked out
-elsewhere, or cleanup fails. `lost_after_restart` agents have their worktree
-cleaned up and their record transitioned to `stopped`. `--dry-run` prints
-these relay effects without sending `DELETE`.
+Calls `DELETE /v1/agents/{id}` and refuses `running` or `paused` agents (use
+`zzapi agents stop` first). For terminal agents, the relay removes the record,
+diagnostic log spool, and Codex transcript/stderr files. Worktree cleanup runs
+the repository stop hook only when the tree is clean and its branch tip matches
+its upstream; watched pull requests and unsafe or unverifiable trees are
+retained with their branch. A missing worktree does not block record removal.
+For `orphaned` agents, the relay attempts to stop the possibly live process
+and retains the record. `--dry-run` summarizes the state-specific cleanup
+effects without sending `DELETE`. Completed records otherwise remain available
+until the configured agent cleanup TTL expires.
 
 ### `zzapi agents logs`
 

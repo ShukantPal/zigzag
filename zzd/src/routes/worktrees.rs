@@ -883,6 +883,44 @@ fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: 
     })
 }
 
+/// Agent deletion may discard a worktree only when its checked-out commit is
+/// present on origin and the worktree has no tracked or untracked changes.
+/// Any uncertainty keeps the worktree for manual inspection.
+pub(crate) fn agent_worktree_is_clean_and_pushed(
+    raw: &str,
+    roots: &[PathBuf],
+) -> Result<bool, WorktreeError> {
+    let path = resolve_existing_worktree_path(raw, roots)?;
+    let status = git_output(&path, &["status", "--porcelain", "--untracked-files=all"])?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Ok(false);
+    }
+    let branch = git_output(&path, &["branch", "--show-current"])?;
+    if !branch.status.success() {
+        return Ok(false);
+    }
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_owned();
+    if branch.is_empty() {
+        return Ok(false);
+    }
+    let head = git_output(&path, &["rev-parse", "HEAD"])?;
+    if !head.status.success() {
+        return Ok(false);
+    }
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    let remote_ref = format!("refs/heads/{branch}");
+    let remote = git_output(&path, &["ls-remote", "--exit-code", "origin", &remote_ref])?;
+    if !remote.status.success() {
+        return Ok(false);
+    }
+    let remote_head = String::from_utf8_lossy(&remote.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    Ok(!remote_head.is_empty() && remote_head == head)
+}
+
 pub(crate) fn worktree_request_fields(
     body: &[u8],
     allowed: &[&str],

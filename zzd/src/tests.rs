@@ -3768,6 +3768,16 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     .unwrap();
     let worktree = worktree_root.join("codex-delete-me");
     agent_create_worktree(&repo, &worktree, "codex/delete-me", &[]).unwrap();
+    let pushed = Command::new("git")
+        .args(["push", "--set-upstream", "origin", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .expect("could not push agent test branch");
+    assert!(
+        pushed.status.success(),
+        "could not push agent test branch: {}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
 
     // A real process in its own process group.
     let mut child = Command::new("/bin/sleep")
