@@ -62,7 +62,7 @@ All routes below require `Authorization: Bearer <token>`.
 | Operation | Endpoint / CLI |
 | --- | --- |
 | Create a supervised Codex agent | `POST /v1/agents` · `zzapi agents create --prompt TEXT --project-dir DIR --branch BRANCH` |
-| Continue an existing Codex thread | `POST /v1/agents/{id}/continue` · `zzapi agents continue ID --prompt TEXT` |
+| Continue an existing Codex thread | `POST /v1/agents/{id}/continue` · `zzapi agents continue ID|BRANCH --prompt TEXT` |
 | List agents (filter by state or task) | `GET /v1/agents` · `zzapi agents list [--state running] [--task-id ID]` |
 | Get agent details | `GET /v1/agents/{id}` · `zzapi agents get ID` |
 | Stop an agent | `DELETE /v1/agents/{id}` · `zzapi agents stop ID` |

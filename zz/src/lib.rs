@@ -68,6 +68,20 @@ impl AgentRecord {
             ),
             ("state".to_owned(), Json::String(self.state.clone())),
             (
+                "branch".to_owned(),
+                self.agent_config
+                    .as_deref()
+                    .and_then(|config| parse_json(config).ok())
+                    .and_then(|config| {
+                        config
+                            .object("branch")
+                            .and_then(Json::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(Json::String)
+                    .unwrap_or(Json::Null),
+            ),
+            (
                 "paused_at".to_owned(),
                 self.paused_at
                     .clone()
@@ -1916,6 +1930,17 @@ mod tests {
             harness_session_id: None,
             harness: None,
         }
+    }
+
+    #[test]
+    fn agent_status_exposes_branch_from_durable_launch_config() {
+        let mut record = agent("agent-1");
+        record.agent_config =
+            Some(r#"{"branch":"feature/work","worktree":"/tmp/work"}"#.to_owned());
+        assert_eq!(
+            record.status_json().object("branch"),
+            Some(&Json::String("feature/work".to_owned()))
+        );
     }
 
     #[test]

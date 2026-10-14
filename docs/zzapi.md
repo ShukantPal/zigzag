@@ -18,7 +18,8 @@ zzapi health
 zzapi agents list [--state running] [--task-id TASK]
 zzapi agents get|pause|resume|stop ID
 zzapi agents create (--prompt TEXT | --prompt-file PATH) --project-dir DIR
-zzapi agents continue ID --prompt TEXT
+zzapi agents continue ID|BRANCH --prompt TEXT
+zzapi agents message ID|BRANCH (--steer TEXT | --queue TEXT)
                     (--branch BRANCH | --no-branch | --pr NUMBER)
                     [--worktree PATH] [--harness codex|gemini|opencode|antigravity|agy]
                     [--model MODEL]
@@ -41,3 +42,11 @@ current executable. It does not require relay credentials or agent flags.
 The CLI intentionally exposes the common surface only. Use an authenticated
 HTTP client for provider and transcript endpoints until corresponding verbs
 are added.
+
+`agents continue` and `agents message` accept an exact branch name as the
+target, for example `zzapi agents continue codex/fix-flaky --prompt "Check the
+CI result"` or `zzapi agents message codex/fix-flaky --steer "Keep the change
+limited to the parser"`. Existing agent IDs and unique ID prefixes keep
+precedence. A branch target selects its single running agent; if multiple
+running agents share the branch, the CLI lists their IDs and asks you to
+disambiguate. A branch with no running agent is an error.
