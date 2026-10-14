@@ -2567,6 +2567,82 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
 }
 
 #[test]
+fn manual_worktree_delete_handler_refuses_live_attachment_then_removes_worktree() {
+    let base = worktree_test_base("manual-delete-handler");
+    let repo = worktree_test_repo(&base);
+    let roots = crate::routes::worktrees::canonical_worktree_roots();
+    let allowed_root = roots
+        .first()
+        .expect("test requires a configured worktree root");
+    let worktree_parent = allowed_root.join(format!(
+        "manual-delete-handler-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    std::fs::create_dir_all(&worktree_parent).unwrap();
+    let path = worktree_parent.join("worktree");
+    let added = Command::new("git")
+        .args(["worktree", "add", "-b", "manual-delete-handler"])
+        .arg(&path)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let (state, state_path) = test_server();
+    let mut live = agent_record("manual-delete-live-agent");
+    live.state = "running".to_owned();
+    live.command = format!("codex exec --cd {}", path.display());
+    state.supervisor.registry.register(live).unwrap();
+    let policy = test_policy();
+    let request_body = format!(r#"{{"path":"{}"}}"#, path.display());
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/worktrees",
+        &request_body,
+    );
+    assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+    assert_eq!(
+        response_json(response).object("error"),
+        Some(&Json::String("worktree_in_use".to_owned()))
+    );
+    assert!(
+        path.exists(),
+        "handler removed a worktree with a live agent"
+    );
+
+    state
+        .supervisor
+        .registry
+        .transition("manual-delete-live-agent", "stopped", None)
+        .unwrap();
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/worktrees",
+        &request_body,
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(
+        response_json(response).object("removed"),
+        Some(&Json::Bool(true))
+    );
+    assert!(!path.exists(), "handler did not remove the worktree");
+
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+    let _ = std::fs::remove_dir_all(&worktree_parent);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
 fn agent_create_request_parsing_and_helpers() {
     let request = parse_agent_create_request(
         br#"{"prompt":"do it","project_dir":"/Users/shukant/Workspace/repo","branch":"codex/x","model":"gpt-6-luna","approval_mode":"full-auto","timeout_secs":3600}"#,
