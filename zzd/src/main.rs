@@ -121,11 +121,13 @@ fn run() -> Result<(), String> {
         .recover(recovered_agent_identity_matches)?;
     recover_native_agents(
         &state.supervisor.registry,
+        &state.store,
         |session_id| {
-            state
-                .supervisor
-                .codex_server()
-                .and_then(|server| server.resume_thread(session_id))
+            state.supervisor.codex_server().and_then(|server| {
+                let events = server.subscribe_thread(session_id)?;
+                server.resume_thread(session_id)?;
+                Ok(events)
+            })
         },
         |session_id| {
             state
@@ -304,8 +306,12 @@ fn run() -> Result<(), String> {
 }
 
 fn recover_native_agents(
-    registry: &AgentRegistry,
-    mut resume_codex: impl FnMut(&str) -> Result<(), String>,
+    registry: &Arc<AgentRegistry>,
+    store: &Arc<Store>,
+    mut resume_codex: impl FnMut(
+        &str,
+    )
+        -> Result<std::sync::mpsc::Receiver<harness::HarnessEvent>, String>,
     mut resume_opencode: impl FnMut(&str) -> Result<(), String>,
 ) {
     let native_agents: Vec<_> = registry
@@ -319,16 +325,33 @@ fn recover_native_agents(
         })
         .collect();
     for (agent, session_id) in native_agents {
-        let (harness, resume) = match agent.harness.as_deref() {
-            Some("opencode") => ("OpenCode", resume_opencode(&session_id)),
-            _ => ("Codex", resume_codex(&session_id)),
-        };
-        if let Err(error) = resume {
-            log::error!(
-                "could not resume {harness} session for agent {}: {error}",
-                agent.id
-            );
-            let _ = registry.transition(&agent.id, "lost_after_restart", None);
+        match agent.harness.as_deref() {
+            Some("opencode") => {
+                if let Err(error) = resume_opencode(&session_id) {
+                    log::error!(
+                        "could not resume OpenCode session for agent {}: {error}",
+                        agent.id
+                    );
+                    let _ = registry.transition(&agent.id, "lost_after_restart", None);
+                }
+            }
+            _ => match resume_codex(&session_id) {
+                Ok(events) => crate::routes::agents::monitor_codex_events(
+                    Arc::clone(registry),
+                    Arc::clone(store),
+                    agent.id.clone(),
+                    agent.task_id.clone(),
+                    agent.execution_id.clone(),
+                    events,
+                ),
+                Err(error) => {
+                    log::error!(
+                        "could not resume Codex session for agent {}: {error}",
+                        agent.id
+                    );
+                    let _ = registry.transition(&agent.id, "lost_after_restart", None);
+                }
+            },
         }
     }
 }

@@ -3,6 +3,7 @@ use crate::events::{
 };
 use crate::exec;
 use crate::github::watch_agent_pr;
+use crate::harness::HarnessEvent;
 use crate::http::{error, query, reply};
 use crate::proc::{
     AgentSpawnDetails, agent_stderr_path, agent_transcript_path, force_kill_process_group,
@@ -1432,15 +1433,45 @@ fn create_codex_thread(
             ("thread_id".to_owned(), Json::String(thread_id.clone())),
         ]),
     ));
-    let store = Arc::clone(&state.store);
-    let id_watch = id.clone();
-    let task_watch = task_id.to_owned();
-    let execution_watch = execution_id.to_owned();
-    let registry = Arc::clone(&state.supervisor.registry);
+    monitor_codex_events(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        id.clone(),
+        task_id.to_owned(),
+        execution_id.to_owned(),
+        events,
+    );
+    reply(
+        stream,
+        200,
+        Json::Object(vec![
+            ("id".to_owned(), Json::String(id)),
+            ("thread_id".to_owned(), Json::String(thread_id)),
+            (
+                "worktree".to_owned(),
+                if request.no_branch {
+                    Json::Null
+                } else {
+                    Json::String(worktree.to_owned())
+                },
+            ),
+            ("working_dir".to_owned(), Json::String(worktree.to_owned())),
+        ]),
+    )
+}
+
+pub(crate) fn monitor_codex_events(
+    registry: Arc<zz::AgentRegistry>,
+    store: Arc<zz::Store>,
+    agent_id: String,
+    task_id: String,
+    execution_id: String,
+    events: std::sync::mpsc::Receiver<HarnessEvent>,
+) {
     thread::spawn(move || {
-        let transcript = agent_transcript_path(&id_watch);
+        let transcript = agent_transcript_path(&agent_id);
         while let Ok(event) = events.recv() {
-            let crate::harness::HarnessEvent::Notification {
+            let HarnessEvent::Notification {
                 value,
                 terminal_turn,
             } = event;
@@ -1461,31 +1492,14 @@ fn create_codex_thread(
             handle_codex_notification(
                 &registry,
                 &store,
-                &id_watch,
-                &task_watch,
-                &execution_watch,
+                &agent_id,
+                &task_id,
+                &execution_id,
                 &value,
                 terminal_turn,
             );
         }
     });
-    reply(
-        stream,
-        200,
-        Json::Object(vec![
-            ("id".to_owned(), Json::String(id)),
-            ("thread_id".to_owned(), Json::String(thread_id)),
-            (
-                "worktree".to_owned(),
-                if request.no_branch {
-                    Json::Null
-                } else {
-                    Json::String(worktree.to_owned())
-                },
-            ),
-            ("working_dir".to_owned(), Json::String(worktree.to_owned())),
-        ]),
-    )
 }
 
 pub(crate) fn handle_codex_notification(

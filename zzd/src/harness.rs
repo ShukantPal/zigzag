@@ -351,6 +351,23 @@ impl CodexServer {
         self.rpc("thread/resume", json!({"threadId":thread_id}))
             .map(|_| ())
     }
+
+    /// Subscribe before resuming so notifications emitted during the resume
+    /// RPC are delivered to the recovered agent's monitor.
+    pub(crate) fn subscribe_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<mpsc::Receiver<HarnessEvent>, String> {
+        let (event_tx, event_rx) = mpsc::channel();
+        self.shared
+            .subscribers
+            .lock()
+            .map_err(|_| "session event map poisoned")?
+            .entry(thread_id.to_owned())
+            .or_default()
+            .push(event_tx);
+        Ok(event_rx)
+    }
     #[allow(dead_code)]
     pub(crate) fn pid(&self) -> u32 {
         self.shared

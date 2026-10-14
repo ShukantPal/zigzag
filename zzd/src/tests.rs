@@ -2091,7 +2091,17 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
             .state,
         "succeeded"
     );
-    let timeline = state.store.timeline("task-1").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let timeline = loop {
+        let timeline = state.store.timeline("task-1").unwrap();
+        let has_completion = timeline
+            .iter()
+            .any(|event| event.object("kind").and_then(Json::as_str) == Some("process_completed"));
+        if has_completion || std::time::Instant::now() >= deadline {
+            break timeline;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     let kinds: Vec<_> = timeline
         .iter()
         .filter_map(|event| event.object("kind").and_then(Json::as_str))
@@ -2165,9 +2175,11 @@ fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
     let mut opencode_sessions = Vec::new();
     crate::recover_native_agents(
         &state.supervisor.registry,
+        &state.store,
         |session_id| {
             codex_sessions.push(session_id.to_owned());
-            Ok(())
+            let (_tx, rx) = std::sync::mpsc::channel();
+            Ok(rx)
         },
         |session_id| {
             opencode_sessions.push(session_id.to_owned());
@@ -2195,6 +2207,72 @@ fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
             .state,
         "running"
     );
+}
+
+#[test]
+fn recovered_codex_completion_transitions_agent_and_records_completion_events() {
+    let (state, _state_path) = test_server();
+    let mut record = agent_record("recovered-codex-completion");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("thread-recovered".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    crate::recover_native_agents(
+        &state.supervisor.registry,
+        &state.store,
+        |session_id| {
+            assert_eq!(session_id, "thread-recovered");
+            let (tx, rx) = std::sync::mpsc::channel();
+            // Model the app-server completing the active turn during resume.
+            tx.send(crate::harness::HarnessEvent::Notification {
+                value: serde_json::json!({
+                    "method":"turn/completed",
+                    "params":{"threadId":"thread-recovered","turn":{"status":"completed"}}
+                }),
+                terminal_turn: true,
+            })
+            .unwrap();
+            Ok(rx)
+        },
+        |_| panic!("OpenCode callback should not run for a Codex agent"),
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while state
+        .supervisor
+        .registry
+        .get("recovered-codex-completion")
+        .is_some_and(|agent| agent.state == "running")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("recovered-codex-completion")
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let timeline = loop {
+        let timeline = state.store.timeline("task-1").unwrap();
+        let has_completion = timeline
+            .iter()
+            .any(|event| event.object("kind").and_then(Json::as_str) == Some("process_completed"));
+        if has_completion || std::time::Instant::now() >= deadline {
+            break timeline;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let kinds: Vec<_> = timeline
+        .iter()
+        .filter_map(|event| event.object("kind").and_then(Json::as_str))
+        .collect();
+    assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
+    assert!(kinds.contains(&"process_completed"), "{kinds:?}");
 }
 
 #[test]
