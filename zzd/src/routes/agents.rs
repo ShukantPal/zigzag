@@ -2166,7 +2166,7 @@ pub(crate) struct ExplicitDeleteEffects {
 pub(crate) fn delete_explicit_agent_with_trust(
     registry: &zz::AgentRegistry,
     agent_id: &str,
-    watched_pr: bool,
+    watched_pr: Result<bool, String>,
     roots: &[PathBuf],
     trusted_repos: &[PathBuf],
 ) -> Result<Option<ExplicitDeleteEffects>, String> {
@@ -2179,7 +2179,16 @@ pub(crate) fn delete_explicit_agent_with_trust(
 
     let worktree_path = agent.worktree_path.as_deref();
     let worktree_existed = worktree_path.is_some_and(|path| Path::new(path).exists());
-    if watched_pr {
+    let retain_for_pr = match watched_pr {
+        Ok(watched) => watched,
+        Err(error) => {
+            log::warn!(
+                "agent_delete PR discovery id={agent_id} failed: {error}; retaining worktree"
+            );
+            true
+        }
+    };
+    if retain_for_pr {
         log::info!("agent_delete id={agent_id}: retaining worktree for watched pull request");
     } else if let Some(path) = worktree_path {
         match crate::routes::worktrees::agent_worktree_is_clean_and_pushed(path, roots) {
@@ -2194,10 +2203,12 @@ pub(crate) fn delete_explicit_agent_with_trust(
                     "agent_delete id={agent_id}: retaining worktree at {path}; another live agent record is attached"
                 );
             }
-            Ok(true) => match crate::routes::worktrees::cleanup_agent_worktree_with_trust(
+            Ok(true) => match crate::routes::worktrees::cleanup_agent_worktree_with_registry_guard(
                 path,
                 roots,
                 trusted_repos,
+                registry,
+                agent_id,
             ) {
                 Ok(()) => {}
                 Err(error) => log::warn!(
@@ -2825,13 +2836,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     };
     if !agent_is_live(&agent) {
         let worktree = agent.worktree_path.clone();
-        let watched_pr = match watch_agent_pr(&agent) {
-            Ok(watching) => watching,
-            Err(message) => {
-                log::warn!("agent_delete PR discovery id={id} failed: {message}");
-                false
-            }
-        };
+        let watched_pr = watch_agent_pr(&agent);
         return match delete_explicit_agent_with_trust(
             &state.supervisor.registry,
             &id,

@@ -572,6 +572,16 @@ pub(crate) fn worktree_delete_plan_with_trust(
     agents: &[(&str, &str)],
     trusted_repos: &[PathBuf],
 ) -> Result<Json, WorktreeError> {
+    worktree_delete_plan_with_guard(path_raw, roots, agents, trusted_repos, None)
+}
+
+fn worktree_delete_plan_with_guard(
+    path_raw: &str,
+    roots: &[PathBuf],
+    agents: &[(&str, &str)],
+    trusted_repos: &[PathBuf],
+    live_agent_guard: Option<(&zz::AgentRegistry, &str)>,
+) -> Result<Json, WorktreeError> {
     let path = resolve_existing_worktree_path(path_raw, roots)?;
     let path_str = path.to_string_lossy();
     // TODO: match on an explicit worktree_path field on the agent record once
@@ -593,6 +603,18 @@ pub(crate) fn worktree_delete_plan_with_trust(
     }
     let repo = worktree_repo(&path)?;
     run_worktree_hook_with_trust(&repo, &path, "repo-stop.sh", false, trusted_repos);
+    if let Some((registry, owner_id)) = live_agent_guard
+        && worktree_has_live_agent(registry, &path, owner_id)
+    {
+        log::warn!(
+            "worktree_delete refused: live agent attached to {} at removal time",
+            path.display()
+        );
+        return Err(WorktreeError {
+            code: 409,
+            message: "worktree_in_use",
+        });
+    }
     log::info!("worktree_delete path={}", path.display());
     RELAY_DELETED_WORKTREES
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -640,13 +662,32 @@ pub(crate) fn cleanup_agent_worktree_with_trust(
     roots: &[PathBuf],
     trusted_repos: &[PathBuf],
 ) -> Result<(), WorktreeError> {
+    cleanup_agent_worktree_inner(raw, roots, trusted_repos, None)
+}
+
+pub(crate) fn cleanup_agent_worktree_with_registry_guard(
+    raw: &str,
+    roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
+    registry: &zz::AgentRegistry,
+    owner_id: &str,
+) -> Result<(), WorktreeError> {
+    cleanup_agent_worktree_inner(raw, roots, trusted_repos, Some((registry, owner_id)))
+}
+
+fn cleanup_agent_worktree_inner(
+    raw: &str,
+    roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
+    live_agent_guard: Option<(&zz::AgentRegistry, &str)>,
+) -> Result<(), WorktreeError> {
     let path = resolve_existing_worktree_path(raw, roots)?;
     let repo = worktree_repo(&path)?;
     let branch_output = git_output(&path, &["branch", "--show-current"])?;
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
-    worktree_delete_plan_with_trust(raw, roots, &[], trusted_repos)?;
+    worktree_delete_plan_with_guard(raw, roots, &[], trusted_repos, live_agent_guard)?;
     if branch.is_empty() || matches!(branch.as_str(), "main" | "master") {
         return Ok(());
     }

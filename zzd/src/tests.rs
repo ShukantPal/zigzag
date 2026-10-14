@@ -1810,7 +1810,7 @@ fn explicit_delete_of_watched_pr_retains_worktree_and_branch() {
     let effects = delete_explicit_agent_with_trust(
         &registry,
         &id,
-        true,
+        Ok(true),
         &roots,
         &[repo.canonicalize().unwrap()],
     )
@@ -1834,12 +1834,47 @@ fn explicit_delete_of_watched_pr_retains_worktree_and_branch() {
 }
 
 #[test]
+fn explicit_delete_pr_discovery_failure_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-pr-error", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        Err("GitHub discovery unavailable".to_owned()),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!effects.worktree_removed);
+    assert!(
+        path.exists(),
+        "worktree was removed after PR discovery failed"
+    );
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-pr-error",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        branch.success(),
+        "branch was removed after PR discovery failed"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn explicit_delete_removes_safe_worktree_and_branch() {
     let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-branch", true);
     let effects = delete_explicit_agent_with_trust(
         &registry,
         &id,
-        false,
+        Ok(false),
         &roots,
         &[repo.canonicalize().unwrap()],
     )
@@ -1873,7 +1908,7 @@ fn explicit_delete_keeps_worktree_attached_to_another_live_agent() {
     let effects = delete_explicit_agent_with_trust(
         &registry,
         &id,
-        false,
+        Ok(false),
         &roots,
         &[repo.canonicalize().unwrap()],
     )
