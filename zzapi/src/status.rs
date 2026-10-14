@@ -595,21 +595,13 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 continue;
             }
             let key = item_id.clone();
-            let index = *indices.entry(key.clone()).or_insert_with(|| {
-                let index = items.len();
-                items.push(TranscriptItem {
-                    id: key.clone(),
-                    item: serde_json::json!({"id":item_id,"type":if kind == "item.agentMessage.delta" {"agent_message"} else {"reasoning"},"text":""}),
-                    state: "in_progress".into(),
-                    raw: event.clone(),
-                    diagnostic: None,
-                    hidden: false,
-                });
-                index
-            });
+            let Some(index) = indices.get(&key).copied() else {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            };
             let text = s(&items[index].item, "text");
             items[index].item["text"] = Value::String(format!("{text}{delta}"));
-            items[index].raw = event;
+            append_transcript_raw(&mut items[index], event);
             continue;
         }
         if kind.starts_with("item.commandExecution.") {
@@ -619,7 +611,9 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 continue;
             }
             let key = item_id.clone();
-            let index = *indices.entry(key.clone()).or_insert_with(|| {
+            let index = if let Some(index) = indices.get(&key).copied() {
+                index
+            } else if kind.ends_with(".started") {
                 let index = items.len();
                 items.push(TranscriptItem {
                     id: key.clone(),
@@ -629,8 +623,12 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                     diagnostic: None,
                     hidden: false,
                 });
+                indices.insert(key, index);
                 index
-            });
+            } else {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            };
             let item = &mut items[index].item;
             for key in ["command", "cwd", "exitCode", "aggregatedOutput", "output"] {
                 if let Some(value) = params.get(key) {
@@ -660,7 +658,7 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             } else {
                 "in_progress".into()
             };
-            items[index].raw = event;
+            append_transcript_raw(&mut items[index], event);
             continue;
         }
         if kind == "turn.diff.updated" {
@@ -671,7 +669,7 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             let id = "turn-diff".to_owned();
             if let Some(index) = indices.get(&id).copied() {
                 items[index].item["diff"] = Value::String(diff.to_owned());
-                items[index].raw = event;
+                append_transcript_raw(&mut items[index], event);
             } else {
                 indices.insert(id.clone(), items.len());
                 items.push(TranscriptItem {
@@ -708,14 +706,11 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                         .cloned()
                         .unwrap_or(Value::String(String::new()));
                 }
-                items[index] = TranscriptItem {
-                    id: key,
-                    item,
-                    state,
-                    raw: event,
-                    diagnostic: None,
-                    hidden: false,
-                };
+                items[index].item = item;
+                items[index].state = state;
+                items[index].diagnostic = None;
+                items[index].hidden = false;
+                append_transcript_raw(&mut items[index], event);
             } else {
                 indices.insert(key.clone(), items.len());
                 items.push(TranscriptItem {
@@ -728,15 +723,22 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 });
             }
         } else {
+            let handled_lifecycle_event = matches!(
+                kind.as_str(),
+                "thread.started"
+                    | "thread.name.updated"
+                    | "thread.tokenUsage.updated"
+                    | "turn.started"
+                    | "turn.completed"
+                    | "turn.failed"
+                    | "turn.diff.updated"
+                    | "mcpServer.startupStatus.updated"
+                    | "error"
+            );
             let unknown = kind.is_empty()
-                || !(kind.starts_with("thread.")
-                    || kind.starts_with("turn.")
-                    || kind.starts_with("thread/")
-                    || kind.starts_with("turn/")
-                    || kind.starts_with("mcpServer.")
-                    || kind.starts_with("mcpServer/")
-                    || kind.starts_with("item/")
-                    || kind == "error");
+                || (!handled_lifecycle_event
+                    && !kind.starts_with("item.")
+                    && !kind.starts_with("item/"));
             let label = if kind == "turn.failed" {
                 Some(format!(
                     "Turn failed: {}",
@@ -789,6 +791,14 @@ fn push_transcript_gap(items: &mut Vec<TranscriptItem>, line_number: usize, raw:
     let _ = line_number;
 }
 
+fn append_transcript_raw(item: &mut TranscriptItem, event: Value) {
+    if let Some(events) = item.raw.as_array_mut() {
+        events.push(event);
+    } else {
+        item.raw = Value::Array(vec![item.raw.clone(), event]);
+    }
+}
+
 fn normalize_item_type(kind: &str) -> String {
     match kind {
         "agentMessage" => "agent_message".into(),
@@ -804,7 +814,7 @@ fn normalize_item_type(kind: &str) -> String {
 
 fn transcript_label(item: &TranscriptItem) -> (String, String) {
     if let Some(label) = &item.diagnostic {
-        return (label.clone(), String::new());
+        return (safe_text(label), String::new());
     }
     let kind = normalize_item_type(&s(&item.item, "type"));
     let state = match s(&item.item, "status").as_str() {
@@ -855,7 +865,7 @@ fn transcript_label(item: &TranscriptItem) -> (String, String) {
 
 fn transcript_detail(item: &TranscriptItem) -> String {
     if let Some(label) = &item.diagnostic {
-        return label.clone();
+        return safe_text(label);
     }
     match normalize_item_type(&s(&item.item, "type")).as_str() {
         "command_execution" => {
@@ -1328,7 +1338,7 @@ fn draw(
                 lines.push(Line::from(format!("Request: {summary}")));
             }
             if let Some(notice) = transcript_notice {
-                lines.push(Line::from(Span::styled(notice, Style::default().fg(Color::Yellow))));
+                lines.push(Line::from(Span::styled(safe_text(notice), Style::default().fg(Color::Yellow))));
             }
             if let Some(prompt) = transcript_prompt {
                 lines.push(Line::from(Span::styled(
@@ -1345,6 +1355,8 @@ fn draw(
                 if raw_view && item.hidden {
                     summary = format!("Protocol event: {}", item.state);
                 }
+                summary = safe_text(&summary);
+                let state = safe_text(&state);
                 let kind = normalize_item_type(&s(&item.item, "type"));
                 let marker = if kind.ends_with("tool_call") || kind == "command_execution" { "▸" } else if kind == "diff" || kind == "file_change" { "±" } else { "•" };
                 let selected_style = if index == transcript_selected {
@@ -1531,6 +1543,8 @@ mod tests {
     #[test]
     fn renders_app_server_stream_as_clean_transcript_items() {
         let fixture = concat!(
+            r#"{"method":"item/started","params":{"item":{"id":"msg-1","type":"agentMessage","text":"","status":"in_progress"}}}"#,
+            "\n",
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"The fix is "}}"#,
             "\n",
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"ready."}}"#,
@@ -1570,6 +1584,12 @@ mod tests {
 
         assert_eq!(s(&visible[0].item, "text"), "The fix is ready.");
         assert_eq!(transcript_label(visible[0]).0, "The fix is ready.");
+        let raw_events = visible[0].raw.as_array().unwrap();
+        assert_eq!(raw_events.len(), 4);
+        assert_eq!(raw_events[0]["method"], "item/started");
+        assert_eq!(raw_events[1]["params"]["delta"], "The fix is ");
+        assert_eq!(raw_events[2]["params"]["delta"], "ready.");
+        assert_eq!(raw_events[3]["method"], "item/completed");
 
         assert_eq!(
             transcript_label(visible[1]).0,
@@ -1595,6 +1615,53 @@ mod tests {
                 .iter()
                 .all(|item| !transcript_label(item).0.contains('{'))
         );
+    }
+
+    #[test]
+    fn flags_orphan_message_deltas_and_unknown_events_in_known_namespaces() {
+        let data = concat!(
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"missing","delta":"orphan"}}"#,
+            "\n",
+            r#"{"method":"turn/futureUpdate","params":{}}"#,
+            "\n",
+            r#"{"method":"mcpServer/futureStatus","params":{}}"#,
+            "\n",
+        );
+        let items = parse_codex_transcript(data);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].state, "gap");
+        assert_eq!(items[0].raw.as_array().unwrap().len(), 1);
+        assert_eq!(
+            transcript_label(&items[1]).0,
+            "Unknown event: turn/futureUpdate"
+        );
+        assert_eq!(
+            transcript_label(&items[2]).0,
+            "Unknown event: mcpServer/futureStatus"
+        );
+        assert!(!items[1].hidden);
+        assert!(!items[2].hidden);
+    }
+
+    #[test]
+    fn sanitizes_terminal_controls_in_event_names_and_error_messages() {
+        let data = concat!(
+            r#"{"method":"turn/\u001b]0;owned\u0007\u001b[31mfuture","params":{}}"#,
+            "\n",
+            r#"{"method":"error","message":"bad\u001b]0;title\u0007\u001b[2J"}"#,
+            "\n",
+        );
+        let items = parse_codex_transcript(data);
+        for item in &items {
+            let summary = transcript_label(item).0;
+            assert!(!summary.chars().any(|ch| ch == '\u{1b}' || ch == '\u{7}'));
+        }
+        assert!(
+            transcript_label(&items[0])
+                .0
+                .contains("�]0;owned��[31mfuture")
+        );
+        assert!(transcript_label(&items[1]).0.contains("bad�]0;title��[2J"));
     }
 
     #[test]
