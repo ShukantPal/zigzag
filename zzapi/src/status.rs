@@ -1244,16 +1244,26 @@ fn read_agent_prompt(client: &Client, agent_id: &str) -> Option<String> {
         .map(safe_text)
 }
 
-pub(super) fn cmd_status(
-    c: &Client,
-    once: bool,
-    all: bool,
-    live_only: bool,
-    state_filter: Option<&str>,
-    interval: u64,
-    task_root: Option<&str>,
-    state_override: Option<&str>,
-) -> Result<(), Fail> {
+pub(super) struct StatusOptions<'a> {
+    pub(super) once: bool,
+    pub(super) all: bool,
+    pub(super) live_only: bool,
+    pub(super) state_filter: Option<&'a str>,
+    pub(super) interval: u64,
+    pub(super) task_root: Option<&'a str>,
+    pub(super) state_override: Option<&'a str>,
+}
+
+pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), Fail> {
+    let StatusOptions {
+        once,
+        all,
+        live_only,
+        state_filter,
+        interval,
+        task_root,
+        state_override,
+    } = options;
     if let Some(state) = state_filter {
         validate_state(state)?;
     }

@@ -1868,13 +1868,15 @@ fn run(cli: Cli) -> Result<(), Fail> {
             state_file,
         } => status::cmd_status(
             &client,
-            once,
-            all,
-            live_only,
-            state.as_deref(),
-            interval,
-            task_root.as_deref(),
-            state_file.as_deref(),
+            status::StatusOptions {
+                once,
+                all,
+                live_only,
+                state_filter: state.as_deref(),
+                interval,
+                task_root: task_root.as_deref(),
+                state_override: state_file.as_deref(),
+            },
         ),
         Commands::Worktrees { cmd } => match cmd {
             WorktreesCmd::Create { path, branch, repo } => {
