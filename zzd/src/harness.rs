@@ -56,6 +56,7 @@ struct Shared {
 struct ApprovalContext {
     agent_id: String,
     worktree: std::path::PathBuf,
+    branch: String,
 }
 
 /// One Codex app-server per daemon isolation domain. The daemon's current
@@ -313,6 +314,7 @@ impl CodexServer {
         &self,
         agent_id: &str,
         cwd: &str,
+        branch: &str,
         prompt: &str,
     ) -> Result<(String, mpsc::Receiver<HarnessEvent>), String> {
         let response = self.rpc("thread/start", json!({"cwd":cwd}))?;
@@ -343,6 +345,7 @@ impl CodexServer {
                 ApprovalContext {
                     agent_id: agent_id.to_owned(),
                     worktree,
+                    branch: branch.to_owned(),
                 },
             );
         let turn = self.rpc(
@@ -356,7 +359,6 @@ impl CodexServer {
                 .map_err(|_| "turn map poisoned")?
                 .insert(thread_id.clone(), turn_id.to_owned());
         }
-        let _ = agent_id;
         Ok((thread_id, event_rx))
     }
 
@@ -788,25 +790,299 @@ fn path_is_within(path: &std::path::Path, root: &std::path::Path) -> bool {
     resolved(path).starts_with(resolved(root))
 }
 
-fn command_text(params: &Value) -> String {
-    match params.get("command") {
-        Some(Value::String(command)) => command.clone(),
-        Some(Value::Array(parts)) => parts
+fn command_words(params: &Value) -> Option<Vec<String>> {
+    match params.get("command")? {
+        Value::Array(parts) => parts
             .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
+            .map(|part| part.as_str().map(str::to_owned))
+            .collect(),
+        // App-server versions that send a string get a deliberately small
+        // grammar: no quoting, escapes, or shell operators are interpreted.
+        Value::String(command)
+            if !command.is_empty()
+                && !command.chars().any(|ch| {
+                    matches!(
+                        ch,
+                        '\'' | '"' | '\\' | ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'
+                    )
+                }) =>
+        {
+            Some(command.split_whitespace().map(str::to_owned).collect())
+        }
+        _ => None,
     }
 }
 
-fn requested_access_is_worktree_scoped(params: &Value, root: &std::path::Path) -> bool {
-    if params.get("networkApprovalContext").is_some() {
+fn approval_audit_operation(words: Option<&[String]>) -> String {
+    let Some(words) = words else {
+        // Invalid encodings may still contain credentials in unexpected
+        // positions, so never copy their raw contents into the audit log.
+        return "<command redacted: invalid command encoding>".to_owned();
+    };
+    let mut redact_next = false;
+    words
+        .iter()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            let sensitive_name = [
+                "token",
+                "password",
+                "secret",
+                "credential",
+                "authorization",
+                "api_key",
+                "api-key",
+            ]
+            .iter()
+            .any(|name| lower.contains(name));
+            if redact_next {
+                redact_next = false;
+                return "[REDACTED]".to_owned();
+            }
+            if sensitive_name && !lower.contains('=') {
+                redact_next = true;
+                return "[REDACTED]".to_owned();
+            }
+            if sensitive_name && word.contains('=') {
+                return format!("{}=[REDACTED]", word.split_once('=').unwrap().0);
+            }
+            if [
+                "ghp_",
+                "gho_",
+                "ghu_",
+                "ghs_",
+                "ghr_",
+                "github_pat_",
+                "akia",
+                "sk-",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            {
+                return "[REDACTED]".to_owned();
+            }
+            word.clone()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn has_outside_path(words: &[String]) -> bool {
+    words.iter().skip(1).any(|word| {
+        let candidate = word
+            .split_once('=')
+            .map_or(word.as_str(), |(_, value)| value);
+        let path = std::path::Path::new(candidate);
+        (path.is_absolute() && candidate != "/tmp")
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    })
+}
+
+fn git_push_targets_own_branch(args: &[String], branch: &str) -> bool {
+    if branch.is_empty() || matches!(branch, "main" | "master") {
         return false;
     }
+    let mut rest = args;
+    if rest.first().is_some_and(|arg| arg == "--force-with-lease") {
+        rest = &rest[1..];
+    }
+    if rest.len() != 2 || rest[0] != "origin" || rest[1].starts_with([':', '+']) {
+        return false;
+    }
+    let is_own_branch_ref =
+        |reference: &str| reference == branch || reference == format!("refs/heads/{branch}");
+    match rest[1].split_once(':') {
+        Some((source, destination)) => is_own_branch_ref(source) && is_own_branch_ref(destination),
+        None => is_own_branch_ref(&rest[1]),
+    }
+}
+
+fn mktemp_is_tmp_scoped(args: &[String]) -> bool {
+    let mut tmpdir = false;
+    let mut absolute_template = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-d" | "-u" | "-q" => index += 1,
+            "-p" | "--tmpdir" => {
+                if args.get(index + 1).map(String::as_str) != Some("/tmp") {
+                    return false;
+                }
+                tmpdir = true;
+                index += 2;
+            }
+            "--tmpdir=/tmp" => {
+                tmpdir = true;
+                index += 1;
+            }
+            "-t" => {
+                let Some(template) = args.get(index + 1) else {
+                    return false;
+                };
+                if template.contains('/') || template.contains("..") {
+                    return false;
+                }
+                index += 2;
+            }
+            value if value.starts_with("/tmp/") => {
+                let path = std::path::Path::new(value);
+                if path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return false;
+                }
+                absolute_template = true;
+                index += 1;
+            }
+            value
+                if value.starts_with('/')
+                    || value.starts_with('-')
+                    || value.contains('/')
+                    || value.contains("..") =>
+            {
+                return false;
+            }
+            _ => index += 1,
+        }
+    }
+    tmpdir || absolute_template
+}
+
+fn gh_read_command(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("pr")
+            if args
+                .get(1)
+                .is_some_and(|sub| matches!(sub.as_str(), "view" | "checks")) =>
+        {
+            args.iter().skip(2).all(|arg| {
+                if arg == "--repo" {
+                    return false;
+                }
+                !matches!(arg.as_str(), "--web" | "--delete-branch")
+            }) && !args.iter().skip(2).any(|arg| arg.starts_with("--repo="))
+        }
+        Some("run") if args.get(1).is_some_and(|sub| sub == "view") => args
+            .iter()
+            .skip(2)
+            .all(|arg| !matches!(arg.as_str(), "--web" | "--log")),
+        Some("api") => {
+            let mut endpoint = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--paginate" | "--slurp" | "--silent" => i += 1,
+                    "--jq" | "--template" => {
+                        if i + 1 >= args.len() {
+                            return false;
+                        }
+                        i += 2;
+                    }
+                    flag if flag.starts_with('-') => return false,
+                    value if endpoint.replace(value).is_some() => return false,
+                    _ => i += 1,
+                }
+            }
+            endpoint.is_some_and(|path| {
+                let lower = path.to_ascii_lowercase();
+                !["secret", "token", "credential", ".env", "contents"]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+                    && !path.contains('%')
+                    && !path.contains('\\')
+                    && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+                    && path.starts_with("repos/")
+                    && path.split('/').count() >= 4
+            })
+        }
+        _ => false,
+    }
+}
+
+fn gh_create_for_own_branch(args: &[String], branch: &str) -> bool {
+    if args.first().map(String::as_str) != Some("pr")
+        || args.get(1).map(String::as_str) != Some("create")
+        || branch.is_empty()
+        || matches!(branch, "main" | "master")
+    {
+        return false;
+    }
+    let mut head = None;
+    let mut i = 2;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(value) = arg.strip_prefix("--head=") {
+            if head.replace(value).is_some() {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        let value_option = matches!(arg, "--head" | "--title" | "--body" | "--base");
+        if value_option {
+            let Some(value) = args.get(i + 1) else {
+                return false;
+            };
+            if arg == "--head" && head.replace(value.as_str()).is_some() {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(arg, "--draft" | "--fill") {
+            i += 1;
+            continue;
+        }
+        // File inputs, repo overrides, web launch, and unknown flags fail closed.
+        return false;
+    }
+    head.is_some_and(|head| head == branch)
+}
+
+fn network_command_is_allowlisted(words: &[String], branch: &str) -> bool {
+    let Some(executable) = words
+        .first()
+        .and_then(|word| std::path::Path::new(word).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let args = &words[1..];
+    match executable {
+        "git" if args.first().is_some_and(|arg| arg == "push") => {
+            git_push_targets_own_branch(&args[1..], branch)
+        }
+        "gh" => gh_create_for_own_branch(args, branch) || gh_read_command(args),
+        _ => false,
+    }
+}
+
+fn package_manager_command_is_safe(executable: &str, args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return false;
+    };
+    if matches!(subcommand, "test" | "build" | "lint" | "check") {
+        return true;
+    }
+    matches!(subcommand, "run")
+        && args
+            .get(1)
+            .is_some_and(|script| matches!(script.as_str(), "build" | "test" | "lint" | "check"))
+        && matches!(executable, "npm" | "pnpm" | "yarn")
+}
+
+fn requested_access_is_worktree_scoped(
+    params: &Value,
+    root: &std::path::Path,
+    allow_network: bool,
+) -> bool {
+    let requested_network = params.get("networkApprovalContext").is_some()
+        || params.pointer("/additionalPermissions/network/enabled") == Some(&Value::Bool(true));
     let Some(filesystem) = params.pointer("/additionalPermissions/fileSystem") else {
-        return params.pointer("/additionalPermissions/network/enabled")
-            != Some(&Value::Bool(true));
+        return !requested_network || allow_network;
     };
     for key in ["read", "write"] {
         if let Some(paths) = filesystem.get(key).and_then(Value::as_array)
@@ -826,12 +1102,16 @@ fn requested_access_is_worktree_scoped(params: &Value, root: &std::path::Path) -
     {
         return false;
     }
-    params.pointer("/additionalPermissions/network/enabled") != Some(&Value::Bool(true))
+    !requested_network || allow_network
 }
 
 fn command_approval(params: &Value, context: Option<&ApprovalContext>) -> ApprovalDecision {
-    let command = command_text(params);
-    let operation = command.chars().take(512).collect::<String>();
+    let words = command_words(params);
+    let command = words
+        .as_ref()
+        .map(|words| words.join(" "))
+        .unwrap_or_default();
+    let operation = approval_audit_operation(words.as_deref());
     let Some(context) = context else {
         return decision(false, "unknown-agent-deny", operation);
     };
@@ -841,149 +1121,167 @@ fn command_approval(params: &Value, context: Option<&ApprovalContext>) -> Approv
     if !path_is_within(std::path::Path::new(cwd), &context.worktree) {
         return decision(false, "cwd-outside-worktree-deny", operation);
     }
-    if !requested_access_is_worktree_scoped(params, &context.worktree) {
+    let Some(words) = words else {
+        return decision(false, "invalid-command-encoding-deny", operation);
+    };
+    if !requested_access_is_worktree_scoped(
+        params,
+        &context.worktree,
+        network_command_is_allowlisted(&words, &context.branch),
+    ) {
         return decision(
             false,
             "network-or-outside-worktree-permission-deny",
             operation,
         );
     }
-
     let lower = command.to_ascii_lowercase();
     if [
         "keychain",
-        "security ",
+        "security",
         ".ssh",
         ".aws",
         ".env",
         "credential",
+        "authorization",
         "access_token",
         "api_key",
         "password",
-        "curl ",
-        "wget ",
-        " nc ",
-        "ssh ",
-        "scp ",
+        "gh_token",
+        ".codex",
+        ".config/gh",
+        ".netrc",
+        ".npmrc",
+        "id_rsa",
+        "id_ed25519",
+        "secret",
+        "token",
+        "private_key",
+        "private-key",
+        "auth.json",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
     {
         return decision(false, "credential-or-network-access-deny", operation);
     }
-    if command.is_empty()
-        || command
-            .chars()
-            .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n'))
-    {
+    if words.is_empty() {
         return decision(false, "shell-composition-deny", operation);
     }
-
-    let words = command.split_whitespace().collect::<Vec<_>>();
     let executable = words
         .first()
         .and_then(|word| std::path::Path::new(word).file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("");
+    if words.first().is_some_and(|word| word.contains('/')) {
+        return decision(false, "explicit-executable-path-deny", operation);
+    }
     if matches!(
         executable,
         "sh" | "bash" | "zsh" | "fish" | "env" | "sudo" | "doas" | "su"
     ) {
         return decision(false, "shell-or-privilege-escalation-deny", operation);
     }
-    let args = &words[1..];
-    if args.iter().any(|arg| {
-        if arg.starts_with("-") && !arg.contains('=') {
-            return false;
-        }
-        let pathish = arg.split_once('=').map(|(_, value)| value).unwrap_or(arg);
-        let path = std::path::Path::new(pathish);
-        if path.is_absolute() {
-            !path_is_within(path, &context.worktree)
-        } else {
-            path.components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-        }
-    }) {
-        return decision(false, "write-or-read-path-outside-worktree-deny", operation);
+    let args = words[1..].to_vec();
+
+    if executable == "git" && args.first().is_some_and(|arg| arg == "push") {
+        let allowed = git_push_targets_own_branch(&args[1..], &context.branch);
+        return decision(
+            allowed,
+            if allowed {
+                "own-branch-git-push-allow"
+            } else {
+                "git-push-outside-own-branch-deny"
+            },
+            operation,
+        );
+    }
+    if executable == "gh" {
+        let allowed = gh_create_for_own_branch(&args, &context.branch) || gh_read_command(&args);
+        return decision(
+            allowed,
+            if allowed {
+                "scoped-gh-command-allow"
+            } else {
+                "gh-command-deny"
+            },
+            operation,
+        );
+    }
+    if executable == "mktemp" {
+        let in_tmp = mktemp_is_tmp_scoped(&args);
+        return decision(
+            in_tmp,
+            if in_tmp {
+                "tmp-scratch-allow"
+            } else {
+                "mktemp-outside-tmp-deny"
+            },
+            operation,
+        );
+    }
+    if has_outside_path(&words) {
+        return decision(false, "path-outside-worktree-deny", operation);
     }
 
     let read_only = match executable {
-        "pwd" | "ls" | "cat" | "head" | "tail" | "rg" | "grep" | "git" => {
-            executable != "git"
-                || matches!(
-                    args.first().copied(),
-                    Some("status" | "diff" | "log" | "show" | "branch" | "rev-parse")
-                )
-        }
-        "sed" => !args.iter().any(|arg| *arg == "-i" || arg.starts_with("-i")),
-        "find" => !args
-            .iter()
-            .any(|arg| matches!(*arg, "-delete" | "-exec" | "-execdir")),
+        "pwd" => args.is_empty(),
+        "git" => match args.first().map(String::as_str) {
+            Some("status" | "diff" | "log" | "show" | "rev-parse" | "ls-files") => true,
+            Some("branch") => {
+                args.len() == 1
+                    || args[1..].iter().all(|arg| {
+                        matches!(
+                            arg.as_str(),
+                            "--list" | "--all" | "-a" | "-r" | "--remotes" | "--show-current"
+                        )
+                    })
+            }
+            Some("remote") => {
+                matches!(args.as_slice(), [remote] if remote == "remote")
+                    || matches!(args.as_slice(), [remote, verbose] if remote == "remote" && matches!(verbose.as_str(), "-v" | "--verbose"))
+            }
+            _ => false,
+        },
         _ => false,
     };
     if read_only {
         return decision(true, "worktree-read-only-command-allow", operation);
     }
 
-    let git_write = executable == "git"
-        && matches!(
-            args.first().copied(),
-            Some(
-                "add"
-                    | "commit"
-                    | "checkout"
-                    | "switch"
-                    | "restore"
-                    | "reset"
-                    | "stash"
-                    | "merge"
-                    | "rebase"
-                    | "tag"
-            )
-        );
     let build_or_test = match executable {
         "cargo" => matches!(
-            args.first().copied(),
+            args.first().map(String::as_str),
             Some("build" | "test" | "check" | "fmt" | "clippy")
         ),
         "go" => matches!(
-            args.first().copied(),
+            args.first().map(String::as_str),
             Some("build" | "test" | "vet" | "fmt")
         ),
-        "npm" | "pnpm" | "yarn" => matches!(
-            args.first().copied(),
-            Some("build" | "test" | "lint" | "check" | "run")
-        ),
-        "pytest" | "bazel" | "make" => {
-            matches!(executable, "pytest" | "make")
-                || matches!(args.first().copied(), Some("build" | "test"))
-        }
+        "npm" | "pnpm" | "yarn" => package_manager_command_is_safe(executable, &args),
+        "bazel" => matches!(args.first().map(String::as_str), Some("build" | "test")),
+        "pytest" => args.is_empty(),
         _ => false,
     };
-    let worktree_file_write = match executable {
-        "sed" => args.iter().any(|arg| *arg == "-i" || arg.starts_with("-i")),
-        "install" => true,
-        "mktemp" => {
-            args.iter().any(|arg| arg.starts_with("--tmpdir="))
-                || args.windows(2).any(|pair| pair[0] == "-p")
-        }
-        _ => false,
-    };
-    if git_write || build_or_test || worktree_file_write {
-        decision(
-            true,
-            if git_write {
-                "worktree-git-operation-allow"
-            } else if build_or_test {
-                "worktree-build-or-test-allow"
-            } else {
-                "worktree-scoped-write-allow"
-            },
-            operation,
-        )
+    if build_or_test {
+        decision(true, "worktree-build-or-test-allow", operation)
     } else {
-        decision(false, "default-deny", operation)
+        let rule = if executable == "git"
+            && args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "branch" | "worktree"))
+        {
+            "destructive-git-operation-deny"
+        } else if executable == "gh"
+            && args
+                .get(1)
+                .is_some_and(|arg| matches!(arg.as_str(), "merge" | "close" | "delete"))
+        {
+            "gh-destructive-operation-deny"
+        } else {
+            "default-deny"
+        };
+        decision(false, rule, operation)
     }
 }
 
@@ -1509,7 +1807,12 @@ mod tests {
         let server = CodexServer { shared };
 
         let (thread_id, events) = server
-            .start_thread("agent-fast", "/tmp", "finish immediately")
+            .start_thread(
+                "agent-fast",
+                "/tmp",
+                "codex/agent-fast",
+                "finish immediately",
+            )
             .unwrap();
         assert_eq!(thread_id, "thread-fast");
         let event = events
@@ -1583,6 +1886,7 @@ mod tests {
         ApprovalContext {
             agent_id: "agent-42".to_owned(),
             worktree: std::path::PathBuf::from("/workspace/repo"),
+            branch: "codex/relay-approval-policy".to_owned(),
         }
     }
 
@@ -1652,6 +1956,244 @@ mod tests {
                 "{params}"
             );
         }
+    }
+
+    #[test]
+    fn own_branch_push_pr_create_and_tmp_mktemp_are_allowlisted() {
+        let context = test_context();
+        for (command, expected_rule) in [
+            (
+                serde_json::json!(["git", "push", "origin", "codex/relay-approval-policy"]),
+                "own-branch-git-push-allow",
+            ),
+            (
+                serde_json::json!([
+                    "git",
+                    "push",
+                    "--force-with-lease",
+                    "origin",
+                    "codex/relay-approval-policy"
+                ]),
+                "own-branch-git-push-allow",
+            ),
+            (
+                serde_json::json!([
+                    "git",
+                    "push",
+                    "origin",
+                    "codex/relay-approval-policy:codex/relay-approval-policy"
+                ]),
+                "own-branch-git-push-allow",
+            ),
+            (
+                serde_json::json!([
+                    "gh",
+                    "pr",
+                    "create",
+                    "--head",
+                    "codex/relay-approval-policy",
+                    "--title",
+                    "relay policy"
+                ]),
+                "scoped-gh-command-allow",
+            ),
+            (
+                serde_json::json!(["gh", "pr", "view", "17"]),
+                "scoped-gh-command-allow",
+            ),
+            (
+                serde_json::json!(["gh", "run", "view", "23"]),
+                "scoped-gh-command-allow",
+            ),
+            (
+                serde_json::json!(["gh", "api", "repos/example/project/pulls/17"]),
+                "scoped-gh-command-allow",
+            ),
+            (
+                serde_json::json!(["mktemp", "-d", "/tmp/zigzag.XXXXXX"]),
+                "tmp-scratch-allow",
+            ),
+        ] {
+            let result = command_approval(
+                &serde_json::json!({"command":command, "cwd":"/workspace/repo"}),
+                Some(&context),
+            );
+            assert!(result.allow, "{}: {}", result.rule, result.operation);
+            assert_eq!(result.rule, expected_rule);
+        }
+        let network_push = command_approval(
+            &serde_json::json!({
+                "command":["git", "push", "origin", "codex/relay-approval-policy"],
+                "cwd":"/workspace/repo",
+                "additionalPermissions":{"network":{"enabled":true}}
+            }),
+            Some(&context),
+        );
+        assert!(network_push.allow, "{}", network_push.rule);
+        let network_pr = command_approval(
+            &serde_json::json!({
+                "command":["gh", "pr", "create", "--head", "codex/relay-approval-policy", "--title", "relay policy"],
+                "cwd":"/workspace/repo",
+                "networkApprovalContext":{"host":"github.com"}
+            }),
+            Some(&context),
+        );
+        assert!(network_pr.allow, "{}", network_pr.rule);
+        let unsafe_network = command_approval(
+            &serde_json::json!({
+                "command":["cargo", "test"],
+                "cwd":"/workspace/repo",
+                "additionalPermissions":{"network":{"enabled":true}}
+            }),
+            Some(&context),
+        );
+        assert!(!unsafe_network.allow);
+    }
+
+    #[test]
+    fn main_push_credentials_destructive_gh_and_worktree_removal_are_denied() {
+        let context = test_context();
+        for command in [
+            serde_json::json!(["git", "push", "origin", "main"]),
+            serde_json::json!(["git", "push", "--force-with-lease", "origin", "main"]),
+            serde_json::json!(["git", "push", "origin", "codex/other-branch"]),
+            serde_json::json!(["git", "push", "origin", "main:codex/relay-approval-policy"]),
+            serde_json::json!([
+                "git",
+                "push",
+                "origin",
+                "codex/other-branch:codex/relay-approval-policy"
+            ]),
+            serde_json::json!([
+                "git",
+                "push",
+                "origin",
+                "refs/heads/main:refs/heads/codex/relay-approval-policy"
+            ]),
+            serde_json::json!([
+                "git",
+                "push",
+                "--delete",
+                "origin",
+                "codex/relay-approval-policy"
+            ]),
+            serde_json::json!(["git", "push", "origin", ":codex/relay-approval-policy"]),
+            serde_json::json!(["./git", "push", "origin", "codex/relay-approval-policy"]),
+            serde_json::json!(["cat", "/Users/worker/.env"]),
+            serde_json::json!(["cat", "private-key"]),
+            serde_json::json!(["gh", "pr", "merge", "17"]),
+            serde_json::json!(["gh", "pr", "close", "17"]),
+            serde_json::json!(["gh", "pr", "delete", "17"]),
+            serde_json::json!(["gh", "pr", "create", "--head", "codex/other-branch"]),
+            serde_json::json!(["gh", "pr", "create", "--title", "implicit current branch"]),
+            serde_json::json!(["npm", "run", "deploy"]),
+            serde_json::json!(["gh", "api", "repos/example/project/actions/se%63rets"]),
+            serde_json::json!(["git", "branch", "-D", "old-branch"]),
+            serde_json::json!(["git", "worktree", "remove", "/tmp/other"]),
+            serde_json::json!(["mktemp", "-p", "/tmp", "../../outside.XXXXXX"]),
+        ] {
+            let result = command_approval(
+                &serde_json::json!({"command":command, "cwd":"/workspace/repo"}),
+                Some(&context),
+            );
+            assert!(
+                !result.allow,
+                "{} was allowed by {}",
+                result.operation, result.rule
+            );
+        }
+    }
+
+    #[test]
+    fn audit_command_redacts_inline_credentials() {
+        let result = command_approval(
+            &serde_json::json!({
+                "command":["env", "GH_TOKEN=ghp_example-secret-value"],
+                "cwd":"/workspace/repo"
+            }),
+            Some(&test_context()),
+        );
+        assert!(!result.allow);
+        assert!(result.operation.contains("GH_TOKEN=[REDACTED]"));
+        assert!(!result.operation.contains("ghp_example-secret-value"));
+
+        let header = command_approval(
+            &serde_json::json!({
+                "command":["gh", "api", "repos/example/project/issues", "-HAuthorization: Bearer ghp_example-secret-value"],
+                "cwd":"/workspace/repo"
+            }),
+            Some(&test_context()),
+        );
+        assert!(!header.operation.contains("ghp_example-secret-value"));
+
+        let malformed = command_approval(
+            &serde_json::json!({
+                "command":["echo", 7, "ghp_example-secret-value"],
+                "cwd":"/workspace/repo"
+            }),
+            Some(&test_context()),
+        );
+        assert!(!malformed.operation.contains("ghp_example-secret-value"));
+    }
+
+    #[test]
+    fn denied_approval_request_gets_a_fast_jsonrpc_answer() {
+        let answer_file = std::env::temp_dir().join(format!(
+            "zigzag-approval-answer-{}-{}.json",
+            std::process::id(),
+            super::AtomicU64::new(1).fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let script = format!(
+            "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"item/commandExecution/requestApproval\",\"params\":{{\"threadId\":\"thread-fast-deny\",\"command\":[\"python\",\"tool.py\"],\"cwd\":\"/workspace/repo\"}}}}'; IFS= read -r answer; printf '%s\\n' \"$answer\" > '{}'",
+            answer_file.display()
+        );
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let shared = Arc::new(Shared {
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            pending: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::new()),
+            approval_contexts: Mutex::new(HashMap::from([(
+                "thread-fast-deny".to_owned(),
+                test_context(),
+            )])),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
+            next_id: AtomicU64::new(1),
+        });
+        let reader_shared = Arc::clone(&shared);
+        thread::spawn(move || super::read_messages(stdout, reader_shared));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let answer = loop {
+            if let Ok(answer) = std::fs::read_to_string(&answer_file) {
+                break answer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval request stalled without a reply"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let response: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(response["id"], 77);
+        assert_eq!(
+            response.pointer("/result/decision").and_then(Value::as_str),
+            Some("decline")
+        );
+        let _ = std::fs::remove_file(answer_file);
+        let mut child = shared.child.lock().unwrap();
+        let _ = child.wait();
     }
 
     #[test]

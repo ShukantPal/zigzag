@@ -1730,7 +1730,8 @@ fn agent_argv_maps_common_options_for_each_harness() {
     let codex = agent_argv("codex", "gpt-6", "full-auto", "/tmp/wt", true, "do it");
     assert_eq!(codex.first().map(String::as_str), Some("exec"));
     assert!(codex.windows(2).any(|v| v == ["-m", "gpt-6"]));
-    assert!(codex.iter().any(|v| v == "--full-auto"));
+    assert!(codex.iter().any(|v| v == "--suggest"));
+    assert!(!codex.iter().any(|v| v == "--full-auto"));
     assert_eq!(codex.last().map(String::as_str), Some("do it"));
 
     let gemini = agent_argv(
