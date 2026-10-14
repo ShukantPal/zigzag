@@ -538,6 +538,7 @@ struct TranscriptItem {
     state: String,
     raw: Value,
     diagnostic: Option<String>,
+    hidden: bool,
 }
 
 fn codex_transcript_path(agent_id: &str) -> Option<PathBuf> {
@@ -573,6 +574,7 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                     "Malformed JSONL record at line {}",
                     line_number + 1
                 )),
+                hidden: false,
             });
             continue;
         };
@@ -584,18 +586,106 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .replace('/', ".");
+        let params = event.get("params").unwrap_or(&Value::Null);
+        if kind == "item.agentMessage.delta" || kind == "item.reasoning.summaryTextDelta" {
+            let item_id = s(params, "itemId");
+            let delta = s(params, "delta");
+            if item_id.is_empty() {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            }
+            let key = item_id.clone();
+            let Some(index) = indices.get(&key).copied() else {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            };
+            let text = s(&items[index].item, "text");
+            items[index].item["text"] = Value::String(format!("{text}{delta}"));
+            append_transcript_raw(&mut items[index], event);
+            continue;
+        }
+        if kind.starts_with("item.commandExecution.") {
+            let item_id = s(params, "itemId");
+            if item_id.is_empty() {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            }
+            let key = item_id.clone();
+            let index = if let Some(index) = indices.get(&key).copied() {
+                index
+            } else if kind.ends_with(".started") {
+                let index = items.len();
+                items.push(TranscriptItem {
+                    id: key.clone(),
+                    item: serde_json::json!({"id":item_id,"type":"command_execution","status":"in_progress"}),
+                    state: "started".into(),
+                    raw: event.clone(),
+                    diagnostic: None,
+                    hidden: false,
+                });
+                indices.insert(key, index);
+                index
+            } else {
+                push_transcript_gap(&mut items, line_number, &event);
+                continue;
+            };
+            let item = &mut items[index].item;
+            for key in ["command", "cwd", "exitCode", "aggregatedOutput", "output"] {
+                if let Some(value) = params.get(key) {
+                    let canonical = match key {
+                        "exitCode" => "exit_code",
+                        "aggregatedOutput" => "aggregated_output",
+                        _ => key,
+                    };
+                    item[canonical] = value.clone();
+                }
+            }
+            if kind.ends_with(".outputDelta") {
+                let output = s(item, "aggregated_output");
+                item["aggregated_output"] =
+                    Value::String(format!("{output}{}", s(params, "delta")));
+            }
+            if kind.ends_with(".completed") {
+                let status = s(params, "status");
+                item["status"] = Value::String(if status.is_empty() {
+                    "completed".into()
+                } else {
+                    status
+                });
+            }
+            items[index].state = if kind.ends_with(".completed") {
+                "completed".into()
+            } else {
+                "in_progress".into()
+            };
+            append_transcript_raw(&mut items[index], event);
+            continue;
+        }
+        if kind == "turn.diff.updated" {
+            let diff = params
+                .get("diff")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let id = "turn-diff".to_owned();
+            if let Some(index) = indices.get(&id).copied() {
+                items[index].item["diff"] = Value::String(diff.to_owned());
+                append_transcript_raw(&mut items[index], event);
+            } else {
+                indices.insert(id.clone(), items.len());
+                items.push(TranscriptItem {
+                    id,
+                    item: serde_json::json!({"type":"diff","diff":diff}),
+                    state: "updated".into(),
+                    raw: event,
+                    diagnostic: None,
+                    hidden: false,
+                });
+            }
+            continue;
+        }
         if kind.starts_with("item.") {
             let Some(item) = event.get("item").or_else(|| event.pointer("/params/item")) else {
-                items.push(TranscriptItem {
-                    id: format!("diagnostic-{line_number}"),
-                    item: Value::Null,
-                    state: "diagnostic".into(),
-                    raw: event,
-                    diagnostic: Some(format!(
-                        "{kind} record has no item at line {}",
-                        line_number + 1
-                    )),
-                });
+                push_transcript_gap(&mut items, line_number, &event);
                 continue;
             };
             let item_id = s(item, "id");
@@ -606,13 +696,21 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             };
             let state = kind.strip_prefix("item.").unwrap_or(&kind).to_owned();
             if let Some(index) = indices.get(&key).copied() {
-                items[index] = TranscriptItem {
-                    id: key,
-                    item: item.clone(),
-                    state,
-                    raw: event,
-                    diagnostic: None,
-                };
+                let mut item = item.clone();
+                if normalize_item_type(&s(&item, "type")) == "agent_message"
+                    && s(&item, "text").is_empty()
+                {
+                    item["text"] = items[index]
+                        .item
+                        .get("text")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
+                }
+                items[index].item = item;
+                items[index].state = state;
+                items[index].diagnostic = None;
+                items[index].hidden = false;
+                append_transcript_raw(&mut items[index], event);
             } else {
                 indices.insert(key.clone(), items.len());
                 items.push(TranscriptItem {
@@ -621,39 +719,104 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                     state,
                     raw: event,
                     diagnostic: None,
+                    hidden: false,
                 });
             }
         } else {
-            // Lifecycle records have no thread item, but remain useful context and
-            // must be inspectable just like item records.
-            let label = match kind.as_str() {
-                "thread.started" => "Thread started".to_owned(),
-                "turn.started" => "Turn started".to_owned(),
-                "turn.completed" => "Turn completed".to_owned(),
-                "turn.failed" => format!(
+            let handled_lifecycle_event = matches!(
+                kind.as_str(),
+                "thread.started"
+                    | "thread.name.updated"
+                    | "thread.tokenUsage.updated"
+                    | "turn.started"
+                    | "turn.completed"
+                    | "turn.failed"
+                    | "turn.diff.updated"
+                    | "mcpServer.startupStatus.updated"
+                    | "error"
+            );
+            let unknown = kind.is_empty()
+                || (!handled_lifecycle_event
+                    && !kind.starts_with("item.")
+                    && !kind.starts_with("item/"));
+            let label = if kind == "turn.failed" {
+                Some(format!(
                     "Turn failed: {}",
                     s(event.get("error").unwrap_or(&Value::Null), "message")
-                ),
-                "error" => format!("Error: {}", s(&event, "message")),
-                _ => format!("Event: {}", if kind.is_empty() { "unknown" } else { &kind }),
+                ))
+            } else if kind == "error" {
+                Some(format!("Error: {}", s(&event, "message")))
+            } else if unknown || kind.starts_with("unknown") {
+                Some(format!(
+                    "Unknown event: {}",
+                    event
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unrecognized app-server event")
+                ))
+            } else {
+                None
             };
+            let hidden = !unknown && label.is_none();
             items.push(TranscriptItem {
                 id: format!("event-{line_number}"),
                 item: Value::Null,
                 state: kind,
                 raw: event,
-                diagnostic: Some(label),
+                diagnostic: label,
+                hidden,
             });
         }
     }
     items
 }
 
+fn push_transcript_gap(items: &mut Vec<TranscriptItem>, line_number: usize, raw: &Value) {
+    if let Some(last) = items.iter_mut().find(|item| item.id == "transcript-gap") {
+        if let Some(events) = last.raw.as_array_mut() {
+            events.push(raw.clone());
+        }
+        return;
+    }
+    items.push(TranscriptItem {
+        id: "transcript-gap".into(),
+        item: Value::Null,
+        state: "gap".into(),
+        raw: Value::Array(vec![raw.clone()]),
+        diagnostic: Some(
+            "Transcript gap: one or more events referenced an item that was not captured".into(),
+        ),
+        hidden: false,
+    });
+    let _ = line_number;
+}
+
+fn append_transcript_raw(item: &mut TranscriptItem, event: Value) {
+    if let Some(events) = item.raw.as_array_mut() {
+        events.push(event);
+    } else {
+        item.raw = Value::Array(vec![item.raw.clone(), event]);
+    }
+}
+
+fn normalize_item_type(kind: &str) -> String {
+    match kind {
+        "agentMessage" => "agent_message".into(),
+        "commandExecution" => "command_execution".into(),
+        "fileChange" => "file_change".into(),
+        "mcpToolCall" => "mcp_tool_call".into(),
+        "collabToolCall" => "collab_tool_call".into(),
+        "webSearch" => "web_search".into(),
+        "todoList" => "todo_list".into(),
+        other => other.to_owned(),
+    }
+}
+
 fn transcript_label(item: &TranscriptItem) -> (String, String) {
     if let Some(label) = &item.diagnostic {
-        return (label.clone(), String::new());
+        return (safe_text(label), String::new());
     }
-    let kind = s(&item.item, "type");
+    let kind = normalize_item_type(&s(&item.item, "type"));
     let state = match s(&item.item, "status").as_str() {
         "in_progress" => "running",
         "completed" => "done",
@@ -664,8 +827,17 @@ fn transcript_label(item: &TranscriptItem) -> (String, String) {
     .to_owned();
     let summary = match kind.as_str() {
         "agent_message" => s(&item.item, "text"),
-        "reasoning" => "Reasoning summary (expand to inspect)".into(),
-        "command_execution" => s(&item.item, "command"),
+        "reasoning" => "Reasoning summary".into(),
+        "command_execution" => {
+            let command = s(&item.item, "command");
+            let exit = s(&item.item, "exit_code");
+            if exit.is_empty() {
+                format!("{command} · running")
+            } else {
+                format!("{command} · exit {exit}")
+            }
+        }
+        "diff" => "Changes".into(),
         "file_change" => {
             let n = item
                 .item
@@ -680,16 +852,111 @@ fn transcript_label(item: &TranscriptItem) -> (String, String) {
         "todo_list" => "Plan updated".into(),
         "error" => s(&item.item, "message"),
         _ => format!(
-            "{} {}",
+            "Unknown item: {}",
             if kind.is_empty() {
-                "Unknown item"
+                "unrecognized item"
             } else {
                 &kind
-            },
-            item.item
+            }
         ),
     };
     (safe_text(&summary), state)
+}
+
+fn transcript_detail(item: &TranscriptItem) -> String {
+    if let Some(label) = &item.diagnostic {
+        return safe_text(label);
+    }
+    match normalize_item_type(&s(&item.item, "type")).as_str() {
+        "command_execution" => {
+            let output = s(&item.item, "aggregated_output");
+            if output.is_empty() {
+                "(no captured output)".into()
+            } else {
+                output
+            }
+        }
+        "agent_message" | "reasoning" => s(&item.item, "text"),
+        "diff" => s(&item.item, "diff"),
+        "file_change" => item
+            .item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .map(|change| {
+                        let path = s(change, "path");
+                        let diff = s(change, "diff");
+                        if diff.is_empty() {
+                            format!("--- {path} (diff unavailable)")
+                        } else {
+                            format!("--- {path}\n{diff}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        "mcp_tool_call" => ["arguments", "result", "error"]
+            .iter()
+            .filter_map(|key| item.item.get(key).map(|value| format!("{key}: {}", value)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "collab_tool_call" => s(&item.item, "prompt"),
+        _ => transcript_label(item).0,
+    }
+}
+
+fn transcript_indices(items: &[TranscriptItem], raw_view: bool) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (!item.hidden || raw_view).then_some(index))
+        .collect()
+}
+
+fn move_transcript_selection(
+    items: &[TranscriptItem],
+    selected: usize,
+    down: bool,
+    raw_view: bool,
+) -> usize {
+    let indices = transcript_indices(items, raw_view);
+    if indices.is_empty() {
+        return 0;
+    }
+    let position = indices
+        .iter()
+        .position(|index| *index == selected)
+        .unwrap_or_else(|| {
+            if down {
+                indices
+                    .iter()
+                    .position(|index| *index > selected)
+                    .unwrap_or(indices.len() - 1)
+            } else {
+                indices
+                    .iter()
+                    .rposition(|index| *index < selected)
+                    .unwrap_or(0)
+            }
+        });
+    indices[if down {
+        (position + 1).min(indices.len() - 1)
+    } else {
+        position.saturating_sub(1)
+    }]
+}
+
+fn visible_transcript_selection(items: &[TranscriptItem], selected: usize) -> usize {
+    let indices = transcript_indices(items, false);
+    indices
+        .iter()
+        .copied()
+        .find(|index| *index >= selected)
+        .or_else(|| indices.last().copied())
+        .unwrap_or(0)
 }
 
 fn safe_text(text: &str) -> String {
@@ -791,6 +1058,7 @@ pub(super) fn cmd_status(
         .and_then(|row| read_agent_prompt(c, &row.agent));
     let (mut transcript_selected, mut transcript_scroll, mut transcript_focus, mut raw_view) =
         (0usize, 0u16, false, false);
+    transcript_selected = visible_transcript_selection(&transcript_items, transcript_selected);
     let mut expanded = HashSet::<String>::new();
     let mut tick = Instant::now();
     let mut transcript_tick = Instant::now();
@@ -830,8 +1098,12 @@ pub(super) fn cmd_status(
                 }
                 Some(KeyCode::Char('j')) | Some(KeyCode::Down) => {
                     if transcript_focus {
-                        transcript_selected =
-                            (transcript_selected + 1).min(transcript_items.len().saturating_sub(1));
+                        transcript_selected = move_transcript_selection(
+                            &transcript_items,
+                            transcript_selected,
+                            true,
+                            raw_view,
+                        );
                         transcript_scroll = transcript_scroll.saturating_add(1);
                     } else {
                         selected = (selected + 1).min(rows.len().saturating_sub(1));
@@ -843,13 +1115,18 @@ pub(super) fn cmd_status(
                         transcript_prompt = rows
                             .get(selected)
                             .and_then(|row| read_agent_prompt(c, &row.agent));
-                        transcript_selected = 0;
+                        transcript_selected = visible_transcript_selection(&transcript_items, 0);
                         transcript_scroll = 0;
                     }
                 }
                 Some(KeyCode::Char('k')) | Some(KeyCode::Up) => {
                     if transcript_focus {
-                        transcript_selected = transcript_selected.saturating_sub(1);
+                        transcript_selected = move_transcript_selection(
+                            &transcript_items,
+                            transcript_selected,
+                            false,
+                            raw_view,
+                        );
                         transcript_scroll = transcript_scroll.saturating_sub(1);
                     } else {
                         selected = selected.saturating_sub(1);
@@ -861,7 +1138,7 @@ pub(super) fn cmd_status(
                         transcript_prompt = rows
                             .get(selected)
                             .and_then(|row| read_agent_prompt(c, &row.agent));
-                        transcript_selected = 0;
+                        transcript_selected = visible_transcript_selection(&transcript_items, 0);
                         transcript_scroll = 0;
                     }
                 }
@@ -871,12 +1148,16 @@ pub(super) fn cmd_status(
                 Some(KeyCode::PageUp) | Some(KeyCode::Char('[')) => {
                     transcript_scroll = transcript_scroll.saturating_sub(10)
                 }
-                Some(KeyCode::Char('v')) => raw_view = !raw_view,
+                Some(KeyCode::Char('v')) => {
+                    raw_view = !raw_view;
+                    if !raw_view {
+                        transcript_selected =
+                            visible_transcript_selection(&transcript_items, transcript_selected);
+                    }
+                }
                 Some(KeyCode::Enter) | Some(KeyCode::Char(' ')) if transcript_focus => {
                     if let Some(item) = transcript_items.get(transcript_selected)
-                        && !item.diagnostic.as_ref().is_some_and(|text| {
-                            text.starts_with("Thread started") || text.starts_with("Turn started")
-                        })
+                        && (raw_view || !item.hidden)
                         && !expanded.insert(item.id.clone())
                     {
                         expanded.remove(&item.id);
@@ -900,8 +1181,11 @@ pub(super) fn cmd_status(
                     transcript_prompt = rows
                         .get(selected)
                         .and_then(|row| read_agent_prompt(c, &row.agent));
-                    transcript_selected =
-                        transcript_selected.min(transcript_items.len().saturating_sub(1));
+                    transcript_selected = if raw_view {
+                        transcript_selected.min(transcript_items.len().saturating_sub(1))
+                    } else {
+                        visible_transcript_selection(&transcript_items, transcript_selected)
+                    };
                 }
                 Err(e) => warnings = vec![format!("relay status unavailable: {}", e.message)],
             }
@@ -913,8 +1197,11 @@ pub(super) fn cmd_status(
         if transcript_tick.elapsed() >= Duration::from_millis(500) {
             if let Some(row) = rows.get(selected) {
                 (transcript_items, transcript_notice) = read_codex_transcript(&row.agent);
-                transcript_selected =
-                    transcript_selected.min(transcript_items.len().saturating_sub(1));
+                transcript_selected = if raw_view {
+                    transcript_selected.min(transcript_items.len().saturating_sub(1))
+                } else {
+                    visible_transcript_selection(&transcript_items, transcript_selected)
+                };
             }
             transcript_tick = Instant::now();
         }
@@ -1051,7 +1338,7 @@ fn draw(
                 lines.push(Line::from(format!("Request: {summary}")));
             }
             if let Some(notice) = transcript_notice {
-                lines.push(Line::from(Span::styled(notice, Style::default().fg(Color::Yellow))));
+                lines.push(Line::from(Span::styled(safe_text(notice), Style::default().fg(Color::Yellow))));
             }
             if let Some(prompt) = transcript_prompt {
                 lines.push(Line::from(Span::styled(
@@ -1061,9 +1348,17 @@ fn draw(
                 lines.extend(prompt.lines().map(|line| Line::from(line.to_owned())));
             }
             for (index, item) in transcript_items.iter().enumerate() {
-                let (summary, state) = transcript_label(item);
-                let kind = s(&item.item, "type");
-                let marker = if kind.ends_with("tool_call") || kind == "command_execution" { "▸" } else { "•" };
+                if item.hidden && !raw_view {
+                    continue;
+                }
+                let (mut summary, state) = transcript_label(item);
+                if raw_view && item.hidden {
+                    summary = format!("Protocol event: {}", item.state);
+                }
+                summary = safe_text(&summary);
+                let state = safe_text(&state);
+                let kind = normalize_item_type(&s(&item.item, "type"));
+                let marker = if kind.ends_with("tool_call") || kind == "command_execution" { "▸" } else if kind == "diff" || kind == "file_change" { "±" } else { "•" };
                 let selected_style = if index == transcript_selected {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else { Style::default() };
@@ -1072,28 +1367,29 @@ fn draw(
                     Span::styled(format!("[{state}] "), Style::default().fg(Color::Yellow)),
                     Span::styled(summary, selected_style),
                 ]));
-                if expanded.contains(&item.id) {
-                    let detail = if raw_view || item.diagnostic.is_some() {
+                if raw_view || expanded.contains(&item.id) {
+                    let detail = if raw_view {
                         serde_json::to_string_pretty(&item.raw).unwrap_or_else(|_| item.raw.to_string())
                     } else {
-                        let kind = s(&item.item, "type");
-                        match kind.as_str() {
-                            "command_execution" => {
-                                let output = s(&item.item, "aggregated_output");
-                                format!("{}\nexit code: {}", if output.is_empty() { "(no captured output)" } else { &output }, s(&item.item, "exit_code"))
-                            }
-                            "agent_message" | "reasoning" => s(&item.item, "text"),
-                            "mcp_tool_call" => ["arguments", "result", "error"].iter()
-                                .filter_map(|key| item.item.get(key).map(|value| format!("{key}: {value}")))
-                                .collect::<Vec<_>>().join("\n"),
-                            "file_change" => item.item.get("changes").map(Value::to_string).unwrap_or_default(),
-                            _ => serde_json::to_string_pretty(&item.item).unwrap_or_else(|_| item.item.to_string()),
-                        }
+                        transcript_detail(item)
                     };
-                    lines.extend(safe_text(&detail).lines().map(|line| Line::from(line.to_owned())));
+                    let diff_mode = kind == "diff" || kind == "file_change";
+                    lines.extend(safe_text(&detail).lines().map(|line| {
+                        if diff_mode && line.starts_with('+') {
+                            Line::from(Span::styled(line.to_owned(), Style::default().fg(Color::Green)))
+                        } else if diff_mode && line.starts_with('-') {
+                            Line::from(Span::styled(line.to_owned(), Style::default().fg(Color::Red)))
+                        } else if diff_mode && line.starts_with("@@") {
+                            Line::from(Span::styled(line.to_owned(), Style::default().fg(Color::Cyan)))
+                        } else {
+                            Line::from(line.to_owned())
+                        }
+                    }));
                 }
             }
-            if transcript_items.is_empty() && transcript_notice.is_none() {
+            if transcript_items.iter().all(|item| item.hidden) && transcript_notice.is_none() && !raw_view {
+                lines.push(Line::from("No transcript messages yet."));
+            } else if transcript_items.is_empty() && transcript_notice.is_none() {
                 lines.push(Line::from("No Codex events yet."));
             }
         } else {
@@ -1241,7 +1537,131 @@ mod tests {
         assert_eq!(items[0].state, "completed");
         assert_eq!(s(&items[0].item, "text"), "done");
         assert_eq!(items[1].state, "turn.completed");
-        assert_eq!(transcript_label(&items[1]).0, "Turn completed");
+        assert!(items[1].hidden);
+    }
+
+    #[test]
+    fn renders_app_server_stream_as_clean_transcript_items() {
+        let fixture = concat!(
+            r#"{"method":"item/started","params":{"item":{"id":"msg-1","type":"agentMessage","text":"","status":"in_progress"}}}"#,
+            "\n",
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"The fix is "}}"#,
+            "\n",
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"ready."}}"#,
+            "\n",
+            r#"{"method":"item/completed","params":{"item":{"id":"msg-1","type":"agentMessage","status":"completed"}}}"#,
+            "\n",
+            r#"{"method":"item/commandExecution/started","params":{"itemId":"cmd-1","command":"cargo test -p zzapi"}}"#,
+            "\n",
+            r#"{"method":"item/commandExecution/outputDelta","params":{"itemId":"cmd-1","delta":"all tests passed"}}"#,
+            "\n",
+            r#"{"method":"item/commandExecution/completed","params":{"itemId":"cmd-1","exitCode":0}}"#,
+            "\n",
+            r#"{"method":"turn/diff/updated","params":{"diff":"diff --git a/README.md b/README.md\n+clean transcript"}}"#,
+            "\n",
+            r#"{"method":"thread/tokenUsage/updated","params":{"total":{"tokens":42}}}"#,
+            "\n",
+            r#"{"method":"mcpServer/startupStatus/updated","params":{"name":"example","status":"ready"}}"#,
+            "\n",
+            r#"{"method":"item/started","params":{"itemId":"lost-1"}}"#,
+            "\n",
+            r#"{"method":"item/updated","params":{"itemId":"lost-2"}}"#,
+            "\n",
+            r#"{"method":"future/workerInsight","params":{"message":"kept concise"}}"#,
+            "\n",
+        );
+        let items = parse_codex_transcript(fixture);
+        let visible: Vec<_> = items.iter().filter(|item| !item.hidden).collect();
+        assert_eq!(
+            visible.len(),
+            5,
+            "visible: {:?}",
+            visible
+                .iter()
+                .map(|item| (item.id.as_str(), item.hidden, transcript_label(item).0))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(s(&visible[0].item, "text"), "The fix is ready.");
+        assert_eq!(transcript_label(visible[0]).0, "The fix is ready.");
+        let raw_events = visible[0].raw.as_array().unwrap();
+        assert_eq!(raw_events.len(), 4);
+        assert_eq!(raw_events[0]["method"], "item/started");
+        assert_eq!(raw_events[1]["params"]["delta"], "The fix is ");
+        assert_eq!(raw_events[2]["params"]["delta"], "ready.");
+        assert_eq!(raw_events[3]["method"], "item/completed");
+
+        assert_eq!(
+            transcript_label(visible[1]).0,
+            "cargo test -p zzapi · exit 0"
+        );
+        assert_eq!(transcript_detail(visible[1]), "all tests passed");
+
+        assert!(transcript_label(visible[2]).0.contains("Changes"));
+        assert!(transcript_detail(visible[2]).contains("+clean transcript"));
+        assert_eq!(
+            visible[3].diagnostic.as_deref(),
+            Some("Transcript gap: one or more events referenced an item that was not captured")
+        );
+        assert_eq!(
+            visible[4].diagnostic.as_deref(),
+            Some("Unknown event: future/workerInsight")
+        );
+
+        let hidden_protocol_events = items.iter().filter(|item| item.hidden).count();
+        assert_eq!(hidden_protocol_events, 2);
+        assert!(
+            visible
+                .iter()
+                .all(|item| !transcript_label(item).0.contains('{'))
+        );
+    }
+
+    #[test]
+    fn flags_orphan_message_deltas_and_unknown_events_in_known_namespaces() {
+        let data = concat!(
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"missing","delta":"orphan"}}"#,
+            "\n",
+            r#"{"method":"turn/futureUpdate","params":{}}"#,
+            "\n",
+            r#"{"method":"mcpServer/futureStatus","params":{}}"#,
+            "\n",
+        );
+        let items = parse_codex_transcript(data);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].state, "gap");
+        assert_eq!(items[0].raw.as_array().unwrap().len(), 1);
+        assert_eq!(
+            transcript_label(&items[1]).0,
+            "Unknown event: turn/futureUpdate"
+        );
+        assert_eq!(
+            transcript_label(&items[2]).0,
+            "Unknown event: mcpServer/futureStatus"
+        );
+        assert!(!items[1].hidden);
+        assert!(!items[2].hidden);
+    }
+
+    #[test]
+    fn sanitizes_terminal_controls_in_event_names_and_error_messages() {
+        let data = concat!(
+            r#"{"method":"turn/\u001b]0;owned\u0007\u001b[31mfuture","params":{}}"#,
+            "\n",
+            r#"{"method":"error","message":"bad\u001b]0;title\u0007\u001b[2J"}"#,
+            "\n",
+        );
+        let items = parse_codex_transcript(data);
+        for item in &items {
+            let summary = transcript_label(item).0;
+            assert!(!summary.chars().any(|ch| ch == '\u{1b}' || ch == '\u{7}'));
+        }
+        assert!(
+            transcript_label(&items[0])
+                .0
+                .contains("�]0;owned��[31mfuture")
+        );
+        assert!(transcript_label(&items[1]).0.contains("bad�]0;title��[2J"));
     }
 
     #[test]
