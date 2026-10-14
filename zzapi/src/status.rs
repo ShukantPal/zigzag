@@ -1,7 +1,10 @@
 //! Read-only agent status dashboard migrated from dept/status.py.
 use super::{ApiError, Client, Fail};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -18,6 +21,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::{self, IsTerminal},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -261,12 +265,32 @@ fn git_branch(worktree: &str) -> String {
     if worktree.is_empty() {
         return String::new();
     }
-    std::process::Command::new("git")
-        .args(["-C", worktree, "branch", "--show-current"])
-        .output()
+    let worktree = Path::new(worktree);
+    let dot_git = worktree.join(".git");
+    let git_dir = match std::fs::metadata(&dot_git) {
+        Ok(metadata) if metadata.is_dir() => dot_git,
+        _ => {
+            let Ok(pointer) = std::fs::read_to_string(dot_git) else {
+                return String::new();
+            };
+            let Some(path) = pointer.trim().strip_prefix("gitdir:") else {
+                return String::new();
+            };
+            let path = PathBuf::from(path.trim());
+            if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            }
+        }
+    };
+    std::fs::read_to_string(git_dir.join("HEAD"))
         .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_owned)
+        })
         .unwrap_or_default()
 }
 fn audit(state: &Path) -> (Vec<Value>, Vec<String>) {
@@ -386,12 +410,16 @@ fn build(
         }
     }
     let mut out: Vec<_> = m.into_values().collect();
+    let mut branches = HashMap::<String, String>::new();
     for r in &mut out {
         if r.worktree.is_empty() {
             r.worktree = wt.get(&r.task).cloned().unwrap_or_default()
         }
         if r.branch.is_empty() {
-            r.branch = git_branch(&r.worktree);
+            r.branch = branches
+                .entry(r.worktree.clone())
+                .or_insert_with(|| git_branch(&r.worktree))
+                .clone();
         }
     }
     out.sort_by(|a, b| {
@@ -704,7 +732,14 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             }
             continue;
         }
-        if kind.starts_with("item.") {
+        if kind.starts_with("item.")
+            && (event.get("item").is_some()
+                || params.get("item").is_some()
+                || matches!(
+                    kind.as_str(),
+                    "item.started" | "item.updated" | "item.completed"
+                ))
+        {
             let Some(item) = event.get("item").or_else(|| event.pointer("/params/item")) else {
                 push_transcript_gap(&mut items, line_number, &event);
                 continue;
@@ -754,6 +789,7 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 kind.as_str(),
                 "thread.started"
                     | "thread.name.updated"
+                    | "thread.status.changed"
                     | "thread.tokenUsage.updated"
                     | "turn.started"
                     | "turn.completed"
@@ -762,11 +798,31 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                     | "mcpServer.startupStatus.updated"
                     | "error"
             );
-            let unknown = kind.is_empty()
-                || (!handled_lifecycle_event
-                    && !kind.starts_with("item.")
-                    && !kind.starts_with("item/"));
-            let label = if kind == "turn.failed" {
+            let handled_item_event = matches!(
+                kind.as_str(),
+                "item.started"
+                    | "item.updated"
+                    | "item.completed"
+                    | "item.agentMessage.delta"
+                    | "item.agent_message.delta"
+                    | "item.reasoning.summaryTextDelta"
+                    | "item.commandExecution.started"
+                    | "item.commandExecution.outputDelta"
+                    | "item.commandExecution.completed"
+            );
+            let unknown = kind.is_empty() || (!handled_lifecycle_event && !handled_item_event);
+            let label = if kind == "thread.status.changed" {
+                let status = params.get("status").unwrap_or(&Value::Null);
+                let status = status
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| s(status, "type"));
+                Some(if status.is_empty() {
+                    "Thread status changed".into()
+                } else {
+                    format!("Thread status: {status}")
+                })
+            } else if kind == "turn.failed" {
                 Some(format!(
                     "Turn failed: {}",
                     s(event.get("error").unwrap_or(&Value::Null), "message")
@@ -774,12 +830,15 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             } else if kind == "error" {
                 Some(format!("Error: {}", s(&event, "message")))
             } else if unknown || kind.starts_with("unknown") {
+                let name = event
+                    .get("method")
+                    .or_else(|| event.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unrecognized app-server event");
+                let payload = event.get("params").unwrap_or(&event);
                 Some(format!(
-                    "Unknown event: {}",
-                    event
-                        .get("method")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unrecognized app-server event")
+                    "Event: {name} · {}",
+                    truncate(&payload.to_string(), 120)
                 ))
             } else {
                 None
@@ -847,6 +906,7 @@ fn append_transcript_raw(item: &mut TranscriptItem, event: Value) {
 fn normalize_item_type(kind: &str) -> String {
     match kind {
         "agentMessage" => "agent_message".into(),
+        "userMessage" => "user_message".into(),
         "commandExecution" => "command_execution".into(),
         "fileChange" => "file_change".into(),
         "mcpToolCall" => "mcp_tool_call".into(),
@@ -854,6 +914,24 @@ fn normalize_item_type(kind: &str) -> String {
         "webSearch" => "web_search".into(),
         "todoList" => "todo_list".into(),
         other => other.to_owned(),
+    }
+}
+
+fn item_text(item: &Value) -> String {
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return text.to_owned();
+    }
+    match item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => s(item, "message"),
     }
 }
 
@@ -872,6 +950,10 @@ fn transcript_label(item: &TranscriptItem) -> (String, String) {
     .to_owned();
     let summary = match kind.as_str() {
         "agent_message" => s(&item.item, "text"),
+        "user_message" => format!(
+            "You: {}",
+            truncate(&item_text(&item.item), EVENT_PROMPT_LIMIT)
+        ),
         "reasoning" => "Reasoning summary".into(),
         "command_execution" => {
             let command = s(&item.item, "command");
@@ -897,18 +979,25 @@ fn transcript_label(item: &TranscriptItem) -> (String, String) {
         "todo_list" => "Plan updated".into(),
         "error" => s(&item.item, "message"),
         _ => format!(
-            "Unknown item: {}",
-            if kind.is_empty() {
-                "unrecognized item"
-            } else {
-                &kind
-            }
+            "{}: {}",
+            if kind.is_empty() { "Item" } else { &kind },
+            truncate(&item.item.to_string(), EVENT_PROMPT_LIMIT)
         ),
     };
     (safe_text(&summary), state)
 }
 
 fn transcript_detail(item: &TranscriptItem) -> String {
+    if item.item.is_null()
+        && (item.raw.get("method").is_some()
+            || item
+                .raw
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !kind.starts_with("item.")))
+    {
+        return serde_json::to_string_pretty(&item.raw).unwrap_or_else(|_| item.raw.to_string());
+    }
     if let Some(label) = &item.diagnostic {
         return safe_text(label);
     }
@@ -922,6 +1011,7 @@ fn transcript_detail(item: &TranscriptItem) -> String {
             }
         }
         "agent_message" | "reasoning" => s(&item.item, "text"),
+        "user_message" => item_text(&item.item),
         "diff" => s(&item.item, "diff"),
         "file_change" => item
             .item
@@ -949,7 +1039,7 @@ fn transcript_detail(item: &TranscriptItem) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         "collab_tool_call" => s(&item.item, "prompt"),
-        _ => transcript_label(item).0,
+        _ => serde_json::to_string_pretty(&item.item).unwrap_or_else(|_| item.item.to_string()),
     }
 }
 
@@ -1004,6 +1094,10 @@ fn visible_transcript_selection(items: &[TranscriptItem], selected: usize) -> us
         .unwrap_or(0)
 }
 
+fn scroll_by(current: u16, delta: i16, maximum: u16) -> u16 {
+    (i32::from(current) + i32::from(delta)).clamp(0, i32::from(maximum)) as u16
+}
+
 fn safe_text(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -1017,6 +1111,32 @@ fn safe_text(text: &str) -> String {
 }
 
 fn read_codex_transcript(client: &Client, agent_id: &str) -> (Vec<TranscriptItem>, Option<String>) {
+    let Some(path) = codex_transcript_path(agent_id) else {
+        return read_remote_transcript(client, agent_id);
+    };
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.len() as usize > CODEX_TRANSCRIPT_LIMIT => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "Transcript exceeds the {} MiB display limit",
+                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
+                )),
+            );
+        }
+        Err(_) => return read_remote_transcript(client, agent_id),
+        _ => {}
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => (parse_codex_transcript(&text), None),
+        Err(_) => read_remote_transcript(client, agent_id),
+    }
+}
+
+fn read_remote_transcript(
+    client: &Client,
+    agent_id: &str,
+) -> (Vec<TranscriptItem>, Option<String>) {
     if let Ok(transcript) = client.get(&format!("/v1/agents/{agent_id}/transcript"), &[])
         && let Some(text) = transcript.get("stdout").and_then(Value::as_str)
     {
@@ -1031,29 +1151,45 @@ fn read_codex_transcript(client: &Client, agent_id: &str) -> (Vec<TranscriptItem
         }
         return (parse_codex_transcript(text), None);
     }
-    let Some(path) = codex_transcript_path(agent_id) else {
-        return (
-            Vec::new(),
-            Some("No local Codex JSONL transcript for this execution".into()),
-        );
-    };
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.len() as usize > CODEX_TRANSCRIPT_LIMIT => {
-            return (
-                Vec::new(),
-                Some(format!(
-                    "Transcript exceeds the {} MiB display limit",
-                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
-                )),
-            );
-        }
-        Err(error) => return (Vec::new(), Some(format!("Transcript unavailable: {error}"))),
-        _ => {}
+    (
+        Vec::new(),
+        Some("Transcript unavailable locally and from the relay".into()),
+    )
+}
+
+struct TranscriptCache {
+    agent_id: String,
+    local_signature: Option<(u64, Option<SystemTime>)>,
+    checked_at: Instant,
+    items: Arc<Vec<TranscriptItem>>,
+    notice: Option<String>,
+}
+
+fn read_codex_transcript_cached(
+    client: &Client,
+    agent_id: &str,
+    cache: &mut Option<TranscriptCache>,
+) -> (Arc<Vec<TranscriptItem>>, Option<String>) {
+    let local_signature = codex_transcript_path(agent_id)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| (metadata.len(), metadata.modified().ok()));
+    if let Some(cached) = cache.as_ref()
+        && cached.agent_id == agent_id
+        && ((local_signature.is_some() && cached.local_signature == local_signature)
+            || cached.checked_at.elapsed() < Duration::from_secs(1))
+    {
+        return (Arc::clone(&cached.items), cached.notice.clone());
     }
-    match std::fs::read_to_string(path) {
-        Ok(text) => (parse_codex_transcript(&text), None),
-        Err(error) => (Vec::new(), Some(format!("Transcript unavailable: {error}"))),
-    }
+    let (items, notice) = read_codex_transcript(client, agent_id);
+    let items = Arc::new(items);
+    *cache = Some(TranscriptCache {
+        agent_id: agent_id.to_owned(),
+        local_signature,
+        checked_at: Instant::now(),
+        items: Arc::clone(&items),
+        notice: notice.clone(),
+    });
+    (items, notice)
 }
 
 fn read_agent_prompt(client: &Client, agent_id: &str) -> Option<String> {
@@ -1108,9 +1244,10 @@ pub(super) fn cmd_status(
     let mut selected = 0usize;
     let mut selected_id = rows.get(selected).map(|row| row.id.clone());
     let mut table_state = ratatui::widgets::TableState::default();
+    let mut transcript_cache = None;
     let (mut transcript_items, mut transcript_notice) = rows
         .get(selected)
-        .map(|row| read_codex_transcript(c, &row.agent))
+        .map(|row| read_codex_transcript_cached(c, &row.agent, &mut transcript_cache))
         .unwrap_or_default();
     let mut transcript_prompt = rows
         .get(selected)
@@ -1121,6 +1258,7 @@ pub(super) fn cmd_status(
     let mut expanded = HashSet::<String>::new();
     let mut tick = Instant::now();
     let mut transcript_tick = Instant::now();
+    let mut max_transcript_scroll = 0u16;
     loop {
         draw(
             &mut terminal,
@@ -1132,100 +1270,136 @@ pub(super) fn cmd_status(
             transcript_notice.as_deref(),
             transcript_prompt.as_deref(),
             transcript_selected,
-            transcript_scroll,
+            &mut transcript_scroll,
+            &mut max_transcript_scroll,
             transcript_focus,
             raw_view,
             &expanded,
             lost,
         );
-        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            let key = match event::read() {
+        if event::poll(Duration::from_millis(33)).unwrap_or(false) {
+            let input = match event::read() {
                 Ok(Event::Key(key))
                     if key.kind != KeyEventKind::Release
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c') =>
                 {
-                    Some(KeyCode::Char('q'))
+                    Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        KeyModifiers::CONTROL,
+                    )))
                 }
-                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => Some(key.code),
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => Some(Event::Key(key)),
+                Ok(Event::Mouse(mouse)) => Some(Event::Mouse(mouse)),
                 _ => None,
             };
-            match key {
-                Some(KeyCode::Char('q' | 'Q')) | Some(KeyCode::Esc) => break,
-                Some(KeyCode::Tab) | Some(KeyCode::Left) | Some(KeyCode::Right) => {
-                    transcript_focus = !transcript_focus;
-                }
-                Some(KeyCode::Char('j')) | Some(KeyCode::Down) => {
-                    if transcript_focus {
-                        transcript_selected = move_transcript_selection(
-                            &transcript_items,
-                            transcript_selected,
-                            true,
-                            raw_view,
-                        );
-                        transcript_scroll = transcript_scroll.saturating_add(1);
-                    } else {
-                        selected = (selected + 1).min(rows.len().saturating_sub(1));
-                        selected_id = rows.get(selected).map(|row| row.id.clone());
-                        (transcript_items, transcript_notice) = rows
-                            .get(selected)
-                            .map(|row| read_codex_transcript(c, &row.agent))
-                            .unwrap_or_default();
-                        transcript_prompt = rows
-                            .get(selected)
-                            .and_then(|row| read_agent_prompt(c, &row.agent));
-                        transcript_selected = visible_transcript_selection(&transcript_items, 0);
-                        transcript_scroll = 0;
+            match input {
+                Some(Event::Mouse(mouse)) => match mouse.kind {
+                    MouseEventKind::ScrollDown => {
+                        transcript_scroll = scroll_by(transcript_scroll, 3, max_transcript_scroll)
                     }
-                }
-                Some(KeyCode::Char('k')) | Some(KeyCode::Up) => {
-                    if transcript_focus {
-                        transcript_selected = move_transcript_selection(
-                            &transcript_items,
-                            transcript_selected,
-                            false,
-                            raw_view,
-                        );
-                        transcript_scroll = transcript_scroll.saturating_sub(1);
-                    } else {
-                        selected = selected.saturating_sub(1);
-                        selected_id = rows.get(selected).map(|row| row.id.clone());
-                        (transcript_items, transcript_notice) = rows
-                            .get(selected)
-                            .map(|row| read_codex_transcript(c, &row.agent))
-                            .unwrap_or_default();
-                        transcript_prompt = rows
-                            .get(selected)
-                            .and_then(|row| read_agent_prompt(c, &row.agent));
-                        transcript_selected = visible_transcript_selection(&transcript_items, 0);
-                        transcript_scroll = 0;
+                    MouseEventKind::ScrollUp => {
+                        transcript_scroll = scroll_by(transcript_scroll, -3, max_transcript_scroll)
                     }
-                }
-                Some(KeyCode::PageDown) | Some(KeyCode::Char(']')) => {
-                    transcript_scroll = transcript_scroll.saturating_add(10)
-                }
-                Some(KeyCode::PageUp) | Some(KeyCode::Char('[')) => {
-                    transcript_scroll = transcript_scroll.saturating_sub(10)
-                }
-                Some(KeyCode::Char('v')) => {
-                    raw_view = !raw_view;
-                    if !raw_view {
-                        transcript_selected =
-                            visible_transcript_selection(&transcript_items, transcript_selected);
+                    _ => {}
+                },
+                Some(Event::Key(key)) => match key.code {
+                    KeyCode::Char('q' | 'Q') | KeyCode::Esc => break,
+                    KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                        transcript_focus = !transcript_focus;
                     }
-                }
-                Some(KeyCode::Enter) | Some(KeyCode::Char(' ')) if transcript_focus => {
-                    if let Some(item) = transcript_items.get(transcript_selected)
-                        && (raw_view || !item.hidden)
-                        && !expanded.insert(item.id.clone())
-                    {
-                        expanded.remove(&item.id);
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if transcript_focus {
+                            transcript_selected = move_transcript_selection(
+                                &transcript_items,
+                                transcript_selected,
+                                true,
+                                raw_view,
+                            );
+                            transcript_scroll = transcript_scroll.saturating_add(1);
+                        } else {
+                            selected = (selected + 1).min(rows.len().saturating_sub(1));
+                            selected_id = rows.get(selected).map(|row| row.id.clone());
+                            (transcript_items, transcript_notice) = rows
+                                .get(selected)
+                                .map(|row| {
+                                    read_codex_transcript_cached(
+                                        c,
+                                        &row.agent,
+                                        &mut transcript_cache,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            transcript_prompt = rows
+                                .get(selected)
+                                .and_then(|row| read_agent_prompt(c, &row.agent));
+                            transcript_selected =
+                                visible_transcript_selection(&transcript_items, 0);
+                            transcript_scroll = 0;
+                        }
                     }
-                }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if transcript_focus {
+                            transcript_selected = move_transcript_selection(
+                                &transcript_items,
+                                transcript_selected,
+                                false,
+                                raw_view,
+                            );
+                            transcript_scroll = transcript_scroll.saturating_sub(1);
+                        } else {
+                            selected = selected.saturating_sub(1);
+                            selected_id = rows.get(selected).map(|row| row.id.clone());
+                            (transcript_items, transcript_notice) = rows
+                                .get(selected)
+                                .map(|row| {
+                                    read_codex_transcript_cached(
+                                        c,
+                                        &row.agent,
+                                        &mut transcript_cache,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            transcript_prompt = rows
+                                .get(selected)
+                                .and_then(|row| read_agent_prompt(c, &row.agent));
+                            transcript_selected =
+                                visible_transcript_selection(&transcript_items, 0);
+                            transcript_scroll = 0;
+                        }
+                    }
+                    KeyCode::PageDown | KeyCode::Char(']') => {
+                        transcript_scroll = transcript_scroll
+                            .saturating_add(10)
+                            .min(max_transcript_scroll)
+                    }
+                    KeyCode::PageUp | KeyCode::Char('[') => {
+                        transcript_scroll = transcript_scroll.saturating_sub(10)
+                    }
+                    KeyCode::Char('v') => {
+                        raw_view = !raw_view;
+                        if !raw_view {
+                            transcript_selected = visible_transcript_selection(
+                                &transcript_items,
+                                transcript_selected,
+                            );
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') if transcript_focus => {
+                        if let Some(item) = transcript_items.get(transcript_selected)
+                            && (raw_view || !item.hidden)
+                            && !expanded.insert(item.id.clone())
+                        {
+                            expanded.remove(&item.id);
+                        }
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
         if tick.elapsed() >= Duration::from_secs(interval.max(1)) {
+            let previous_agent = rows.get(selected).map(|row| row.agent.clone());
             match snapshot(c, &state, all) {
                 Ok((r, w, lo)) => {
                     rows = r;
@@ -1233,13 +1407,18 @@ pub(super) fn cmd_status(
                     lost = lo;
                     selected = resolve_selection(&rows, selected_id.as_deref(), selected);
                     selected_id = rows.get(selected).map(|row| row.id.clone());
-                    (transcript_items, transcript_notice) = rows
-                        .get(selected)
-                        .map(|row| read_codex_transcript(c, &row.agent))
-                        .unwrap_or_default();
-                    transcript_prompt = rows
-                        .get(selected)
-                        .and_then(|row| read_agent_prompt(c, &row.agent));
+                    let current_agent = rows.get(selected).map(|row| row.agent.clone());
+                    if current_agent != previous_agent {
+                        (transcript_items, transcript_notice) = rows
+                            .get(selected)
+                            .map(|row| {
+                                read_codex_transcript_cached(c, &row.agent, &mut transcript_cache)
+                            })
+                            .unwrap_or_default();
+                        transcript_prompt = rows
+                            .get(selected)
+                            .and_then(|row| read_agent_prompt(c, &row.agent));
+                    }
                     transcript_selected = if raw_view {
                         transcript_selected.min(transcript_items.len().saturating_sub(1))
                     } else {
@@ -1248,6 +1427,7 @@ pub(super) fn cmd_status(
                 }
                 Err(e) => warnings = vec![format!("relay status unavailable: {}", e.message)],
             }
+            transcript_tick = Instant::now();
             tick = Instant::now()
         }
         // Refresh the local JSONL independently from the slower relay snapshot.
@@ -1255,7 +1435,8 @@ pub(super) fn cmd_status(
         // this read to the status interval makes the transcript feel stale.
         if transcript_tick.elapsed() >= Duration::from_millis(500) {
             if let Some(row) = rows.get(selected) {
-                (transcript_items, transcript_notice) = read_codex_transcript(c, &row.agent);
+                (transcript_items, transcript_notice) =
+                    read_codex_transcript_cached(c, &row.agent, &mut transcript_cache);
                 transcript_selected = if raw_view {
                     transcript_selected.min(transcript_items.len().saturating_sub(1))
                 } else {
@@ -1275,7 +1456,12 @@ impl TerminalSession {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            crossterm::cursor::Hide
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -1284,7 +1470,12 @@ impl TerminalSession {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
+                let _ = execute!(
+                    io::stdout(),
+                    crossterm::cursor::Show,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
                 Err(error)
             }
         }
@@ -1297,6 +1488,7 @@ impl Drop for TerminalSession {
         let _ = execute!(
             self.terminal.backend_mut(),
             crossterm::cursor::Show,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
     }
@@ -1313,7 +1505,8 @@ fn draw(
     transcript_notice: Option<&str>,
     transcript_prompt: Option<&str>,
     transcript_selected: usize,
-    transcript_scroll: u16,
+    transcript_scroll: &mut u16,
+    max_transcript_scroll: &mut u16,
     transcript_focus: bool,
     raw_view: bool,
     expanded: &HashSet<String>,
@@ -1458,10 +1651,25 @@ fn draw(
             lines.push(Line::from(Span::styled(format!("WARNING: {warning}"), Style::default().fg(Color::Red))));
         }
         let title = if transcript_focus { " Transcript · focused " } else { " Transcript " };
+        let inner_width = panes[1].width.saturating_sub(2).max(1) as usize;
+        let content_lines = lines
+            .iter()
+            .map(|line| {
+                let width = line
+                    .spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum::<usize>();
+                width.max(1).div_ceil(inner_width)
+            })
+            .sum::<usize>();
         let paragraph = Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: true })
-            .scroll((transcript_scroll, 0));
+            .wrap(Wrap { trim: true });
+        let content_height = panes[1].height.saturating_sub(2) as usize;
+        *max_transcript_scroll = content_lines.saturating_sub(content_height).min(u16::MAX as usize) as u16;
+        *transcript_scroll = (*transcript_scroll).min(*max_transcript_scroll);
+        let paragraph = paragraph.scroll((*transcript_scroll, 0));
         frame.render_widget(paragraph, panes[1]);
     });
 }
@@ -1564,6 +1772,69 @@ mod tests {
     }
 
     #[test]
+    fn mouse_scroll_moves_in_small_bounded_steps() {
+        let mut scroll = 12;
+        scroll = scroll_by(scroll, 3, 20);
+        assert_eq!(scroll, 15);
+        for _ in 0..100 {
+            scroll = scroll_by(scroll, 3, 20);
+        }
+        assert_eq!(scroll, 20);
+        for _ in 0..100 {
+            scroll = scroll_by(scroll, -3, 20);
+        }
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn reads_branch_from_git_head_without_spawning_git() {
+        let dir = std::env::temp_dir().join(format!(
+            "zzapi-status-branch-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let normal = dir.join("normal");
+        std::fs::create_dir_all(normal.join(".git")).unwrap();
+        std::fs::write(normal.join(".git/HEAD"), "ref: refs/heads/codex/status\n").unwrap();
+        assert_eq!(git_branch(normal.to_str().unwrap()), "codex/status");
+
+        let linked = dir.join("linked");
+        let git_dir = dir.join("common/worktrees/linked");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../common/worktrees/linked\n").unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/codex/linked\n").unwrap();
+        assert_eq!(git_branch(linked.to_str().unwrap()), "codex/linked");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_transcript_item_renders_its_payload_as_a_fallback() {
+        let items = parse_codex_transcript(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"future-1\",\"type\":\"futureWidget\",\"value\":\"kept\"}}\n",
+        );
+        assert_eq!(items.len(), 1);
+        assert!(transcript_label(&items[0]).0.contains("futureWidget"));
+        assert!(transcript_label(&items[0]).0.contains("kept"));
+        assert!(transcript_detail(&items[0]).contains("kept"));
+    }
+
+    #[test]
+    fn unhandled_item_namespace_events_remain_visible_with_payloads() {
+        let items = parse_codex_transcript(
+            "{\"method\":\"item/fileChange/requestApproval\",\"params\":{\"itemId\":\"file-1\",\"reason\":\"outside workspace\"}}\n",
+        );
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].hidden);
+        assert!(
+            transcript_label(&items[0])
+                .0
+                .contains("item/fileChange/requestApproval")
+        );
+        assert!(transcript_detail(&items[0]).contains("outside workspace"));
+    }
+
+    #[test]
     fn reconciles_item_updates_and_keeps_malformed_records_visible() {
         let data = concat!(
             "{\"type\":\"item.started\",\"item\":{\"id\":\"cmd-1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"status\":\"in_progress\"}}\n",
@@ -1604,6 +1875,8 @@ mod tests {
         let fixture = concat!(
             r#"{"method":"item/started","params":{"item":{"id":"msg-1","type":"agentMessage","text":"","status":"in_progress"}}}"#,
             "\n",
+            r#"{"method":"item/completed","params":{"item":{"id":"user-1","type":"userMessage","content":[{"type":"text","text":"Please explain the change."}],"status":"completed"}}}"#,
+            "\n",
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"The fix is "}}"#,
             "\n",
             r#"{"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"ready."}}"#,
@@ -1626,6 +1899,8 @@ mod tests {
             "\n",
             r#"{"method":"item/updated","params":{"itemId":"lost-2"}}"#,
             "\n",
+            r#"{"method":"thread/status/changed","params":{"status":{"type":"idle"}}}"#,
+            "\n",
             r#"{"method":"future/workerInsight","params":{"message":"kept concise"}}"#,
             "\n",
         );
@@ -1633,7 +1908,7 @@ mod tests {
         let visible: Vec<_> = items.iter().filter(|item| !item.hidden).collect();
         assert_eq!(
             visible.len(),
-            5,
+            7,
             "visible: {:?}",
             visible
                 .iter()
@@ -1652,27 +1927,39 @@ mod tests {
 
         assert_eq!(
             transcript_label(visible[1]).0,
+            "You: Please explain the change."
+        );
+        assert_eq!(transcript_detail(visible[1]), "Please explain the change.");
+
+        assert_eq!(
+            transcript_label(visible[2]).0,
             "cargo test -p zzapi · exit 0"
         );
-        assert_eq!(transcript_detail(visible[1]), "all tests passed");
-
-        assert!(transcript_label(visible[2]).0.contains("Changes"));
-        assert!(transcript_detail(visible[2]).contains("+clean transcript"));
-        assert_eq!(
-            visible[3].diagnostic.as_deref(),
-            Some("Transcript gap: one or more events referenced an item that was not captured")
-        );
+        assert_eq!(transcript_detail(visible[2]), "all tests passed");
+        assert!(transcript_label(visible[3]).0.contains("Changes"));
+        assert!(transcript_detail(visible[3]).contains("+clean transcript"));
         assert_eq!(
             visible[4].diagnostic.as_deref(),
-            Some("Unknown event: future/workerInsight")
+            Some("Transcript gap: one or more events referenced an item that was not captured")
         );
+        assert!(
+            transcript_label(visible[5])
+                .0
+                .contains("Thread status: idle")
+        );
+        assert!(
+            transcript_label(visible[6])
+                .0
+                .contains("Event: future/workerInsight")
+        );
+        assert!(transcript_label(visible[6]).0.contains("kept concise"));
 
         let hidden_protocol_events = items.iter().filter(|item| item.hidden).count();
         assert_eq!(hidden_protocol_events, 2);
         assert!(
             visible
                 .iter()
-                .all(|item| !transcript_label(item).0.contains('{'))
+                .all(|item| !transcript_label(item).0.contains("Unknown event:"))
         );
     }
 
@@ -1689,15 +1976,15 @@ mod tests {
         let items = parse_codex_transcript(data);
         assert_eq!(items.len(), 3);
         assert!(
-            items[0]
-                .diagnostic
-                .as_deref()
-                .unwrap()
-                .contains("Unknown event: turn/futureUpdate")
+            transcript_label(&items[0])
+                .0
+                .contains("Event: turn/futureUpdate")
         );
-        assert_eq!(
-            transcript_label(&items[1]).0,
-            "Unknown event: mcpServer/futureStatus"
+        assert!(transcript_label(&items[0]).0.contains("{}"));
+        assert!(
+            transcript_label(&items[1])
+                .0
+                .contains("Event: mcpServer/futureStatus")
         );
         assert_eq!(
             transcript_label(&items[2]).0,
