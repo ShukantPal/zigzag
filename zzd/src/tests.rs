@@ -44,9 +44,10 @@ use crate::routes::agents::{
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
-    cleanup_agent_worktree, configured_worktree_base, resolve_existing_worktree_path,
-    resolve_new_worktree_path, resolve_worktree_repo, valid_worktree_branch,
-    worktree_branch_checkout_path, worktree_create_plan, worktree_delete_plan,
+    cleanup_agent_worktree, configured_worktree_base, discover_worktrees, handle_deleted_worktrees,
+    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
+    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan,
+    worktree_delete_plan,
 };
 use crate::server::{
     ConnectionLimiter, ConnectionPermit, MAX_CONNECTIONS, Server, Supervisor, handle_with_services,
@@ -1536,6 +1537,226 @@ fn worktree_create_and_delete_roundtrip() {
     worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).unwrap();
     assert!(worktree_delete_plan(wt2.to_str().unwrap(), &roots, &[]).is_err());
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn manual_worktree_remove_runs_configured_delete_hook_after_relay_observes_it() {
+    let base = worktree_test_base("wt-manual-hook");
+    let roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let hook_dir = repo.join(".zigzag");
+    std::fs::create_dir_all(&hook_dir).unwrap();
+    std::fs::write(
+        hook_dir.join("repo-stop.sh"),
+        "printf '%s|%s|%s\\n' \"$1\" \"$ZIGZAG_WORKTREE_OBSERVED\" \"$ZIGZAG_WORKTREE_REPO\" >> \"$(dirname \"$0\")/manual-hook.log\"\n",
+    )
+    .unwrap();
+    let worktree = roots[0].join("nested").join("manual-delete");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let added = Command::new("git")
+        .args(["worktree", "add", "-b", "manual-delete"])
+        .arg(&worktree)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let roots = vec![roots[0].canonicalize().unwrap()];
+    let observed = discover_worktrees(&roots);
+    let target = worktree.canonicalize().unwrap();
+    assert_eq!(observed.get(&target), Some(&repo.canonicalize().unwrap()));
+    let removed = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let current = discover_worktrees(&roots);
+    handle_deleted_worktrees(&observed, &current);
+    assert_eq!(
+        std::fs::read_to_string(hook_dir.join("manual-hook.log")).unwrap(),
+        format!(
+            "{}|1|{}\n",
+            target.display(),
+            repo.canonicalize().unwrap().display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn default_worktree_delete_hook_clears_only_proven_worktree_caches() {
+    let base = worktree_test_base("wt-default-hook");
+    let roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let source_hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.zigzag/repo-stop.sh");
+    std::fs::copy(source_hook, hooks.join("repo-stop.sh")).unwrap();
+    let first = roots[0].join("cache-one");
+    let second = roots[0].join("cache-two");
+    for (path, branch) in [(&first, "cache-one"), (&second, "cache-two")] {
+        let added = Command::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(path)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        for cache in [".cache", "node_modules", "target", "build", "dist"] {
+            std::fs::create_dir_all(path.join(cache)).unwrap();
+            std::fs::write(path.join(cache).join("sentinel"), "cache").unwrap();
+        }
+    }
+    let first = first.canonicalize().unwrap();
+    let second = second.canonicalize().unwrap();
+    let log = run_shell_capture(&first);
+    assert!(log.contains(&format!("worktree-delete hook path={}", first.display())));
+    for cache in [".cache", "node_modules", "target", "build", "dist"] {
+        assert!(!first.join(cache).exists(), "did not clear {cache}");
+        assert!(
+            second.join(cache).join("sentinel").exists(),
+            "cleared sibling cache {cache}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn default_worktree_delete_hook_removes_only_the_matching_bazel_output_base() {
+    let base = worktree_test_base("wt-bazel-hook");
+    let roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let source_hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.zigzag/repo-stop.sh");
+    std::fs::copy(source_hook, hooks.join("repo-stop.sh")).unwrap();
+    let first = roots[0].join("bazel-one");
+    let second = roots[0].join("bazel-two");
+    for (path, branch) in [(&first, "bazel-one"), (&second, "bazel-two")] {
+        let added = Command::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(path)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+    let first = first.canonicalize().unwrap();
+    let second = second.canonicalize().unwrap();
+    let output_root = base.join("xdg").join("bazel").join(format!(
+        "_bazel_{}",
+        std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned())
+    ));
+    let output_base = output_root.join(md5_path(&first));
+    let other_output_base = output_root.join(md5_path(&second));
+    std::fs::create_dir_all(output_base.join("execroot")).unwrap();
+    std::fs::create_dir_all(other_output_base.join("execroot")).unwrap();
+    std::os::unix::fs::symlink(&first, output_base.join("execroot/project")).unwrap();
+    std::os::unix::fs::symlink(&second, other_output_base.join("execroot/project")).unwrap();
+    let output = Command::new("sh")
+        .arg(hooks.join("repo-stop.sh"))
+        .arg(&first)
+        .current_dir(&first)
+        .env("HOME", &base)
+        .env("XDG_CACHE_HOME", base.join("xdg"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_base.exists());
+    assert!(
+        other_output_base.exists(),
+        "removed another worktree's Bazel output base"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+fn md5_path(path: &Path) -> String {
+    let mut child = Command::new("openssl")
+        .args(["dgst", "-md5"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(path.to_string_lossy().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned()
+}
+
+fn run_shell_capture(worktree: &Path) -> String {
+    let output = Command::new("sh")
+        .arg(
+            worktree
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("repo/.zigzag/repo-stop.sh"),
+        )
+        .arg(worktree)
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn default_worktree_delete_hook_refuses_unregistered_external_target() {
+    let base = worktree_test_base("wt-hook-refuse");
+    let _roots = worktree_test_roots(&base);
+    let repo = worktree_test_repo(&base);
+    let hooks = repo.join(".zigzag");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let source_hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.zigzag/repo-stop.sh");
+    std::fs::copy(source_hook, hooks.join("repo-stop.sh")).unwrap();
+    let target = base.join("outside");
+    std::fs::create_dir_all(target.join("target")).unwrap();
+    let output = Command::new("sh")
+        .arg(hooks.join("repo-stop.sh"))
+        .arg(&target)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refused"));
+    assert!(target.join("target").exists());
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]

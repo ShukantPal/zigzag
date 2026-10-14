@@ -1,8 +1,13 @@
 use crate::http::{error, reply};
 use crate::server::Server;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+static RELAY_DELETED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 use zz::{Json, parse_json};
 
 // --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
@@ -229,15 +234,30 @@ fn worktree_repo(path: &Path) -> Result<PathBuf, WorktreeError> {
 /// Run an optional repository lifecycle script through the user's shell.
 /// Hook output and failures are logged, while hooks remain best-effort.
 pub(crate) fn run_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
+    run_worktree_hook_inner(repo, worktree, hook, false);
+}
+
+fn run_observed_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
+    run_worktree_hook_inner(repo, worktree, hook, true);
+}
+
+fn run_worktree_hook_inner(repo: &Path, worktree: &Path, hook: &str, observed_deleted: bool) {
     let script = repo.join(".zigzag").join(hook);
     if !script.is_file() {
         return;
     }
     let path = worktree.to_string_lossy();
+    let current_dir = if worktree.is_dir() { worktree } else { repo };
     match Command::new("sh")
         .arg(&script)
         .arg(path.as_ref())
-        .current_dir(worktree)
+        .env("ZIGZAG_WORKTREE_PATH", path.as_ref())
+        .env(
+            "ZIGZAG_WORKTREE_OBSERVED",
+            if observed_deleted { "1" } else { "0" },
+        )
+        .env("ZIGZAG_WORKTREE_REPO", repo)
+        .current_dir(current_dir)
         .output()
     {
         Ok(output) => {
@@ -264,6 +284,78 @@ pub(crate) fn run_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
         ),
     }
 }
+
+/// Observe configured worktree roots for manual `git worktree remove` calls.
+/// The relay can recover a removal only if it saw the exact worktree path and
+/// owning repository before deletion. Missed removals are never guessed.
+pub(crate) fn worktree_deletion_watch_loop(roots: Vec<PathBuf>) {
+    let mut observed = HashMap::<PathBuf, PathBuf>::new();
+    loop {
+        let current = discover_worktrees(&roots);
+        handle_deleted_worktrees(&observed, &current);
+        observed = current;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+pub(crate) fn handle_deleted_worktrees(
+    observed: &HashMap<PathBuf, PathBuf>,
+    current: &HashMap<PathBuf, PathBuf>,
+) {
+    for (path, repo) in observed {
+        if current.contains_key(path) {
+            continue;
+        }
+        let relay_deleted = RELAY_DELETED_WORKTREES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map(|mut paths| paths.remove(path))
+            .unwrap_or(false);
+        if relay_deleted {
+            continue;
+        }
+        log::info!(
+            "worktree_delete observed manual removal path={}",
+            path.display()
+        );
+        run_observed_worktree_hook(repo, path, "repo-stop.sh");
+    }
+}
+
+pub(crate) fn discover_worktrees(roots: &[PathBuf]) -> HashMap<PathBuf, PathBuf> {
+    let mut found = HashMap::new();
+    for root in roots {
+        let mut pending = vec![(root.clone(), 0usize)];
+        while let Some((directory, depth)) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                } // Never follow a symlink out of the root.
+                if path.join(".git").exists() {
+                    let Ok(path) = std::fs::canonicalize(path) else {
+                        continue;
+                    };
+                    if path.starts_with(root) {
+                        if let Ok(repo) = worktree_repo(&path) {
+                            found.insert(path, repo);
+                        }
+                    }
+                } else if depth < 8 {
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// True when `refs/heads/<branch>` exists. Exit 0 means present, exit 1 means
 /// absent; anything else is a genuine git failure.
 pub(crate) fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
@@ -415,8 +507,21 @@ pub(crate) fn worktree_delete_plan(
     let repo = worktree_repo(&path)?;
     run_worktree_hook(&repo, &path, "repo-stop.sh");
     log::info!("worktree_delete path={}", path.display());
+    RELAY_DELETED_WORKTREES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        })?
+        .insert(path.clone());
     let remove = git_output(&repo, &["worktree", "remove", "--force", &path_str])?;
     if !remove.status.success() {
+        if let Some(paths) = RELAY_DELETED_WORKTREES.get() {
+            if let Ok(mut paths) = paths.lock() {
+                paths.remove(&path);
+            }
+        }
         log::warn!(
             "worktree_delete remove failed for {}: {}",
             path.display(),

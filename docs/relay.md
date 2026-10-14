@@ -55,3 +55,27 @@ defaults to 16.
 Worktree routes canonicalize paths, permit only `/private/tmp` or
 `/Users/shukant/.codex/worktrees`, reject traversal, and will not remove a
 live agent's worktree. Stopping an agent deliberately does not clean it up.
+
+Worktree deletion runs the owning repository's optional
+`.zigzag/repo-stop.sh <absolute-worktree-path>` hook before relay-initiated
+removal. A two-second relay poll also watches configured worktree roots and
+runs the same hook after it observes a manual `git worktree remove`. Manual
+removals are observable only for worktrees the relay saw before deletion; a
+worktree removed before the first scan or while the relay is stopped cannot be
+recovered. The hook runs from the repository root after manual removal and
+receives `ZIGZAG_WORKTREE_PATH`, `ZIGZAG_WORKTREE_REPO`, and
+`ZIGZAG_WORKTREE_OBSERVED=1` for relay-observed deletions.
+
+The default hook clears `.cache`, `node_modules`, `target`, `build`, `dist`,
+and Bazel's workspace symlink directories only as direct children of the
+verified worktree. It also removes the Bazel output base whose directory name
+is the MD5 of that worktree path under known default per-user output roots
+(Linux XDG cache, modern macOS cache, and legacy macOS `/private/var/tmp`).
+The matching output base must also contain an `execroot` symlink to that exact
+worktree path. It leaves custom Bazel output roots and output bases without
+that ownership evidence alone. The hook verifies the target is the
+owning repository's exact Git worktree, or, after removal, that the relay
+observed that exact path/repository pair (or Git still marks it prunable).
+Unverified paths are refused and logged; every run reports the invocation and
+each cache removed. Git's shared install base and repository cache are outside
+the selected output base and are never targeted.
