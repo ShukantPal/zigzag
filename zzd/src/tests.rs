@@ -1594,48 +1594,6 @@ fn manual_worktree_remove_runs_configured_delete_hook_after_relay_observes_it() 
 }
 
 #[test]
-fn default_worktree_delete_hook_clears_only_proven_worktree_caches() {
-    let base = worktree_test_base("wt-default-hook");
-    let roots = worktree_test_roots(&base);
-    let repo = worktree_test_repo(&base);
-    let hooks = repo.join(".zigzag");
-    std::fs::create_dir_all(&hooks).unwrap();
-    let source_hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.zigzag/repo-stop.sh");
-    std::fs::copy(source_hook, hooks.join("repo-stop.sh")).unwrap();
-    let first = roots[0].join("cache-one");
-    let second = roots[0].join("cache-two");
-    for (path, branch) in [(&first, "cache-one"), (&second, "cache-two")] {
-        let added = Command::new("git")
-            .args(["worktree", "add", "-b", branch])
-            .arg(path)
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(
-            added.status.success(),
-            "{}",
-            String::from_utf8_lossy(&added.stderr)
-        );
-        for cache in [".cache", "node_modules", "target", "build", "dist"] {
-            std::fs::create_dir_all(path.join(cache)).unwrap();
-            std::fs::write(path.join(cache).join("sentinel"), "cache").unwrap();
-        }
-    }
-    let first = first.canonicalize().unwrap();
-    let second = second.canonicalize().unwrap();
-    let log = run_shell_capture(&first);
-    assert!(log.contains(&format!("worktree-delete hook path={}", first.display())));
-    for cache in [".cache", "node_modules", "target", "build", "dist"] {
-        assert!(!first.join(cache).exists(), "did not clear {cache}");
-        assert!(
-            second.join(cache).join("sentinel").exists(),
-            "cleared sibling cache {cache}"
-        );
-    }
-    let _ = std::fs::remove_dir_all(base);
-}
-
-#[test]
 fn default_worktree_delete_hook_removes_only_the_matching_bazel_output_base() {
     let base = worktree_test_base("wt-bazel-hook");
     let roots = worktree_test_roots(&base);
@@ -1661,6 +1619,10 @@ fn default_worktree_delete_hook_removes_only_the_matching_bazel_output_base() {
     }
     let first = first.canonicalize().unwrap();
     let second = second.canonicalize().unwrap();
+    for cache in [".cache", "node_modules", "target", "build", "dist"] {
+        std::fs::create_dir_all(first.join(cache)).unwrap();
+        std::fs::write(first.join(cache).join("sentinel"), "keep").unwrap();
+    }
     let output_root = base.join("xdg").join("bazel").join(format!(
         "_bazel_{}",
         std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned())
@@ -1677,7 +1639,6 @@ fn default_worktree_delete_hook_removes_only_the_matching_bazel_output_base() {
         .current_dir(&first)
         .env("HOME", &base)
         .env("XDG_CACHE_HOME", base.join("xdg"))
-        .env("PATH", fake_docker_path(&base, false))
         .output()
         .unwrap();
     assert!(
@@ -1690,6 +1651,12 @@ fn default_worktree_delete_hook_removes_only_the_matching_bazel_output_base() {
         other_output_base.exists(),
         "removed another worktree's Bazel output base"
     );
+    for cache in [".cache", "node_modules", "target", "build", "dist"] {
+        assert!(
+            first.join(cache).join("sentinel").exists(),
+            "hook also removed {cache}"
+        );
+    }
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -1713,121 +1680,6 @@ fn md5_path(path: &Path) -> String {
         .last()
         .unwrap()
         .to_owned()
-}
-
-#[test]
-fn default_worktree_delete_hook_removes_only_exactly_labeled_docker_volumes() {
-    let base = worktree_test_base("wt-docker-hook");
-    let roots = worktree_test_roots(&base);
-    let repo = worktree_test_repo(&base);
-    let hooks = repo.join(".zigzag");
-    std::fs::create_dir_all(&hooks).unwrap();
-    let source_hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.zigzag/repo-stop.sh");
-    std::fs::copy(source_hook, hooks.join("repo-stop.sh")).unwrap();
-    let worktree = roots[0].join("docker-volumes");
-    let added = Command::new("git")
-        .args(["worktree", "add", "-b", "docker-volumes"])
-        .arg(&worktree)
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(
-        added.status.success(),
-        "{}",
-        String::from_utf8_lossy(&added.stderr)
-    );
-    let worktree = worktree.canonicalize().unwrap();
-    let docker_dir = base.join("fake-docker");
-    std::fs::create_dir_all(&docker_dir).unwrap();
-    let calls = base.join("docker-calls.log");
-    let removed = base.join("docker-removed.log");
-    let docker = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_CALLS\"\ncase \"$1:$2\" in\n  volume:ls)\n    [ \"$5\" = \"label=com.zigzag.worktree=$DOCKER_TARGET\" ] || exit 3\n    printf 'owned-volume\\nmismatched-volume\\n'\n    ;;\n  volume:inspect)\n    [ \"$3\" = --format ] || exit 4\n    case \"$5\" in\n      owned-volume) printf '%s\\n' \"$DOCKER_TARGET\" ;;\n      mismatched-volume) printf '/different/worktree\\n' ;;\n      *) exit 5 ;;\n    esac\n    ;;\n  volume:rm)\n    [ \"$3\" = owned-volume ] || exit 6\n    printf '%s\\n' \"$3\" >> \"$DOCKER_REMOVED\"\n    ;;\n  *) exit 7 ;;\nesac\n";
-    std::fs::write(docker_dir.join("docker"), docker).unwrap();
-    let chmod = Command::new("chmod")
-        .args(["+x"])
-        .arg(docker_dir.join("docker"))
-        .status()
-        .unwrap();
-    assert!(chmod.success());
-    let output = Command::new("sh")
-        .arg(hooks.join("repo-stop.sh"))
-        .arg(&worktree)
-        .current_dir(&worktree)
-        .env("PATH", fake_docker_path_with_dir(&docker_dir))
-        .env("DOCKER_TARGET", &worktree)
-        .env("DOCKER_CALLS", &calls)
-        .env("DOCKER_REMOVED", &removed)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("removed Docker volume=owned-volume"));
-    assert_eq!(std::fs::read_to_string(removed).unwrap(), "owned-volume\n");
-    let calls = std::fs::read_to_string(calls).unwrap();
-    assert!(calls.contains(&format!(
-        "volume ls --quiet --filter label=com.zigzag.worktree={}",
-        worktree.display()
-    )));
-    assert!(calls.contains("volume inspect"));
-    assert!(calls.contains("volume rm owned-volume"));
-    assert!(!calls.contains("volume rm mismatched-volume"));
-    assert!(!calls.contains("prune"));
-    let _ = std::fs::remove_dir_all(base);
-}
-
-fn fake_docker_path(base: &Path, return_empty: bool) -> String {
-    let directory = base.join("fake-docker-unavailable");
-    std::fs::create_dir_all(&directory).unwrap();
-    let script = if return_empty {
-        "#!/bin/sh\nexit 0\n"
-    } else {
-        "#!/bin/sh\necho 'docker intentionally unavailable in this test' >&2\nexit 1\n"
-    };
-    std::fs::write(directory.join("docker"), script).unwrap();
-    let status = Command::new("chmod")
-        .args(["+x"])
-        .arg(directory.join("docker"))
-        .status()
-        .unwrap();
-    assert!(status.success());
-    fake_docker_path_with_dir(&directory)
-}
-
-fn fake_docker_path_with_dir(directory: &Path) -> String {
-    format!(
-        "{}:{}",
-        directory.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
-fn run_shell_capture(worktree: &Path) -> String {
-    let output = Command::new("sh")
-        .arg(
-            worktree
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("repo/.zigzag/repo-stop.sh"),
-        )
-        .arg(worktree)
-        .current_dir(worktree)
-        .env(
-            "PATH",
-            fake_docker_path(worktree.parent().unwrap().parent().unwrap(), false),
-        )
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
