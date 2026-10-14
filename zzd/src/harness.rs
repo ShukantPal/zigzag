@@ -27,6 +27,11 @@ pub(crate) enum HarnessEvent {
 #[allow(dead_code)]
 pub(crate) trait HarnessSession: Send + Sync {
     fn send(&self, text: &str, delivery: Delivery) -> Result<(), String>;
+    /// Explicitly restore a durable conversation after its agent reached a
+    /// terminal state. Implementations must never replace it with a new thread.
+    fn resume_thread(&self) -> Result<Option<mpsc::Receiver<HarnessEvent>>, String> {
+        Err("harness does not support transcript resume".to_owned())
+    }
     fn continue_turn(&self, text: &str) -> Result<Value, String> {
         let _ = text;
         Err("harness does not support synchronous continuation".to_owned())
@@ -506,6 +511,19 @@ struct CodexSession {
     thread_id: String,
 }
 impl HarnessSession for CodexSession {
+    fn resume_thread(&self) -> Result<Option<mpsc::Receiver<HarnessEvent>>, String> {
+        let events = self.server.subscribe_thread(&self.thread_id)?;
+        match self.server.resume_thread(&self.thread_id) {
+            Ok(()) => Ok(Some(events)),
+            Err(error) => {
+                if let Ok(mut subscribers) = self.server.shared.subscribers.lock() {
+                    subscribers.remove(&self.thread_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn send(&self, text: &str, delivery: Delivery) -> Result<(), String> {
         if !self.server.has_thread(&self.thread_id) {
             self.server.resume_thread(&self.thread_id)?;

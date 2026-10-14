@@ -3180,6 +3180,16 @@ impl HarnessSession for MessageSession {
         unreachable!()
     }
 
+    fn resume_thread(
+        &self,
+    ) -> Result<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>, String> {
+        if self.failure {
+            Err("rollout missing".to_owned())
+        } else {
+            Ok(None)
+        }
+    }
+
     fn continue_turn(&self, text: &str) -> Result<serde_json::Value, String> {
         self.send(text, Delivery::Queue)?;
         Ok(serde_json::json!({"status":"completed","output":"follow-up-result"}))
@@ -3245,23 +3255,148 @@ fn agent_continue_on_idle_thread_returns_followup_result() {
 }
 
 #[test]
-fn agent_continue_missing_or_dead_agent_fails_without_creating_a_record() {
+fn agent_continue_resumes_finished_agent_and_fails_cleanly_without_rollout() {
     let (state, _state_path) = test_server();
     let mut record = agent_record("continue-dead");
     record.state = "succeeded".to_owned();
     record.harness = Some("codex".to_owned());
     record.harness_session_id = Some("codex-session".to_owned());
     state.supervisor.registry.register(record).unwrap();
-    let before = state.supervisor.registry.list(None, None).len();
     let session: Arc<dyn HarnessSession> = Arc::new(MessageSession {
         sent: Mutex::new(Vec::new()),
         failure: false,
     });
-    let dead = post_continue_with_session(&state, "continue-dead", "follow up", session.clone());
-    assert!(dead.starts_with("HTTP/1.1 409"), "{dead}");
+    let resumed = post_continue_with_session(&state, "continue-dead", "follow up", session.clone());
+    assert!(resumed.starts_with("HTTP/1.1 200"), "{resumed}");
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("continue-dead")
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+    let mut missing_rollout = agent_record("continue-no-rollout");
+    missing_rollout.state = "interrupted".to_owned();
+    missing_rollout.harness = Some("codex".to_owned());
+    missing_rollout.harness_session_id = Some("missing-rollout-thread".to_owned());
+    state.supervisor.registry.register(missing_rollout).unwrap();
+    let before_missing_request = state.supervisor.registry.list(None, None).len();
+    let missing_rollout_session: Arc<dyn HarnessSession> = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: true,
+    });
+    let unavailable = post_continue_with_session(
+        &state,
+        "continue-no-rollout",
+        "follow up",
+        missing_rollout_session,
+    );
+    assert!(unavailable.starts_with("HTTP/1.1 409"), "{unavailable}");
+    assert_eq!(
+        response_json(unavailable)
+            .object("error")
+            .and_then(Json::as_str),
+        Some("agent_transcript_unavailable")
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("continue-no-rollout")
+            .unwrap()
+            .state,
+        "interrupted"
+    );
     let missing = post_continue_with_session(&state, "no-such-agent", "follow up", session);
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
-    assert_eq!(state.supervisor.registry.list(None, None).len(), before);
+    assert_eq!(
+        state.supervisor.registry.list(None, None).len(),
+        before_missing_request
+    );
+}
+
+struct InterruptContinueSession {
+    interrupted: Mutex<bool>,
+    sent: Mutex<Vec<(String, Delivery)>>,
+}
+impl HarnessSession for InterruptContinueSession {
+    fn send(&self, text: &str, delivery: Delivery) -> Result<(), String> {
+        self.sent.lock().unwrap().push((text.to_owned(), delivery));
+        Ok(())
+    }
+    fn interrupt(&self) -> Result<(), String> {
+        *self.interrupted.lock().unwrap() = true;
+        Ok(())
+    }
+    fn continue_turn(&self, text: &str) -> Result<serde_json::Value, String> {
+        assert!(
+            *self.interrupted.lock().unwrap(),
+            "interrupt must precede the follow-up turn"
+        );
+        self.sent
+            .lock()
+            .unwrap()
+            .push((text.to_owned(), Delivery::Queue));
+        Ok(serde_json::json!({"status":"completed"}))
+    }
+}
+
+#[test]
+fn agent_continue_interrupts_live_turn_only_when_requested() {
+    let (state, _) = test_server();
+    let mut record = agent_record("continue-steer");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let session = Arc::new(InterruptContinueSession {
+        interrupted: Mutex::new(false),
+        sent: Mutex::new(Vec::new()),
+    });
+    let response = post_continue_interrupt(
+        &state,
+        "continue-steer",
+        "redirect now",
+        session.clone(),
+        true,
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(*session.interrupted.lock().unwrap());
+    assert_eq!(
+        session.sent.lock().unwrap().as_slice(),
+        [("redirect now".to_owned(), Delivery::Queue)]
+    );
+}
+
+fn post_continue_interrupt(
+    state: &Server,
+    id: &str,
+    prompt: &str,
+    session: Arc<dyn HarnessSession>,
+    interrupt: bool,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    agent_post_request_with_session_resolver(
+        &mut stream,
+        state,
+        AgentRoute::Continue(id),
+        serde_json::json!({"prompt":prompt,"interrupt":interrupt})
+            .to_string()
+            .into_bytes(),
+        move |_, _, _| Ok(Arc::clone(&session)),
+    )
+    .unwrap();
+    drop(stream);
+    client.join().unwrap()
 }
 
 struct InProgressContinueSession {

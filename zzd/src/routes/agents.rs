@@ -346,7 +346,16 @@ fn agent_continue_request(
     let Some(object) = value.as_object() else {
         return reply(stream, 400, error("invalid_agent_continue_request"));
     };
-    if object.keys().any(|key| key != "prompt") {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "prompt" | "interrupt"))
+    {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    }
+    if value
+        .get("interrupt")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return reply(stream, 400, error("invalid_agent_continue_request"));
     }
     let Some(prompt) = value
@@ -359,7 +368,12 @@ fn agent_continue_request(
     let Some(agent) = state.supervisor.registry.get(id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
-    if agent.state != "running" {
+    let interrupt = value
+        .get("interrupt")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let was_running = agent.state == "running";
+    if interrupt && !was_running {
         return reply(stream, 409, error("agent_not_running"));
     }
     let (Some(harness), Some(session_id)) = (
@@ -375,16 +389,72 @@ fn agent_continue_request(
         Ok(session) => session,
         Err((status, code)) => return reply(stream, status, error(code)),
     };
+    if !was_running {
+        let events = match session.resume_thread() {
+            Ok(events) => events,
+            Err(message) => {
+                log::warn!("agent transcript resume failed id={id}: {message}");
+                return reply(stream, 409, error("agent_transcript_unavailable"));
+            }
+        };
+        if let Some(events) = events {
+            let registry = Arc::clone(&state.supervisor.registry);
+            let store = Arc::clone(&state.store);
+            let agent_id = agent.id.clone();
+            let task_id = agent.task_id.clone();
+            let execution_id = agent.execution_id.clone();
+            thread::spawn(move || {
+                monitor_codex_events(registry, store, agent_id, task_id, execution_id, events)
+            });
+        }
+        if state
+            .supervisor
+            .registry
+            .transition(id, "running", None)
+            .is_err()
+        {
+            return reply(stream, 500, error("could_not_persist_agent_state"));
+        }
+    } else if interrupt && let Err(message) = session.interrupt() {
+        log::warn!("agent interrupt steering failed id={id}: {message}");
+        return reply(stream, 503, error("harness_interrupt_failed"));
+    }
     let result = match session.continue_turn(prompt) {
         Ok(result) => result,
         Err(message) if message == "agent_thread_unavailable" => {
+            if !was_running {
+                let _ = state
+                    .supervisor
+                    .registry
+                    .transition(id, &agent.state, agent.exit_code);
+            }
             return reply(stream, 409, error("agent_thread_unavailable"));
         }
         Err(message) => {
             log::warn!("agent continuation failed id={id}: {message}");
+            if !was_running {
+                let _ = state
+                    .supervisor
+                    .registry
+                    .transition(id, &agent.state, agent.exit_code);
+            }
             return reply(stream, 503, error("harness_continue_failed"));
         }
     };
+    let terminal = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("succeeded");
+    let terminal = match terminal {
+        "completed" | "succeeded" => "succeeded",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        _ => "running",
+    };
+    let _ = state
+        .supervisor
+        .registry
+        .transition(id, terminal, agent.exit_code);
     let response =
         parse_json(&serde_json::json!({"agent_id": agent.id, "turn": result}).to_string())
             .map_err(|_| "could not serialize continuation result")?;
