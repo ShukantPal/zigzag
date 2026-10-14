@@ -2162,11 +2162,13 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
-            queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+            queued: Mutex::new(HashMap::new()),
             approval_contexts: Mutex::new(HashMap::from([(
                 "thread-fast-deny".to_owned(),
                 test_context(),
             )])),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             next_id: AtomicU64::new(1),
         });
         let reader_shared = Arc::clone(&shared);
