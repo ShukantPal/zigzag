@@ -2162,6 +2162,46 @@ fn transcript_prefers_rollout_exclusively_and_reports_invalid_rollout_lines() {
 }
 
 #[test]
+fn unreadable_matching_codex_rollout_reports_gap_without_relay_fallback() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f9";
+    let mut record = agent_record("rollout-unreadable");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-unreadable", "stdout", b"wrong relay transcript\n")
+        .unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-unreadable-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(&rollout, [b'{', 0xff, b'}', b'\n']).unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-unreadable",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .expect("transcript should expose the unreadable rollout gap");
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("transcript.diagnostic"), "{stdout}");
+    assert!(stdout.contains("could not be read"), "{stdout}");
+    assert!(!stdout.contains("wrong relay transcript"), "{stdout}");
+    assert_eq!(transcript.object("log_degraded"), Some(&Json::Bool(true)));
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[test]
 fn transcript_ambiguous_task_id_is_rejected() {
     let (state, _state_path) = test_server();
     for (id, text) in [

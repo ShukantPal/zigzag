@@ -689,10 +689,25 @@ pub(crate) fn transcript_json_with_sessions_dir(
         .flatten()
         .zip(sessions_dir.as_deref())
         .and_then(|(thread_id, sessions)| codex_rollout_transcript(sessions, thread_id));
-    let logs = if let Some(rollout) = rollout.as_deref() {
-        transcript_logs_from_text(rollout, after, tail, &agent)
-    } else {
-        agent_logs_json(registry, &agent.id, "both", after, tail)?
+    let (logs, log_degraded) = match rollout {
+        Some(Ok(rollout)) => (
+            transcript_logs_from_text(&rollout, after, tail, &agent, false),
+            false,
+        ),
+        Some(Err(())) => (
+            transcript_logs_from_text(
+                &codex_rollout_unreadable_diagnostic(),
+                after,
+                tail,
+                &agent,
+                true,
+            ),
+            true,
+        ),
+        None => (
+            agent_logs_json(registry, &agent.id, "both", after, tail)?,
+            false,
+        ),
     };
 
     let mut stdout_text = String::new();
@@ -753,7 +768,10 @@ pub(crate) fn transcript_json_with_sessions_dir(
             "next_cursor".to_owned(),
             logs.object("next_cursor")?.clone(),
         ),
-        ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
+        (
+            "log_degraded".to_owned(),
+            Json::Bool(agent.log_degraded || log_degraded),
+        ),
     ]))
 }
 
@@ -833,7 +851,10 @@ fn resolve_registered_agent_id(registry: &zz::AgentRegistry, id_or_task: &str) -
 
 /// Read the durable Codex app-server rollout for a thread. Rollout records are
 /// translated to the same item/lifecycle JSONL model used by the transcript UI.
-fn codex_rollout_transcript(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
+fn codex_rollout_transcript(
+    sessions: &std::path::Path,
+    thread_id: &str,
+) -> Option<Result<String, ()>> {
     if thread_id.is_empty()
         || !thread_id
             .bytes()
@@ -866,15 +887,26 @@ fn codex_rollout_transcript(sessions: &std::path::Path, thread_id: &str) -> Opti
                         if !path.starts_with(&sessions) {
                             continue;
                         }
-                        return std::fs::read_to_string(path)
-                            .ok()
-                            .map(|source| normalize_codex_rollout(&source));
+                        return Some(
+                            std::fs::read_to_string(path)
+                                .map(|source| normalize_codex_rollout(&source))
+                                .map_err(|_| ()),
+                        );
                     }
                 }
             }
         }
     }
     None
+}
+
+fn codex_rollout_unreadable_diagnostic() -> String {
+    serde_json::json!({
+        "type": "transcript.diagnostic",
+        "message": "matching Codex rollout could not be read; transcript content is unavailable",
+    })
+    .to_string()
+        + "\n"
 }
 
 fn normalize_codex_rollout(source: &str) -> String {
@@ -955,6 +987,7 @@ fn transcript_logs_from_text(
     after: u64,
     tail: Option<usize>,
     agent: &zz::AgentRecord,
+    log_degraded: bool,
 ) -> Json {
     let start = if after == 0 {
         tail.filter(|limit| text.len() > *limit)
@@ -981,7 +1014,7 @@ fn transcript_logs_from_text(
         ("next_cursor".into(), Json::number(text.len() as u64)),
         ("dropped_before".into(), Json::number(0)),
         ("complete".into(), Json::Bool(agent.state != "running")),
-        ("log_degraded".into(), Json::Bool(false)),
+        ("log_degraded".into(), Json::Bool(log_degraded)),
     ])
 }
 
