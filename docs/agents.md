@@ -36,6 +36,15 @@ native harness. Stop remains session-scoped. Pause/resume are unavailable for
 app-server sessions because signaling their shared process would affect every
 agent in the domain.
 
+`POST /v1/agents/{id}/continue` accepts `{ "prompt": "..." }` and returns
+only after the Codex follow-up turn completes. If another turn is active, the
+prompt is queued behind it; requests are not interrupted or discarded. A
+missing, unresumable, or non-running agent returns an error and never creates
+a replacement thread. This is the synchronous continuation path exposed by
+`zzapi agents continue <id> --prompt TEXT`; use agent completion tracking to
+decide when to call it. It uses the same bearer-token authentication as agent
+creation.
+
 The shared live-session budget defaults to four Codex threads and OpenCode
 sessions across a daemon domain. Set `ZIGZAG_MAX_LIVE_AGENT_THREADS` before
 starting the daemon to tune it for the machine; it must be a positive integer.

@@ -137,6 +137,7 @@ pub(crate) enum AgentRoute<'a> {
     Pause(&'a str),
     Resume(&'a str),
     Message(&'a str),
+    Continue(&'a str),
 }
 
 /// POST-only route: `/v1/agents/{id}/restart`.
@@ -168,6 +169,9 @@ pub(crate) fn agent_route<'a>(method: &'a str, path: &'a str) -> Option<AgentRou
     }
     if let Some(id) = rest.strip_suffix("/messages") {
         return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Message(id));
+    }
+    if let Some(id) = rest.strip_suffix("/continue") {
+        return (!id.is_empty() && !id.contains('/')).then_some(AgentRoute::Continue(id));
     }
     (!rest.is_empty() && !rest.contains('/')).then_some(AgentRoute::Status(rest))
 }
@@ -280,6 +284,7 @@ pub(crate) fn agent_request(
         AgentRoute::Pause(_)
         | AgentRoute::Resume(_)
         | AgentRoute::Message(_)
+        | AgentRoute::Continue(_)
         | AgentRoute::Create => reply(stream, 404, error("not_found")),
     }
 }
@@ -313,8 +318,75 @@ where
         AgentRoute::Pause(id) => pause_agent_request(stream, state, id),
         AgentRoute::Resume(id) => resume_agent_request(stream, state, id),
         AgentRoute::Message(id) => agent_message_request(stream, state, id, body, &resolve_session),
+        AgentRoute::Continue(id) => {
+            agent_continue_request(stream, state, id, body, &resolve_session)
+        }
         _ => reply(stream, 404, error("not_found")),
     }
+}
+
+fn agent_continue_request(
+    stream: &mut TcpStream,
+    state: &Server,
+    id: &str,
+    body: Vec<u8>,
+    resolve_session: &impl Fn(
+        &Server,
+        &str,
+        &str,
+    )
+        -> Result<Arc<dyn crate::harness::HarnessSession>, (u16, &'static str)>,
+) -> Result<(), String> {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return reply(stream, 400, error("invalid_agent_continue_request")),
+    };
+    let Some(object) = value.as_object() else {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    };
+    if object.keys().any(|key| key != "prompt") {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    }
+    let Some(prompt) = value
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+    else {
+        return reply(stream, 400, error("invalid_agent_continue_request"));
+    };
+    let Some(agent) = state.supervisor.registry.get(id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if agent.state != "running" {
+        return reply(stream, 409, error("agent_not_running"));
+    }
+    let (Some(harness), Some(session_id)) = (
+        agent.harness.as_deref(),
+        agent.harness_session_id.as_deref(),
+    ) else {
+        return reply(stream, 409, error("agent_not_interactive"));
+    };
+    if harness != "codex" {
+        return reply(stream, 501, error("harness_continue_unsupported"));
+    }
+    let session = match resolve_session(state, harness, session_id) {
+        Ok(session) => session,
+        Err((status, code)) => return reply(stream, status, error(code)),
+    };
+    let result = match session.continue_turn(prompt) {
+        Ok(result) => result,
+        Err(message) if message == "agent_thread_unavailable" => {
+            return reply(stream, 409, error("agent_thread_unavailable"));
+        }
+        Err(message) => {
+            log::warn!("agent continuation failed id={id}: {message}");
+            return reply(stream, 503, error("harness_continue_failed"));
+        }
+    };
+    let response =
+        parse_json(&serde_json::json!({"agent_id": agent.id, "turn": result}).to_string())
+            .map_err(|_| "could not serialize continuation result")?;
+    reply(stream, 200, response)
 }
 
 fn resolve_agent_session(
