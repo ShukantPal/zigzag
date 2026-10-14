@@ -3317,6 +3317,218 @@ fn agent_continue_resumes_finished_agent_and_fails_cleanly_without_rollout() {
     );
 }
 
+struct TerminalContinueSession {
+    status: &'static str,
+}
+
+struct StaleCompletionContinueSession {
+    registry: Arc<zz::AgentRegistry>,
+    events: Mutex<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>>,
+    observed_state: std::sync::mpsc::Sender<String>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl HarnessSession for StaleCompletionContinueSession {
+    fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resume_thread(
+        &self,
+    ) -> Result<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>, String> {
+        Ok(self.events.lock().unwrap().take())
+    }
+
+    fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
+        // Give the queued resume event an opportunity to race while this new
+        // turn is active, then report the state observed inside the turn.
+        std::thread::sleep(Duration::from_millis(200));
+        let state = self
+            .registry
+            .get("continue-stale-completion")
+            .unwrap()
+            .state;
+        let _ = self.observed_state.send(state);
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(serde_json::json!({"status":"completed"}))
+    }
+
+    fn interrupt(&self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+impl HarnessSession for TerminalContinueSession {
+    fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resume_thread(
+        &self,
+    ) -> Result<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>, String> {
+        Ok(None)
+    }
+
+    fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"status":self.status}))
+    }
+
+    fn interrupt(&self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn agent_continue_resumes_failed_and_stopped_records() {
+    let (state, _) = test_server();
+    for (id, initial_state) in [
+        ("continue-failed", "failed"),
+        ("continue-stopped", "stopped"),
+    ] {
+        let mut record = agent_record(id);
+        record.state = initial_state.to_owned();
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some(format!("{id}-thread"));
+        state.supervisor.registry.register(record).unwrap();
+
+        let session: Arc<dyn HarnessSession> = Arc::new(TerminalContinueSession {
+            status: "completed",
+        });
+        let response = post_continue_with_session(&state, id, "resume work", session);
+        assert!(response.starts_with("HTTP/1.1 200"), "{id}: {response}");
+        assert_eq!(
+            state.supervisor.registry.get(id).unwrap().state,
+            "succeeded"
+        );
+    }
+}
+
+#[test]
+fn agent_continue_persists_failed_and_interrupted_turn_statuses() {
+    let (state, _) = test_server();
+    for (id, turn_status, expected_state) in [
+        ("continue-turn-failed", "failed", "failed"),
+        ("continue-turn-interrupted", "interrupted", "interrupted"),
+    ] {
+        let mut record = agent_record(id);
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some(format!("{id}-thread"));
+        state.supervisor.registry.register(record).unwrap();
+
+        let session: Arc<dyn HarnessSession> = Arc::new(TerminalContinueSession {
+            status: turn_status,
+        });
+        let response = post_continue_with_session(&state, id, "finish turn", session);
+        assert!(response.starts_with("HTTP/1.1 200"), "{id}: {response}");
+        assert_eq!(
+            state.supervisor.registry.get(id).unwrap().state,
+            expected_state
+        );
+    }
+}
+
+#[test]
+fn resumed_stale_completion_does_not_finish_the_new_turn() {
+    let (state, _) = test_server();
+    let mut record = agent_record("continue-stale-completion");
+    record.state = "failed".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("continue-stale-completion-thread".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    event_tx
+        .send(crate::harness::HarnessEvent::Notification {
+            value: serde_json::json!({
+                "method":"turn/completed",
+                "params":{"threadId":"continue-stale-completion-thread","turn":{"id":"old-turn","status":"completed"}}
+            }),
+            terminal_turn: true,
+        })
+        .unwrap();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let session: Arc<dyn HarnessSession> = Arc::new(StaleCompletionContinueSession {
+        registry: Arc::clone(&state.supervisor.registry),
+        events: Mutex::new(Some(event_rx)),
+        observed_state: observed_tx,
+        release: Mutex::new(release_rx),
+    });
+    let state_for_request = Arc::clone(&state);
+    let request = thread::spawn(move || {
+        post_continue_with_session(
+            &state_for_request,
+            "continue-stale-completion",
+            "new turn",
+            session,
+        )
+    });
+
+    assert_eq!(
+        observed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "running",
+        "the persisted turn's completion must not finish the active continuation"
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("continue-stale-completion")
+            .unwrap()
+            .state,
+        "running"
+    );
+    release_tx.send(()).unwrap();
+    let response = request.join().unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("continue-stale-completion")
+            .unwrap()
+            .state,
+        "succeeded"
+    );
+}
+
+#[test]
+fn agent_continue_with_interrupt_rejects_terminal_agent_as_not_running() {
+    let (state, _) = test_server();
+    let mut record = agent_record("continue-terminal-interrupt");
+    record.state = "failed".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("continue-terminal-interrupt-thread".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let session: Arc<dyn HarnessSession> = Arc::new(TerminalContinueSession {
+        status: "completed",
+    });
+    let response = post_continue_interrupt(
+        &state,
+        "continue-terminal-interrupt",
+        "should not run",
+        session,
+        true,
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("error")
+            .and_then(Json::as_str),
+        Some("agent_not_running")
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("continue-terminal-interrupt")
+            .unwrap()
+            .state,
+        "failed"
+    );
+}
+
 struct InterruptContinueSession {
     interrupted: Mutex<bool>,
     sent: Mutex<Vec<(String, Delivery)>>,

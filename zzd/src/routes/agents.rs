@@ -389,6 +389,7 @@ fn agent_continue_request(
         Ok(session) => session,
         Err((status, code)) => return reply(stream, status, error(code)),
     };
+    let mut resumed_events = None;
     if !was_running {
         let events = match session.resume_thread() {
             Ok(events) => events,
@@ -397,16 +398,7 @@ fn agent_continue_request(
                 return reply(stream, 409, error("agent_transcript_unavailable"));
             }
         };
-        if let Some(events) = events {
-            let registry = Arc::clone(&state.supervisor.registry);
-            let store = Arc::clone(&state.store);
-            let agent_id = agent.id.clone();
-            let task_id = agent.task_id.clone();
-            let execution_id = agent.execution_id.clone();
-            thread::spawn(move || {
-                monitor_codex_events(registry, store, agent_id, task_id, execution_id, events)
-            });
-        }
+        resumed_events = events;
         if state
             .supervisor
             .registry
@@ -455,6 +447,20 @@ fn agent_continue_request(
         .supervisor
         .registry
         .transition(id, terminal, agent.exit_code);
+    // thread/resume can queue a synthetic turn/completed for the persisted
+    // latest terminal turn. Do not let that event race the state transition
+    // above and mark this newly resumed turn terminal. Keep the receiver
+    // buffered until continue_turn has returned, then start monitoring it.
+    if let Some(events) = resumed_events {
+        let registry = Arc::clone(&state.supervisor.registry);
+        let store = Arc::clone(&state.store);
+        let agent_id = agent.id.clone();
+        let task_id = agent.task_id.clone();
+        let execution_id = agent.execution_id.clone();
+        thread::spawn(move || {
+            monitor_codex_events(registry, store, agent_id, task_id, execution_id, events)
+        });
+    }
     let response =
         parse_json(&serde_json::json!({"agent_id": agent.id, "turn": result}).to_string())
             .map_err(|_| "could not serialize continuation result")?;
