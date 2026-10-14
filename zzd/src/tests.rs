@@ -3696,6 +3696,61 @@ fn agent_delete_dead_process_deregisters_without_signalling() {
 }
 
 #[test]
+fn agent_delete_stops_a_paused_agent_before_returning() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn paused agent process");
+    let pgid = child.id() as i32;
+    let identity = process_identity(pgid).expect("process identity");
+    assert_eq!(unsafe { libc::kill(-pgid, libc::SIGSTOP) }, 0);
+    let reaper = thread::spawn(move || child.wait().expect("reap paused agent"));
+
+    let mut record = agent_record("paused-delete-agent");
+    record.state = "paused".to_owned();
+    record.paused_at = Some("2026-10-14T00:00:00Z".to_owned());
+    record.leader_pid = pgid;
+    record.process_group = pgid;
+    record.process_identity = Some(identity);
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/paused-delete-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("stopped")
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+    let _ = reaper.join().unwrap();
+    assert!(
+        !process_group_running(pgid),
+        "paused process group survived delete"
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("paused-delete-agent")
+            .unwrap()
+            .state,
+        "stopped"
+    );
+}
+
+#[test]
 fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     let (state, _state_path) = test_server();
     let policy =

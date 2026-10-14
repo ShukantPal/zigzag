@@ -283,14 +283,14 @@ enum AgentsCmd {
         #[arg(long)]
         prompt: String,
     },
-    /// Gracefully stop an agent through the relay (cleans up its worktree and may delete its branch)
+    /// Stop a live agent; terminal agents have their record and worktree cleaned up
     Stop {
         /// Agent handle (unique prefix accepted)
         id: String,
     },
-    /// Delete an agent through the relay
+    /// Remove a terminal agent record through the relay (live agents are refused)
     #[command(
-        long_about = "Calls DELETE /v1/agents/{id}; refuses agents in the running state. After a successful stop, the relay retains the record and transitions it to stopped or killed. It removes the worktree unless it retains it for a watched pull request. Worktree cleanup attempts to delete the branch unless it is main/master, checked out elsewhere, or cleanup fails. A lost_after_restart agent has its worktree cleaned up and its record transitioned to stopped."
+        long_about = "Calls DELETE /v1/agents/{id}; refuses agents in the running or paused state. For terminal agents, the relay removes the durable agent record, diagnostic log spool, and Codex transcript/stderr files. It removes the worktree through the repository stop hook only when the worktree is clean and its current branch tip exactly matches origin; otherwise it keeps the worktree and branch and logs why. A watched pull request also retains its worktree. When removed, the worktree cleanup attempts to delete its branch unless it is main/master or checked out elsewhere. A missing recorded worktree does not block record removal. For orphaned agents, the relay attempts to stop the possibly live process and retains the record; it applies the same worktree safety checks."
     )]
     Delete {
         /// Agent handle (unique prefix accepted)
@@ -836,24 +836,18 @@ fn resolve_agent_id(client: &Client, prefix: &str) -> Result<String, ApiError> {
         Err(_) => {}
     }
     let resp = client.get("/v1/agents", &[])?;
-    let agents = resp
+    let matches: Vec<String> = resp
         .get("agents")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
+        .and_then(|a| a.as_array())
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|a| a.get("id").and_then(|i| i.as_str()))
+                .filter(|id| id.starts_with(prefix))
+                .map(|id| id.to_string())
+                .collect()
+        })
         .unwrap_or_default();
-    resolve_agent_id_from_list(prefix, agents)
-}
-
-fn resolve_agent_id_from_list(
-    prefix: &str,
-    agents: &[serde_json::Value],
-) -> Result<String, ApiError> {
-    let matches: Vec<String> = agents
-        .iter()
-        .filter_map(|agent| agent.get("id").and_then(serde_json::Value::as_str))
-        .filter(|id| id.starts_with(prefix))
-        .map(str::to_owned)
-        .collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
         0 => Err(ApiError {
@@ -868,59 +862,6 @@ fn resolve_agent_id_from_list(
                     .iter()
                     .take(5)
                     .map(|m| m.chars().take(12).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }),
-    }
-}
-
-/// Resolve an existing ID or unique ID prefix first, then an exact branch name.
-/// Branch targets only select running agents so a stale registry entry can
-/// never make a follow-up appear to succeed.
-fn resolve_agent_target(client: &Client, target: &str) -> Result<String, ApiError> {
-    match resolve_agent_id(client, target) {
-        Ok(id) => return Ok(id),
-        Err(error) if error.status == 404 => {}
-        Err(error) => return Err(error),
-    }
-
-    let response = client.get("/v1/agents", &[])?;
-    let agents = response
-        .get("agents")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    select_live_agent_for_branch(target, agents)
-}
-
-fn select_live_agent_for_branch(
-    branch: &str,
-    agents: &[serde_json::Value],
-) -> Result<String, ApiError> {
-    let matches: Vec<&serde_json::Value> = agents
-        .iter()
-        .filter(|agent| agent.get("branch").and_then(serde_json::Value::as_str) == Some(branch))
-        .collect();
-    let running: Vec<&serde_json::Value> = matches
-        .iter()
-        .copied()
-        .filter(|agent| agent.get("state").and_then(serde_json::Value::as_str) == Some("running"))
-        .collect();
-
-    match running.as_slice() {
-        [agent] => Ok(s(agent, "id")),
-        [] => Err(ApiError {
-            status: 404,
-            message: format!("no live agent on branch {branch:?}"),
-        }),
-        _ => Err(ApiError {
-            status: 0,
-            message: format!(
-                "multiple live agents on branch {branch:?}; specify an agent ID: {}",
-                running
-                    .iter()
-                    .map(|agent| format!("{} ({})", s(agent, "id"), s(agent, "state")))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1145,7 +1086,7 @@ fn cmd_agents_message(
     steer: Option<&str>,
     queue: Option<&str>,
 ) -> Result<(), Fail> {
-    let id = resolve_agent_target(client, id)?;
+    let id = resolve_agent_id(client, id)?;
     let (text, delivery) = match (steer, queue) {
         (Some(text), None) => (text, "steer"),
         (None, Some(text)) => (text, "queue"),
@@ -1167,7 +1108,7 @@ fn cmd_agents_message(
 }
 
 fn cmd_agents_continue(client: &Client, id: &str, prompt: &str) -> Result<(), Fail> {
-    let id = resolve_agent_target(client, id)?;
+    let id = resolve_agent_id(client, id)?;
     let body = serde_json::json!({"prompt":prompt});
     let response = client.post_with_timeout(&format!("/v1/agents/{id}/continue"), &body, 1800)?;
     emit(client, &response, || {
@@ -1183,7 +1124,11 @@ fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
     let id = resolve_agent_id(client, id)?;
     let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
     emit(client, &resp, || {
-        println!("stopped {}", s(&resp, "id"));
+        if resp.get("deleted").and_then(|value| value.as_bool()) == Some(true) {
+            println!("deleted {}", s(&resp, "id"));
+        } else {
+            println!("stopped {}", s(&resp, "id"));
+        }
     });
     Ok(())
 }
@@ -1192,23 +1137,41 @@ fn cmd_agents_delete(client: &Client, id: &str, dry_run: bool) -> Result<(), Fai
     let id = resolve_agent_id(client, id)?;
     let agent = client.get(&format!("/v1/agents/{id}"), &[])?;
     let state = s(&agent, "state");
-    if state == "running" {
+    if agent_state_is_live_for_delete(&state) {
         return Err(Fail::Config(format!(
-            "refusing to delete running agent {id}; use `zzapi agents stop {id}` first"
+            "refusing to delete {state} agent {id}; use `zzapi agents stop {id}` first"
         )));
     }
 
     if dry_run {
         println!("Dry run for agent {id} (state: {state}):");
-        println!("- The relay keeps the agent record and transitions it to stopped or killed.");
+        if state == "orphaned" {
+            println!(
+                "- The relay attempts to stop the possibly live process and retains its agent record with a stopped/killed state."
+            );
+            println!(
+                "- After a successful stop, it removes the worktree through the repository stop hook only when clean and its branch tip exactly matches origin; a watched pull request also retains the worktree."
+            );
+            println!(
+                "- Dirty, unpushed, or unverifiable worktrees are kept with their branch and a relay warning."
+            );
+        } else {
+            println!(
+                "- The relay removes the agent record, diagnostic log spool, and Codex transcript/stderr files."
+            );
+            println!(
+                "- It removes the worktree through the repository stop hook only when clean and the current branch tip exactly matches origin; otherwise it keeps the worktree and branch and logs why."
+            );
+            if state == "lost_after_restart" {
+                println!("- A missing worktree does not block record removal.");
+            } else {
+                println!(
+                    "- A watched pull request also retains its worktree; a missing worktree does not block record removal."
+                );
+            }
+        }
         println!(
-            "- The relay removes the worktree after a successful stop, except when it retains the worktree for a watched pull request."
-        );
-        println!(
-            "- When it removes the worktree, it attempts to delete its branch unless it is main/master, checked out elsewhere, or worktree cleanup fails."
-        );
-        println!(
-            "- A lost_after_restart agent has its worktree cleaned up and its record transitioned to stopped."
+            "- When it removes the worktree, it attempts to delete its branch unless it is main/master, checked out elsewhere, or cleanup fails."
         );
         println!("No DELETE request was sent.");
         return Ok(());
@@ -1216,13 +1179,26 @@ fn cmd_agents_delete(client: &Client, id: &str, dry_run: bool) -> Result<(), Fai
 
     let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
     emit(client, &resp, || {
-        println!(
-            "delete completed for {} (stopped={})",
-            s(&resp, "id"),
-            s(&resp, "stopped")
-        );
+        if resp.get("deleted").and_then(|value| value.as_bool()) == Some(true) {
+            println!(
+                "deleted {} (worktree_removed={}, transcript_removed={})",
+                s(&resp, "id"),
+                s(&resp, "worktree_removed"),
+                s(&resp, "transcript_removed")
+            );
+        } else {
+            println!(
+                "stop completed for {} (stopped={})",
+                s(&resp, "id"),
+                s(&resp, "stopped")
+            );
+        }
     });
     Ok(())
+}
+
+fn agent_state_is_live_for_delete(state: &str) -> bool {
+    matches!(state, "running" | "paused")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1997,6 +1973,14 @@ mod tests {
     }
 
     #[test]
+    fn agent_delete_cli_guard_rejects_running_and_paused_agents() {
+        assert!(agent_state_is_live_for_delete("running"));
+        assert!(agent_state_is_live_for_delete("paused"));
+        assert!(!agent_state_is_live_for_delete("succeeded"));
+        assert!(!agent_state_is_live_for_delete("orphaned"));
+    }
+
+    #[test]
     fn transcript_follow_uses_the_relay_cursor() {
         assert_eq!(
             transcript_cursor(&serde_json::json!({"next_cursor": 7})),
@@ -2196,70 +2180,6 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["zzapi", "agents", "continue", "abc"]).is_err());
-    }
-
-    #[test]
-    fn branch_target_prefers_the_running_agent_over_stale_matches() {
-        let agents = serde_json::json!([
-            {"id":"old-agent", "branch":"feature/work", "state":"completed"},
-            {"id":"live-agent", "branch":"feature/work", "state":"running"}
-        ]);
-        assert_eq!(
-            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap(),
-            "live-agent"
-        );
-    }
-
-    #[test]
-    fn branch_target_reports_ambiguous_live_agents_with_their_ids() {
-        let agents = serde_json::json!([
-            {"id":"agent-one", "branch":"feature/work", "state":"running"},
-            {"id":"agent-two", "branch":"feature/work", "state":"running"}
-        ]);
-        let error =
-            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap_err();
-        assert!(error.message.contains("multiple live agents on branch"));
-        assert!(error.message.contains("agent-one"));
-        assert!(error.message.contains("agent-two"));
-    }
-
-    #[test]
-    fn branch_target_without_a_running_agent_fails_clearly() {
-        let agents = serde_json::json!([
-            {"id":"old-agent", "branch":"feature/work", "state":"completed"}
-        ]);
-        let error =
-            select_live_agent_for_branch("feature/work", agents.as_array().unwrap()).unwrap_err();
-        assert_eq!(error.message, "no live agent on branch \"feature/work\"");
-    }
-
-    #[test]
-    fn agent_id_exact_prefix_and_ambiguous_prefix_resolution_is_preserved() {
-        let agents = serde_json::json!([
-            {"id":"agent-123456"},
-            {"id":"agent-987654"}
-        ]);
-        let agents = agents.as_array().unwrap();
-        assert_eq!(
-            resolve_agent_id_from_list("agent-123456", agents).unwrap(),
-            "agent-123456"
-        );
-        assert_eq!(
-            resolve_agent_id_from_list("agent-123", agents).unwrap(),
-            "agent-123456"
-        );
-        assert_eq!(
-            resolve_agent_id_from_list("agent-", agents)
-                .unwrap_err()
-                .message,
-            "ambiguous prefix \"agent-\" matches 2 agents: agent-123456, agent-987654"
-        );
-        assert_eq!(
-            resolve_agent_id_from_list("missing", agents)
-                .unwrap_err()
-                .message,
-            "unknown_agent"
-        );
     }
 
     #[cfg(unix)]

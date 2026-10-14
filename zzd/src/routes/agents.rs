@@ -2769,7 +2769,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
             Err(_) => reply(stream, 500, error("could_not_delete_agent")),
         };
     }
-    if !matches!(agent.state.as_str(), "running" | "orphaned") {
+    if !matches!(agent.state.as_str(), "running" | "paused" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));
     }
     if let (Some(harness), Some(session_id)) = (
@@ -2828,6 +2828,14 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     // signalling. The pgid > 0 guard keeps kill(-pgid, ..) from ever
     // resolving to the relay's own process group on a corrupt record.
     let (stopped, graceful) = if pgid > 0 && recovered_agent_identity_matches(&agent) {
+        // A SIGSTOP-paused process cannot handle SIGTERM. Resume only after
+        // validating the recorded process identity, then use the normal
+        // bounded shutdown path before considering its worktree.
+        if agent.state == "paused" {
+            unsafe {
+                libc::kill(-pgid, libc::SIGCONT);
+            }
+        }
         stop_process_group(&id, pgid, &state.supervisor)
     } else {
         (true, true)

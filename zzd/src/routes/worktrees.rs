@@ -578,7 +578,7 @@ pub(crate) fn worktree_delete_plan_with_trust(
     // the agent-creation endpoints record it; command-substring matching is a
     // stopgap until then.
     let attached = agents.iter().any(|(state, command)| {
-        matches!(*state, "running" | "orphaned")
+        matches!(*state, "running" | "paused" | "orphaned")
             && (command.contains(&*path_str) || command.contains(path_raw))
     });
     if attached {
