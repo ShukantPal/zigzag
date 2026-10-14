@@ -86,6 +86,47 @@ if [ -d "$target" ]; then
   done
 fi
 
+# Docker/OrbStack volumes are eligible only under this exact label convention:
+# com.zigzag.worktree=<canonical absolute worktree path>. List by label, then
+# inspect the label again before removing each individual volume. Never prune.
+if command -v docker >/dev/null 2>&1; then
+  case "$target" in
+    *'
+'*)
+      echo "refused Docker volume scan: worktree path contains a newline: $target" >&2
+      ;;
+    *)
+      volume_filter="label=com.zigzag.worktree=$target"
+      if volume_names=$(docker volume ls --quiet --filter "$volume_filter" 2>&1); then
+        if [ -z "$volume_names" ]; then
+          echo "no Docker volumes labeled for worktree=$target"
+        else
+          printf '%s\n' "$volume_names" | while IFS= read -r volume; do
+            [ -n "$volume" ] || continue
+            if volume_label=$(docker volume inspect --format '{{ index .Labels "com.zigzag.worktree" }}' "$volume" 2>&1); then
+              if [ "$volume_label" = "$target" ]; then
+                if docker volume rm "$volume" >/dev/null 2>&1; then
+                  echo "removed Docker volume=$volume worktree=$target"
+                else
+                  echo "refused Docker volume removal: volume is in use or removal failed name=$volume worktree=$target" >&2
+                fi
+              else
+                echo "refused Docker volume removal: ownership label mismatch name=$volume expected=$target actual=$volume_label" >&2
+              fi
+            else
+              echo "refused Docker volume removal: could not inspect ownership name=$volume worktree=$target" >&2
+            fi
+          done
+        fi
+      else
+        echo "skipped Docker volume cleanup: docker volume ls failed: $volume_names" >&2
+      fi
+      ;;
+  esac
+else
+  echo "skipped Docker volume cleanup: docker CLI is unavailable"
+fi
+
 # Bazel's default output base is output_user_root/_bazel_$USER/<MD5(workspace)>.
 # Use only known platform default roots. A custom output_user_root/output_base
 # is intentionally left alone because this hook cannot prove its ownership.

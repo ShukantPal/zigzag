@@ -79,3 +79,13 @@ observed that exact path/repository pair (or Git still marks it prunable).
 Unverified paths are refused and logged; every run reports the invocation and
 each cache removed. Git's shared install base and repository cache are outside
 the selected output base and are never targeted.
+
+Docker volumes (including volumes managed by OrbStack's Docker-compatible
+CLI) use the label convention `com.zigzag.worktree=<canonical absolute
+worktree path>`. For example, from a worktree root, create a volume with
+`docker volume create --label "com.zigzag.worktree=$(pwd -P)" project-db`.
+The deletion hook asks Docker for volumes carrying that exact label, inspects
+each label again, and removes only individually verified matches with
+`docker volume rm <name>`. Unlabeled or mismatched volumes are kept and logged;
+if the Docker CLI/daemon is unavailable, cleanup is skipped and logged. The
+hook never runs `docker volume prune` or `docker system prune`.
