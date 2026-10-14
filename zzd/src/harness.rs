@@ -27,7 +27,16 @@ pub(crate) enum HarnessEvent {
 #[allow(dead_code)]
 pub(crate) trait HarnessSession: Send + Sync {
     fn send(&self, text: &str, delivery: Delivery) -> Result<(), String>;
+    fn continue_turn(&self, text: &str) -> Result<Value, String> {
+        let _ = text;
+        Err("harness does not support synchronous continuation".to_owned())
+    }
     fn interrupt(&self) -> Result<(), String>;
+}
+
+struct QueuedTurn {
+    text: String,
+    completion: Option<mpsc::Sender<Result<Value, String>>>,
 }
 
 struct Shared {
@@ -36,7 +45,9 @@ struct Shared {
     pending: Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
     subscribers: Mutex<HashMap<String, Vec<mpsc::Sender<HarnessEvent>>>>,
     turns: Mutex<HashMap<String, String>>,
-    queued: Mutex<HashMap<String, VecDeque<String>>>,
+    queued: Mutex<HashMap<String, VecDeque<QueuedTurn>>>,
+    completions: Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>,
+    early_completions: Mutex<std::collections::HashSet<String>>,
     approval_contexts: Mutex<HashMap<String, ApprovalContext>>,
     next_id: AtomicU64,
 }
@@ -281,6 +292,8 @@ impl CodexServer {
             subscribers: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             queued: Mutex::new(HashMap::new()),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             approval_contexts: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
@@ -536,7 +549,10 @@ impl HarnessSession for CodexSession {
                         .map_err(|_| "turn queue poisoned")?
                         .entry(self.thread_id.clone())
                         .or_default()
-                        .push_back(text.to_owned());
+                        .push_back(QueuedTurn {
+                            text: text.to_owned(),
+                            completion: None,
+                        });
                 } else {
                     let turn = self.server.rpc(
                         "turn/start",
@@ -554,6 +570,87 @@ impl HarnessSession for CodexSession {
             }
         }
         Ok(())
+    }
+    fn continue_turn(&self, text: &str) -> Result<Value, String> {
+        if !self.server.has_thread(&self.thread_id) {
+            self.server
+                .resume_thread(&self.thread_id)
+                .map_err(|_| "agent_thread_unavailable".to_owned())?;
+            self.server
+                .shared
+                .subscribers
+                .lock()
+                .map_err(|_| "session event map poisoned")?
+                .entry(self.thread_id.clone())
+                .or_default();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut completion = Some(tx);
+        // Serialize the active check with completion handling so a turn that
+        // finishes between the check and enqueue cannot strand this request.
+        let mut queued = self
+            .server
+            .shared
+            .queued
+            .lock()
+            .map_err(|_| "turn queue poisoned")?;
+        let active = self
+            .server
+            .shared
+            .turns
+            .lock()
+            .map_err(|_| "turn map poisoned")?
+            .contains_key(&self.thread_id);
+        if active {
+            queued
+                .entry(self.thread_id.clone())
+                .or_default()
+                .push_back(QueuedTurn {
+                    text: text.to_owned(),
+                    completion: completion.take(),
+                });
+        } else {
+            self.server
+                .shared
+                .turns
+                .lock()
+                .map_err(|_| "turn map poisoned")?
+                .insert(self.thread_id.clone(), "__starting__".to_owned());
+            self.server
+                .shared
+                .early_completions
+                .lock()
+                .map_err(|_| "early completion map poisoned")?
+                .remove(&self.thread_id);
+        }
+        drop(queued);
+        if let Some(tx) = completion {
+            self.server
+                .shared
+                .completions
+                .lock()
+                .map_err(|_| "turn completion map poisoned")?
+                .insert(self.thread_id.clone(), tx.clone());
+            let turn = self.server.rpc(
+                "turn/start",
+                json!({"threadId":self.thread_id,"input":[{"type":"text","text":text}]}),
+            );
+            let turn = match turn {
+                Ok(turn) => turn,
+                Err(_) => {
+                    fail_queued_turns(&self.server.shared, &self.thread_id, None);
+                    return Err("agent_thread_unavailable".to_owned());
+                }
+            };
+            let Some(turn_id) = turn.pointer("/turn/id").and_then(Value::as_str) else {
+                fail_queued_turns(&self.server.shared, &self.thread_id, None);
+                return Err("agent_thread_unavailable".to_owned());
+            };
+            reconcile_started_turn(&self.server.shared, &self.thread_id, turn_id);
+        }
+        rx.recv()
+            .map_err(|_| "app-server ended before the follow-up turn completed".to_owned())?
     }
     fn interrupt(&self) -> Result<(), String> {
         // A completed turn is already idle. Treat stopping that session as
@@ -963,6 +1060,37 @@ fn approval_response(
     Err("unsupported app-server request")
 }
 
+fn fail_queued_turns(
+    shared: &Shared,
+    thread_id: &str,
+    current: Option<mpsc::Sender<Result<Value, String>>>,
+) {
+    if let Some(current) = current {
+        let _ = current.send(Err("agent_thread_unavailable".to_owned()));
+    }
+    if let Some(completion) = shared
+        .completions
+        .lock()
+        .ok()
+        .and_then(|mut completions| completions.remove(thread_id))
+    {
+        let _ = completion.send(Err("agent_thread_unavailable".to_owned()));
+    }
+    let mut queued = shared.queued.lock().ok();
+    if let Ok(mut turns) = shared.turns.lock()
+        && turns.get(thread_id).is_some_and(|id| id == "__starting__")
+    {
+        turns.remove(thread_id);
+    }
+    if let Some(pending) = queued.as_mut().and_then(|queued| queued.remove(thread_id)) {
+        for pending in pending {
+            if let Some(completion) = pending.completion {
+                let _ = completion.send(Err("agent_thread_unavailable".to_owned()));
+            }
+        }
+    }
+}
+
 fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -1019,26 +1147,63 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                         turns.insert(thread_id.to_owned(), turn_id.to_owned());
                     }
                 } else if method == "turn/completed" {
+                    let mut queued_guard = shared.queued.lock().ok();
                     if let Ok(mut turns) = shared.turns.lock() {
+                        if turns.get(thread_id).map(String::as_str) == Some("__starting__")
+                            && let Ok(mut early) = shared.early_completions.lock()
+                        {
+                            early.insert(thread_id.to_owned());
+                        }
                         turns.remove(thread_id);
                     }
-                    let next = shared.queued.lock().ok().and_then(|mut queued| {
-                        queued.get_mut(thread_id).and_then(VecDeque::pop_front)
-                    });
+                    if let Some(completion) = shared
+                        .completions
+                        .lock()
+                        .ok()
+                        .and_then(|mut completions| completions.remove(thread_id))
+                    {
+                        let result = value.pointer("/params/turn").cloned().unwrap_or_else(|| {
+                            value.pointer("/params").cloned().unwrap_or(Value::Null)
+                        });
+                        let _ = completion.send(Ok(result));
+                    }
+                    let next = queued_guard
+                        .as_mut()
+                        .and_then(|queued| queued.get_mut(thread_id).and_then(VecDeque::pop_front));
+                    if next.is_some()
+                        && let Ok(mut turns) = shared.turns.lock()
+                    {
+                        // Reserve the thread while the queued turn is started
+                        // on a worker; the reader thread must remain free to
+                        // receive the JSON-RPC response.
+                        turns.insert(thread_id.to_owned(), "__starting__".to_owned());
+                        if let Ok(mut early) = shared.early_completions.lock() {
+                            early.remove(thread_id);
+                        }
+                    }
+                    drop(queued_guard);
                     terminal_turn = next.is_none();
                     if let Some(text) = next {
                         let shared = Arc::clone(&shared);
                         let thread_id = thread_id.to_owned();
                         thread::spawn(move || {
                             let server = CodexServer { shared };
+                            if let Some(completion) = text.completion.as_ref()
+                                && let Ok(mut completions) = server.shared.completions.lock()
+                            {
+                                completions.insert(thread_id.clone(), completion.clone());
+                            }
                             if let Ok(turn) = server.rpc(
                                 "turn/start",
-                                json!({"threadId":thread_id,"input":[{"type":"text","text":text}]}),
-                            ) && let Some(turn_id) =
-                                turn.pointer("/turn/id").and_then(Value::as_str)
-                                && let Ok(mut turns) = server.shared.turns.lock()
-                            {
-                                turns.insert(thread_id, turn_id.to_owned());
+                                json!({"threadId":thread_id,"input":[{"type":"text","text":text.text}]}),
+                            ) {
+                                if let Some(turn_id) = turn.pointer("/turn/id").and_then(Value::as_str) {
+                                    reconcile_started_turn(&server.shared, &thread_id, turn_id);
+                                } else {
+                                    fail_queued_turns(&server.shared, &thread_id, text.completion);
+                                }
+                            } else {
+                                fail_queued_turns(&server.shared, &thread_id, text.completion);
                             }
                         });
                     }
@@ -1063,13 +1228,44 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
             let _ = tx.send(Err("app-server exited".to_owned()));
         }
     }
+    if let Ok(mut completions) = shared.completions.lock() {
+        for (_, tx) in completions.drain() {
+            let _ = tx.send(Err("agent_thread_unavailable".to_owned()));
+        }
+    }
+    if let Ok(mut queued) = shared.queued.lock() {
+        for (_, turns) in queued.drain() {
+            for turn in turns {
+                if let Some(tx) = turn.completion {
+                    let _ = tx.send(Err("agent_thread_unavailable".to_owned()));
+                }
+            }
+        }
+    }
+}
+
+/// Apply the turn/start response without resurrecting a turn whose terminal
+/// notification arrived while the request was still in flight.
+fn reconcile_started_turn(shared: &Shared, thread_id: &str, turn_id: &str) {
+    if let Ok(mut turns) = shared.turns.lock() {
+        let completed_early = shared
+            .early_completions
+            .lock()
+            .map(|mut early| early.remove(thread_id))
+            .unwrap_or(false);
+        if completed_early {
+            turns.remove(thread_id);
+        } else {
+            turns.insert(thread_id.to_owned(), turn_id.to_owned());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalContext, CodexServer, HarnessEvent, Shared, approval_audit_line, approval_response,
-        command_approval,
+        ApprovalContext, CodexServer, HarnessEvent, QueuedTurn, Shared, approval_audit_line,
+        approval_response, command_approval,
     };
     use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
@@ -1077,6 +1273,146 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
+
+    fn mock_server(script: &str, thread_id: &str) -> Arc<CodexServer> {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let shared = Arc::new(Shared {
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            pending: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::from([(thread_id.to_owned(), Vec::new())])),
+            turns: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashMap::new()),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
+            approval_contexts: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        });
+        let reader_shared = Arc::clone(&shared);
+        thread::spawn(move || super::read_messages(stdout, reader_shared));
+        Arc::new(CodexServer { shared })
+    }
+
+    #[test]
+    fn continuation_delivers_completion_emitted_before_turn_start_response() {
+        let script = r#"
+            IFS= read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fast","turn":{"id":"turn-fast","status":"completed","output":"done"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-fast"}}}'
+        "#;
+        let server = mock_server(script, "thread-fast");
+        let session = server.session("thread-fast".to_owned());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = done_tx.send(session.continue_turn("follow up"));
+        });
+        let result = match done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                server.stop().unwrap();
+                panic!("continuation did not receive its early completion: {error}");
+            }
+        };
+        assert_eq!(
+            result.pointer("/output").and_then(Value::as_str),
+            Some("done")
+        );
+        assert!(
+            !server
+                .shared
+                .turns
+                .lock()
+                .unwrap()
+                .contains_key("thread-fast")
+        );
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn queued_continuation_reaches_app_server_and_handles_early_completion() {
+        let script = r#"
+            IFS= read -r trigger
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-queue","turn":{"id":"turn-active","status":"completed"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+            IFS= read -r queued
+            case "$queued" in *'"text":"queued prompt"'*) ;; *) exit 3 ;; esac
+            printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-queue","turn":{"id":"turn-next","status":"completed","output":"queued done"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-next"}}}'
+        "#;
+        let server = mock_server(script, "thread-queue");
+        server
+            .shared
+            .turns
+            .lock()
+            .unwrap()
+            .insert("thread-queue".to_owned(), "turn-active".to_owned());
+        let session = server.session("thread-queue".to_owned());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = done_tx.send(session.continue_turn("queued prompt"));
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if server
+                .shared
+                .queued
+                .lock()
+                .unwrap()
+                .get("thread-queue")
+                .is_some_and(|queued| !queued.is_empty())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "continuation was not queued behind the active turn"
+            );
+            thread::yield_now();
+        }
+        server.rpc("test/trigger", serde_json::json!({})).unwrap();
+        let result = match done_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                server.stop().unwrap();
+                panic!("queued continuation did not receive its completion: {error}");
+            }
+        };
+        assert_eq!(
+            result.pointer("/output").and_then(Value::as_str),
+            Some("queued done")
+        );
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn continuation_fails_when_persisted_thread_cannot_be_resumed() {
+        let script = r#"
+            IFS= read -r request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"thread not found"}}'
+        "#;
+        let server = mock_server(script, "missing-thread");
+        server
+            .shared
+            .subscribers
+            .lock()
+            .unwrap()
+            .remove("missing-thread");
+        let error = server
+            .session("missing-thread".to_owned())
+            .continue_turn("follow up")
+            .unwrap_err();
+        assert_eq!(error, "agent_thread_unavailable");
+        server.stop().unwrap();
+    }
 
     #[test]
     fn interrupting_idle_codex_session_succeeds_without_rpc() {
@@ -1094,7 +1430,9 @@ mod tests {
                 pending: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(HashMap::new()),
                 turns: Mutex::new(HashMap::new()),
-                queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+                queued: Mutex::new(HashMap::<String, VecDeque<QueuedTurn>>::new()),
+                completions: Mutex::new(HashMap::new()),
+                early_completions: Mutex::new(std::collections::HashSet::new()),
                 approval_contexts: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
@@ -1131,7 +1469,9 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
-            queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+            queued: Mutex::new(HashMap::<String, VecDeque<QueuedTurn>>::new()),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             approval_contexts: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
@@ -1180,7 +1520,9 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
-            queued: Mutex::new(HashMap::<String, VecDeque<String>>::new()),
+            queued: Mutex::new(HashMap::<String, VecDeque<QueuedTurn>>::new()),
+            completions: Mutex::new(HashMap::new()),
+            early_completions: Mutex::new(std::collections::HashSet::new()),
             approval_contexts: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });

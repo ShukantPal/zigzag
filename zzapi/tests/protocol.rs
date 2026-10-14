@@ -135,6 +135,40 @@ fn agents_create_reads_prompt_files_client_side_and_keeps_inline_text() {
 }
 
 #[test]
+fn agents_continue_posts_authenticated_prompt_and_returns_turn_result() {
+    let (port, server) = transcript_server([
+        r#"{"id":"agent-1"}"#,
+        r#"{"agent_id":"agent-1","turn":{"status":"completed","id":"turn-2"}}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "--json",
+            "agents",
+            "continue",
+            "agent-1",
+            "--prompt",
+            "address review feedback",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/agents/agent-1 HTTP/1.1\r\n"));
+    assert!(requests[0].contains("Authorization: Bearer test-token\r\n"));
+    assert!(requests[1].starts_with("POST /v1/agents/agent-1/continue HTTP/1.1\r\n"));
+    assert!(requests[1].contains("Authorization: Bearer test-token\r\n"));
+    assert!(requests[1].contains(r#"{"prompt":"address review feedback"}"#));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"turn\""));
+}
+
+#[test]
 fn admin_check_update_posts_authenticated_request_and_displays_update_result() {
     let (port, server) = transcript_server([
         r#"{"current_version":"1.2.3","latest_available_version":"1.2.4","update_applied":true}"#,
