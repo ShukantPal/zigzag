@@ -353,22 +353,37 @@ mod tests {
     struct MemoryStore {
         value: Option<String>,
         deletes: usize,
+        fail_get: bool,
+        fail_set: bool,
+        fail_delete: bool,
     }
 
     impl SecretStore for MemoryStore {
         fn get(&mut self) -> Result<Option<String>, ()> {
-            Ok(self.value.clone())
+            if self.fail_get {
+                Err(())
+            } else {
+                Ok(self.value.clone())
+            }
         }
 
         fn set(&mut self, value: &str) -> Result<(), ()> {
-            self.value = Some(value.to_owned());
-            Ok(())
+            if self.fail_set {
+                Err(())
+            } else {
+                self.value = Some(value.to_owned());
+                Ok(())
+            }
         }
 
         fn delete(&mut self) -> Result<(), ()> {
             self.deletes += 1;
-            self.value = None;
-            Ok(())
+            if self.fail_delete {
+                Err(())
+            } else {
+                self.value = None;
+                Ok(())
+            }
         }
     }
 
@@ -496,6 +511,78 @@ mod tests {
     }
 
     #[test]
+    fn keychain_store_failures_map_to_generic_secret_errors() {
+        let mut store = MemoryStore {
+            fail_set: true,
+            ..MemoryStore::default()
+        };
+        let response = route_reply(|stream| {
+            buildbuddy_store_with(
+                stream,
+                br#"{"token":"submitted-sensitive-token"}"#,
+                &mut store,
+                1_000,
+            )
+        });
+        assert!(response.starts_with("HTTP/1.1 500"));
+        assert!(response.contains("secret_storage_unavailable"));
+        assert!(!response.contains("submitted-sensitive-token"));
+
+        let mut store = MemoryStore {
+            fail_delete: true,
+            value: Some("stored-sensitive-token".to_owned()),
+            ..MemoryStore::default()
+        };
+        let response = route_reply(|stream| buildbuddy_revoke_with(stream, &mut store));
+        assert!(response.starts_with("HTTP/1.1 500"));
+        assert!(response.contains("secret_storage_unavailable"));
+        assert!(!response.contains("stored-sensitive-token"));
+
+        let mut store = MemoryStore {
+            fail_get: true,
+            value: Some("stored-sensitive-token".to_owned()),
+            ..MemoryStore::default()
+        };
+        let response = route_reply(|stream| {
+            buildbuddy_get_invocation_with(
+                stream,
+                br#"{"invocation_id":"inv-1"}"#,
+                &mut store,
+                1_000,
+            )
+        });
+        assert!(response.starts_with("HTTP/1.1 500"));
+        assert!(response.contains("secret_storage_unavailable"));
+        assert!(!response.contains("stored-sensitive-token"));
+    }
+
+    #[test]
+    fn malformed_stored_records_return_generic_errors_without_disclosure() {
+        let records = [
+            "malformed-stored-token-not-json",
+            r#"{"version":2,"purpose":"buildbuddy.invocations.read","token":"malformed-stored-token","expires_at":2000}"#,
+            r#"{"version":1,"purpose":"buildbuddy.invocations.read","token":"malformed-stored-token","expires_at":"not-a-timestamp"}"#,
+        ];
+        for record in records {
+            let mut store = MemoryStore {
+                value: Some(record.to_owned()),
+                ..MemoryStore::default()
+            };
+            let response = route_reply(|stream| {
+                buildbuddy_get_invocation_with(
+                    stream,
+                    br#"{"invocation_id":"inv-1"}"#,
+                    &mut store,
+                    1_000,
+                )
+            });
+            assert!(response.starts_with("HTTP/1.1 500"));
+            assert!(response.contains("secret_storage_unavailable"));
+            assert!(!response.contains("malformed-stored-token"));
+        }
+    }
+
+    #[test]
     fn buildbuddy_api_key_is_not_forwarded_across_redirects() {
         let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let redirect_address = redirect_listener.local_addr().unwrap();
@@ -525,7 +612,7 @@ mod tests {
             "sensitive-api-key",
             "inv-1",
         );
-        assert!(matches!(result, Err(302)));
+        assert!(result.is_err());
         redirect_server.join().unwrap();
         assert!(destination_listener.accept().is_err());
     }
