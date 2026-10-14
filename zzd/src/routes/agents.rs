@@ -616,6 +616,7 @@ fn native_agent_record(
         process_identity: None,
         worktree_path: (!request.no_branch).then_some(worktree.to_owned()),
         started_at: unix_timestamp(),
+        completed_at: None,
         deadline_at: request.timeout_secs.map(|seconds| {
             unix_timestamp()
                 .parse::<u64>()
@@ -2101,11 +2102,6 @@ pub(crate) fn handle_codex_notification(
                             ]),
                         ),
                     );
-                    if state == "succeeded"
-                        && let Err(error) = delete_inactive_agent(registry, agent_id)
-                    {
-                        log::error!("completed agent deletion failed agent={agent_id}: {error}");
-                    }
                 }
                 _ => {
                     let _ = registry.mark_audit_degraded(agent_id);
@@ -2146,15 +2142,70 @@ pub(crate) fn delete_inactive_agent(
     }
 }
 
-/// Sweep durable inactive records left by earlier relay versions.
+/// Completed agents remain inspectable for a day by default. Configure a
+/// longer or shorter positive retention window with ZIGZAG_AGENT_CLEANUP_TTL_SECS.
+const DEFAULT_AGENT_CLEANUP_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn agent_cleanup_ttl_secs() -> u64 {
+    parse_agent_cleanup_ttl(
+        std::env::var("ZIGZAG_AGENT_CLEANUP_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn parse_agent_cleanup_ttl(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_AGENT_CLEANUP_TTL_SECS)
+}
+
 pub(crate) fn sweep_inactive_agents(registry: &zz::AgentRegistry) -> usize {
-    let inactive: Vec<_> = registry
-        .list(None, None)
-        .into_iter()
-        .filter(|agent| !agent_is_live(agent))
-        .collect();
+    let now = unix_timestamp().parse::<u64>().unwrap_or_default();
+    sweep_inactive_agents_at(registry, now, agent_cleanup_ttl_secs())
+}
+
+pub(crate) fn sweep_inactive_agents_at(
+    registry: &zz::AgentRegistry,
+    now: u64,
+    ttl_secs: u64,
+) -> usize {
+    let mut expired = Vec::new();
+    for mut agent in registry.list(None, None) {
+        if agent_is_live(&agent) {
+            continue;
+        }
+        if agent.completed_at.is_none() {
+            match registry.ensure_completed_at(&agent.id) {
+                Ok(Some(updated)) => agent = updated,
+                Ok(None) => continue,
+                Err(error) => {
+                    log::error!(
+                        "could not timestamp legacy completed agent {}: {error}",
+                        agent.id
+                    );
+                    continue;
+                }
+            }
+        }
+        let Some(completed_at) = agent
+            .completed_at
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            log::warn!(
+                "keeping completed agent={} with invalid completion timestamp",
+                agent.id
+            );
+            continue;
+        };
+        if now.saturating_sub(completed_at) >= ttl_secs {
+            expired.push(agent);
+        }
+    }
     let mut deleted = 0;
-    for agent in inactive {
+    for agent in expired {
         match delete_inactive_agent(registry, &agent.id) {
             Ok(true) => deleted += 1,
             Ok(false) => {}
@@ -2164,7 +2215,10 @@ pub(crate) fn sweep_inactive_agents(registry: &zz::AgentRegistry) -> usize {
             ),
         }
     }
-    log::info!("startup inactive agent sweep deleted {deleted} records");
+    log::info!(
+        "expired inactive agent sweep deleted {deleted} records (ttl={}s)",
+        ttl_secs
+    );
     deleted
 }
 

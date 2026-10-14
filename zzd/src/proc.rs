@@ -233,6 +233,7 @@ pub(crate) fn spawn_proc(
         process_identity: Some(process_identity),
         worktree_path: details.worktree_path,
         started_at: unix_timestamp(),
+        completed_at: None,
         deadline_at: details.deadline_at,
         command: format!(
             "{} {}",
@@ -546,6 +547,7 @@ pub(crate) fn prune_procs(entries: &mut HashMap<String, ProcEntry>, now: Instant
 }
 pub(crate) fn start_reaper(state: Arc<Server>) {
     thread::spawn(move || {
+        let mut cleanup_tick = 0_u16;
         loop {
             let mut in_memory = std::collections::HashSet::new();
             if let Ok(mut entries) = state.supervisor.procs.lock() {
@@ -618,6 +620,11 @@ pub(crate) fn start_reaper(state: Arc<Server>) {
                 .supervisor
                 .registry
                 .prune(unix_timestamp().parse().unwrap_or_default());
+            cleanup_tick = cleanup_tick.wrapping_add(1);
+            if cleanup_tick >= 300 {
+                cleanup_tick = 0;
+                crate::routes::agents::sweep_inactive_agents(&state.supervisor.registry);
+            }
             thread::sleep(Duration::from_millis(200));
         }
     });

@@ -42,9 +42,10 @@ use crate::routes::agents::{
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
     delete_completed_agent, delete_inactive_agent, dispatch_agent_message,
     handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
-    parse_agent_create_request, persisted_agent_config, repair_transcript_tail, restart_argv,
-    restart_config, sweep_completed_agents, sweep_inactive_agents,
-    transcript_json_with_sessions_dir, valid_agent_model,
+    parse_agent_cleanup_ttl, parse_agent_create_request, persisted_agent_config,
+    repair_transcript_tail, restart_argv, restart_config, sweep_completed_agents,
+    sweep_inactive_agents, sweep_inactive_agents_at, transcript_json_with_sessions_dir,
+    valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
@@ -923,6 +924,7 @@ fn recovery_replays_a_persisted_first_output_fact() {
         process_identity: Some("test:1".to_owned()),
         worktree_path: None,
         started_at: "1".to_owned(),
+        completed_at: None,
         deadline_at: None,
         command: "sh -c".to_owned(),
         state: "orphaned".to_owned(),
@@ -1142,7 +1144,7 @@ fn detached_process_endpoints_authenticate_and_manage_process_trees() {
         completed.object("stdout"),
         Some(&Json::String("hello".to_owned()))
     );
-    // Completion removes the succeeded record from the relay registry.
+    // Completion retains the succeeded record for the inspection TTL.
     let raw = request_once(
         Arc::clone(&state),
         &policy,
@@ -1151,8 +1153,12 @@ fn detached_process_endpoints_authenticate_and_manage_process_trees() {
         "",
     );
     assert!(
-        raw.starts_with("HTTP/1.1 404"),
-        "agent record remains: {raw}"
+        raw.starts_with("HTTP/1.1 200"),
+        "completed record missing: {raw}"
+    );
+    assert_eq!(
+        response_json(raw).object("state").and_then(Json::as_str),
+        Some("succeeded")
     );
     let audit = state.store.timeline("echo").unwrap();
     let kinds: Vec<_> = audit
@@ -2038,18 +2044,77 @@ fn worktree_hook_failures_are_logged_and_environment_is_scrubbed() {
 }
 
 #[test]
-fn startup_sweep_deletes_inactive_backlog_records_only() {
+fn ttl_sweep_removes_expired_backlog_and_keeps_fresh_completion() {
     let (state, _) = test_server();
     let mut succeeded = agent_record("old-succeeded");
     succeeded.state = "succeeded".to_owned();
+    succeeded.completed_at = Some("10".to_owned());
     state.supervisor.registry.register(succeeded).unwrap();
     let mut failed = agent_record("old-failed");
     failed.state = "failed".to_owned();
+    failed.completed_at = Some("11".to_owned());
     state.supervisor.registry.register(failed).unwrap();
+    let mut fresh = agent_record("fresh-succeeded");
+    fresh.state = "succeeded".to_owned();
+    fresh.completed_at = Some("99990".to_owned());
+    state.supervisor.registry.register(fresh).unwrap();
+    let mut legacy = agent_record("legacy-succeeded");
+    legacy.state = "succeeded".to_owned();
+    state.supervisor.registry.register(legacy).unwrap();
 
-    assert_eq!(sweep_inactive_agents(&state.supervisor.registry), 2);
+    assert_eq!(
+        sweep_inactive_agents_at(&state.supervisor.registry, 100_000, 86_400),
+        2
+    );
     assert!(state.supervisor.registry.get("old-succeeded").is_none());
     assert!(state.supervisor.registry.get("old-failed").is_none());
+    assert!(state.supervisor.registry.get("fresh-succeeded").is_some());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("legacy-succeeded")
+            .unwrap()
+            .completed_at
+            .is_some()
+    );
+}
+
+#[test]
+fn cleanup_ttl_defaults_to_one_day_and_accepts_positive_override() {
+    assert_eq!(parse_agent_cleanup_ttl(None), 86_400);
+    assert_eq!(parse_agent_cleanup_ttl(Some("3600")), 3_600);
+    assert_eq!(parse_agent_cleanup_ttl(Some("0")), 86_400);
+    assert_eq!(parse_agent_cleanup_ttl(Some("invalid")), 86_400);
+}
+
+#[test]
+fn ttl_sweep_deletes_expired_clean_pushed_worktree_and_keeps_branch() {
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("ttl-auto-clean", true);
+    registry.transition(&id, "succeeded", None).unwrap();
+    let completed_at = registry
+        .get(&id)
+        .unwrap()
+        .completed_at
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+
+    assert_eq!(sweep_inactive_agents_at(&registry, completed_at + 1, 1), 1);
+    assert!(!path.exists());
+    assert!(registry.get(&id).is_none());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/ttl-auto-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "TTL cleanup deleted the branch");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
 #[test]
@@ -2609,6 +2674,7 @@ fn agent_record(id: &str) -> AgentRecord {
         process_identity: None,
         worktree_path: None,
         started_at: "2026-10-09T00:00:00Z".to_owned(),
+        completed_at: None,
         deadline_at: None,
         command: "sleep 300".to_owned(),
         state: "running".to_owned(),
@@ -2898,7 +2964,13 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         true,
     );
 
-    assert!(state.supervisor.registry.get(id).is_none());
+    let completed = state
+        .supervisor
+        .registry
+        .get(id)
+        .expect("completion retains agent for TTL");
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -3249,18 +3321,18 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
         .supervisor
         .registry
         .get("recovered-codex-completion")
-        .is_some()
+        .is_some_and(|agent| agent.state == "running")
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(
-        state
-            .supervisor
-            .registry
-            .get("recovered-codex-completion")
-            .is_none()
-    );
+    let completed = state
+        .supervisor
+        .registry
+        .get("recovered-codex-completion")
+        .unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -3314,18 +3386,18 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
         .supervisor
         .registry
         .get("recovered-codex-terminal-at-resume")
-        .is_some()
+        .is_some_and(|agent| agent.state == "running")
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(
-        state
-            .supervisor
-            .registry
-            .get("recovered-codex-terminal-at-resume")
-            .is_none()
-    );
+    let completed = state
+        .supervisor
+        .registry
+        .get("recovered-codex-terminal-at-resume")
+        .unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert!(completed.completed_at.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();

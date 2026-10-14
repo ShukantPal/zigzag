@@ -866,17 +866,7 @@ pub(crate) fn cleanup_inactive_agent_worktree(
 }
 
 pub(crate) fn agent_state_is_terminal(state: &str) -> bool {
-    matches!(
-        state,
-        "succeeded"
-            | "failed"
-            | "interrupted"
-            | "unexpected_exit"
-            | "lost_after_restart"
-            | "stopped"
-            | "killed"
-            | "finished"
-    )
+    zz::is_terminal_agent_state(state)
 }
 
 fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: &str) -> bool {

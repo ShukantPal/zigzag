@@ -162,7 +162,7 @@ fn e2e_spawn_to_completion_records_logs_and_events() {
         "proc never finished"
     );
 
-    // Successful completion removes the registry record from the panel.
+    // Completed records stay visible during the configured inspection window.
     let raw = request_once(
         Arc::clone(&state),
         &policy,
@@ -171,8 +171,19 @@ fn e2e_spawn_to_completion_records_logs_and_events() {
         "",
     );
     assert!(
-        raw.starts_with("HTTP/1.1 404"),
-        "agent record remains: {raw}"
+        raw.starts_with("HTTP/1.1 200"),
+        "completed record missing: {raw}"
+    );
+    let completed_record = response_json(raw);
+    assert_eq!(
+        completed_record.object("state").and_then(Json::as_str),
+        Some("succeeded")
+    );
+    assert!(
+        completed_record
+            .object("completed_at")
+            .and_then(Json::as_str)
+            .is_some()
     );
     assert!(
         completed
@@ -360,7 +371,8 @@ fn e2e_agent_no_branch_runs_in_project_without_worktree_or_checkout() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
-/// Completion removes the agent record and its durable transcript artifacts.
+/// Completion preserves the record and artifacts until the TTL expires, then
+/// the relay sweep removes both.
 #[test]
 fn e2e_opencode_agent_create_cleans_transcript_after_registry_deletion() {
     let (state, _state_path) = test_server();
@@ -393,13 +405,31 @@ fn e2e_opencode_agent_create_cleans_transcript_after_registry_deletion() {
         completed.object("exit_code").and_then(Json::as_u64),
         Some(0)
     );
-    assert!(
-        state.supervisor.registry.get(&handle).is_none(),
-        "completed agent record was not deleted"
-    );
-
     let transcript_path = agent_transcript_path(&handle).expect("valid agent transcript path");
     let stderr_path = agent_stderr_path(&handle).expect("valid agent stderr path");
+    let completed_at = state
+        .supervisor
+        .registry
+        .get(&handle)
+        .unwrap()
+        .completed_at
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        transcript_path.exists(),
+        "transcript should remain during TTL"
+    );
+    assert!(stderr_path.exists(), "stderr should remain during TTL");
+    assert_eq!(
+        crate::routes::agents::sweep_inactive_agents_at(
+            &state.supervisor.registry,
+            completed_at + 86_400,
+            86_400,
+        ),
+        1
+    );
+    assert!(state.supervisor.registry.get(&handle).is_none());
     assert!(
         !transcript_path.exists(),
         "completed agent transcript was not cleaned up"
@@ -485,19 +515,20 @@ fn e2e_client_agent_commands_events_and_fake_codex() {
 
     let (_, by_state) = client.call("GET", "/v1/agents?state=succeeded", "");
     let agents = json_array(by_state.object("agents").unwrap());
-    assert!(
-        agents.is_empty(),
-        "succeeded agent record remains: {agents:?}"
+    assert_eq!(
+        agents.len(),
+        1,
+        "completion must remain visible for TTL: {agents:?}"
     );
     let (_, by_task) = client.call("GET", &format!("/v1/agents?task_id={task_id}"), "");
-    assert!(json_array(by_task.object("agents").unwrap()).is_empty());
+    assert_eq!(json_array(by_task.object("agents").unwrap()).len(), 1);
     let (_, no_match) = client.call("GET", "/v1/agents?state=running", "");
     assert!(json_array(no_match.object("agents").unwrap()).is_empty());
 
     let (raw, _) = client.call("GET", &format!("/v1/agents/{agent_id}"), "");
     assert!(
-        raw.starts_with("HTTP/1.1 404"),
-        "agent record remains: {raw}"
+        raw.starts_with("HTTP/1.1 200"),
+        "completed record missing: {raw}"
     );
 
     let event_body = format!(

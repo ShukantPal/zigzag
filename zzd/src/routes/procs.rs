@@ -161,12 +161,6 @@ pub(crate) fn update_proc_status_with_handle(
             if registry.transition(handle, state, entry.exit_code).is_ok() {
                 entry.finished_at = Some(Instant::now());
                 let completed_agent = registry.get(handle);
-                if state == "succeeded"
-                    && let Err(error) =
-                        crate::routes::agents::delete_inactive_agent(registry, handle)
-                {
-                    log::error!("completed agent deletion failed agent={handle}: {error}");
-                }
                 if let Some(agent) = completed_agent {
                     if agent
                         .worktree_path
