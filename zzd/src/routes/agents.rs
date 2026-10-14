@@ -873,35 +873,76 @@ pub(crate) fn transcript_json_with_sessions_dir(
 /// files survived, preserve the transcript instead of turning a read into
 /// `unknown_agent`. This response intentionally contains only fields that
 /// can be recovered from those files.
-fn orphan_transcript_json(id: &str, after: u64, tail: Option<usize>) -> Option<Json> {
-    fn read(path: Option<PathBuf>, after: u64, tail: Option<usize>) -> Option<String> {
-        let text = std::fs::read_to_string(path?).ok()?;
-        let start = usize::try_from(after).ok()?.min(text.len());
-        let mut start = start;
-        while !text.is_char_boundary(start) {
+const TRANSCRIPT_FILE_READ_LIMIT: usize = 512 * 1024;
+
+/// Read a bounded, line-aligned transcript slice directly from disk. `after == 0`
+/// selects the newest tail; subsequent cursors advance through the file in chunks.
+fn read_bounded_transcript_file(
+    path: Option<PathBuf>,
+    after: u64,
+    tail: Option<usize>,
+) -> Option<(String, u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path?).ok()?;
+    let size = file.metadata().ok()?.len();
+    let limit = tail
+        .unwrap_or(TRANSCRIPT_FILE_READ_LIMIT)
+        .clamp(1, TRANSCRIPT_FILE_READ_LIMIT);
+    let mut start = if after == 0 {
+        size.saturating_sub(limit as u64)
+    } else {
+        after.min(size)
+    };
+    file.seek(SeekFrom::Start(start)).ok()?;
+    if start > 0 {
+        let mut byte = [0u8; 1];
+        let mut skipped = 0usize;
+        while skipped < limit && file.read(&mut byte).ok()? == 1 {
             start += 1;
-        }
-        let mut text = text[start..].to_owned();
-        if let Some(limit) = tail
-            && text.len() > limit
-        {
-            let mut start = text.len() - limit;
-            while !text.is_char_boundary(start) {
-                start += 1;
+            skipped += 1;
+            if byte[0] == b'\n' {
+                break;
             }
-            text = text[start..].to_owned();
         }
-        Some(text)
+        if skipped == limit && byte[0] != b'\n' {
+            return Some((String::new(), start, start));
+        }
     }
-    let stdout = read(agent_transcript_path(id), after, tail);
-    let stderr = read(agent_stderr_path(id), after, tail);
+    let read_limit = if after == 0 {
+        size.saturating_sub(start).min(limit as u64) as usize
+    } else {
+        limit
+    };
+    let mut bytes = vec![0; read_limit];
+    let count = file.read(&mut bytes).ok()?;
+    bytes.truncate(count);
+    let end = start.saturating_add(count as u64);
+    Some((String::from_utf8_lossy(&bytes).into_owned(), start, end))
+}
+
+fn orphan_transcript_json(id: &str, after: u64, tail: Option<usize>) -> Option<Json> {
+    orphan_transcript_json_from_paths(
+        id,
+        after,
+        tail,
+        agent_transcript_path(id),
+        agent_stderr_path(id),
+    )
+}
+
+pub(crate) fn orphan_transcript_json_from_paths(
+    id: &str,
+    after: u64,
+    tail: Option<usize>,
+    transcript_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
+) -> Option<Json> {
+    let stdout = read_bounded_transcript_file(transcript_path, after, tail);
+    let stderr = read_bounded_transcript_file(stderr_path, after, tail);
     if stdout.is_none() && stderr.is_none() {
         return None;
     }
-    let next_cursor = agent_transcript_path(id)
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let next_cursor = stdout.as_ref().map_or(0, |(_, _, end)| *end);
     Some(Json::Object(vec![
         ("id".to_owned(), Json::String(id.to_owned())),
         ("task_id".to_owned(), Json::Null),
@@ -917,11 +958,11 @@ fn orphan_transcript_json(id: &str, after: u64, tail: Option<usize>) -> Option<J
         ("last_message".to_owned(), Json::Null),
         (
             "stdout".to_owned(),
-            Json::String(stdout.unwrap_or_default()),
+            Json::String(stdout.map_or_else(String::new, |(text, _, _)| text)),
         ),
         (
             "stderr".to_owned(),
-            Json::String(stderr.unwrap_or_default()),
+            Json::String(stderr.map_or_else(String::new, |(text, _, _)| text)),
         ),
         ("next_cursor".to_owned(), Json::number(next_cursor)),
         ("log_degraded".to_owned(), Json::Bool(true)),
@@ -1121,61 +1162,57 @@ pub(crate) fn agent_logs_json(
     after: u64,
     tail: Option<usize>,
 ) -> Option<Json> {
+    agent_logs_json_from_paths(
+        registry,
+        id,
+        stream,
+        after,
+        tail,
+        agent_transcript_path(id),
+        agent_stderr_path(id),
+    )
+}
+
+pub(crate) fn agent_logs_json_from_paths(
+    registry: &zz::AgentRegistry,
+    id: &str,
+    stream: &str,
+    after: u64,
+    tail: Option<usize>,
+    transcript_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
+) -> Option<Json> {
     let agent = registry.get(id)?;
     if agent.stdout_next > 0 {
         return registry.logs_json(id, stream, after, tail);
     }
-    let transcript = agent_transcript_path(id).and_then(|path| std::fs::read_to_string(path).ok());
+    let transcript = read_bounded_transcript_file(transcript_path, after, tail);
     let Some(transcript) = transcript else {
         return registry.logs_json(id, stream, after, tail);
     };
 
     let stderr_logs = registry.logs_json(id, "stderr", after, tail)?;
-    let durable_stderr = agent_stderr_path(id).and_then(|path| std::fs::read_to_string(path).ok());
+    let durable_stderr = read_bounded_transcript_file(stderr_path, after, tail);
     let mut records = Vec::new();
-    if matches!(stream, "stdout" | "both") && after < transcript.len() as u64 {
-        let mut start = usize::try_from(after)
-            .unwrap_or(usize::MAX)
-            .min(transcript.len());
-        if after == 0
-            && let Some(limit) = tail
-            && transcript.len() > limit
-        {
-            start = transcript.len() - limit;
-            while !transcript.is_char_boundary(start) {
-                start += 1;
-            }
-        }
-        let data = transcript[start..].to_owned();
+    if matches!(stream, "stdout" | "both") {
+        let (data, start, _) = &transcript;
         if !data.is_empty() {
             records.push(Json::Object(vec![
                 ("stream".to_owned(), Json::String("stdout".to_owned())),
-                ("cursor".to_owned(), Json::number(start as u64)),
-                ("data".to_owned(), Json::String(data)),
+                ("cursor".to_owned(), Json::number(*start)),
+                ("data".to_owned(), Json::String(data.clone())),
             ]));
         }
     }
     if matches!(stream, "stderr" | "both")
-        && after == 0
-        && let Some(stderr) = durable_stderr.as_deref()
+        && let Some((stderr, start, _)) = durable_stderr.as_ref()
+        && !stderr.is_empty()
     {
-        let data = match tail {
-            Some(limit) if stderr.len() > limit => {
-                let mut start = stderr.len() - limit;
-                while !stderr.is_char_boundary(start) {
-                    start += 1;
-                }
-                stderr[start..].to_owned()
-            }
-            _ => stderr.to_owned(),
-        };
-        if !data.is_empty() {
-            records.push(Json::Object(vec![
-                ("stream".to_owned(), Json::String("stderr".to_owned())),
-                ("cursor".to_owned(), Json::number(0)),
-                ("data".to_owned(), Json::String(data)),
-            ]));
-        }
+        records.push(Json::Object(vec![
+            ("stream".to_owned(), Json::String("stderr".to_owned())),
+            ("cursor".to_owned(), Json::number(*start)),
+            ("data".to_owned(), Json::String(stderr.clone())),
+        ]));
     }
     if matches!(stream, "stderr" | "both")
         && durable_stderr.is_none()
@@ -1187,18 +1224,7 @@ pub(crate) fn agent_logs_json(
         ("records".to_owned(), Json::Array(records)),
         (
             "next_cursor".to_owned(),
-            Json::number(
-                agent.log_next.max(
-                    agent_transcript_path(id)
-                        .and_then(|path| std::fs::metadata(path).ok())
-                        .map_or(0, |metadata| metadata.len())
-                        .max(
-                            agent_stderr_path(id)
-                                .and_then(|path| std::fs::metadata(path).ok())
-                                .map_or(0, |metadata| metadata.len()),
-                        ),
-                ),
-            ),
+            Json::number(agent.log_next.max(transcript.2)),
         ),
         (
             "dropped_before".to_owned(),

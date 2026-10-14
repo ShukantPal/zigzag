@@ -39,13 +39,13 @@ use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
-    agent_post_request_with_session_resolver, agent_route,
+    agent_logs_json_from_paths, agent_post_request_with_session_resolver, agent_route,
     cleanup_stopped_agent_worktree_with_trust, default_agent_worktree,
     delete_explicit_agent_with_trust, delete_inactive_agent, delete_inactive_agent_with_trust,
     dispatch_agent_message, handle_codex_notification, monitor_codex_events,
-    monitor_codex_events_to_path, parse_agent_cleanup_ttl, parse_agent_create_request,
-    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
-    sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
+    monitor_codex_events_to_path, orphan_transcript_json_from_paths, parse_agent_cleanup_ttl,
+    parse_agent_create_request, persisted_agent_config, repair_transcript_tail, restart_argv,
+    restart_config, sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
@@ -3091,6 +3091,99 @@ fn agent_record(id: &str) -> AgentRecord {
         harness_session_id: None,
         harness: None,
     }
+}
+
+#[test]
+fn durable_and_orphan_transcript_fallbacks_read_only_bounded_file_windows() {
+    let (state, _state_path) = test_server();
+    let id = "bounded-durable-file";
+    state
+        .supervisor
+        .registry
+        .register(agent_record(id))
+        .unwrap();
+    let transcript_path = std::env::temp_dir().join(format!(
+        "zigzag-bounded-transcript-{}-{}.jsonl",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let payload = "record-data-".repeat(10);
+    let mut transcript = std::fs::File::create(&transcript_path).unwrap();
+    for _ in 0..20_000 {
+        use std::io::Write;
+        writeln!(transcript, "{payload}").unwrap();
+    }
+    drop(transcript);
+    let tail = 1024;
+
+    let durable = agent_logs_json_from_paths(
+        &state.supervisor.registry,
+        id,
+        "stdout",
+        0,
+        Some(tail),
+        Some(transcript_path.clone()),
+        None,
+    )
+    .unwrap();
+    let durable_data = durable
+        .object("records")
+        .and_then(|records| match records {
+            Json::Array(records) => records.first(),
+            _ => None,
+        })
+        .and_then(|record| record.object("data"))
+        .and_then(Json::as_str)
+        .unwrap();
+    assert!(durable_data.len() <= tail);
+    assert!(durable_data.ends_with('\n'));
+
+    let durable_uncapped_request = agent_logs_json_from_paths(
+        &state.supervisor.registry,
+        id,
+        "stdout",
+        0,
+        Some(usize::MAX),
+        Some(transcript_path.clone()),
+        None,
+    )
+    .unwrap();
+    let durable_uncapped_data = durable_uncapped_request
+        .object("records")
+        .and_then(|records| match records {
+            Json::Array(records) => records.first(),
+            _ => None,
+        })
+        .and_then(|record| record.object("data"))
+        .and_then(Json::as_str)
+        .unwrap();
+    assert!(durable_uncapped_data.len() <= 512 * 1024);
+
+    let orphan = orphan_transcript_json_from_paths(
+        "orphan-bounded",
+        0,
+        Some(tail),
+        Some(transcript_path.clone()),
+        None,
+    )
+    .unwrap();
+    let orphan_data = orphan.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(orphan_data.len() <= tail);
+    assert!(orphan_data.ends_with('\n'));
+    let orphan_uncapped = orphan_transcript_json_from_paths(
+        "orphan-bounded",
+        0,
+        Some(usize::MAX),
+        Some(transcript_path.clone()),
+        None,
+    )
+    .unwrap();
+    let orphan_uncapped_data = orphan_uncapped
+        .object("stdout")
+        .and_then(Json::as_str)
+        .unwrap();
+    assert!(orphan_uncapped_data.len() <= 512 * 1024);
+    std::fs::remove_file(transcript_path).unwrap();
 }
 
 #[test]
