@@ -15,7 +15,10 @@ pub(crate) fn test_policy() -> exec::Policy {
 }
 
 use crate::auth::authorized;
-use crate::config::{allowlist_file, is_get_allowlist, server_config, valid_github_repo};
+use crate::config::{
+    AllowlistCommand, allowlist_file, is_get_allowlist, parse_allowlist_command, server_config,
+    valid_github_repo,
+};
 use crate::events::{persist_event, relay_event, relay_event_at, replay_recovered_lifecycle};
 use crate::exec;
 use crate::github::{
@@ -322,6 +325,158 @@ fn allowlist_updater_accepts_only_its_exact_arguments() {
     ] {
         assert!(allowlist_file(&invalid).is_err());
     }
+}
+
+#[test]
+fn allowlist_cli_parses_add_list_remove_and_show() {
+    assert_eq!(
+        parse_allowlist_command(&["list".into()]).unwrap(),
+        AllowlistCommand::List
+    );
+    assert_eq!(
+        parse_allowlist_command(&["show".into(), "git".into()]).unwrap(),
+        AllowlistCommand::Show("git".into())
+    );
+    assert_eq!(
+        parse_allowlist_command(&["remove".into(), "git".into()]).unwrap(),
+        AllowlistCommand::Remove("git".into())
+    );
+    assert_eq!(
+        parse_allowlist_command(&[
+            "add".into(),
+            "git".into(),
+            "--args".into(),
+            "status".into(),
+            "--short".into(),
+            "--args".into(),
+            "--version".into(),
+        ])
+        .unwrap(),
+        AllowlistCommand::Add {
+            bin: "git".into(),
+            prefixes: vec![
+                vec!["status".into(), "--short".into()],
+                vec!["--version".into()]
+            ],
+            repos: Default::default(),
+        }
+    );
+    assert_eq!(
+        parse_allowlist_command(&["add".into(), "date".into()]).unwrap(),
+        AllowlistCommand::Add {
+            bin: "date".into(),
+            prefixes: vec![vec![]],
+            repos: Default::default(),
+        }
+    );
+}
+
+#[test]
+fn allowlist_cli_edits_and_inspects_entries_and_can_remove_last_entry() {
+    let mut policy = crate::exec::Policy::parse(
+        r#"{"bins":{"git":{"path":"/usr/bin/git","commands":[["status"]]}}}"#,
+    )
+    .unwrap();
+    assert!(policy.entry("git").is_some()); // show
+    assert_eq!(policy.entries().count(), 1); // list
+    policy
+        .add_entry(
+            "date".into(),
+            "/bin/date".into(),
+            vec![vec![]],
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(policy.allowed_path("date", &[]), Some("/bin/date"));
+    assert_eq!(policy.allowed_path("date", &["-u".into()]), None);
+    let round_trip = crate::exec::Policy::parse(&policy.canonical_json()).unwrap();
+    assert_eq!(round_trip.allowed_path("date", &[]), Some("/bin/date"));
+    assert_eq!(round_trip.allowed_path("date", &["-u".into()]), None);
+    policy.remove_entry("git").unwrap();
+    policy.remove_entry("date").unwrap();
+    assert_eq!(policy.entries().count(), 0);
+    assert_eq!(
+        crate::exec::Policy::parse(&policy.canonical_json()).unwrap(),
+        policy
+    );
+}
+
+#[test]
+fn allowlist_cli_rejects_invalid_bins_prefixes_and_repositories() {
+    for arguments in [
+        vec!["add".into(), "Git".into()],
+        vec!["add".into(), "git".into(), "--args".into()],
+        vec!["add".into(), "git".into(), "--repo".into(), "bad".into()],
+        vec!["remove".into(), "../git".into()],
+        vec!["show".into(), "git".into(), "unexpected".into()],
+    ] {
+        assert!(
+            parse_allowlist_command(&arguments).is_err(),
+            "accepted {arguments:?}"
+        );
+    }
+    let mut policy = crate::exec::Policy::parse(r#"{"bins":{}}"#).unwrap();
+    assert!(
+        policy
+            .add_entry(
+                "Bad".into(),
+                "/bin/true".into(),
+                vec![vec![]],
+                Default::default()
+            )
+            .is_err()
+    );
+    assert!(
+        policy
+            .add_entry(
+                "git".into(),
+                "relative/git".into(),
+                vec![vec![]],
+                Default::default()
+            )
+            .is_err()
+    );
+    assert!(
+        policy
+            .add_entry(
+                "git".into(),
+                "/bin/git".into(),
+                vec![vec!["".into()]],
+                Default::default()
+            )
+            .is_err()
+    );
+    assert!(policy.remove_entry("missing").is_err());
+}
+
+#[test]
+fn gh_allowlist_cli_requires_repository_scope() {
+    let mut policy = crate::exec::Policy::parse(r#"{"bins":{}}"#).unwrap();
+    assert!(
+        policy
+            .add_entry(
+                "gh".into(),
+                "/usr/bin/gh".into(),
+                vec![vec!["pr".into(), "view".into()]],
+                Default::default()
+            )
+            .unwrap_err()
+            .contains("--repo")
+    );
+    assert_eq!(
+        parse_allowlist_command(&[
+            "add".into(),
+            "gh".into(),
+            "--repo".into(),
+            "owner/repo".into()
+        ])
+        .unwrap(),
+        AllowlistCommand::Add {
+            bin: "gh".into(),
+            prefixes: vec![vec![]],
+            repos: ["owner/repo".into()].into(),
+        }
+    );
 }
 
 #[test]

@@ -1,8 +1,10 @@
-use crate::session::{is_tailscale_ipv4, require_gui_login_session};
+use crate::session::{is_tailscale_ipv4, require_interactive_gui_login_session};
 use crate::update;
 use crate::{comment_router, exec};
+use std::collections::BTreeSet;
 use std::env;
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -186,7 +188,10 @@ pub(crate) fn valid_github_repo(repo: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 pub(crate) fn run_config(arguments: &[String]) -> Result<(), String> {
-    require_gui_login_session()?;
+    require_interactive_gui_login_session()?;
+    if arguments.first().map(String::as_str) == Some("allowlist") {
+        return run_allowlist(&arguments[1..]);
+    }
     if is_get_allowlist(arguments) {
         let policy = exec::load_policy()?;
         println!("{}", policy.canonical_json());
@@ -199,6 +204,190 @@ pub(crate) fn run_config(arguments: &[String]) -> Result<(), String> {
     exec::store_policy(&policy)?;
     println!("{}", policy.canonical_json());
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AllowlistCommand {
+    List,
+    Add {
+        bin: String,
+        prefixes: Vec<Vec<String>>,
+        repos: BTreeSet<String>,
+    },
+    Remove(String),
+    Show(String),
+}
+
+pub(crate) fn parse_allowlist_command(arguments: &[String]) -> Result<AllowlistCommand, String> {
+    let usage = "usage: zigzag config allowlist (list | add BIN [--args ARG ...] [--args ARG ...] [--repo OWNER/REPO ...] | remove BIN | show BIN)";
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return Err(usage.to_owned());
+    };
+    match command {
+        "list" if arguments.len() == 1 => Ok(AllowlistCommand::List),
+        "show" | "remove" if arguments.len() == 2 => {
+            let bin = &arguments[1];
+            if !exec::valid_bin_name(bin) {
+                return Err(format!("invalid binary name: {bin}"));
+            }
+            if command == "show" {
+                Ok(AllowlistCommand::Show(bin.clone()))
+            } else {
+                Ok(AllowlistCommand::Remove(bin.clone()))
+            }
+        }
+        "add" if arguments.len() >= 2 => {
+            let bin = &arguments[1];
+            if !exec::valid_bin_name(bin) {
+                return Err(format!("invalid binary name: {bin}"));
+            }
+            let mut prefixes = Vec::new();
+            let mut repos = BTreeSet::new();
+            let mut index = 2;
+            while index < arguments.len() {
+                match arguments[index].as_str() {
+                    "--args" => {
+                        index += 1;
+                        let mut prefix = Vec::new();
+                        while index < arguments.len()
+                            && arguments[index] != "--args"
+                            && arguments[index] != "--repo"
+                        {
+                            prefix.push(arguments[index].clone());
+                            index += 1;
+                        }
+                        if prefix.is_empty() {
+                            return Err(
+                                "--args requires at least one argument prefix value".to_owned()
+                            );
+                        }
+                        prefixes.push(prefix);
+                    }
+                    "--repo" => {
+                        index += 1;
+                        let repo = arguments
+                            .get(index)
+                            .ok_or_else(|| "--repo requires OWNER/REPO".to_owned())?;
+                        if !exec::valid_github_repo(repo) {
+                            return Err(format!("invalid GitHub repository name: {repo}"));
+                        }
+                        repos.insert(repo.clone());
+                        index += 1;
+                    }
+                    option => {
+                        return Err(format!("unknown allowlist add option: {option}; {usage}"));
+                    }
+                }
+            }
+            if prefixes.is_empty() {
+                // An omitted prefix grants only the no-argument invocation.
+                prefixes.push(Vec::new());
+            }
+            Ok(AllowlistCommand::Add {
+                bin: bin.clone(),
+                prefixes,
+                repos,
+            })
+        }
+        "list" | "show" | "remove" => Err(usage.to_owned()),
+        _ => Err(usage.to_owned()),
+    }
+}
+
+fn run_allowlist(arguments: &[String]) -> Result<(), String> {
+    let command = parse_allowlist_command(arguments)?;
+    let mut policy = exec::load_policy()?;
+    match command {
+        AllowlistCommand::List => print_allowlist(&policy),
+        AllowlistCommand::Show(bin) => print_allowlist_entry(&policy, &bin)?,
+        AllowlistCommand::Add {
+            bin,
+            prefixes,
+            repos,
+        } => {
+            let path = resolve_allowlist_binary(&bin)?;
+            policy.add_entry(bin.clone(), path.clone(), prefixes.clone(), repos)?;
+            exec::store_policy(&policy)?;
+            println!("Added {bin} at {path}");
+            print_entry_details(&bin, policy.entry(&bin).expect("new entry was added"));
+        }
+        AllowlistCommand::Remove(bin) => {
+            policy.remove_entry(&bin)?;
+            exec::store_policy(&policy)?;
+            println!("Removed {bin}");
+        }
+    }
+    Ok(())
+}
+
+fn print_allowlist(policy: &exec::Policy) {
+    if policy.entries().next().is_none() {
+        println!("Exec allowlist is empty.");
+        return;
+    }
+    for (name, entry) in policy.entries() {
+        print!("{name}: {} | ", entry.path);
+        print_prefixes(&entry.commands);
+        println!();
+    }
+}
+
+fn print_allowlist_entry(policy: &exec::Policy, name: &str) -> Result<(), String> {
+    let entry = policy
+        .entry(name)
+        .ok_or_else(|| format!("binary {name} is not allowlisted"))?;
+    println!("{name}: {}", entry.path);
+    print_entry_details(name, entry);
+    Ok(())
+}
+
+fn print_entry_details(name: &str, entry: &exec::BinPolicy) {
+    print!("  argument prefixes: ");
+    print_prefixes(&entry.commands);
+    println!();
+    if name == "gh" {
+        println!(
+            "  repositories: {}",
+            entry
+                .gh_read_repos
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn print_prefixes(prefixes: &[Vec<String>]) {
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if index > 0 {
+            print!("; ");
+        }
+        if prefix.is_empty() {
+            print!("(no arguments)");
+        } else {
+            print!("{}", prefix.join(" "));
+        }
+    }
+}
+
+fn resolve_allowlist_binary(name: &str) -> Result<String, String> {
+    let path =
+        env::var_os("PATH").ok_or_else(|| "PATH is not set; cannot resolve binary".to_owned())?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(name);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            let canonical = std::fs::canonicalize(&candidate)
+                .map_err(|error| format!("could not resolve binary {name}: {error}"))?;
+            return Ok(canonical.to_string_lossy().into_owned());
+        }
+    }
+    Err(format!(
+        "binary {name} was not found as an executable in PATH"
+    ))
 }
 pub(crate) fn is_get_allowlist(arguments: &[String]) -> bool {
     arguments.len() == 1 && arguments[0] == "get-allowlist"

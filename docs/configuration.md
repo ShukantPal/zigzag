@@ -10,8 +10,12 @@ creating another job.
 
 The relay prefers its executable allowlist in macOS Keychain. The daemon reads
 it in a GUI login session; `zigzag config get-allowlist` and
-`zigzag config set-allowlist --file PATH` remain privileged GUI-session
-commands. If the daemon has no GUI Keychain session or the Keychain item cannot
+`zigzag config set-allowlist --file PATH` require both that session and a
+foreground terminal. Every `config` invocation uses this check, including the
+allowlist list/show/add/remove commands. `/v1/exec` and `/v1/spawn` launch
+children with stdin detached, so those children cannot use the CLI to change
+policy even though they inherit the daemon's GUI security session. If the
+daemon has no GUI Keychain session or the Keychain item cannot
 be read, `/v1/exec` and `/v1/spawn` keep working with the configured fallback
 policy. The daemon logs a warning when it enters this degraded mode.
 
@@ -29,7 +33,7 @@ and have permissions `0600` or stricter. For a LaunchAgent, add an
 ```
 
 Write the policy JSON directly to the fallback path and protect it with
-`chmod 600 PATH`. The GUI-session `zigzag config set-allowlist --file PATH`
+`chmod 600 PATH`. The foreground-terminal `zigzag config set-allowlist --file PATH`
 command continues to update Keychain; it does not write the fallback file.
 When the fallback file is absent or invalid, the daemon uses an empty
 allowlist, so exec and spawn requests are denied while unrelated relay routes

@@ -1,4 +1,5 @@
 use crate::proc::COMPAT_OUTPUT_CAP;
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::process::Command;
 
@@ -59,6 +60,34 @@ pub(crate) fn require_gui_login_session() -> Result<(), String> {
         )
     }
 }
+/// Policy editing is a local owner action. A GUI login session by itself is
+/// inherited by every relay child, so also require stdin to be the foreground
+/// terminal. `/v1/exec` and `/v1/spawn` explicitly replace child stdin with
+/// `/dev/null`, which makes this check fail for relay-launched commands.
+pub(crate) fn require_interactive_gui_login_session() -> Result<(), String> {
+    if !is_foreground_terminal(std::io::stdin().is_terminal()) {
+        return Err("allowlist changes require a foreground local terminal".to_owned());
+    }
+    require_gui_login_session()
+}
+
+fn is_foreground_terminal(stdin_is_terminal: bool) -> bool {
+    // `tcgetpgrp` verifies that this process group currently owns the
+    // terminal, so a background job cannot mutate policy through a reused fd.
+    let foreground_group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    interactive_terminal_allowed(stdin_is_terminal, foreground_group, unsafe {
+        libc::getpgrp()
+    })
+}
+
+fn interactive_terminal_allowed(
+    stdin_is_terminal: bool,
+    foreground_group: i32,
+    process_group: i32,
+) -> bool {
+    stdin_is_terminal && foreground_group >= 0 && foreground_group == process_group
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn require_gui_login_session() -> Result<(), String> {
     Err("privileged daemon operations require Shukant's local macOS GUI login session".to_owned())
@@ -79,4 +108,17 @@ pub(crate) fn resolve_tailscale_ip() -> Result<IpAddr, String> {
 }
 pub(crate) fn is_tailscale_ipv4(address: IpAddr) -> bool {
     matches!(address, IpAddr::V4(address) if address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::interactive_terminal_allowed;
+
+    #[test]
+    fn policy_editor_requires_foreground_tty_stdin() {
+        assert!(interactive_terminal_allowed(true, 17, 17));
+        assert!(!interactive_terminal_allowed(false, 17, 17));
+        assert!(!interactive_terminal_allowed(true, 16, 17));
+        assert!(!interactive_terminal_allowed(true, -1, 17));
+    }
 }
