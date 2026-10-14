@@ -870,7 +870,16 @@ pub(crate) fn agent_state_is_terminal(state: &str) -> bool {
     zz::is_terminal_agent_state(state)
 }
 
-fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: &str) -> bool {
+pub(crate) fn worktree_has_live_agent(
+    registry: &zz::AgentRegistry,
+    path: &Path,
+    owner_id: &str,
+) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        // If we cannot establish the path identity, keep the worktree rather
+        // than risk removing one that another live agent is using.
+        return true;
+    };
     registry.list(None, None).iter().any(|other| {
         other.id != owner_id
             && !agent_state_is_terminal(&other.state)
@@ -879,7 +888,7 @@ fn worktree_has_live_agent(registry: &zz::AgentRegistry, path: &Path, owner_id: 
                 .as_deref()
                 .and_then(|other_path| std::fs::canonicalize(other_path).ok())
                 .as_deref()
-                == Some(path)
+                == Some(path.as_path())
     })
 }
 

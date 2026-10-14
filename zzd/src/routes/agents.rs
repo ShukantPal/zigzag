@@ -2183,6 +2183,17 @@ pub(crate) fn delete_explicit_agent_with_trust(
         log::info!("agent_delete id={agent_id}: retaining worktree for watched pull request");
     } else if let Some(path) = worktree_path {
         match crate::routes::worktrees::agent_worktree_is_clean_and_pushed(path, roots) {
+            Ok(true)
+                if crate::routes::worktrees::worktree_has_live_agent(
+                    registry,
+                    Path::new(path),
+                    agent_id,
+                ) =>
+            {
+                log::info!(
+                    "agent_delete id={agent_id}: retaining worktree at {path}; another live agent record is attached"
+                );
+            }
             Ok(true) => match crate::routes::worktrees::cleanup_agent_worktree_with_trust(
                 path,
                 roots,

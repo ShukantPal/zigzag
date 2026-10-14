@@ -1863,6 +1863,45 @@ fn explicit_delete_removes_safe_worktree_and_branch() {
 }
 
 #[test]
+fn explicit_delete_keeps_worktree_attached_to_another_live_agent() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-live", true);
+    let mut live = agent_record("other-live-delete-agent");
+    live.state = "running".to_owned();
+    live.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(live).unwrap();
+
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        false,
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(!effects.worktree_removed);
+    assert!(
+        path.exists(),
+        "worktree attached to a live agent was removed"
+    );
+    assert!(registry.get(&id).is_none(), "terminal agent record remains");
+    assert!(registry.get("other-live-delete-agent").is_some());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-live",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "live agent's branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn completed_dirty_worktree_is_kept() {
     let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
     std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
