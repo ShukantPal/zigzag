@@ -1094,106 +1094,121 @@ fn fail_queued_turns(
 fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    while reader.read_line(&mut line).unwrap_or(0) > 0 {
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            if let Some(method) = value.get("method").and_then(Value::as_str)
-                && let Some(id) = value.get("id")
+    loop {
+        let bytes = match reader.read_line(&mut line) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("Codex app-server message stream read failed: {error}");
+                break;
+            }
+        };
+        if bytes == 0 {
+            break;
+        }
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("dropping malformed Codex app-server message: {error}");
+                line.clear();
+                continue;
+            }
+        };
+        if let Some(method) = value.get("method").and_then(Value::as_str)
+            && let Some(id) = value.get("id")
+        {
+            let thread_id = value.pointer("/params/threadId").and_then(Value::as_str);
+            let context = thread_id.and_then(|thread_id| {
+                shared
+                    .approval_contexts
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(thread_id).cloned())
+            });
+            let result = approval_response(
+                method,
+                id,
+                value.get("params").unwrap_or(&Value::Null),
+                context.as_ref(),
+            );
+            let response = match result {
+                Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                Err(message) => {
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}})
+                }
+            };
+            if let Ok(mut writer) = shared.writer.lock() {
+                let _ = serde_json::to_writer(&mut *writer, &response);
+                let _ = writer.write_all(b"\n");
+                let _ = writer.flush();
+            }
+        } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
+            if let Ok(mut pending) = shared.pending.lock()
+                && let Some(tx) = pending.remove(&id)
             {
-                let thread_id = value.pointer("/params/threadId").and_then(Value::as_str);
-                let context = thread_id.and_then(|thread_id| {
-                    shared
-                        .approval_contexts
-                        .lock()
-                        .ok()
-                        .and_then(|map| map.get(thread_id).cloned())
-                });
-                let result = approval_response(
-                    method,
-                    id,
-                    value.get("params").unwrap_or(&Value::Null),
-                    context.as_ref(),
-                );
-                let response = match result {
-                    Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-                    Err(message) => {
-                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}})
-                    }
+                let result = if let Some(error) = value.get("error") {
+                    Err(error.to_string())
+                } else {
+                    Ok(value.get("result").cloned().unwrap_or(Value::Null))
                 };
-                if let Ok(mut writer) = shared.writer.lock() {
-                    let _ = serde_json::to_writer(&mut *writer, &response);
-                    let _ = writer.write_all(b"\n");
-                    let _ = writer.flush();
-                }
-            } else if let Some(id) = value.get("id").and_then(Value::as_u64) {
-                if let Ok(mut pending) = shared.pending.lock()
-                    && let Some(tx) = pending.remove(&id)
+                let _ = tx.send(result);
+            }
+        } else if let Some(thread_id) = value.pointer("/params/threadId").and_then(Value::as_str) {
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            let mut terminal_turn = method != "turn/completed";
+            if method == "turn/started" {
+                if let Some(turn_id) = value.pointer("/params/turn/id").and_then(Value::as_str)
+                    && let Ok(mut turns) = shared.turns.lock()
                 {
-                    let result = if let Some(error) = value.get("error") {
-                        Err(error.to_string())
-                    } else {
-                        Ok(value.get("result").cloned().unwrap_or(Value::Null))
-                    };
-                    let _ = tx.send(result);
+                    turns.insert(thread_id.to_owned(), turn_id.to_owned());
                 }
-            } else if let Some(thread_id) =
-                value.pointer("/params/threadId").and_then(Value::as_str)
-            {
-                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-                let mut terminal_turn = method != "turn/completed";
-                if method == "turn/started" {
-                    if let Some(turn_id) = value.pointer("/params/turn/id").and_then(Value::as_str)
-                        && let Ok(mut turns) = shared.turns.lock()
+            } else if method == "turn/completed" {
+                let mut queued_guard = shared.queued.lock().ok();
+                if let Ok(mut turns) = shared.turns.lock() {
+                    if turns.get(thread_id).map(String::as_str) == Some("__starting__")
+                        && let Ok(mut early) = shared.early_completions.lock()
                     {
-                        turns.insert(thread_id.to_owned(), turn_id.to_owned());
+                        early.insert(thread_id.to_owned());
                     }
-                } else if method == "turn/completed" {
-                    let mut queued_guard = shared.queued.lock().ok();
-                    if let Ok(mut turns) = shared.turns.lock() {
-                        if turns.get(thread_id).map(String::as_str) == Some("__starting__")
-                            && let Ok(mut early) = shared.early_completions.lock()
+                    turns.remove(thread_id);
+                }
+                if let Some(completion) = shared
+                    .completions
+                    .lock()
+                    .ok()
+                    .and_then(|mut completions| completions.remove(thread_id))
+                {
+                    let result = value.pointer("/params/turn").cloned().unwrap_or_else(|| {
+                        value.pointer("/params").cloned().unwrap_or(Value::Null)
+                    });
+                    let _ = completion.send(Ok(result));
+                }
+                let next = queued_guard
+                    .as_mut()
+                    .and_then(|queued| queued.get_mut(thread_id).and_then(VecDeque::pop_front));
+                if next.is_some()
+                    && let Ok(mut turns) = shared.turns.lock()
+                {
+                    // Reserve the thread while the queued turn is started
+                    // on a worker; the reader thread must remain free to
+                    // receive the JSON-RPC response.
+                    turns.insert(thread_id.to_owned(), "__starting__".to_owned());
+                    if let Ok(mut early) = shared.early_completions.lock() {
+                        early.remove(thread_id);
+                    }
+                }
+                drop(queued_guard);
+                terminal_turn = next.is_none();
+                if let Some(text) = next {
+                    let shared = Arc::clone(&shared);
+                    let thread_id = thread_id.to_owned();
+                    thread::spawn(move || {
+                        let server = CodexServer { shared };
+                        if let Some(completion) = text.completion.as_ref()
+                            && let Ok(mut completions) = server.shared.completions.lock()
                         {
-                            early.insert(thread_id.to_owned());
+                            completions.insert(thread_id.clone(), completion.clone());
                         }
-                        turns.remove(thread_id);
-                    }
-                    if let Some(completion) = shared
-                        .completions
-                        .lock()
-                        .ok()
-                        .and_then(|mut completions| completions.remove(thread_id))
-                    {
-                        let result = value.pointer("/params/turn").cloned().unwrap_or_else(|| {
-                            value.pointer("/params").cloned().unwrap_or(Value::Null)
-                        });
-                        let _ = completion.send(Ok(result));
-                    }
-                    let next = queued_guard
-                        .as_mut()
-                        .and_then(|queued| queued.get_mut(thread_id).and_then(VecDeque::pop_front));
-                    if next.is_some()
-                        && let Ok(mut turns) = shared.turns.lock()
-                    {
-                        // Reserve the thread while the queued turn is started
-                        // on a worker; the reader thread must remain free to
-                        // receive the JSON-RPC response.
-                        turns.insert(thread_id.to_owned(), "__starting__".to_owned());
-                        if let Ok(mut early) = shared.early_completions.lock() {
-                            early.remove(thread_id);
-                        }
-                    }
-                    drop(queued_guard);
-                    terminal_turn = next.is_none();
-                    if let Some(text) = next {
-                        let shared = Arc::clone(&shared);
-                        let thread_id = thread_id.to_owned();
-                        thread::spawn(move || {
-                            let server = CodexServer { shared };
-                            if let Some(completion) = text.completion.as_ref()
-                                && let Ok(mut completions) = server.shared.completions.lock()
-                            {
-                                completions.insert(thread_id.clone(), completion.clone());
-                            }
-                            if let Ok(turn) = server.rpc(
+                        if let Ok(turn) = server.rpc(
                                 "turn/start",
                                 json!({"threadId":thread_id,"input":[{"type":"text","text":text.text}]}),
                             ) {
@@ -1205,21 +1220,35 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                             } else {
                                 fail_queued_turns(&server.shared, &thread_id, text.completion);
                             }
-                        });
-                    }
-                }
-                if let Ok(mut map) = shared.subscribers.lock()
-                    && let Some(list) = map.get_mut(thread_id)
-                {
-                    list.retain(|tx| {
-                        tx.send(HarnessEvent::Notification {
-                            value: value.clone(),
-                            terminal_turn,
-                        })
-                        .is_ok()
                     });
                 }
             }
+            match shared.subscribers.lock() {
+                Ok(mut map) => match map.get_mut(thread_id) {
+                    Some(list) => list.retain(|tx| {
+                        match tx.send(HarnessEvent::Notification {
+                            value: value.clone(),
+                            terminal_turn,
+                        }) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                log::warn!("Codex monitor channel closed for thread {thread_id}");
+                                false
+                            }
+                        }
+                    }),
+                    None => log::warn!(
+                        "dropping Codex notification for thread without a monitor: {thread_id}"
+                    ),
+                },
+                Err(_) => log::error!("Codex subscriber map lock poisoned"),
+            }
+        } else {
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            log::warn!("dropping Codex notification without params.threadId: {method}");
         }
         line.clear();
     }

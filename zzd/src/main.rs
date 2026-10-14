@@ -23,7 +23,7 @@ mod e2e;
 mod tests;
 
 use crate::config::{run_config, server_config};
-use crate::events::{new_execution_id, relay_event, replay_recovered_lifecycle};
+use crate::events::{new_execution_id, persist_event, relay_event, replay_recovered_lifecycle};
 use crate::github::{github_watch_loop, should_start_legacy_watch};
 use crate::proc::{recovered_agent_identity_matches, start_reaper};
 use crate::routes::events::run_timeline;
@@ -282,12 +282,26 @@ fn run() -> Result<(), String> {
                 *execution_id = new_execution_id().ok();
             }
             if let Some(execution_id) = execution_id.as_deref() {
-                let _ = update_audit_state.store.add(relay_event(
-                    kind,
-                    "relay-update",
-                    execution_id,
-                    payload,
-                ));
+                let event = relay_event(kind, "relay-update", execution_id, payload);
+                let mut last_warning = std::time::Instant::now();
+                let mut warned = false;
+                loop {
+                    match persist_event(&update_audit_state.store, event.clone()) {
+                        Ok(()) => break,
+                        Err(error) => {
+                            if !warned
+                                || last_warning.elapsed() >= std::time::Duration::from_secs(5)
+                            {
+                                log::error!(
+                                    "could not persist relay update event {kind}; retrying: {error}"
+                                );
+                                last_warning = std::time::Instant::now();
+                                warned = true;
+                            }
+                            thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                }
             }
         }),
         update_arguments,

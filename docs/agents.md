@@ -81,10 +81,14 @@ requested cursor, the bounded spool has irretrievably lost earlier output.
 
 ## Event delivery
 
-`events.json` is durable but bounded. A duplicate event ID is idempotent only
-while retained, so consumers must deduplicate. Long-poll reads return `epoch`,
-`reset`, `lost`, `events`, and `next`: pass `next` as `after`, preserve epoch,
-rebuild a projection on `reset`, and treat `lost` as eviction.
+`events.json` keeps a bounded in-memory cache backed by append-only JSONL
+segments in `events.stream/`. Segments are synced before an event is reported
+accepted, and whole segments are garbage-collected 30 days after creation. A
+reader whose cursor predates the cache reads the retained segments, so cache
+eviction does not set `lost`. A duplicate event ID remains idempotent while its
+segment is retained. Long-poll reads return `epoch`, `reset`, `lost`, `events`,
+and `next`: pass `next` as `after`, preserve epoch, rebuild a projection on
+`reset`, and treat `lost` as an expired or otherwise unavailable file window.
 
 Schema-v1 facts contain `id`, `task_id`, `execution_id`, `kind`, `source`,
 `occurred_at`, `clock`, and object `payload`. Facts with an execution ID are
@@ -99,6 +103,7 @@ for whether a process exited.
 | --- | --- |
 | `~/.codex/zigzag/zigzag.token` | Bearer token, mode 0600; never log it. |
 | `~/.codex/zigzag/events.json` | Bounded durable live-event store. |
+| `~/.codex/zigzag/events.stream/` | Append-only event segments; whole files expire after 30 days. |
 | `~/.codex/zigzag/events.audit/` | Per-execution append-only audit JSONL. |
 | `~/.codex/zigzag/events.agents.json` | Durable relay agent registry. |
 | `~/.codex/zigzag/events.agents.agent-logs/` | Owner-only bounded stdout/stderr spools. |

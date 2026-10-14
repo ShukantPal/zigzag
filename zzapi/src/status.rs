@@ -555,6 +555,7 @@ fn codex_transcript_path(agent_id: &str) -> Option<PathBuf> {
 fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
     let mut items: Vec<TranscriptItem> = Vec::new();
     let mut indices = HashMap::<String, usize>::new();
+    let mut pending_deltas = HashMap::<String, (String, Vec<Value>)>::new();
     let complete = if text.ends_with('\n') {
         text
     } else {
@@ -587,15 +588,35 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             .unwrap_or("")
             .replace('/', ".");
         let params = event.get("params").unwrap_or(&Value::Null);
-        if kind == "item.agentMessage.delta" || kind == "item.reasoning.summaryTextDelta" {
-            let item_id = s(params, "itemId");
+        if kind == "item.agentMessage.delta" || kind == "item.agent_message.delta" {
+            let item_id = params
+                .get("itemId")
+                .or_else(|| params.get("item_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let delta = s(params, "delta");
             if item_id.is_empty() {
                 push_transcript_gap(&mut items, line_number, &event);
                 continue;
             }
-            let key = item_id.clone();
-            let Some(index) = indices.get(&key).copied() else {
+            if let Some(index) = indices.get(item_id).copied() {
+                append_agent_message_delta(&mut items[index].item, &delta);
+                append_transcript_raw(&mut items[index], event);
+            } else {
+                pending_deltas
+                    .entry(item_id.to_owned())
+                    .and_modify(|(text, events)| {
+                        text.push_str(&delta);
+                        events.push(event.clone());
+                    })
+                    .or_insert((delta, vec![event]));
+            }
+            continue;
+        }
+        if kind == "item.reasoning.summaryTextDelta" {
+            let item_id = s(params, "itemId");
+            let delta = s(params, "delta");
+            let Some(index) = indices.get(&item_id).copied() else {
                 push_transcript_gap(&mut items, line_number, &event);
                 continue;
             };
@@ -713,11 +734,17 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
                 append_transcript_raw(&mut items[index], event);
             } else {
                 indices.insert(key.clone(), items.len());
+                let mut item = item.clone();
+                let mut raw = event;
+                if let Some((delta, events)) = pending_deltas.remove(&key) {
+                    append_agent_message_delta(&mut item, &delta);
+                    raw = Value::Array(std::iter::once(raw).chain(events).collect());
+                }
                 items.push(TranscriptItem {
                     id: key,
-                    item: item.clone(),
+                    item,
                     state,
-                    raw: event,
+                    raw,
                     diagnostic: None,
                     hidden: false,
                 });
@@ -768,7 +795,25 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             });
         }
     }
+    for (item_id, (_, events)) in pending_deltas {
+        let diagnostic = TranscriptItem {
+            id: format!("orphan-delta-{item_id}"),
+            item: Value::Null,
+            state: "diagnostic".into(),
+            raw: Value::Array(events),
+            diagnostic: Some(format!(
+                "Transcript delta references missing item {item_id} after reading the full transcript"
+            )),
+            hidden: false,
+        };
+        items.push(diagnostic);
+    }
     items
+}
+
+fn append_agent_message_delta(item: &mut Value, delta: &str) {
+    let current = s(item, "text");
+    item["text"] = Value::String(format!("{current}{delta}"));
 }
 
 fn push_transcript_gap(items: &mut Vec<TranscriptItem>, line_number: usize, raw: &Value) {
@@ -1643,18 +1688,39 @@ mod tests {
         );
         let items = parse_codex_transcript(data);
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].state, "gap");
-        assert_eq!(items[0].raw.as_array().unwrap().len(), 1);
+        assert!(
+            items[0]
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("Unknown event: turn/futureUpdate")
+        );
         assert_eq!(
             transcript_label(&items[1]).0,
-            "Unknown event: turn/futureUpdate"
+            "Unknown event: mcpServer/futureStatus"
         );
         assert_eq!(
             transcript_label(&items[2]).0,
-            "Unknown event: mcpServer/futureStatus"
+            "Transcript delta references missing item missing after reading the full transcript"
         );
+        assert!(!items[0].hidden);
         assert!(!items[1].hidden);
-        assert!(!items[2].hidden);
+    }
+
+    #[test]
+    fn reconciles_message_deltas_that_precede_their_item() {
+        let items = parse_codex_transcript(concat!(
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"hello \"}}\n",
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"msg-1\",\"delta\":\"world\"}}\n",
+            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"msg-1\",\"type\":\"agentMessage\",\"text\":\"\"}}}\n",
+        ));
+        assert_eq!(items.len(), 1);
+        assert_eq!(s(&items[0].item, "text"), "hello world");
+        let raw = items[0].raw.as_array().unwrap();
+        assert_eq!(raw.len(), 3);
+        assert_eq!(raw[0]["method"], "item/started");
+        assert_eq!(raw[1]["params"]["delta"], "hello ");
+        assert_eq!(raw[2]["params"]["delta"], "world");
     }
 
     #[test]
