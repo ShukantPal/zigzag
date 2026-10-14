@@ -671,14 +671,16 @@ pub(crate) fn transcript_json_with_sessions_dir(
     tail: Option<usize>,
     sessions_dir: Option<std::path::PathBuf>,
 ) -> Option<Json> {
-    let agent = registry.get(id).or_else(|| {
-        registry
-            .list(None, Some(id))
-            .into_iter()
-            .next()
-            .map(|record| record.id.clone())
-            .and_then(|agent_id| registry.get(&agent_id))
-    });
+    let agent = if let Some(agent) = registry.get(id) {
+        Some(agent)
+    } else {
+        let mut matches = registry.list(None, Some(id)).into_iter();
+        match (matches.next(), matches.next()) {
+            (Some(agent), None) => Some(agent),
+            (Some(_), Some(_)) => return None,
+            (None, _) => None,
+        }
+    };
     let Some(agent) = agent else {
         return orphan_transcript_json(id, after, tail);
     };
@@ -839,8 +841,9 @@ fn codex_rollout_transcript(sessions: &std::path::Path, thread_id: &str) -> Opti
     {
         return None;
     }
+    let sessions = sessions.canonicalize().ok()?;
     let suffix = format!("-{thread_id}.jsonl");
-    for year in std::fs::read_dir(sessions).ok()?.flatten() {
+    for year in std::fs::read_dir(&sessions).ok()?.flatten() {
         if !year.file_type().ok()?.is_dir() {
             continue;
         }
@@ -856,7 +859,14 @@ fn codex_rollout_transcript(sessions: &std::path::Path, thread_id: &str) -> Opti
                     let name = file.file_name();
                     let name = name.to_string_lossy();
                     if name.starts_with("rollout-") && name.ends_with(&suffix) {
-                        return std::fs::read_to_string(file.path())
+                        if !file.file_type().ok()?.is_file() {
+                            continue;
+                        }
+                        let path = file.path().canonicalize().ok()?;
+                        if !path.starts_with(&sessions) {
+                            continue;
+                        }
+                        return std::fs::read_to_string(path)
                             .ok()
                             .map(|source| normalize_codex_rollout(&source));
                     }
@@ -871,49 +881,63 @@ fn normalize_codex_rollout(source: &str) -> String {
     use serde_json::{Value, json};
     let mut output = String::new();
     for (index, line) in source.lines().enumerate() {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = record.get("payload").cloned().unwrap_or(Value::Null);
-        let normalized = match kind {
-            "response_item" => {
-                let mut item = payload;
-                if item.get("type").and_then(Value::as_str) == Some("message")
-                    && item.get("role").and_then(Value::as_str) == Some("assistant")
-                {
-                    item["type"] = Value::String("agent_message".into());
-                    if let Some(content) = item.get("content").and_then(Value::as_array) {
-                        let text = content
-                            .iter()
-                            .filter_map(|part| {
-                                (part.get("type").and_then(Value::as_str) == Some("output_text"))
-                                    .then(|| part.get("text").and_then(Value::as_str))
-                                    .flatten()
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            item["text"] = Value::String(text);
+        let normalized = match serde_json::from_str::<Value>(line) {
+            Err(error) => json!({
+                "type": "transcript.diagnostic",
+                "line": index + 1,
+                "message": format!("malformed rollout JSON: {error}"),
+                "raw": line,
+            }),
+            Ok(record) => {
+                let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+                let payload = record.get("payload").cloned().unwrap_or(Value::Null);
+                match kind {
+                    "response_item" => {
+                        let mut item = payload;
+                        if item.get("type").and_then(Value::as_str) == Some("message")
+                            && item.get("role").and_then(Value::as_str) == Some("assistant")
+                        {
+                            item["type"] = Value::String("agent_message".into());
+                            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                                let text = content
+                                    .iter()
+                                    .filter_map(|part| {
+                                        (part.get("type").and_then(Value::as_str)
+                                            == Some("output_text"))
+                                        .then(|| part.get("text").and_then(Value::as_str))
+                                        .flatten()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                if !text.is_empty() {
+                                    item["text"] = Value::String(text);
+                                }
+                            }
                         }
+                        json!({"type":"item.completed","item":item})
                     }
+                    "event_msg" => {
+                        let event = payload
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("event");
+                        let lifecycle = match event {
+                            "task_started" | "turn_started" => "turn.started",
+                            "task_complete" | "turn_complete" => "turn.completed",
+                            _ => event,
+                        };
+                        json!({"type":lifecycle})
+                    }
+                    "session_meta" => json!({"type":"thread.started"}),
+                    _ => json!({
+                        "type": "transcript.diagnostic",
+                        "line": index + 1,
+                        "message": "unrecognized rollout record",
+                        "record_type": kind,
+                        "record": record,
+                    }),
                 }
-                json!({"type":"item.completed","item":item})
             }
-            "event_msg" => {
-                let event = payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("event");
-                let lifecycle = match event {
-                    "task_started" | "turn_started" => "turn.started",
-                    "task_complete" | "turn_complete" => "turn.completed",
-                    _ => event,
-                };
-                json!({"type":lifecycle})
-            }
-            "session_meta" => json!({"type":"thread.started"}),
-            _ => continue,
         };
         if index > 0 {
             output.push('\n');

@@ -2113,6 +2113,162 @@ fn transcript_uses_codex_rollout_when_relay_transcript_is_missing_by_agent_and_t
 }
 
 #[test]
+fn transcript_prefers_rollout_exclusively_and_reports_invalid_rollout_lines() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f5";
+    let mut record = agent_record("rollout-exclusive");
+    record.task_id = "rollout-exclusive-task".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-exclusive", "stdout", b"relay-only content\n")
+        .unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-exclusive-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(
+        &rollout,
+        concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"assistant-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"rollout-only content\"}]}}\n",
+            "not valid JSON\n",
+            "{\"type\":\"future_record\",\"payload\":{\"text\":\"unrecognized rollout content\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-exclusive",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("rollout-only content"), "{stdout}");
+    assert!(!stdout.contains("relay-only content"), "{stdout}");
+    assert!(stdout.contains("transcript.diagnostic"), "{stdout}");
+    assert!(stdout.contains("unrecognized rollout content"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[test]
+fn transcript_ambiguous_task_id_is_rejected() {
+    let (state, _state_path) = test_server();
+    for (id, text) in [
+        ("ambiguous-first", "first-agent-secret"),
+        ("ambiguous-second", "second-agent-secret"),
+    ] {
+        let mut record = agent_record(id);
+        record.task_id = "shared-retried-task".to_owned();
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some("01a138f4-c546-7ca0-bece-deba1ab4a5f6".to_owned());
+        state.supervisor.registry.register(record).unwrap();
+        state
+            .supervisor
+            .registry
+            .append_log(id, "stdout", text.as_bytes())
+            .unwrap();
+    }
+    assert!(
+        transcript_json_with_sessions_dir(
+            &state.supervisor.registry,
+            "shared-retried-task",
+            0,
+            None,
+            None,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn codex_transcript_falls_back_to_relay_when_rollout_is_missing() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f8";
+    let mut record = agent_record("rollout-missing");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-missing", "stdout", b"relay fallback output\n")
+        .unwrap();
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-missing-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-missing",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("relay fallback output"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_rollout_rejects_matching_symlink_outside_sessions() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f7";
+    let mut record = agent_record("rollout-symlink");
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .append_log("rollout-symlink", "stdout", b"relay fallback\n")
+        .unwrap();
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-symlink-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let outside = sessions.with_extension("outside.jsonl");
+    std::fs::write(&outside, "outside-secret\n").unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl")),
+    )
+    .unwrap();
+
+    let transcript = transcript_json_with_sessions_dir(
+        &state.supervisor.registry,
+        "rollout-symlink",
+        0,
+        None,
+        Some(sessions.clone()),
+    )
+    .unwrap();
+    let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+    assert!(stdout.contains("relay fallback"), "{stdout}");
+    assert!(!stdout.contains("outside-secret"), "{stdout}");
+    std::fs::remove_dir_all(sessions).unwrap();
+    std::fs::remove_file(outside).unwrap();
+}
+
+#[test]
 fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     let (state, _state_path) = test_server();
     let mut record = agent_record("codex-completion-regression");
