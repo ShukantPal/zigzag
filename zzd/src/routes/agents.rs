@@ -2319,7 +2319,8 @@ fn create_codex_thread(
             return reply(stream, 503, error("could_not_start_app_server"));
         }
     };
-    let (thread_id, events) = match server.start_thread(task_id, worktree, prompt) {
+    let model = request.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL);
+    let (thread_id, events) = match server.start_thread(task_id, worktree, prompt, model) {
         Ok(result) => result,
         Err(message) => {
             log::error!("could not start codex thread: {message}");
