@@ -213,8 +213,12 @@ fn cleanup_if_merged(state: &Server, pr: &WatchedPr) -> Result<(), String> {
     let path = Path::new(&pr.worktree);
     if path.exists() {
         let roots = crate::routes::worktrees::canonical_worktree_roots();
-        crate::routes::worktrees::cleanup_agent_worktree(&pr.worktree, &roots)
-            .map_err(|error| error.message.to_owned())?;
+        crate::routes::worktrees::cleanup_agent_worktree(
+            &pr.worktree,
+            &roots,
+            &state.supervisor.registry,
+        )
+        .map_err(|error| error.message.to_owned())?;
     }
     let _guard = WATCHED_PR_WRITE
         .lock()

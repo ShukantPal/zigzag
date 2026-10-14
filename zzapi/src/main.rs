@@ -299,6 +299,17 @@ enum AgentsCmd {
         /// Agent handle (unique prefix accepted)
         id: String,
     },
+    /// Remove a terminal agent record through the relay (live agents are refused)
+    #[command(
+        long_about = "Calls DELETE /v1/agents/{id}; refuses agents in the running or paused state. For terminal agents, the relay removes the durable agent record, diagnostic log spool, and Codex transcript/stderr files. It removes the worktree through the repository stop hook only when the worktree is clean and its current branch tip exactly matches origin; otherwise it keeps the worktree and branch and logs why. A watched pull request also retains its worktree. When removed, the worktree cleanup attempts to delete its branch unless it is main/master or checked out elsewhere. A missing recorded worktree does not block record removal. For orphaned agents, the relay attempts to stop the possibly live process and retains the record; it applies the same worktree safety checks."
+    )]
+    Delete {
+        /// Agent handle (unique prefix accepted)
+        id: String,
+        /// Show the relay effects without sending DELETE
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Read an agent's captured output
     Logs {
         /// Agent handle (unique prefix accepted)
@@ -1192,9 +1203,81 @@ fn cmd_agents_stop(client: &Client, id: &str) -> Result<(), Fail> {
     let id = resolve_agent_id(client, id)?;
     let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
     emit(client, &resp, || {
-        println!("stopped {}", s(&resp, "id"));
+        if resp.get("deleted").and_then(|value| value.as_bool()) == Some(true) {
+            println!("deleted {}", s(&resp, "id"));
+        } else {
+            println!("stopped {}", s(&resp, "id"));
+        }
     });
     Ok(())
+}
+
+fn cmd_agents_delete(client: &Client, id: &str, dry_run: bool) -> Result<(), Fail> {
+    let id = resolve_agent_id(client, id)?;
+    let agent = client.get(&format!("/v1/agents/{id}"), &[])?;
+    let state = s(&agent, "state");
+    if agent_state_is_live_for_delete(&state) {
+        return Err(Fail::Config(format!(
+            "refusing to delete {state} agent {id}; use `zzapi agents stop {id}` first"
+        )));
+    }
+
+    if dry_run {
+        println!("Dry run for agent {id} (state: {state}):");
+        if state == "orphaned" {
+            println!(
+                "- The relay attempts to stop the possibly live process and retains its agent record with a stopped/killed state."
+            );
+            println!(
+                "- After a successful stop, it removes the worktree through the repository stop hook only when clean and its branch tip exactly matches origin; a watched pull request also retains the worktree."
+            );
+            println!(
+                "- Dirty, unpushed, or unverifiable worktrees are kept with their branch and a relay warning."
+            );
+        } else {
+            println!(
+                "- The relay removes the agent record, diagnostic log spool, and Codex transcript/stderr files."
+            );
+            println!(
+                "- It removes the worktree through the repository stop hook only when clean and the current branch tip exactly matches origin; otherwise it keeps the worktree and branch and logs why."
+            );
+            if state == "lost_after_restart" {
+                println!("- A missing worktree does not block record removal.");
+            } else {
+                println!(
+                    "- A watched pull request also retains its worktree; a missing worktree does not block record removal."
+                );
+            }
+        }
+        println!(
+            "- When it removes the worktree, it attempts to delete its branch unless it is main/master, checked out elsewhere, or cleanup fails."
+        );
+        println!("No DELETE request was sent.");
+        return Ok(());
+    }
+
+    let resp = client.request("DELETE", &format!("/v1/agents/{id}"), &[], None, 120)?;
+    emit(client, &resp, || {
+        if resp.get("deleted").and_then(|value| value.as_bool()) == Some(true) {
+            println!(
+                "deleted {} (worktree_removed={}, transcript_removed={})",
+                s(&resp, "id"),
+                s(&resp, "worktree_removed"),
+                s(&resp, "transcript_removed")
+            );
+        } else {
+            println!(
+                "stop completed for {} (stopped={})",
+                s(&resp, "id"),
+                s(&resp, "stopped")
+            );
+        }
+    });
+    Ok(())
+}
+
+fn agent_state_is_live_for_delete(state: &str) -> bool {
+    matches!(state, "running" | "paused")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1846,6 +1929,7 @@ fn run(cli: Cli) -> Result<(), Fail> {
                 interrupt,
             } => cmd_agents_continue(&client, &id, &prompt, interrupt),
             AgentsCmd::Stop { id } => cmd_agents_stop(&client, &id),
+            AgentsCmd::Delete { id, dry_run } => cmd_agents_delete(&client, &id, dry_run),
             AgentsCmd::Logs {
                 id,
                 stream,
@@ -1975,6 +2059,14 @@ mod tests {
             resolve_agent_prompt(None, Some(&path)),
             Err(Fail::Config(message)) if message.contains("could not read --prompt-file")
         ));
+    }
+
+    #[test]
+    fn agent_delete_cli_guard_rejects_running_and_paused_agents() {
+        assert!(agent_state_is_live_for_delete("running"));
+        assert!(agent_state_is_live_for_delete("paused"));
+        assert!(!agent_state_is_live_for_delete("succeeded"));
+        assert!(!agent_state_is_live_for_delete("orphaned"));
     }
 
     #[test]

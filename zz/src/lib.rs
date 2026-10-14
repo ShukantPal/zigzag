@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Durable, deliberately small record for a supervised agent.  Command
@@ -163,6 +163,8 @@ impl AgentRecord {
 pub struct AgentRegistry {
     path: PathBuf,
     spool_dir: PathBuf,
+    // Serializes durable attachment registration with guarded worktree removal.
+    worktree_attachments: Mutex<()>,
     inner: Mutex<std::collections::BTreeMap<String, AgentRecord>>,
 }
 
@@ -194,11 +196,21 @@ impl AgentRegistry {
         Ok(Self {
             path,
             spool_dir,
+            worktree_attachments: Mutex::new(()),
             inner: Mutex::new(records),
         })
     }
 
+    /// Hold this while checking for live worktree attachments and removing the
+    /// worktree. `register` takes the same lock before persisting a new agent.
+    pub fn lock_worktree_attachments(&self) -> Result<MutexGuard<'_, ()>, String> {
+        self.worktree_attachments
+            .lock()
+            .map_err(|_| "agent worktree attachment lock poisoned".to_owned())
+    }
+
     pub fn register(&self, record: AgentRecord) -> Result<(), String> {
+        let _attachment_guard = self.lock_worktree_attachments()?;
         let mut entries = self
             .inner
             .lock()

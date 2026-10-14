@@ -156,7 +156,7 @@ Configuration precedence: `--hostname` / `ZIGZAG_HOSTNAME` (default `100.101.237
 ```text
 zzapi health
 zzapi agents list [--state running] [--task-id TASK]
-zzapi agents get|pause|resume|stop ID
+zzapi agents get|pause|resume|stop|delete ID
 zzapi agents create --prompt TEXT --project-dir DIR
                     (--branch BRANCH | --no-branch | --pr NUMBER)
                     [--worktree PATH] [--model MODEL]
@@ -813,9 +813,31 @@ it merely SIGCONTs a paused current process group.
 zzapi agents stop ID_OR_UNIQUE_PREFIX
 ```
 
-Calls `DELETE /v1/agents/{id}`.  This gracefully stops then may force-kill the
-native process group.  It deliberately leaves the worktree.  Capture logs and
-result context first, then use `zzapi worktrees delete` only when safe.
+Calls `DELETE /v1/agents/{id}`. For a live agent, the relay gracefully stops
+then may force-kill the verified process group and retains the record in its
+terminal state. A paused process is resumed before shutdown. After a successful
+stop, safe worktree cleanup runs only when the tree is clean and its branch tip
+matches its upstream; watched pull requests and unsafe or unverifiable trees
+are retained. Cleanup uses the repository stop hook and removes the branch
+only when safe. Completed records remain available until the configured agent
+cleanup TTL expires.
+
+### `zzapi agents delete`
+
+```sh
+zzapi agents delete ID_OR_UNIQUE_PREFIX [--dry-run]
+```
+
+Calls `DELETE /v1/agents/{id}` and refuses `running` or `paused` agents (use
+`zzapi agents stop` first). For terminal agents, the relay removes the record,
+diagnostic log spool, and Codex transcript/stderr files. Worktree cleanup runs
+the repository stop hook only when the tree is clean and its branch tip matches
+its upstream; watched pull requests and unsafe or unverifiable trees are
+retained with their branch. A missing worktree does not block record removal.
+For `orphaned` agents, the relay attempts to stop the possibly live process
+and retains the record. `--dry-run` summarizes the state-specific cleanup
+effects without sending `DELETE`. Completed records otherwise remain available
+until the configured agent cleanup TTL expires.
 
 ### `zzapi agents logs`
 

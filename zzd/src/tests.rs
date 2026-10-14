@@ -39,21 +39,23 @@ use crate::review_loop;
 use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
-    agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    delete_inactive_agent, delete_inactive_agent_with_trust, dispatch_agent_message,
-    handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
-    parse_agent_cleanup_ttl, parse_agent_create_request, persisted_agent_config,
-    repair_transcript_tail, restart_argv, restart_config, sweep_inactive_agents_at,
-    transcript_json_with_sessions_dir, valid_agent_model,
+    agent_post_request_with_session_resolver, agent_route,
+    cleanup_stopped_agent_worktree_with_trust, default_agent_worktree,
+    delete_explicit_agent_with_trust, delete_inactive_agent, delete_inactive_agent_with_trust,
+    dispatch_agent_message, handle_codex_notification, monitor_codex_events,
+    monitor_codex_events_to_path, parse_agent_cleanup_ttl, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
 use crate::routes::worktrees::{
     cleanup_agent_worktree_with_trust, configured_worktree_base, discover_worktrees,
-    handle_deleted_worktrees_with_trust, resolve_existing_worktree_path, resolve_new_worktree_path,
-    resolve_worktree_repo, run_worktree_hook_using_shell, run_worktree_hook_with_trust,
-    valid_worktree_branch, worktree_branch_checkout_path, worktree_create_plan_with_trust,
+    handle_deleted_worktrees_with_trust, remove_inactive_worktree_if_unattached,
+    resolve_existing_worktree_path, resolve_new_worktree_path, resolve_worktree_repo,
+    run_worktree_hook_using_shell, run_worktree_hook_with_trust, valid_worktree_branch,
+    worktree_branch_checkout_path, worktree_create_plan_with_trust,
     worktree_delete_plan_with_trust,
 };
 use crate::server::{
@@ -1805,6 +1807,313 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
 }
 
 #[test]
+fn explicit_delete_of_watched_pr_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-watched", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        Ok(true),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!effects.worktree_removed);
+    assert!(path.exists(), "watched PR worktree was removed");
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-watched",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "watched PR branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn explicit_delete_pr_discovery_failure_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-pr-error", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        Err("GitHub discovery unavailable".to_owned()),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!effects.worktree_removed);
+    assert!(
+        path.exists(),
+        "worktree was removed after PR discovery failed"
+    );
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-pr-error",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        branch.success(),
+        "branch was removed after PR discovery failed"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn explicit_delete_removes_safe_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-branch", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(effects.worktree_removed);
+    assert!(!path.exists(), "safe worktree was not removed");
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-branch",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "explicit delete retained its branch");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn explicit_delete_keeps_worktree_attached_to_another_live_agent() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-live", true);
+    let mut live = agent_record("other-live-delete-agent");
+    live.state = "running".to_owned();
+    live.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(live).unwrap();
+
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(!effects.worktree_removed);
+    assert!(
+        path.exists(),
+        "worktree attached to a live agent was removed"
+    );
+    assert!(registry.get(&id).is_none(), "terminal agent record remains");
+    assert!(registry.get("other-live-delete-agent").is_some());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-live",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "live agent's branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_pr_discovery_failure_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) =
+        completed_worktree_fixture("live-delete-pr-error", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Err("GitHub discovery unavailable".to_owned()),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(
+        path.exists(),
+        "live-agent worktree was removed after discovery failed"
+    );
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-pr-error",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(
+        branch.success(),
+        "live-agent branch was removed after discovery failed"
+    );
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_keeps_worktree_attached_to_another_live_agent() {
+    let (repo, path, roots, registry, id) =
+        completed_worktree_fixture("live-delete-attached", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+    let mut other = agent_record("other-live-shutdown-agent");
+    other.state = "running".to_owned();
+    other.worktree_path = Some(path.to_string_lossy().into_owned());
+    registry.register(other).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(
+        path.exists(),
+        "worktree attached to another live agent was removed"
+    );
+    assert!(registry.get("other-live-shutdown-agent").is_some());
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-attached",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "attached live-agent branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn ttl_worktree_removal_serializes_concurrent_agent_registration() {
+    let (repo, path, _roots, registry, owner_id) =
+        completed_worktree_fixture("ttl-lock-race", true);
+    let registry = Arc::new(registry);
+    let (remove_ready_tx, remove_ready_rx) = std::sync::mpsc::channel();
+    let (allow_remove_tx, allow_remove_rx) = std::sync::mpsc::channel();
+    let removing_registry = Arc::clone(&registry);
+    let removing_path = path.clone();
+    let removing_repo = repo.clone();
+    let registering_path = path.clone();
+    let removal = thread::spawn(move || {
+        remove_inactive_worktree_if_unattached(
+            &removing_registry,
+            &owner_id,
+            &removing_path,
+            || {
+                remove_ready_tx.send(()).unwrap();
+                allow_remove_rx.recv().unwrap();
+                Command::new("git")
+                    .args(["worktree", "remove"])
+                    .arg(&removing_path)
+                    .current_dir(&removing_repo)
+                    .output()
+                    .map_err(|_| crate::routes::worktrees::WorktreeError {
+                        code: 500,
+                        message: "worktree_git_failed",
+                    })
+            },
+        )
+    });
+
+    remove_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let registering_registry = Arc::clone(&registry);
+    let (registration_started_tx, registration_started_rx) = std::sync::mpsc::channel();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let registering = thread::spawn(move || {
+        let mut record = agent_record("concurrent-live-agent");
+        record.state = "running".to_owned();
+        record.worktree_path = Some(registering_path.to_string_lossy().into_owned());
+        registration_started_tx.send(()).unwrap();
+        registered_tx
+            .send(registering_registry.register(record))
+            .unwrap();
+    });
+    registration_started_rx.recv().unwrap();
+    assert!(
+        matches!(
+            registered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "registration passed the production TTL removal critical section"
+    );
+
+    allow_remove_tx.send(()).unwrap();
+    let output = removal.join().unwrap().unwrap().unwrap();
+    assert!(output.status.success(), "git worktree remove failed");
+    registered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    registering.join().unwrap();
+    assert!(!path.exists(), "TTL removal did not complete");
+    assert!(registry.get("concurrent-live-agent").is_some());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn live_agent_delete_removes_safe_unwatched_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("live-delete-clean", true);
+    let mut agent = registry.get(&id).unwrap();
+    agent.state = "running".to_owned();
+    registry.transition(&id, "running", None).unwrap();
+
+    cleanup_stopped_agent_worktree_with_trust(
+        &registry,
+        &agent,
+        Ok(false),
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    );
+
+    assert!(!path.exists(), "safe live-agent worktree was not removed");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/live-delete-clean",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "safe live-agent branch was not removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn completed_dirty_worktree_is_kept() {
     let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
     std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
@@ -2166,10 +2475,12 @@ fn agent_worktree_cleanup_runs_stop_hook_and_deletes_feature_branch() {
     .unwrap();
 
     let roots = vec![std::env::temp_dir().canonicalize().unwrap()];
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
     cleanup_agent_worktree_with_trust(
         worktree.to_str().unwrap(),
         &roots,
         &[repo.canonicalize().unwrap()],
+        &registry,
     )
     .unwrap();
     assert!(!worktree.exists());
@@ -2253,6 +2564,84 @@ fn worktree_endpoints_reject_outside_roots_over_http() {
     );
     drop(state);
     let _ = std::fs::remove_file(state_path);
+}
+
+#[test]
+fn manual_worktree_delete_handler_refuses_live_attachment_then_removes_worktree() {
+    let base = worktree_test_base("manual-delete-handler");
+    let repo = worktree_test_repo(&base);
+    let roots = worktree_test_roots(&base);
+    let allowed_root = &roots[0];
+    let worktree_parent = allowed_root.join(format!(
+        "manual-delete-handler-{}",
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    std::fs::create_dir_all(&worktree_parent).unwrap();
+    let path = worktree_parent.join("worktree");
+    let added = Command::new("git")
+        .args(["worktree", "add", "-b", "manual-delete-handler"])
+        .arg(&path)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let (state, state_path) = test_server();
+    let mut live = agent_record("manual-delete-live-agent");
+    live.state = "running".to_owned();
+    live.command = format!("codex exec --cd {}", path.display());
+    state.supervisor.registry.register(live).unwrap();
+    let policy = test_policy();
+    let request_body = format!(r#"{{"path":"{}"}}"#, path.display());
+
+    let response = crate::routes::worktrees::with_worktree_roots_for_test(&roots, || {
+        request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            "/v1/worktrees",
+            &request_body,
+        )
+    });
+    assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+    assert_eq!(
+        response_json(response).object("error"),
+        Some(&Json::String("worktree_in_use".to_owned()))
+    );
+    assert!(
+        path.exists(),
+        "handler removed a worktree with a live agent"
+    );
+
+    state
+        .supervisor
+        .registry
+        .transition("manual-delete-live-agent", "stopped", None)
+        .unwrap();
+    let response = crate::routes::worktrees::with_worktree_roots_for_test(&roots, || {
+        request_once(
+            Arc::clone(&state),
+            &policy,
+            "DELETE",
+            "/v1/worktrees",
+            &request_body,
+        )
+    });
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(
+        response_json(response).object("removed"),
+        Some(&Json::Bool(true))
+    );
+    assert!(!path.exists(), "handler did not remove the worktree");
+
+    drop(state);
+    let _ = std::fs::remove_file(state_path);
+    let _ = std::fs::remove_dir_all(&worktree_parent);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -3121,6 +3510,14 @@ fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body = response_json(response);
     assert_eq!(body.object("deleted").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        body.object("worktree_removed").and_then(Json::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        body.object("transcript_removed").and_then(Json::as_bool),
+        Some(false)
+    );
     assert!(state.supervisor.registry.get("done-agent").is_none());
 }
 
@@ -4009,7 +4406,62 @@ fn agent_delete_dead_process_deregisters_without_signalling() {
 }
 
 #[test]
-fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
+fn agent_delete_stops_a_paused_agent_before_returning() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "trap 'exit 0' TERM; while :; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("spawn paused agent process");
+    let pgid = child.id() as i32;
+    let identity = process_identity(pgid).expect("process identity");
+    assert_eq!(unsafe { libc::kill(-pgid, libc::SIGSTOP) }, 0);
+    let reaper = thread::spawn(move || child.wait().expect("reap paused agent"));
+
+    let mut record = agent_record("paused-delete-agent");
+    record.state = "paused".to_owned();
+    record.paused_at = Some("2026-10-14T00:00:00Z".to_owned());
+    record.leader_pid = pgid;
+    record.process_group = pgid;
+    record.process_identity = Some(identity);
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/paused-delete-agent",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("stopped")
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+    let _ = reaper.join().unwrap();
+    assert!(
+        !process_group_running(pgid),
+        "paused process group survived delete"
+    );
+    assert_eq!(
+        state
+            .supervisor
+            .registry
+            .get("paused-delete-agent")
+            .unwrap()
+            .state,
+        "stopped"
+    );
+}
+
+#[test]
+fn agent_delete_retains_worktree_when_live_agent_pr_discovery_fails() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
@@ -4026,6 +4478,16 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
     .unwrap();
     let worktree = worktree_root.join("codex-delete-me");
     agent_create_worktree(&repo, &worktree, "codex/delete-me", &[]).unwrap();
+    let pushed = Command::new("git")
+        .args(["push", "--set-upstream", "origin", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .expect("could not push agent test branch");
+    assert!(
+        pushed.status.success(),
+        "could not push agent test branch: {}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
 
     // A real process in its own process group.
     let mut child = Command::new("/bin/sleep")
@@ -4081,7 +4543,10 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         state.supervisor.registry.get("delete-me").unwrap().state,
         "stopped"
     );
-    assert!(!worktree.exists(), "agent worktree was not removed");
+    assert!(
+        worktree.exists(),
+        "agent worktree was removed after PR discovery failed"
+    );
     let branch = Command::new("git")
         .args([
             "show-ref",
@@ -4092,7 +4557,10 @@ fn agent_delete_terminates_process_group_and_cleans_worktree_and_branch() {
         .current_dir(&repo)
         .status()
         .unwrap();
-    assert!(!branch.success(), "agent branch was not deleted");
+    assert!(
+        branch.success(),
+        "agent branch was removed after PR discovery failed"
+    );
     assert!(
         !hooks.join("stop-ran").exists(),
         "repository hook ran without an explicit local trust decision"
