@@ -342,10 +342,10 @@ pub(crate) fn discover_worktrees(roots: &[PathBuf]) -> HashMap<PathBuf, PathBuf>
                     let Ok(path) = std::fs::canonicalize(path) else {
                         continue;
                     };
-                    if path.starts_with(root) {
-                        if let Ok(repo) = worktree_repo(&path) {
-                            found.insert(path, repo);
-                        }
+                    if path.starts_with(root)
+                        && let Ok(repo) = worktree_repo(&path)
+                    {
+                        found.insert(path, repo);
                     }
                 } else if depth < 8 {
                     pending.push((path, depth + 1));
@@ -517,10 +517,10 @@ pub(crate) fn worktree_delete_plan(
         .insert(path.clone());
     let remove = git_output(&repo, &["worktree", "remove", "--force", &path_str])?;
     if !remove.status.success() {
-        if let Some(paths) = RELAY_DELETED_WORKTREES.get() {
-            if let Ok(mut paths) = paths.lock() {
-                paths.remove(&path);
-            }
+        if let Some(paths) = RELAY_DELETED_WORKTREES.get()
+            && let Ok(mut paths) = paths.lock()
+        {
+            paths.remove(&path);
         }
         log::warn!(
             "worktree_delete remove failed for {}: {}",
