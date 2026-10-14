@@ -44,12 +44,13 @@ All routes require the relay bearer token unless specifically noted.
 Successful agent completion removes the registry record automatically, and
 startup sweeps inactive records left by earlier relay versions. A linked
 worktree is removed only when it is clean, its branch has no commits ahead of
-its configured upstream, and no other live agent record refers to it. Otherwise
-the relay retains the worktree and logs why. Missing worktree paths are logged
-and treated as already absent. The branch is retained. A manual DELETE of a
-running Codex or OpenCode agent interrupts its session and returns without
-worktree cleanup; the generic process path performs legacy worktree cleanup
-after stopping, except when a pull request is being watched.
+its configured remote-tracking upstream, and no other live agent record refers
+to it. Otherwise the relay retains the worktree and logs why. Missing worktree
+paths are logged and treated as already absent. The branch is retained. Once
+the record is removed, its transcript and stderr files are removed as well. A
+manual DELETE of a running Codex or OpenCode agent interrupts its session and
+returns without worktree cleanup; the generic process path performs legacy
+worktree cleanup after stopping, except when a pull request is being watched.
 
 `openapi.yaml` documents wire formats but does not yet enumerate every
 implemented route; check `zzd/src/routes/` when they differ.

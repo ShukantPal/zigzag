@@ -360,10 +360,9 @@ fn e2e_agent_no_branch_runs_in_project_without_worktree_or_checkout() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
-/// Completed agents are removed from the registry, while their durable
-/// transcript file remains available for recovery from the filesystem.
+/// Completion removes the agent record and its durable transcript artifacts.
 #[test]
-fn e2e_opencode_agent_create_persists_transcript_after_registry_deletion() {
+fn e2e_opencode_agent_create_cleans_transcript_after_registry_deletion() {
     let (state, _state_path) = test_server();
     let policy = test_policy();
     let id = unique_id("opencode-agent-transcript");
@@ -394,42 +393,20 @@ fn e2e_opencode_agent_create_persists_transcript_after_registry_deletion() {
         completed.object("exit_code").and_then(Json::as_u64),
         Some(0)
     );
+    assert!(
+        state.supervisor.registry.get(&handle).is_none(),
+        "completed agent record was not deleted"
+    );
 
     let transcript_path = agent_transcript_path(&handle).expect("valid agent transcript path");
-    let transcript = std::fs::read_to_string(&transcript_path)
-        .expect("API-created agent transcript was not persisted");
-    assert!(
-        transcript.contains("persisted-agent-output"),
-        "persisted transcript missing Codex output: {transcript}"
-    );
     let stderr_path = agent_stderr_path(&handle).expect("valid agent stderr path");
-    let stderr =
-        std::fs::read_to_string(&stderr_path).expect("API-created agent stderr was not persisted");
     assert!(
-        stderr.contains("persisted-agent-stderr"),
-        "persisted stderr missing Codex diagnostics: {stderr}"
-    );
-
-    let served = response_json(request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/transcript"),
-        "",
-    ));
-    assert!(
-        served
-            .object("stdout")
-            .and_then(Json::as_str)
-            .is_some_and(|stdout| stdout.contains("persisted-agent-output")),
-        "transcript endpoint did not return persisted output: {served:?}"
+        !transcript_path.exists(),
+        "completed agent transcript was not cleaned up"
     );
     assert!(
-        served
-            .object("stderr")
-            .and_then(Json::as_str)
-            .is_some_and(|stderr| stderr.contains("persisted-agent-stderr")),
-        "transcript endpoint did not return persisted stderr: {served:?}"
+        !stderr_path.exists(),
+        "completed agent stderr file was not cleaned up"
     );
 
     let output = Command::new("git")
@@ -439,8 +416,6 @@ fn e2e_opencode_agent_create_persists_transcript_after_registry_deletion() {
         .expect("could not clean up agent test worktree");
     assert!(output.status.success());
     std::fs::remove_dir_all(repo).expect("could not clean up agent test repository");
-    std::fs::remove_file(transcript_path).expect("could not clean up agent transcript");
-    std::fs::remove_file(stderr_path).expect("could not clean up agent stderr");
 }
 
 /// Exercise the public agent/event command permutations through an

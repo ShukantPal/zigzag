@@ -2138,6 +2138,7 @@ pub(crate) fn delete_inactive_agent(
         &agent_worktree_roots(),
     );
     if registry.deregister(agent_id)?.is_some() {
+        crate::proc::remove_agent_output_files(agent_id);
         log::info!("inactive agent record deleted agent={agent_id}");
         Ok(true)
     } else {

@@ -32,7 +32,7 @@ use crate::http::{
 use crate::proc::{
     AgentSpawnDetails, COMPAT_OUTPUT_CAP, FINISHED_PROC_RETENTION, MAX_FINISHED_PROCS, ProcEntry,
     agent_stderr_path, agent_transcript_path, process_group_running, process_identity, prune_procs,
-    recovered_agent_identity_matches, spawn_proc, unique_handle,
+    recovered_agent_identity_matches, remove_agent_output_files_from, spawn_proc, unique_handle,
 };
 use crate::provider::DEFAULT_CODEX_MODEL;
 use crate::review_loop;
@@ -2879,7 +2879,8 @@ fn codex_rollout_rejects_matching_symlink_outside_sessions() {
 #[test]
 fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     let (state, _state_path) = test_server();
-    let mut record = agent_record("codex-completion-regression");
+    let id = "codex-completion-regression";
+    let mut record = agent_record(id);
     record.harness = Some("codex".to_owned());
     record.harness_session_id = Some("thread-completed".to_owned());
     state.supervisor.registry.register(record).unwrap();
@@ -2887,7 +2888,7 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
     handle_codex_notification(
         &state.supervisor.registry,
         &state.store,
-        "codex-completion-regression",
+        id,
         "task-1",
         "exec-1",
         &serde_json::json!({
@@ -2897,13 +2898,7 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         true,
     );
 
-    assert!(
-        state
-            .supervisor
-            .registry
-            .get("codex-completion-regression")
-            .is_none()
-    );
+    assert!(state.supervisor.registry.get(id).is_none());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
         let timeline = state.store.timeline("task-1").unwrap();
@@ -2921,6 +2916,25 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         .collect();
     assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
     assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+}
+
+#[test]
+fn completion_output_cleanup_removes_transcript_and_stderr_files() {
+    let home = worktree_test_base("agent-output-cleanup");
+    let id = "0123456789abcdef0123456789abcdef";
+    let transcript = home
+        .join(".zigzag/agents/codex")
+        .join(format!("{id}.jsonl"));
+    let stderr = transcript.with_extension("stderr");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "transcript output\n").unwrap();
+    std::fs::write(&stderr, "stderr output\n").unwrap();
+
+    remove_agent_output_files_from(id, &home);
+
+    assert!(!transcript.exists());
+    assert!(!stderr.exists());
+    let _ = std::fs::remove_dir_all(home);
 }
 
 #[test]

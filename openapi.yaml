@@ -790,7 +790,8 @@ paths:
         and log unsafe worktrees. Treat an already missing worktree as absent.
         Never delete the feature branch. The relay removes completed records
         automatically at completion and sweeps persisted inactive records on
-        startup.
+        startup. Lifecycle deletion also removes the agent's transcript and
+        stderr files.
       security:
         - bearerAuth: []
       parameters:
