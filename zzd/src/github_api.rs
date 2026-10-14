@@ -15,6 +15,7 @@ const GITHUB_BUNDLE_HOSTS: &[&str] = &[
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
+    "tmaproduction.blob.core.windows.net",
 ];
 const KEYCHAIN_BASE64_PREFIX: &str = "go-keyring-base64:";
 
@@ -850,12 +851,21 @@ mod tests {
             "https://github.com.attacker.example/bundle",
             "https://user@github.com/bundle",
             "https://anything.blob.core.windows.net/bundle",
+            "https://evil.blob.core.windows.net/bundle",
+            "https://tmaproduction.evil.com/bundle",
+            "https://user:password@tmaproduction.blob.core.windows.net/bundle",
             "https://api.github.com:8443/bundle",
+            "https://tmaproduction.blob.core.windows.net:8443/bundle",
             "https://productionresultssa19.blob.core.windows.net:8443/bundle",
         ] {
             assert!(validate_bundle_url(unsafe_url, GITHUB_BUNDLE_HOSTS).is_err());
         }
         assert!(validate_bundle_url("https://api.github.com/bundle", GITHUB_BUNDLE_HOSTS).is_ok());
+        assert!(validate_bundle_url(
+            "https://tmaproduction.blob.core.windows.net/attestations/1369377226/2026/10/13/55302578.json.sn?sig=redacted",
+            GITHUB_BUNDLE_HOSTS,
+        )
+        .is_ok());
         assert!(
             bundle_redirect_target("https://api.github.com/bundle", "http://127.0.0.1/").is_err()
         );
