@@ -275,7 +275,9 @@ pub(crate) fn agent_request(
                 Ok(value) => value,
                 Err(_) => return reply(stream, 400, error("invalid_transcript_query")),
             };
-            match transcript_json(&state.supervisor.registry, id, after, tail) {
+            let id = resolve_registered_agent_id(&state.supervisor.registry, id)
+                .unwrap_or_else(|| id.to_owned());
+            match transcript_json(&state.supervisor.registry, &id, after, tail) {
                 Some(json) => reply(stream, 200, json),
                 None => reply(stream, 404, error("unknown_agent")),
             }
@@ -651,7 +653,9 @@ fn transcript_json(
     after: u64,
     tail: Option<usize>,
 ) -> Option<Json> {
-    let agent = registry.get(id)?;
+    let Some(agent) = registry.get(id) else {
+        return orphan_transcript_json(id, after, tail);
+    };
     let logs = agent_logs_json(registry, id, "both", after, tail)?;
 
     let mut stdout_text = String::new();
@@ -714,6 +718,80 @@ fn transcript_json(
         ),
         ("log_degraded".to_owned(), Json::Bool(agent.log_degraded)),
     ]))
+}
+
+/// When the durable registry record is absent or unreadable but the output
+/// files survived, preserve the transcript instead of turning a read into
+/// `unknown_agent`. This response intentionally contains only fields that
+/// can be recovered from those files.
+fn orphan_transcript_json(id: &str, after: u64, tail: Option<usize>) -> Option<Json> {
+    fn read(path: Option<PathBuf>, after: u64, tail: Option<usize>) -> Option<String> {
+        let text = std::fs::read_to_string(path?).ok()?;
+        let start = usize::try_from(after).ok()?.min(text.len());
+        let mut start = start;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut text = text[start..].to_owned();
+        if let Some(limit) = tail
+            && text.len() > limit
+        {
+            let mut start = text.len() - limit;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text = text[start..].to_owned();
+        }
+        Some(text)
+    }
+    let stdout = read(agent_transcript_path(id), after, tail);
+    let stderr = read(agent_stderr_path(id), after, tail);
+    if stdout.is_none() && stderr.is_none() {
+        return None;
+    }
+    let next_cursor = agent_transcript_path(id)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Some(Json::Object(vec![
+        ("id".to_owned(), Json::String(id.to_owned())),
+        ("task_id".to_owned(), Json::Null),
+        ("execution_id".to_owned(), Json::Null),
+        ("command".to_owned(), Json::Null),
+        (
+            "state".to_owned(),
+            Json::String("lost_after_restart".to_owned()),
+        ),
+        ("started_at".to_owned(), Json::Null),
+        ("exit_code".to_owned(), Json::Null),
+        ("prompt".to_owned(), Json::Null),
+        ("last_message".to_owned(), Json::Null),
+        (
+            "stdout".to_owned(),
+            Json::String(stdout.unwrap_or_default()),
+        ),
+        (
+            "stderr".to_owned(),
+            Json::String(stderr.unwrap_or_default()),
+        ),
+        ("next_cursor".to_owned(), Json::number(next_cursor)),
+        ("log_degraded".to_owned(), Json::Bool(true)),
+    ]))
+}
+
+/// Resolve a transcript route by agent ID, with task ID support for the
+/// single-record case. Task IDs can be retried, so an ambiguous task ID is
+/// deliberately not guessed.
+fn resolve_registered_agent_id(registry: &zz::AgentRegistry, id_or_task: &str) -> Option<String> {
+    if registry.get(id_or_task).is_some() {
+        return Some(id_or_task.to_owned());
+    }
+    let mut matches = registry
+        .list(None, Some(id_or_task))
+        .into_iter()
+        .map(|agent| agent.id);
+    let id = matches.next()?;
+    matches.next().is_none().then_some(id)
 }
 
 /// Read agent logs from the ordered diagnostics spool, falling back to durable
@@ -1571,6 +1649,39 @@ pub(crate) fn monitor_codex_events(
                 terminal_turn,
             );
         }
+        // The app-server event stream is the only live handle for a native
+        // Codex thread. A disconnected stream has no process-table reaper to
+        // notice the missing worker, so turn a still-running record into an
+        // honest restartable terminal state before the worktree remains
+        // attached indefinitely.
+        if registry
+            .get(&agent_id)
+            .is_some_and(|agent| agent.state == "running")
+        {
+            if registry
+                .transition(&agent_id, "lost_after_restart", None)
+                .is_err()
+            {
+                let _ = registry.mark_audit_degraded(&agent_id);
+            }
+            if store
+                .add(relay_event(
+                    "process_failed",
+                    &task_id,
+                    &execution_id,
+                    Json::Object(vec![
+                        ("agent_id".to_owned(), Json::String(agent_id.clone())),
+                        (
+                            "reason".to_owned(),
+                            Json::String("harness_event_stream_closed".to_owned()),
+                        ),
+                    ]),
+                ))
+                .is_err()
+            {
+                let _ = registry.mark_audit_degraded(&agent_id);
+            }
+        }
     });
 }
 
@@ -2150,9 +2261,46 @@ pub(crate) fn agent_restart_request(
 /// `DELETE /v1/agents/{id}`: gracefully stop a registered agent's process
 /// group, remove its worktree, and deregister it.
 pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> Result<(), String> {
-    let Some(agent) = state.supervisor.registry.get(id) else {
+    let Some(id) = resolve_registered_agent_id(&state.supervisor.registry, id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
+    let Some(agent) = state.supervisor.registry.get(&id) else {
+        return reply(stream, 404, error("unknown_agent"));
+    };
+    if agent.state == "lost_after_restart" {
+        if let Some(path) = agent.worktree_path.as_deref() {
+            match cleanup_agent_worktree(path, &agent_worktree_roots()) {
+                Ok(()) => log::info!("agent_delete id={id}: stale worktree cleaned up at {path}"),
+                Err(failure) => {
+                    log::warn!(
+                        "agent_delete id={id}: stale worktree cleanup failed: {}",
+                        failure.message
+                    );
+                    return reply(stream, failure.code, error(failure.message));
+                }
+            }
+        }
+        if state
+            .supervisor
+            .registry
+            .transition(&id, "stopped", None)
+            .is_err()
+        {
+            return reply(stream, 500, error("could_not_persist_agent_state"));
+        }
+        return reply(
+            stream,
+            200,
+            Json::Object(vec![
+                ("id".to_owned(), Json::String(id)),
+                ("stopped".to_owned(), Json::Bool(true)),
+                (
+                    "worktree".to_owned(),
+                    agent.worktree_path.map(Json::String).unwrap_or(Json::Null),
+                ),
+            ]),
+        );
+    }
     if !matches!(agent.state.as_str(), "running" | "orphaned") {
         return reply(stream, 409, error("agent_not_running"));
     }
@@ -2179,7 +2327,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         if state
             .supervisor
             .registry
-            .transition(id, "stopped", None)
+            .transition(&id, "stopped", None)
             .is_err()
         {
             return reply(stream, 500, error("could_not_persist_agent_state"));
@@ -2212,7 +2360,7 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     // signalling. The pgid > 0 guard keeps kill(-pgid, ..) from ever
     // resolving to the relay's own process group on a corrupt record.
     let (stopped, graceful) = if pgid > 0 && recovered_agent_identity_matches(&agent) {
-        stop_process_group(id, pgid, &state.supervisor)
+        stop_process_group(&id, pgid, &state.supervisor)
     } else {
         (true, true)
     };
@@ -2220,13 +2368,13 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         // Mark any live proc-table entry finished so the reaper does not
         // overwrite the terminal state with its own exit classification.
         if let Ok(mut table) = state.supervisor.procs.lock()
-            && let Some(entry) = table.get_mut(id)
+            && let Some(entry) = table.get_mut(&id)
         {
             let _ = entry.child.try_wait();
             entry.finished_at = Some(Instant::now());
         }
         let terminal = if graceful { "stopped" } else { "killed" };
-        let _ = state.supervisor.registry.transition(id, terminal, None);
+        let _ = state.supervisor.registry.transition(&id, terminal, None);
     } else {
         log::error!(
             "agent_stop id={id} pgid={pgid}: process group survived SIGKILL; left registered"
