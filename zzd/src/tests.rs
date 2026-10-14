@@ -2014,6 +2014,41 @@ fn live_agent_delete_keeps_worktree_attached_to_another_live_agent() {
 }
 
 #[test]
+fn agent_registration_waits_for_guarded_worktree_removal_lock() {
+    let registry_path = std::env::temp_dir().join(format!(
+        "zigzag-attachment-lock-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let registry = Arc::new(AgentRegistry::open(&registry_path).unwrap());
+    let removal_guard = registry.lock_worktree_attachments().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let registering_registry = Arc::clone(&registry);
+    let join = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let result = registering_registry.register(agent_record("new-live-agent"));
+        registered_tx.send(result).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(
+        matches!(
+            registered_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "agent registration passed the guarded removal lock"
+    );
+    drop(removal_guard);
+    registered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    join.join().unwrap();
+    assert!(registry.get("new-live-agent").is_some());
+}
+
+#[test]
 fn live_agent_delete_removes_safe_unwatched_worktree_and_branch() {
     let (repo, path, roots, registry, id) = completed_worktree_fixture("live-delete-clean", true);
     let mut agent = registry.get(&id).unwrap();

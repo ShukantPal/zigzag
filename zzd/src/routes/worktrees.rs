@@ -681,6 +681,21 @@ fn cleanup_agent_worktree_inner(
     trusted_repos: &[PathBuf],
     live_agent_guard: Option<(&zz::AgentRegistry, &str)>,
 ) -> Result<(), WorktreeError> {
+    // Keep registration out from the guarded recheck through branch cleanup.
+    // This closes the gap between `git worktree remove` and deleting its branch.
+    let _attachment_guard = match live_agent_guard {
+        Some((registry, _)) => {
+            Some(
+                registry
+                    .lock_worktree_attachments()
+                    .map_err(|_| WorktreeError {
+                        code: 500,
+                        message: "worktree_git_failed",
+                    })?,
+            )
+        }
+        None => None,
+    };
     let path = resolve_existing_worktree_path(raw, roots)?;
     let repo = worktree_repo(&path)?;
     let branch_output = git_output(&path, &["branch", "--show-current"])?;
@@ -1047,6 +1062,10 @@ pub(crate) fn worktree_delete(
     let path = match worktree_string_field(&fields, "path") {
         Ok(path) => path,
         Err(failure) => return reply(stream, failure.code, error(failure.message)),
+    };
+    let _attachment_guard = match state.supervisor.registry.lock_worktree_attachments() {
+        Ok(guard) => guard,
+        Err(_) => return reply(stream, 500, error("worktree_git_failed")),
     };
     let agents = state.supervisor.registry.list(None, None);
     let commands: Vec<(&str, &str)> = agents
