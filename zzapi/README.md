@@ -100,9 +100,11 @@ files remain inline text, preserving relay-side path behavior.
 
 In `zzapi status`, use `↑/↓` to choose an agent, `Tab` or `←/→` to focus the
 transcript, `↑/↓` to select an item, and `Enter` or `Space` to expand tool
-details and captured command output. Press `v` to inspect the selected event's
-raw JSON, `PgUp/PgDn` to scroll, and `q` to exit. The transcript reads the local
-Codex JSONL file at `~/.zigzag/agents/codex/<agent-id>.jsonl`.
+details and captured command output. The transcript groups streamed messages,
+shows command and exit status in one row, and hides protocol bookkeeping by
+default. Press `v` to switch to raw JSON events, `PgUp/PgDn` to scroll, and `q`
+to exit. The transcript reads the local Codex JSONL file at
+`~/.zigzag/agents/codex/<agent-id>.jsonl`.
 
 ## Exit codes
 
