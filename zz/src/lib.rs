@@ -23,7 +23,7 @@ pub struct AgentRecord {
     /// when the operating system reuses a numeric process identifier.
     pub process_identity: Option<String>,
     /// Filesystem path of the agent's worktree, when the agent was created
-    /// with one. Deleting an agent never removes its worktree.
+    /// with one. Completion removes it only when the relay verifies it is safe.
     pub worktree_path: Option<String>,
     pub started_at: String,
     pub deadline_at: Option<String>,
@@ -247,6 +247,24 @@ impl AgentRegistry {
         self.save(&updated)?;
         *entries = updated;
         Ok(Some(result))
+    }
+
+    /// Remove an agent through the relay's durable registry API. The new
+    /// snapshot is persisted before the in-memory record disappears.
+    pub fn deregister(&self, id: &str) -> Result<Option<AgentRecord>, String> {
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_owned())?;
+        let Some(record) = entries.get(id).cloned() else {
+            return Ok(None);
+        };
+        let mut updated = entries.clone();
+        updated.remove(id);
+        self.save(&updated)?;
+        *entries = updated;
+        let _ = fs::remove_file(self.log_path(id));
+        Ok(Some(record))
     }
 
     /// Persist the first observed byte so a transient archive failure can be

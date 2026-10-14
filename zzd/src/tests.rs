@@ -40,10 +40,11 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    dispatch_agent_message, handle_codex_notification, monitor_codex_events,
-    monitor_codex_events_to_path, parse_agent_create_request, persisted_agent_config,
-    repair_transcript_tail, restart_argv, restart_config, transcript_json_with_sessions_dir,
-    valid_agent_model,
+    delete_completed_agent, dispatch_agent_message, handle_codex_notification,
+    monitor_codex_events, monitor_codex_events_to_path, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    sweep_completed_agents, transcript_json_with_sessions_dir, valid_agent_model,
+};
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -1140,28 +1141,18 @@ fn detached_process_endpoints_authenticate_and_manage_process_trees() {
         completed.object("stdout"),
         Some(&Json::String("hello".to_owned()))
     );
-    // New diagnostics are read-only and use the same authenticated relay
-    // path; the legacy proc response above remains unchanged.
-    let agent = response_json(request_once(
+    // Completion removes the succeeded record from the relay registry.
+    let raw = request_once(
         Arc::clone(&state),
         &policy,
         "GET",
         &format!("/v1/agents/{handle}"),
         "",
-    ));
-    assert_eq!(agent.object("id"), Some(&Json::String(handle.clone())));
-    assert_eq!(
-        agent.object("state"),
-        Some(&Json::String("succeeded".to_owned()))
     );
-    let logs = response_json(request_once(
-        Arc::clone(&state),
-        &policy,
-        "GET",
-        &format!("/v1/agents/{handle}/logs?stream=stdout&after=0"),
-        "",
-    ));
-    assert!(logs.to_json().contains("hello"));
+    assert!(
+        raw.starts_with("HTTP/1.1 404"),
+        "agent record remains: {raw}"
+    );
     let audit = state.store.timeline("echo").unwrap();
     let kinds: Vec<_> = audit
         .iter()
@@ -1774,7 +1765,7 @@ fn completed_worktree_fixture(
 
 #[test]
 fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
-    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-clean", true);
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-clean", true);
     let hooks = repo.join(".zigzag");
     std::fs::create_dir_all(&hooks).unwrap();
     std::fs::write(
@@ -1782,8 +1773,12 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
         "printf 'stopped\\n' >> \"$(dirname \"$0\")/stop.log\"\n",
     )
     .unwrap();
-    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(delete_completed_agent(&registry, &id).unwrap());
     assert!(!path.exists(), "clean pushed worktree was not removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
     let branch = Command::new("git")
         .args([
             "show-ref",
@@ -1804,16 +1799,20 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
 
 #[test]
 fn completed_dirty_worktree_is_kept() {
-    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
     std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
-    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(delete_completed_agent(&registry, &id).unwrap());
     assert!(path.exists(), "dirty worktree was removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
 #[test]
 fn completed_worktree_with_unpushed_commits_is_kept() {
-    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-unpushed", true);
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-unpushed", true);
     std::fs::write(path.join("pushed-later.txt"), "commit me").unwrap();
     let git = |args: &[&str]| {
         let output = Command::new("git")
@@ -1829,23 +1828,32 @@ fn completed_worktree_with_unpushed_commits_is_kept() {
     };
     git(&["add", "pushed-later.txt"]);
     git(&["commit", "-m", "un-pushed work"]);
-    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(delete_completed_agent(&registry, &id).unwrap());
     assert!(path.exists(), "worktree with unpushed commit was removed");
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
 #[test]
 fn completed_worktree_with_another_live_agent_record_is_kept() {
-    let (repo, path, roots, registry, id) = completed_worktree_fixture("auto-live", true);
+    let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-live", true);
     let mut live = agent_record("other-live-agent");
     live.state = "running".to_owned();
     live.worktree_path = Some(path.to_string_lossy().into_owned());
     registry.register(live).unwrap();
-    cleanup_completed_agent_worktree(&registry, &id, &roots);
+    assert!(delete_completed_agent(&registry, &id).unwrap());
     assert!(
         path.exists(),
         "worktree with a live agent record was removed"
     );
+    assert!(
+        registry.get(&id).is_none(),
+        "completed agent record remains"
+    );
+    assert!(registry.get("other-live-agent").is_some());
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
@@ -2013,6 +2021,41 @@ fn worktree_hook_failures_are_logged_and_environment_is_scrubbed() {
             .any(|line| line.contains("worktree_hook name=repo-stop.sh could not run")),
         "invocation error warning missing: {logs:?}"
     );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn startup_sweep_deletes_succeeded_backlog_records_only() {
+    let (state, _) = test_server();
+    let mut succeeded = agent_record("old-succeeded");
+    succeeded.state = "succeeded".to_owned();
+    state.supervisor.registry.register(succeeded).unwrap();
+    let mut failed = agent_record("old-failed");
+    failed.state = "failed".to_owned();
+    state.supervisor.registry.register(failed).unwrap();
+
+    assert_eq!(sweep_completed_agents(&state.supervisor.registry), 1);
+    assert!(state.supervisor.registry.get("old-succeeded").is_none());
+    assert!(state.supervisor.registry.get("old-failed").is_some());
+}
+
+#[test]
+fn completion_deletion_never_removes_the_main_worktree() {
+    let base = worktree_test_base("auto-main-worktree");
+    let repo = worktree_test_repo(&base);
+    let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
+    let mut record = agent_record("main-worktree-agent");
+    record.state = "succeeded".to_owned();
+    record.worktree_path = Some(repo.to_string_lossy().into_owned());
+    registry.register(record).unwrap();
+
+    assert!(delete_completed_agent(&registry, "main-worktree-agent").unwrap());
+    assert!(
+        repo.exists(),
+        "completion cleanup removed the main worktree"
+    );
+    assert!(repo.join(".git").exists());
+    assert!(registry.get("main-worktree-agent").is_none());
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -2841,14 +2884,12 @@ fn completed_codex_turn_transitions_agent_and_emits_completion_event() {
         true,
     );
 
-    assert_eq!(
+    assert!(
         state
             .supervisor
             .registry
             .get("codex-completion-regression")
-            .unwrap()
-            .state,
-        "succeeded"
+            .is_none()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
@@ -2959,7 +3000,7 @@ fn agent_delete_unknown_agent_is_404() {
 }
 
 #[test]
-fn agent_delete_terminal_agent_is_409() {
+fn agent_delete_completed_agent_uses_safe_relay_deletion_flow() {
     let (state, _state_path) = test_server();
     let policy =
         exec::Policy::parse(r#"{"bins":{"sh":{"path":"/bin/sh","commands":[["-c"]]}}}"#).unwrap();
@@ -2973,17 +3014,10 @@ fn agent_delete_terminal_agent_is_409() {
         "/v1/agents/done-agent",
         "",
     );
-    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body = response_json(response);
-    assert_eq!(
-        body.object("error").and_then(Json::as_str),
-        Some("agent_not_running")
-    );
-    // The terminal record is untouched.
-    assert_eq!(
-        state.supervisor.registry.get("done-agent").unwrap().state,
-        "succeeded"
-    );
+    assert_eq!(body.object("deleted").and_then(Json::as_bool), Some(true));
+    assert!(state.supervisor.registry.get("done-agent").is_none());
 }
 
 #[test]
@@ -3153,19 +3187,17 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
         .supervisor
         .registry
         .get("recovered-codex-completion")
-        .is_some_and(|agent| agent.state == "running")
+        .is_some()
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
+    assert!(
         state
             .supervisor
             .registry
             .get("recovered-codex-completion")
-            .unwrap()
-            .state,
-        "succeeded"
+            .is_none()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {
@@ -3220,19 +3252,17 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
         .supervisor
         .registry
         .get("recovered-codex-terminal-at-resume")
-        .is_some_and(|agent| agent.state == "running")
+        .is_some()
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
+    assert!(
         state
             .supervisor
             .registry
             .get("recovered-codex-terminal-at-resume")
-            .unwrap()
-            .state,
-        "succeeded"
+            .is_none()
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let timeline = loop {

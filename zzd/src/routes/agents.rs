@@ -2101,12 +2101,10 @@ pub(crate) fn handle_codex_notification(
                             ]),
                         ),
                     );
-                    if state == "succeeded" {
-                        crate::routes::worktrees::cleanup_completed_agent_worktree(
-                            registry,
-                            agent_id,
-                            &crate::routes::worktrees::canonical_worktree_roots(),
-                        );
+                    if state == "succeeded"
+                        && let Err(error) = delete_completed_agent(registry, agent_id)
+                    {
+                        log::error!("completed agent deletion failed agent={agent_id}: {error}");
                     }
                 }
                 _ => {
@@ -2115,6 +2113,50 @@ pub(crate) fn handle_codex_notification(
             }
         }
     }
+}
+
+/// Run completed-agent deletion through the relay's durable agent lifecycle:
+/// safely clean the worktree when eligible, then remove the registry record.
+/// An unsafe worktree stays on disk and is logged by the cleanup helper.
+pub(crate) fn delete_completed_agent(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+) -> Result<bool, String> {
+    let Some(agent) = registry.get(agent_id) else {
+        return Ok(false);
+    };
+    if agent.state != "succeeded" {
+        return Ok(false);
+    }
+    crate::routes::worktrees::cleanup_completed_agent_worktree(
+        registry,
+        agent_id,
+        &agent_worktree_roots(),
+    );
+    if registry.deregister(agent_id)?.is_some() {
+        log::info!("completed agent record deleted agent={agent_id}");
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Sweep durable succeeded records left by earlier relay versions.
+pub(crate) fn sweep_completed_agents(registry: &zz::AgentRegistry) -> usize {
+    let completed = registry.list(Some("succeeded"), None);
+    let mut deleted = 0;
+    for agent in completed {
+        match delete_completed_agent(registry, &agent.id) {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(error) => log::error!(
+                "startup completed agent deletion failed agent={}: {error}",
+                agent.id
+            ),
+        }
+    }
+    log::info!("startup completed agent sweep deleted {deleted} records");
+    deleted
 }
 
 #[cfg(not(test))]
@@ -2631,6 +2673,26 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     let Some(agent) = state.supervisor.registry.get(&id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
+    if agent.state == "succeeded" {
+        let worktree = agent.worktree_path.clone();
+        return match delete_completed_agent(&state.supervisor.registry, &id) {
+            Ok(true) => reply(
+                stream,
+                200,
+                Json::Object(vec![
+                    ("id".to_owned(), Json::String(id)),
+                    ("stopped".to_owned(), Json::Bool(true)),
+                    ("deleted".to_owned(), Json::Bool(true)),
+                    (
+                        "worktree".to_owned(),
+                        worktree.map(Json::String).unwrap_or(Json::Null),
+                    ),
+                ]),
+            ),
+            Ok(false) => reply(stream, 409, error("agent_not_completed")),
+            Err(_) => reply(stream, 500, error("could_not_delete_agent")),
+        };
+    }
     if agent.state == "lost_after_restart" {
         if let Some(path) = agent.worktree_path.as_deref() {
             match cleanup_agent_worktree(path, &agent_worktree_roots()) {
