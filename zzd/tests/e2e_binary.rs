@@ -398,8 +398,7 @@ fn binary_agents_endpoints() {
     assert_eq!(status, 400, "bad agent query not rejected");
 }
 
-#[test]
-fn binary_codex_agent_uses_requested_model_for_thread() {
+fn assert_codex_thread_start_model(requested_model: Option<&str>, expected_model: &str) {
     let relay = TestRelay::start();
     let codex_home = relay.dir.join(".codex");
     std::fs::create_dir_all(&codex_home).unwrap();
@@ -428,13 +427,15 @@ while IFS= read -r request; do :; done
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    let body = serde_json::json!({
-        "prompt": "verify the model override",
+    let mut body = serde_json::json!({
+        "prompt": "verify the thread model",
         "project_dir": relay.dir,
         "no_branch": true,
-        "no_auto_pr": true,
-        "model": "gpt-6-luna"
+        "no_auto_pr": true
     });
+    if let Some(model) = requested_model {
+        body["model"] = serde_json::json!(model);
+    }
     let (status, created) = relay.authed("POST", "/v1/agents", Some(&body.to_string()));
     assert_eq!(status, 200, "agent create failed: {created}");
     let request: serde_json::Value =
@@ -445,7 +446,17 @@ while IFS= read -r request; do :; done
         request["params"]["cwd"],
         std::fs::canonicalize(&relay.dir).unwrap().to_str().unwrap()
     );
-    assert_eq!(request["params"]["model"], "gpt-6-luna");
+    assert_eq!(request["params"]["model"], expected_model);
+}
+
+#[test]
+fn binary_codex_agent_uses_requested_model_for_thread() {
+    assert_codex_thread_start_model(Some("gpt-6-astra"), "gpt-6-astra");
+}
+
+#[test]
+fn binary_codex_agent_uses_default_model_when_omitted() {
+    assert_codex_thread_start_model(None, "gpt-6-luna");
 }
 
 #[test]
