@@ -1314,6 +1314,36 @@ pub(crate) fn test_server() -> (Arc<Server>, PathBuf) {
     )
 }
 
+#[test]
+fn buildbuddy_secret_mutations_require_the_separate_control_secret() {
+    let (mut state, state_path) = test_server();
+    Arc::get_mut(&mut state).unwrap().control_secret = Some("c".repeat(32));
+    let body = r#"{"token":"example-secret-token"}"#;
+    let normal_bearer = request_once_with_gate_token(
+        Arc::clone(&state),
+        &exec::Policy::parse(r#"{"bins":{}}"#).unwrap(),
+        "POST",
+        "/v1/secrets/buildbuddy",
+        body,
+        &"x".repeat(32),
+        review_loop::gate_report,
+    );
+    assert!(normal_bearer.starts_with("HTTP/1.1 401"));
+    assert!(!normal_bearer.contains("example-secret-token"));
+
+    Arc::get_mut(&mut state).unwrap().control_secret = None;
+    let disabled = request_once(
+        state,
+        &exec::Policy::parse(r#"{"bins":{}}"#).unwrap(),
+        "POST",
+        "/v1/secrets/buildbuddy",
+        body,
+    );
+    assert!(disabled.starts_with("HTTP/1.1 404"));
+    assert!(!disabled.contains("example-secret-token"));
+    let _ = std::fs::remove_file(state_path);
+}
+
 fn test_review_config() -> review_loop::ReviewLoopConfig {
     review_loop::ReviewLoopConfig {
         enabled: true,

@@ -13,6 +13,7 @@ use crate::routes::exec::{exec_request, spawn_request};
 use crate::routes::procs::{ProcRoute, kill_proc, poll_proc, proc_route};
 use crate::routes::providers::providers_request;
 use crate::routes::worktrees::{worktree_create, worktree_delete};
+use crate::secrets::{buildbuddy_get_invocation, buildbuddy_revoke, buildbuddy_store};
 use crate::session::require_gui_login_session;
 use crate::update;
 use std::collections::HashMap;
@@ -233,8 +234,10 @@ where
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
     let _request_guard = logging::begin_request(&request.method, request_path, &source);
-    let control_route =
-        request.method == "POST" && matches!(proc_route(request_path), Some(ProcRoute::Kill(_)));
+    let control_route = (request.method == "POST"
+        && (matches!(proc_route(request_path), Some(ProcRoute::Kill(_)))
+            || request_path == "/v1/secrets/buildbuddy"))
+        || (request.method == "DELETE" && request_path == "/v1/secrets/buildbuddy");
     let Some(required_secret) = (if control_route {
         state.control_secret.as_deref()
     } else {
@@ -254,6 +257,15 @@ where
         reply(&mut stream, 401, error("unauthorized"))?;
         return Ok(());
     }
+    if control_route
+        && matches!(request_path, "/v1/secrets/buildbuddy")
+        && !stream
+            .peer_addr()
+            .is_ok_and(|address| address.ip().is_loopback())
+    {
+        reply(&mut stream, 403, error("local_access_required"))?;
+        return Ok(());
+    }
     match (request.method.as_str(), request_path) {
         ("GET", "/v1/health") => reply(
             &mut stream,
@@ -271,6 +283,11 @@ where
             crate::routes::agents::agent_bulk_delete(&mut stream, &state, &request.target)
         }
         ("GET", "/v1/providers") => providers_request(&mut stream),
+        ("POST", "/v1/secrets/buildbuddy") => buildbuddy_store(&mut stream, &request.body),
+        ("DELETE", "/v1/secrets/buildbuddy") => buildbuddy_revoke(&mut stream),
+        ("POST", "/v1/secrets/buildbuddy/invocations") => {
+            buildbuddy_get_invocation(&mut stream, &request.body)
+        }
         ("DELETE", path) => match agent_route("DELETE", path) {
             Some(AgentRoute::Status(id)) => agent_delete(&mut stream, &state, id),
             _ => reply(&mut stream, 404, error("not_found")),
