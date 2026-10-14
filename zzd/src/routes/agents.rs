@@ -359,16 +359,16 @@ pub(crate) fn agent_bulk_delete(
     {
         return reply(stream, 400, error("invalid_agent_delete_query"));
     }
-    let branch = if let Some(branch) = values.get("branch") {
-        branch.clone()
+    let (branch, repository) = if let Some(branch) = values.get("branch") {
+        (branch.clone(), None)
     } else {
         let Some(number) = values.get("pr").and_then(|v| v.parse::<u64>().ok()) else {
             return reply(stream, 400, error("invalid_agent_delete_query"));
         };
-        let Some(branch) = resolve_pr_branch(number) else {
+        let Some((repository, branch)) = resolve_pr_details(number) else {
             return reply(stream, 404, error("unknown_pull_request"));
         };
-        branch
+        (branch, Some(repository))
     };
     let keep_last = match values
         .get("keep_last")
@@ -396,59 +396,43 @@ pub(crate) fn agent_bulk_delete(
             .checked_sub(duration)
             .unwrap_or(std::time::UNIX_EPOCH)
     });
-    let mut candidates: Vec<AgentRecord> = state
-        .supervisor
-        .registry
-        .list(None, None)
-        .into_iter()
-        .filter(|agent| {
-            agent.status_json().object("branch").and_then(Json::as_str) == Some(branch.as_str())
-                && cutoff.is_none_or(|cutoff| {
-                    parse_rfc3339_epoch(&agent.started_at).is_some_and(|epoch| {
-                        std::time::UNIX_EPOCH + Duration::from_secs(epoch) < cutoff
-                    })
-                })
-        })
-        .collect();
-    candidates.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    let selected = candidates.into_iter().skip(keep_last).collect::<Vec<_>>();
-    let mut deleted = Vec::new();
-    let mut skipped = 0u64;
-    let mut failures = Vec::new();
-    for agent in selected {
-        if agent_is_live(&agent) {
-            skipped += 1;
-            continue;
-        }
-        if dry_run {
-            deleted.push(agent.id);
-            continue;
-        }
-        match delete_explicit_agent_with_trust(
+    let candidates = state.supervisor.registry.list(None, None);
+    let selected = select_bulk_delete_candidates(
+        candidates,
+        &branch,
+        repository.as_deref(),
+        cutoff,
+        keep_last,
+    );
+    let result = apply_bulk_delete(selected, dry_run, |agent| {
+        delete_explicit_agent_with_trust(
             &state.supervisor.registry,
             &agent.id,
-            watch_agent_pr(&agent),
+            watch_agent_pr(agent),
             &agent_worktree_roots(),
             &crate::routes::worktrees::trusted_hook_repos(),
-        ) {
-            Ok(Some(_)) => deleted.push(agent.id),
-            Ok(None) => skipped += 1,
-            Err(_) => failures.push(Json::String(agent.id)),
-        }
-    }
+        )
+        .map(|effects| effects.is_some())
+    });
     reply(
         stream,
         200,
         Json::Object(vec![
             ("branch".into(), Json::String(branch)),
             ("dry_run".into(), Json::Bool(dry_run)),
-            ("deleted_count".into(), Json::number(deleted.len() as u64)),
-            ("skipped_count".into(), Json::number(skipped)),
+            (
+                "deleted_count".into(),
+                Json::number(result.deleted.len() as u64),
+            ),
+            ("skipped_count".into(), Json::number(result.skipped)),
             (
                 "deleted".into(),
-                Json::Array(deleted.into_iter().map(Json::String).collect()),
+                Json::Array(result.deleted.into_iter().map(Json::String).collect()),
             ),
-            ("failures".into(), Json::Array(failures)),
+            (
+                "failures".into(),
+                Json::Array(result.failures.into_iter().map(Json::String).collect()),
+            ),
         ]),
     )
 }
@@ -492,6 +476,78 @@ fn parse_rfc3339_epoch(value: &str) -> Option<u64> {
         .ok()?
         .checked_mul(86400)?
         .checked_add(hour * 3600 + minute * 60 + second)
+}
+
+fn parse_timestamp_epoch(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .or_else(|| parse_rfc3339_epoch(value))
+}
+
+fn select_bulk_delete_candidates(
+    candidates: Vec<AgentRecord>,
+    branch: &str,
+    repository: Option<&str>,
+    cutoff: Option<std::time::SystemTime>,
+    keep_last: usize,
+) -> Vec<AgentRecord> {
+    let mut candidates = candidates
+        .into_iter()
+        .filter(|agent| {
+            agent.status_json().object("branch").and_then(Json::as_str) == Some(branch)
+                && repository
+                    .is_none_or(|repository| agent_repository(agent).as_deref() == Some(repository))
+                && cutoff.is_none_or(|cutoff| {
+                    parse_timestamp_epoch(&agent.started_at).is_some_and(|epoch| {
+                        std::time::UNIX_EPOCH + Duration::from_secs(epoch) < cutoff
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        parse_timestamp_epoch(&b.started_at).cmp(&parse_timestamp_epoch(&a.started_at))
+    });
+    candidates.into_iter().skip(keep_last).collect()
+}
+
+struct BulkDeleteResult {
+    deleted: Vec<String>,
+    skipped: u64,
+    failures: Vec<String>,
+}
+
+fn apply_bulk_delete(
+    selected: Vec<AgentRecord>,
+    dry_run: bool,
+    mut delete: impl FnMut(&AgentRecord) -> Result<bool, String>,
+) -> BulkDeleteResult {
+    let mut result = BulkDeleteResult {
+        deleted: Vec::new(),
+        skipped: 0,
+        failures: Vec::new(),
+    };
+    for agent in selected {
+        if agent_is_live(&agent) {
+            result.skipped += 1;
+        } else if dry_run {
+            result.deleted.push(agent.id);
+        } else {
+            match delete(&agent) {
+                Ok(true) => result.deleted.push(agent.id),
+                Ok(false) => result.skipped += 1,
+                Err(_) => result.failures.push(agent.id),
+            }
+        }
+    }
+    result
+}
+
+fn agent_repository(agent: &AgentRecord) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_str(agent.agent_config.as_deref()?).ok()?;
+    let project_dir = config.get("project_dir")?.as_str()?;
+    let remote = git_output(Path::new(project_dir), &["remote", "get-url", "origin"]).ok()?;
+    crate::github::github_repository(&String::from_utf8_lossy(&remote.stdout))
 }
 
 fn enriched_agent_status(state: &Server, agent: &AgentRecord) -> Json {
@@ -603,10 +659,6 @@ fn select_transcript_items(mut transcript: Json, tail: Option<usize>, since: Opt
     transcript
 }
 
-fn resolve_pr_branch(number: u64) -> Option<String> {
-    resolve_pr_details(number).map(|(_, branch)| branch)
-}
-
 fn resolve_pr_details(number: u64) -> Option<(String, String)> {
     let root = agent_worktree_repo_root();
     let repository = git_output(&root, &["remote", "get-url", "origin"])
@@ -713,6 +765,11 @@ fn agent_continue_request(
     };
     let Some(agent) = state.supervisor.registry.get(id) else {
         return reply(stream, 404, error("unknown_agent"));
+    };
+    let _continuation_guard = match state.supervisor.registry.try_lock_continuation(id) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return reply(stream, 409, error("agent_continue_in_progress")),
+        Err(_) => return reply(stream, 500, error("could_not_lock_agent_continuation")),
     };
     let interrupt = value
         .get("interrupt")
@@ -3522,8 +3579,54 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
 
 #[cfg(test)]
 mod agent_dx_tests {
-    use super::{parse_duration, parse_rfc3339_epoch, select_transcript_items};
-    use zz::Json;
+    use super::{
+        apply_bulk_delete, parse_duration, parse_rfc3339_epoch, parse_timestamp_epoch,
+        select_bulk_delete_candidates, select_transcript_items,
+    };
+    use std::process::Command;
+    use std::time::{Duration, UNIX_EPOCH};
+    use zz::{AgentRecord, Json};
+
+    fn record(id: &str, started_at: &str, state: &str, repo: Option<&str>) -> AgentRecord {
+        AgentRecord {
+            id: id.to_owned(),
+            task_id: id.to_owned(),
+            execution_id: id.to_owned(),
+            leader_pid: 0,
+            process_group: 0,
+            process_identity: None,
+            worktree_path: None,
+            started_at: started_at.to_owned(),
+            completed_at: None,
+            deadline_at: None,
+            command: String::new(),
+            state: state.to_owned(),
+            paused_at: None,
+            exit_code: None,
+            log_degraded: false,
+            audit_degraded: false,
+            redacted: false,
+            stdout_next: 0,
+            stderr_next: 0,
+            stdout_dropped_before: 0,
+            stderr_dropped_before: 0,
+            log_next: 0,
+            log_dropped_before: 0,
+            first_output_at: None,
+            first_output_stream: None,
+            first_output_bytes: None,
+            restarted_from: None,
+            agent_config: Some(
+                serde_json::json!({
+                    "branch": "shared-branch",
+                    "project_dir": repo,
+                })
+                .to_string(),
+            ),
+            harness_session_id: None,
+            harness: None,
+        }
+    }
 
     #[test]
     fn transcript_tail_and_since_select_exclusive_item_sequences() {
@@ -3566,5 +3669,115 @@ mod agent_dx_tests {
         assert_eq!(parse_duration("12h").unwrap().as_secs(), 43200);
         assert!(parse_duration("7x").is_err());
         assert_eq!(parse_rfc3339_epoch("1970-01-02T00:00:00Z"), Some(86400));
+        assert_eq!(parse_timestamp_epoch("1760000000"), Some(1760000000));
+    }
+
+    #[test]
+    fn bulk_delete_age_and_keep_last_handle_unix_and_rfc3339_records() {
+        let candidates = vec![
+            record("unix-old", "1700000000", "succeeded", None),
+            record("rfc3339-middle", "2025-01-01T00:00:00Z", "succeeded", None),
+            record("unix-new", "1800000000", "succeeded", None),
+        ];
+        let cutoff = UNIX_EPOCH + Duration::from_secs(1720000000);
+        let aged = select_bulk_delete_candidates(
+            candidates.clone(),
+            "shared-branch",
+            None,
+            Some(cutoff),
+            0,
+        );
+        assert_eq!(
+            aged.iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["unix-old"]
+        );
+
+        let keep_last = select_bulk_delete_candidates(candidates, "shared-branch", None, None, 1);
+        assert_eq!(
+            keep_last
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rfc3339-middle", "unix-old"]
+        );
+    }
+
+    #[test]
+    fn bulk_delete_selection_scopes_same_branch_to_repository() {
+        let base = std::env::temp_dir().join(format!("agent-dx-repos-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        for (path, remote) in [
+            (&first, "https://github.com/owner/first.git"),
+            (&second, "https://github.com/owner/second.git"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .args(["remote", "add", "origin", remote])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let first_path = first.to_string_lossy().into_owned();
+        let second_path = second.to_string_lossy().into_owned();
+        let selected = select_bulk_delete_candidates(
+            vec![
+                record("first-agent", "1700000000", "succeeded", Some(&first_path)),
+                record(
+                    "second-agent",
+                    "1700000000",
+                    "succeeded",
+                    Some(&second_path),
+                ),
+            ],
+            "shared-branch",
+            Some("owner/first"),
+            None,
+            0,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first-agent"]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bulk_delete_dry_run_live_skip_and_failure_results_are_explicit() {
+        let selected = vec![
+            record("terminal", "1700000000", "succeeded", None),
+            record("live", "1700000000", "running", None),
+        ];
+        let mut delete_calls = 0;
+        let dry_run = apply_bulk_delete(selected.clone(), true, |_| {
+            delete_calls += 1;
+            Ok(true)
+        });
+        assert_eq!(delete_calls, 0, "dry-run must not mutate records");
+        assert_eq!(dry_run.deleted, ["terminal"]);
+        assert_eq!(dry_run.skipped, 1);
+
+        let failed =
+            apply_bulk_delete(selected, false, |_| Err("registry write failed".to_owned()));
+        assert!(failed.deleted.is_empty());
+        assert_eq!(failed.skipped, 1);
+        assert_eq!(failed.failures, ["terminal"]);
     }
 }

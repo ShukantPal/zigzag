@@ -2740,6 +2740,28 @@ mod tests {
     }
 
     #[test]
+    fn pr_target_reports_missing_and_ambiguous_live_agents() {
+        let no_live = serde_json::json!([
+            {"id":"old-agent", "state":"succeeded"}
+        ]);
+        assert_eq!(
+            select_live_agent_for_pr(135, no_live.as_array().unwrap())
+                .unwrap_err()
+                .message,
+            "no live agent for PR #135"
+        );
+
+        let ambiguous = serde_json::json!([
+            {"id":"agent-one", "state":"running"},
+            {"id":"agent-two", "state":"running"}
+        ]);
+        let error = select_live_agent_for_pr(135, ambiguous.as_array().unwrap()).unwrap_err();
+        assert!(error.message.contains("multiple live agents for PR #135"));
+        assert!(error.message.contains("agent-one"));
+        assert!(error.message.contains("agent-two"));
+    }
+
+    #[test]
     fn agent_id_exact_prefix_and_ambiguous_prefix_resolution_is_preserved() {
         let agents = serde_json::json!([
             {"id":"agent-123456"},

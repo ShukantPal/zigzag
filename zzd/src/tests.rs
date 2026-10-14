@@ -3853,8 +3853,10 @@ struct MessageSession {
 }
 
 struct LifecycleObservingContinueSession {
-    registry: Arc<zz::AgentRegistry>,
+    state: Arc<Server>,
     agent_id: String,
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl HarnessSession for LifecycleObservingContinueSession {
@@ -3870,6 +3872,8 @@ impl HarnessSession for LifecycleObservingContinueSession {
 
     fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
         let agent = self
+            .state
+            .supervisor
             .registry
             .get(&self.agent_id)
             .expect("agent record persists");
@@ -3878,12 +3882,18 @@ impl HarnessSession for LifecycleObservingContinueSession {
             "turn execution must persist running before dispatch"
         );
         assert!(
-            self.registry
+            self.state
+                .supervisor
+                .registry
                 .list(Some("running"), None)
                 .iter()
                 .any(|entry| entry.id == self.agent_id),
             "state-filtered list must expose the active continuation"
         );
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            entered.send(()).unwrap();
+        }
+        self.release.lock().unwrap().recv().unwrap();
         Ok(serde_json::json!({"status":"completed"}))
     }
 
@@ -3910,24 +3920,124 @@ fn completed_agent_returns_to_running_during_continuation_then_succeeds() {
         "succeeded"
     );
 
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let session: Arc<dyn HarnessSession> = Arc::new(LifecycleObservingContinueSession {
-        registry: Arc::clone(&state.supervisor.registry),
+        state: Arc::clone(&state),
         agent_id: id.to_owned(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
     });
-    let response = post_continue_with_session(&state, id, "keep going", session);
+    let request_state = Arc::clone(&state);
+    let request_session = Arc::clone(&session);
+    let request = thread::spawn(move || {
+        post_continue_with_session(&request_state, id, "keep going", request_session)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("continuation never entered its blocked turn");
+
+    let during = response_json(request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "GET",
+        "/v1/agents?state=running",
+        "",
+    ));
+    assert!(
+        during
+            .object("agents")
+            .and_then(|value| match value {
+                Json::Array(agents) => Some(agents),
+                _ => None,
+            })
+            .is_some_and(|agents| agents.iter().any(|agent| {
+                agent.object("id").and_then(Json::as_str) == Some(id)
+                    && agent.object("state").and_then(Json::as_str) == Some("running")
+            })),
+        "HTTP state filter must include the blocked continuation: {during:?}"
+    );
+    let concurrent =
+        post_continue_with_session(&state, id, "queued follow-up", Arc::clone(&session));
+    assert!(concurrent.starts_with("HTTP/1.1 409"), "{concurrent}");
+    assert_eq!(
+        response_json(concurrent)
+            .object("error")
+            .and_then(Json::as_str),
+        Some("agent_continue_in_progress")
+    );
+
+    release_tx.send(()).unwrap();
+    let response = request.join().unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert_eq!(
         state.supervisor.registry.get(id).unwrap().state,
         "succeeded"
     );
+    let after = response_json(request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "GET",
+        "/v1/agents?state=succeeded",
+        "",
+    ));
     assert!(
-        state
-            .supervisor
-            .registry
-            .list(Some("running"), None)
-            .iter()
-            .all(|entry| entry.id != id)
+        after
+            .object("agents")
+            .and_then(|value| match value {
+                Json::Array(agents) => Some(agents),
+                _ => None,
+            })
+            .is_some_and(|agents| agents.iter().any(|agent| {
+                agent.object("id").and_then(Json::as_str) == Some(id)
+                    && agent.object("state").and_then(Json::as_str) == Some("succeeded")
+            })),
+        "HTTP state filter must include the completed continuation: {after:?}"
     );
+}
+
+#[test]
+fn bulk_agent_delete_dry_run_preserves_records_and_delete_skips_live_agents() {
+    let (state, _) = test_server();
+    let mut terminal = agent_record("bulk-terminal");
+    terminal.started_at = "1700000000".to_owned();
+    terminal.agent_config = Some(r#"{"branch":"feature/x","project_dir":"/repo"}"#.to_owned());
+    state.supervisor.registry.register(terminal).unwrap();
+    state
+        .supervisor
+        .registry
+        .transition("bulk-terminal", "succeeded", Some(0))
+        .unwrap();
+
+    let mut live = agent_record("bulk-live");
+    live.started_at = "1700000000".to_owned();
+    live.agent_config = Some(r#"{"branch":"feature/x","project_dir":"/repo"}"#.to_owned());
+    state.supervisor.registry.register(live).unwrap();
+
+    let target = "/v1/agents?branch=feature%2Fx&older_than=7d&dry_run=1";
+    let dry_run = response_json(request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "DELETE",
+        target,
+        "",
+    ));
+    assert_eq!(dry_run.object("deleted_count"), Some(&Json::number(1)));
+    assert_eq!(dry_run.object("skipped_count"), Some(&Json::number(1)));
+    assert!(state.supervisor.registry.get("bulk-terminal").is_some());
+    assert!(state.supervisor.registry.get("bulk-live").is_some());
+
+    let deleted = response_json(request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "DELETE",
+        "/v1/agents?branch=feature%2Fx&older_than=7d",
+        "",
+    ));
+    assert_eq!(deleted.object("deleted_count"), Some(&Json::number(1)));
+    assert_eq!(deleted.object("skipped_count"), Some(&Json::number(1)));
+    assert!(state.supervisor.registry.get("bulk-terminal").is_none());
+    assert!(state.supervisor.registry.get("bulk-live").is_some());
 }
 
 impl HarnessSession for MessageSession {

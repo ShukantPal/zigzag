@@ -350,6 +350,40 @@ fn built_binary_continues_the_live_agent_selected_by_branch() {
 }
 
 #[test]
+fn built_binary_continues_the_live_agent_selected_by_pr() {
+    let (port, server) = transcript_server([
+        r#"{"repository":"owner/repo","agents":[{"id":"stale","state":"succeeded"},{"id":"agent-pr","state":"running"}]}"#,
+        r#"{"agent_id":"agent-pr","turn":{"status":"completed"}}"#,
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
+        .args([
+            "--hostname",
+            &format!("127.0.0.1:{port}"),
+            "agents",
+            "continue",
+            "--pr",
+            "135",
+            "--prompt",
+            "continue review fixes",
+        ])
+        .env("ZIGZAG_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nrequests={requests:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        requests[0].starts_with("GET /v1/agents?pr=135 "),
+        "{requests:?}"
+    );
+    assert!(requests[1].starts_with("POST /v1/agents/agent-pr/continue "));
+    assert!(requests[1].contains(r#"{"prompt":"continue review fixes"}"#));
+}
+
+#[test]
 fn list_branch_filter_is_sent_to_the_relay() {
     let (port, server) = transcript_server([r#"{"agents":[]}"#]);
     let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
