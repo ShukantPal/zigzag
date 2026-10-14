@@ -576,9 +576,16 @@ fn parse_codex_transcript(text: &str) -> Vec<TranscriptItem> {
             });
             continue;
         };
-        let kind = s(&event, "type");
+        // Codex CLI JSONL uses `type`, while app-server notifications (which
+        // the relay persists) use `method` and carry items under params.item.
+        let kind = event
+            .get("type")
+            .or_else(|| event.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace('/', ".");
         if kind.starts_with("item.") {
-            let Some(item) = event.get("item") else {
+            let Some(item) = event.get("item").or_else(|| event.pointer("/params/item")) else {
                 items.push(TranscriptItem {
                     id: format!("diagnostic-{line_number}"),
                     item: Value::Null,
@@ -1220,6 +1227,21 @@ mod tests {
                 .unwrap()
                 .contains("Malformed")
         );
+    }
+
+    #[test]
+    fn parses_codex_app_server_notification_methods() {
+        let data = concat!(
+            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"msg-1\",\"type\":\"agent_message\",\"text\":\"working\",\"status\":\"in_progress\"}}}\n",
+            "{\"method\":\"item/completed\",\"params\":{\"item\":{\"id\":\"msg-1\",\"type\":\"agent_message\",\"text\":\"done\",\"status\":\"completed\"}}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n",
+        );
+        let items = parse_codex_transcript(data);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, "completed");
+        assert_eq!(s(&items[0].item, "text"), "done");
+        assert_eq!(items[1].state, "turn.completed");
+        assert_eq!(transcript_label(&items[1]).0, "Turn completed");
     }
 
     #[test]
