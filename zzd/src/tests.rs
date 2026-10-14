@@ -3852,6 +3852,84 @@ struct MessageSession {
     failure: bool,
 }
 
+struct LifecycleObservingContinueSession {
+    registry: Arc<zz::AgentRegistry>,
+    agent_id: String,
+}
+
+impl HarnessSession for LifecycleObservingContinueSession {
+    fn send(&self, _text: &str, _delivery: Delivery) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resume_thread(
+        &self,
+    ) -> Result<Option<std::sync::mpsc::Receiver<crate::harness::HarnessEvent>>, String> {
+        Ok(None)
+    }
+
+    fn continue_turn(&self, _text: &str) -> Result<serde_json::Value, String> {
+        let agent = self
+            .registry
+            .get(&self.agent_id)
+            .expect("agent record persists");
+        assert_eq!(
+            agent.state, "running",
+            "turn execution must persist running before dispatch"
+        );
+        assert!(
+            self.registry
+                .list(Some("running"), None)
+                .iter()
+                .any(|entry| entry.id == self.agent_id),
+            "state-filtered list must expose the active continuation"
+        );
+        Ok(serde_json::json!({"status":"completed"}))
+    }
+
+    fn interrupt(&self) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn completed_agent_returns_to_running_during_continuation_then_succeeds() {
+    let (state, _) = test_server();
+    let id = "continue-lifecycle";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("continue-lifecycle-thread".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    state
+        .supervisor
+        .registry
+        .transition(id, "succeeded", Some(0))
+        .unwrap();
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "succeeded"
+    );
+
+    let session: Arc<dyn HarnessSession> = Arc::new(LifecycleObservingContinueSession {
+        registry: Arc::clone(&state.supervisor.registry),
+        agent_id: id.to_owned(),
+    });
+    let response = post_continue_with_session(&state, id, "keep going", session);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "succeeded"
+    );
+    assert!(
+        state
+            .supervisor
+            .registry
+            .list(Some("running"), None)
+            .iter()
+            .all(|entry| entry.id != id)
+    );
+}
+
 impl HarnessSession for MessageSession {
     fn send(&self, text: &str, delivery: Delivery) -> Result<(), String> {
         if self.failure {
