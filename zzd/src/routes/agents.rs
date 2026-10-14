@@ -653,10 +653,45 @@ fn transcript_json(
     after: u64,
     tail: Option<usize>,
 ) -> Option<Json> {
-    let Some(agent) = registry.get(id) else {
+    transcript_json_with_sessions_dir(
+        registry,
+        id,
+        after,
+        tail,
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".codex/sessions")),
+    )
+}
+
+pub(crate) fn transcript_json_with_sessions_dir(
+    registry: &zz::AgentRegistry,
+    id: &str,
+    after: u64,
+    tail: Option<usize>,
+    sessions_dir: Option<std::path::PathBuf>,
+) -> Option<Json> {
+    let agent = registry.get(id).or_else(|| {
+        registry
+            .list(None, Some(id))
+            .into_iter()
+            .next()
+            .map(|record| record.id.clone())
+            .and_then(|agent_id| registry.get(&agent_id))
+    });
+    let Some(agent) = agent else {
         return orphan_transcript_json(id, after, tail);
     };
-    let logs = agent_logs_json(registry, id, "both", after, tail)?;
+    let rollout = (agent.harness.as_deref() == Some("codex"))
+        .then_some(agent.harness_session_id.as_deref())
+        .flatten()
+        .zip(sessions_dir.as_deref())
+        .and_then(|(thread_id, sessions)| codex_rollout_transcript(sessions, thread_id));
+    let logs = if let Some(rollout) = rollout.as_deref() {
+        transcript_logs_from_text(rollout, after, tail, &agent)
+    } else {
+        agent_logs_json(registry, &agent.id, "both", after, tail)?
+    };
 
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
@@ -792,6 +827,138 @@ fn resolve_registered_agent_id(registry: &zz::AgentRegistry, id_or_task: &str) -
         .map(|agent| agent.id);
     let id = matches.next()?;
     matches.next().is_none().then_some(id)
+}
+
+/// Read the durable Codex app-server rollout for a thread. Rollout records are
+/// translated to the same item/lifecycle JSONL model used by the transcript UI.
+fn codex_rollout_transcript(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
+    if thread_id.is_empty()
+        || !thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let suffix = format!("-{thread_id}.jsonl");
+    for year in std::fs::read_dir(sessions).ok()?.flatten() {
+        if !year.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for month in std::fs::read_dir(year.path()).ok()?.flatten() {
+            if !month.file_type().ok()?.is_dir() {
+                continue;
+            }
+            for day in std::fs::read_dir(month.path()).ok()?.flatten() {
+                if !day.file_type().ok()?.is_dir() {
+                    continue;
+                }
+                for file in std::fs::read_dir(day.path()).ok()?.flatten() {
+                    let name = file.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("rollout-") && name.ends_with(&suffix) {
+                        return std::fs::read_to_string(file.path())
+                            .ok()
+                            .map(|source| normalize_codex_rollout(&source));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_codex_rollout(source: &str) -> String {
+    use serde_json::{Value, json};
+    let mut output = String::new();
+    for (index, line) in source.lines().enumerate() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = record.get("payload").cloned().unwrap_or(Value::Null);
+        let normalized = match kind {
+            "response_item" => {
+                let mut item = payload;
+                if item.get("type").and_then(Value::as_str) == Some("message")
+                    && item.get("role").and_then(Value::as_str) == Some("assistant")
+                {
+                    item["type"] = Value::String("agent_message".into());
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        let text = content
+                            .iter()
+                            .filter_map(|part| {
+                                (part.get("type").and_then(Value::as_str) == Some("output_text"))
+                                    .then(|| part.get("text").and_then(Value::as_str))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() {
+                            item["text"] = Value::String(text);
+                        }
+                    }
+                }
+                json!({"type":"item.completed","item":item})
+            }
+            "event_msg" => {
+                let event = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("event");
+                let lifecycle = match event {
+                    "task_started" | "turn_started" => "turn.started",
+                    "task_complete" | "turn_complete" => "turn.completed",
+                    _ => event,
+                };
+                json!({"type":lifecycle})
+            }
+            "session_meta" => json!({"type":"thread.started"}),
+            _ => continue,
+        };
+        if index > 0 {
+            output.push('\n');
+        }
+        output.push_str(&normalized.to_string());
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output
+}
+
+fn transcript_logs_from_text(
+    text: &str,
+    after: u64,
+    tail: Option<usize>,
+    agent: &zz::AgentRecord,
+) -> Json {
+    let start = if after == 0 {
+        tail.filter(|limit| text.len() > *limit)
+            .map_or(0, |limit| text.len() - limit)
+    } else {
+        usize::try_from(after).unwrap_or(usize::MAX).min(text.len())
+    };
+    let mut start = start;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let data = &text[start..];
+    let records = if data.is_empty() {
+        Vec::new()
+    } else {
+        vec![Json::Object(vec![
+            ("stream".into(), Json::String("stdout".into())),
+            ("cursor".into(), Json::number(start as u64)),
+            ("data".into(), Json::String(data.to_owned())),
+        ])]
+    };
+    Json::Object(vec![
+        ("records".into(), Json::Array(records)),
+        ("next_cursor".into(), Json::number(text.len() as u64)),
+        ("dropped_before".into(), Json::number(0)),
+        ("complete".into(), Json::Bool(agent.state != "running")),
+        ("log_degraded".into(), Json::Bool(false)),
+    ])
 }
 
 /// Read agent logs from the ordered diagnostics spool, falling back to durable

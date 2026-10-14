@@ -971,7 +971,21 @@ fn safe_text(text: &str) -> String {
         .collect()
 }
 
-fn read_codex_transcript(agent_id: &str) -> (Vec<TranscriptItem>, Option<String>) {
+fn read_codex_transcript(client: &Client, agent_id: &str) -> (Vec<TranscriptItem>, Option<String>) {
+    if let Ok(transcript) = client.get(&format!("/v1/agents/{agent_id}/transcript"), &[])
+        && let Some(text) = transcript.get("stdout").and_then(Value::as_str)
+    {
+        if text.len() > CODEX_TRANSCRIPT_LIMIT {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "Transcript exceeds the {} MiB display limit",
+                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
+                )),
+            );
+        }
+        return (parse_codex_transcript(text), None);
+    }
     let Some(path) = codex_transcript_path(agent_id) else {
         return (
             Vec::new(),
@@ -1051,7 +1065,7 @@ pub(super) fn cmd_status(
     let mut table_state = ratatui::widgets::TableState::default();
     let (mut transcript_items, mut transcript_notice) = rows
         .get(selected)
-        .map(|row| read_codex_transcript(&row.agent))
+        .map(|row| read_codex_transcript(c, &row.agent))
         .unwrap_or_default();
     let mut transcript_prompt = rows
         .get(selected)
@@ -1110,7 +1124,7 @@ pub(super) fn cmd_status(
                         selected_id = rows.get(selected).map(|row| row.id.clone());
                         (transcript_items, transcript_notice) = rows
                             .get(selected)
-                            .map(|row| read_codex_transcript(&row.agent))
+                            .map(|row| read_codex_transcript(c, &row.agent))
                             .unwrap_or_default();
                         transcript_prompt = rows
                             .get(selected)
@@ -1133,7 +1147,7 @@ pub(super) fn cmd_status(
                         selected_id = rows.get(selected).map(|row| row.id.clone());
                         (transcript_items, transcript_notice) = rows
                             .get(selected)
-                            .map(|row| read_codex_transcript(&row.agent))
+                            .map(|row| read_codex_transcript(c, &row.agent))
                             .unwrap_or_default();
                         transcript_prompt = rows
                             .get(selected)
@@ -1176,7 +1190,7 @@ pub(super) fn cmd_status(
                     selected_id = rows.get(selected).map(|row| row.id.clone());
                     (transcript_items, transcript_notice) = rows
                         .get(selected)
-                        .map(|row| read_codex_transcript(&row.agent))
+                        .map(|row| read_codex_transcript(c, &row.agent))
                         .unwrap_or_default();
                     transcript_prompt = rows
                         .get(selected)
@@ -1196,7 +1210,7 @@ pub(super) fn cmd_status(
         // this read to the status interval makes the transcript feel stale.
         if transcript_tick.elapsed() >= Duration::from_millis(500) {
             if let Some(row) = rows.get(selected) {
-                (transcript_items, transcript_notice) = read_codex_transcript(&row.agent);
+                (transcript_items, transcript_notice) = read_codex_transcript(c, &row.agent);
                 transcript_selected = if raw_view {
                     transcript_selected.min(transcript_items.len().saturating_sub(1))
                 } else {

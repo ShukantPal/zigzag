@@ -38,7 +38,7 @@ use crate::routes::agents::{
     agent_harness_config, agent_post_request_with_session_resolver, agent_route,
     default_agent_worktree, dispatch_agent_message, handle_codex_notification,
     monitor_codex_events, parse_agent_create_request, persisted_agent_config, restart_argv,
-    restart_config, valid_agent_model,
+    restart_config, transcript_json_with_sessions_dir, valid_agent_model,
 };
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
 use crate::routes::exec::{parse_exec_request, parse_spawn_request};
@@ -2063,6 +2063,53 @@ fn agent_record(id: &str) -> AgentRecord {
         harness_session_id: None,
         harness: None,
     }
+}
+
+#[test]
+fn transcript_uses_codex_rollout_when_relay_transcript_is_missing_by_agent_and_task_id() {
+    let (state, _state_path) = test_server();
+    let thread_id = "01a138f4-c546-7ca0-bece-deba1ab4a5f4";
+    let mut record = agent_record("a69b0e23");
+    record.task_id = "rollout-task".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let sessions = std::env::temp_dir().join(format!(
+        "zigzag-rollout-transcript-{}-{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let day = sessions.join("2026/10/13");
+    std::fs::create_dir_all(&day).unwrap();
+    let rollout = day.join(format!("rollout-2026-10-13T22-48-47-{thread_id}.jsonl"));
+    std::fs::write(
+        &rollout,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"assistant-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"rollout answer\"}]}}\n"
+        ),
+    )
+    .unwrap();
+
+    for lookup in ["a69b0e23", "rollout-task"] {
+        let transcript = transcript_json_with_sessions_dir(
+            &state.supervisor.registry,
+            lookup,
+            0,
+            None,
+            Some(sessions.clone()),
+        )
+        .expect("transcript should be available");
+        let stdout = transcript.object("stdout").and_then(Json::as_str).unwrap();
+        assert!(stdout.contains("rollout answer"), "{stdout}");
+        assert!(stdout.contains("thread.started"), "{stdout}");
+        assert!(stdout.contains("turn.started"), "{stdout}");
+        assert!(!stdout.contains("relay-only"), "{stdout}");
+    }
+
+    std::fs::remove_dir_all(sessions).unwrap();
 }
 
 #[test]
