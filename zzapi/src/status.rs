@@ -31,6 +31,7 @@ const EVENT_PROMPT_LIMIT: usize = 100;
 const EVENT_LIMIT: usize = 10_000;
 // The TUI keeps at most one bounded byte window of transcript data in memory.
 const TRANSCRIPT_WINDOW_BYTES: usize = 512 * 1024;
+const TRANSCRIPT_SANE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 const STATUS_STATES: &[&str] = &[
     "not observed",
     "running",
@@ -1191,6 +1192,14 @@ fn read_transcript_window(
             false,
         );
     };
+    if size > TRANSCRIPT_SANE_LIMIT_BYTES {
+        return (
+            Vec::new(),
+            Some("Transcript exceeds the 100 MiB sane bound (possible runaway thread); start a new agent".into()),
+            0,
+            false,
+        );
+    }
     let Some(start) = align_transcript_offset(path, offset.min(size)) else {
         return (
             Vec::new(),
@@ -1257,6 +1266,18 @@ fn read_remote_transcript(
         &[("tail", TRANSCRIPT_WINDOW_BYTES.to_string())],
     ) && let Some(text) = transcript.get("stdout").and_then(Value::as_str)
     {
+        if transcript
+            .get("next_cursor")
+            .and_then(Value::as_u64)
+            .is_some_and(|size| size > TRANSCRIPT_SANE_LIMIT_BYTES)
+        {
+            return (
+                Vec::new(),
+                Some("Transcript exceeds the 100 MiB sane bound (possible runaway thread); start a new agent".into()),
+                0,
+                false,
+            );
+        }
         return (parse_codex_transcript(text), None, 0, false);
     }
     (
@@ -2007,6 +2028,27 @@ mod tests {
         assert!(second_next > next);
         assert!(second_more);
         assert_ne!(first[0].id, second[0].id);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transcript_over_one_hundred_mib_shows_runaway_warning_without_reading() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "zzapi-transcript-over-limit-{}.jsonl",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.set_len(TRANSCRIPT_SANE_LIMIT_BYTES + 1).unwrap();
+        file.flush().unwrap();
+
+        let (items, notice, next, more) = read_transcript_window(&path, 0);
+        assert!(items.is_empty());
+        assert_eq!(next, 0);
+        assert!(!more);
+        let notice = notice.expect("oversized transcript warning");
+        assert!(notice.contains("100 MiB sane bound"));
+        assert!(notice.contains("start a new agent"));
         std::fs::remove_file(path).unwrap();
     }
 
