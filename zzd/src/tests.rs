@@ -3061,6 +3061,7 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
     let repo = worktree_test_repo(&base);
     let worktree = allowed_root.join("codex-orphan");
     agent_create_worktree(&repo, &worktree, "codex/orphan", &[]).unwrap();
+    std::fs::write(worktree.join("preserve-me.txt"), "recover this work\n").unwrap();
 
     let id = "a69b0e234eea56ab8cbf6747c4ecb951";
     let mut record = agent_record(id);
@@ -3126,10 +3127,7 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
     );
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(state.supervisor.registry.get(id).is_none());
-    assert!(
-        worktree.exists(),
-        "worktree without verified pushed state was removed"
-    );
+    assert!(worktree.exists(), "dirty worktree was removed");
     let checkout = worktree_branch_checkout_path(&repo, "codex/orphan").unwrap();
     assert!(
         checkout
