@@ -1,8 +1,13 @@
 use crate::http::{error, reply};
 use crate::server::Server;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+static RELAY_DELETED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 use zz::{Json, parse_json};
 
 // --- Worktree management endpoints (agent-creation rollout, part 1 of 4) ---
@@ -226,18 +231,85 @@ fn worktree_repo(path: &Path) -> Result<PathBuf, WorktreeError> {
         })
 }
 
-/// Run an optional repository lifecycle script through the user's shell.
-/// Hook output and failures are logged, while hooks remain best-effort.
-pub(crate) fn run_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
-    let script = repo.join(".zigzag").join(hook);
+/// Exact canonical repository roots trusted by the local operator to run
+/// repository-provided hooks. Empty or invalid configuration fails closed.
+pub(crate) fn trusted_hook_repos() -> Vec<PathBuf> {
+    std::env::var_os("ZIGZAG_TRUSTED_HOOK_REPOS")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn run_worktree_hook_with_trust(
+    repo: &Path,
+    worktree: &Path,
+    hook: &str,
+    observed_deleted: bool,
+    trusted_repos: &[PathBuf],
+) {
+    run_worktree_hook_using_shell(
+        repo,
+        worktree,
+        hook,
+        observed_deleted,
+        trusted_repos,
+        Path::new("/bin/sh"),
+    );
+}
+
+pub(crate) fn run_worktree_hook_using_shell(
+    repo: &Path,
+    worktree: &Path,
+    hook: &str,
+    observed_deleted: bool,
+    trusted_repos: &[PathBuf],
+    shell: &Path,
+) {
+    let canonical_repo = match std::fs::canonicalize(repo) {
+        Ok(repo) => repo,
+        Err(error) => {
+            log::warn!(
+                "worktree_hook name={} skipped: cannot resolve repository {}: {error}",
+                hook,
+                repo.display()
+            );
+            return;
+        }
+    };
+    if !trusted_repos
+        .iter()
+        .any(|trusted| trusted == &canonical_repo)
+    {
+        log::warn!(
+            "worktree_hook name={} skipped for untrusted repository {}",
+            hook,
+            canonical_repo.display()
+        );
+        return;
+    }
+    let script = canonical_repo.join(".zigzag").join(hook);
     if !script.is_file() {
         return;
     }
     let path = worktree.to_string_lossy();
-    match Command::new("sh")
+    let current_dir = if worktree.is_dir() { worktree } else { repo };
+    match Command::new(shell)
         .arg(&script)
         .arg(path.as_ref())
-        .current_dir(worktree)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("ZIGZAG_WORKTREE_PATH", path.as_ref())
+        .env(
+            "ZIGZAG_WORKTREE_OBSERVED",
+            if observed_deleted { "1" } else { "0" },
+        )
+        .env("ZIGZAG_WORKTREE_REPO", &canonical_repo)
+        .current_dir(current_dir)
         .output()
     {
         Ok(output) => {
@@ -264,6 +336,86 @@ pub(crate) fn run_worktree_hook(repo: &Path, worktree: &Path, hook: &str) {
         ),
     }
 }
+
+/// Observe configured worktree roots for manual `git worktree remove` calls.
+/// The relay can recover a removal only if it saw the exact worktree path and
+/// owning repository before deletion. Missed removals are never guessed.
+pub(crate) fn worktree_deletion_watch_loop(roots: Vec<PathBuf>) {
+    let mut observed = HashMap::<PathBuf, PathBuf>::new();
+    loop {
+        let current = discover_worktrees(&roots);
+        handle_deleted_worktrees(&observed, &current);
+        observed = current;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+pub(crate) fn handle_deleted_worktrees(
+    observed: &HashMap<PathBuf, PathBuf>,
+    current: &HashMap<PathBuf, PathBuf>,
+) {
+    handle_deleted_worktrees_with_trust(observed, current, &trusted_hook_repos());
+}
+
+pub(crate) fn handle_deleted_worktrees_with_trust(
+    observed: &HashMap<PathBuf, PathBuf>,
+    current: &HashMap<PathBuf, PathBuf>,
+    trusted_repos: &[PathBuf],
+) {
+    for (path, repo) in observed {
+        if current.contains_key(path) {
+            continue;
+        }
+        let relay_deleted = RELAY_DELETED_WORKTREES
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map(|mut paths| paths.remove(path))
+            .unwrap_or(false);
+        if relay_deleted {
+            continue;
+        }
+        log::info!(
+            "worktree_delete observed manual removal path={}",
+            path.display()
+        );
+        run_worktree_hook_with_trust(repo, path, "repo-stop.sh", true, trusted_repos);
+    }
+}
+
+pub(crate) fn discover_worktrees(roots: &[PathBuf]) -> HashMap<PathBuf, PathBuf> {
+    let mut found = HashMap::new();
+    for root in roots {
+        let mut pending = vec![(root.clone(), 0usize)];
+        while let Some((directory, depth)) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                } // Never follow a symlink out of the root.
+                if path.join(".git").exists() {
+                    let Ok(path) = std::fs::canonicalize(path) else {
+                        continue;
+                    };
+                    if path.starts_with(root)
+                        && let Ok(repo) = worktree_repo(&path)
+                    {
+                        found.insert(path, repo);
+                    }
+                } else if depth < 8 {
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// True when `refs/heads/<branch>` exists. Exit 0 means present, exit 1 means
 /// absent; anything else is a genuine git failure.
 pub(crate) fn worktree_branch_exists(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
@@ -326,6 +478,24 @@ pub(crate) fn worktree_create_plan(
     roots: &[PathBuf],
     repo_root: &Path,
 ) -> Result<Json, WorktreeError> {
+    worktree_create_plan_with_trust(
+        path_raw,
+        branch,
+        repo_raw,
+        roots,
+        repo_root,
+        &trusted_hook_repos(),
+    )
+}
+
+pub(crate) fn worktree_create_plan_with_trust(
+    path_raw: &str,
+    branch: &str,
+    repo_raw: &str,
+    roots: &[PathBuf],
+    repo_root: &Path,
+    trusted_repos: &[PathBuf],
+) -> Result<Json, WorktreeError> {
     let path = resolve_new_worktree_path(path_raw, roots)?;
     let repo = resolve_worktree_repo(repo_raw, repo_root)?;
     if !valid_worktree_branch(branch) {
@@ -377,7 +547,7 @@ pub(crate) fn worktree_create_plan(
             message: "worktree_git_add_failed",
         });
     }
-    run_worktree_hook(&repo, &path, "repo-start.sh");
+    run_worktree_hook_with_trust(&repo, &path, "repo-start.sh", false, trusted_repos);
     Ok(Json::Object(vec![
         (
             "path".to_owned(),
@@ -392,6 +562,15 @@ pub(crate) fn worktree_delete_plan(
     path_raw: &str,
     roots: &[PathBuf],
     agents: &[(&str, &str)],
+) -> Result<Json, WorktreeError> {
+    worktree_delete_plan_with_trust(path_raw, roots, agents, &trusted_hook_repos())
+}
+
+pub(crate) fn worktree_delete_plan_with_trust(
+    path_raw: &str,
+    roots: &[PathBuf],
+    agents: &[(&str, &str)],
+    trusted_repos: &[PathBuf],
 ) -> Result<Json, WorktreeError> {
     let path = resolve_existing_worktree_path(path_raw, roots)?;
     let path_str = path.to_string_lossy();
@@ -413,10 +592,23 @@ pub(crate) fn worktree_delete_plan(
         });
     }
     let repo = worktree_repo(&path)?;
-    run_worktree_hook(&repo, &path, "repo-stop.sh");
+    run_worktree_hook_with_trust(&repo, &path, "repo-stop.sh", false, trusted_repos);
     log::info!("worktree_delete path={}", path.display());
+    RELAY_DELETED_WORKTREES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| WorktreeError {
+            code: 500,
+            message: "worktree_git_failed",
+        })?
+        .insert(path.clone());
     let remove = git_output(&repo, &["worktree", "remove", "--force", &path_str])?;
     if !remove.status.success() {
+        if let Some(paths) = RELAY_DELETED_WORKTREES.get()
+            && let Ok(mut paths) = paths.lock()
+        {
+            paths.remove(&path);
+        }
         log::warn!(
             "worktree_delete remove failed for {}: {}",
             path.display(),
@@ -440,13 +632,21 @@ pub(crate) fn worktree_delete_plan(
 /// Remove an agent's worktree and delete its branch when it is safe to do so.
 /// This is best-effort from the API because the process has already stopped.
 pub(crate) fn cleanup_agent_worktree(raw: &str, roots: &[PathBuf]) -> Result<(), WorktreeError> {
+    cleanup_agent_worktree_with_trust(raw, roots, &trusted_hook_repos())
+}
+
+pub(crate) fn cleanup_agent_worktree_with_trust(
+    raw: &str,
+    roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
+) -> Result<(), WorktreeError> {
     let path = resolve_existing_worktree_path(raw, roots)?;
     let repo = worktree_repo(&path)?;
     let branch_output = git_output(&path, &["branch", "--show-current"])?;
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
-    worktree_delete_plan(raw, roots, &[])?;
+    worktree_delete_plan_with_trust(raw, roots, &[], trusted_repos)?;
     if branch.is_empty() || matches!(branch.as_str(), "main" | "master") {
         return Ok(());
     }

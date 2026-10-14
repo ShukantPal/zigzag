@@ -205,6 +205,8 @@ fn run() -> Result<(), String> {
     let cleanup_state = Arc::clone(&state);
     let cleanup_interval = config.github_watch_interval;
     thread::spawn(move || github::watched_pr_cleanup_loop(cleanup_state, cleanup_interval));
+    let worktree_roots = crate::routes::worktrees::canonical_worktree_roots();
+    thread::spawn(move || crate::routes::worktrees::worktree_deletion_watch_loop(worktree_roots));
     comment_router::configure_session_gate(
         config.state_file.with_extension("comment-router.json"),
     )?;
