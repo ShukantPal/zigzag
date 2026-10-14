@@ -212,10 +212,10 @@ pub(crate) fn agent_request(
                     }) {
                         return None;
                     }
-                    if let Some(branch) = branch_filter {
-                        if status.object("branch").and_then(Json::as_str) != Some(branch) {
-                            return None;
-                        }
+                    if let Some(branch) = branch_filter
+                        && status.object("branch").and_then(Json::as_str) != Some(branch)
+                    {
+                        return None;
                     }
                     Some(status)
                 })
@@ -507,10 +507,10 @@ fn enriched_agent_status(state: &Server, agent: &AgentRecord) -> Json {
     let in_flight = active_turn.is_some();
     let mut status = agent.status_json();
     if let Json::Object(ref mut fields) = status {
-        if active_turn.is_some() {
-            if let Some((_, value)) = fields.iter_mut().find(|(key, _)| key == "state") {
-                *value = Json::String("running".to_owned());
-            }
+        if active_turn.is_some()
+            && let Some((_, value)) = fields.iter_mut().find(|(key, _)| key == "state")
+        {
+            *value = Json::String("running".to_owned());
         }
         fields.push(("turn_in_flight".to_owned(), Json::Bool(in_flight)));
         fields.push((
@@ -619,10 +619,10 @@ fn resolve_pr_details(number: u64) -> Option<(String, String)> {
                     .as_ref()
                     .is_none_or(|repo| &entry.repository == repo)
         });
-        if let Some(entry) = matches.next() {
-            if matches.next().is_none() {
-                return Some((entry.repository.clone(), entry.branch.clone()));
-            }
+        if let Some(entry) = matches.next()
+            && matches.next().is_none()
+        {
+            return Some((entry.repository.clone(), entry.branch.clone()));
         }
     }
     let repository = repository?;

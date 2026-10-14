@@ -1394,7 +1394,7 @@ fn last_final_answer(transcript: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .last()
+        .next_back()
 }
 
 fn select_live_agent_for_pr(pr: u64, agents: &[serde_json::Value]) -> Result<String, ApiError> {
@@ -1637,10 +1637,10 @@ fn cmd_agents_transcript(
         } else if let Some(tail) = tail {
             q.push(("tail_items", tail.to_string()));
         }
-        if previous.is_none() {
-            if let Some(since) = since {
-                q.push(("since", since.to_string()));
-            }
+        if previous.is_none()
+            && let Some(since) = since
+        {
+            q.push(("since", since.to_string()));
         }
         let response = client.get(&format!("/v1/agents/{id}/transcript"), &q)?;
         if client.json {
