@@ -29,7 +29,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const INTERNAL: &str = "relay-update";
 const EVENT_PROMPT_LIMIT: usize = 100;
 const EVENT_LIMIT: usize = 10_000;
-const CODEX_TRANSCRIPT_LIMIT: usize = 16 * 1024 * 1024;
+// The TUI keeps at most one bounded byte window of transcript data in memory.
+const TRANSCRIPT_WINDOW_BYTES: usize = 512 * 1024;
 const STATUS_STATES: &[&str] = &[
     "not observed",
     "running",
@@ -1147,50 +1148,122 @@ fn safe_text(text: &str) -> String {
         .collect()
 }
 
-fn read_codex_transcript(client: &Client, agent_id: &str) -> (Vec<TranscriptItem>, Option<String>) {
-    let Some(path) = codex_transcript_path(agent_id) else {
-        return read_remote_transcript(client, agent_id);
+fn align_transcript_offset(path: &Path, offset: u64) -> Option<u64> {
+    if offset == 0 {
+        return Some(0);
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset.saturating_sub(1))).ok()?;
+    let mut previous = [0u8; 1];
+    file.read_exact(&mut previous).ok()?;
+    if previous[0] == b'\n' {
+        Some(offset)
+    } else {
+        let mut byte = [0u8; 1];
+        while file.read(&mut byte).ok()? == 1 {
+            if byte[0] == b'\n' {
+                return file.stream_position().ok();
+            }
+        }
+        Some(file.stream_position().ok()?)
+    }
+}
+
+fn read_transcript_window(
+    path: &Path,
+    offset: u64,
+) -> (Vec<TranscriptItem>, Option<String>, u64, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (
+            Vec::new(),
+            Some("Transcript unavailable locally".into()),
+            offset,
+            false,
+        );
     };
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.len() as usize > CODEX_TRANSCRIPT_LIMIT => {
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return (
+            Vec::new(),
+            Some("Transcript unavailable locally".into()),
+            offset,
+            false,
+        );
+    };
+    let Some(start) = align_transcript_offset(path, offset.min(size)) else {
+        return (
+            Vec::new(),
+            Some("Transcript unavailable locally".into()),
+            offset,
+            false,
+        );
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (
+            Vec::new(),
+            Some("Transcript unavailable locally".into()),
+            start,
+            false,
+        );
+    }
+    // Read no more than one window plus one byte; only parse complete JSONL records.
+    let mut bytes = vec![0; TRANSCRIPT_WINDOW_BYTES + 1];
+    let count = file.read(&mut bytes).unwrap_or(0);
+    bytes.truncate(count);
+    let has_more = start.saturating_add(count as u64) < size;
+    if has_more {
+        if let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            bytes.truncate(end + 1);
+        } else {
             return (
                 Vec::new(),
-                Some(format!(
-                    "Transcript exceeds the {} MiB display limit",
-                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
-                )),
+                Some("Transcript contains a record larger than the display window".into()),
+                start,
+                false,
             );
         }
-        Err(_) => return read_remote_transcript(client, agent_id),
-        _ => {}
     }
-    match std::fs::read_to_string(path) {
-        Ok(text) => (parse_codex_transcript(&text), None),
-        Err(_) => read_remote_transcript(client, agent_id),
+    let next = start.saturating_add(bytes.len() as u64);
+    let text = String::from_utf8_lossy(&bytes);
+    (parse_codex_transcript(&text), None, next, has_more)
+}
+
+fn read_codex_transcript(
+    client: &Client,
+    agent_id: &str,
+    offset: u64,
+) -> (Vec<TranscriptItem>, Option<String>, u64, bool) {
+    let Some(path) = codex_transcript_path(agent_id) else {
+        return read_remote_transcript(client, agent_id, offset);
+    };
+    if path.exists() {
+        read_transcript_window(&path, offset)
+    } else {
+        read_remote_transcript(client, agent_id, offset)
     }
 }
 
 fn read_remote_transcript(
     client: &Client,
     agent_id: &str,
-) -> (Vec<TranscriptItem>, Option<String>) {
-    if let Ok(transcript) = client.get(&format!("/v1/agents/{agent_id}/transcript"), &[])
-        && let Some(text) = transcript.get("stdout").and_then(Value::as_str)
+    offset: u64,
+) -> (Vec<TranscriptItem>, Option<String>, u64, bool) {
+    // The relay's `after` cursor can return every remaining byte, so keep the
+    // fallback to a bounded tail until it offers range reads.
+    let _ = offset;
+    if let Ok(transcript) = client.get(
+        &format!("/v1/agents/{agent_id}/transcript"),
+        &[("tail", TRANSCRIPT_WINDOW_BYTES.to_string())],
+    ) && let Some(text) = transcript.get("stdout").and_then(Value::as_str)
     {
-        if text.len() > CODEX_TRANSCRIPT_LIMIT {
-            return (
-                Vec::new(),
-                Some(format!(
-                    "Transcript exceeds the {} MiB display limit",
-                    CODEX_TRANSCRIPT_LIMIT / 1024 / 1024
-                )),
-            );
-        }
-        return (parse_codex_transcript(text), None);
+        return (parse_codex_transcript(text), None, 0, false);
     }
     (
         Vec::new(),
         Some("Transcript unavailable locally and from the relay".into()),
+        offset,
+        false,
     )
 }
 
@@ -1199,6 +1272,9 @@ struct TranscriptCache {
     local_signature: Option<(u64, Option<SystemTime>)>,
     checked_at: Instant,
     items: Arc<Vec<TranscriptItem>>,
+    offset: u64,
+    next_offset: u64,
+    has_more: bool,
     notice: Option<String>,
 }
 
@@ -1206,27 +1282,37 @@ fn read_codex_transcript_cached(
     client: &Client,
     agent_id: &str,
     cache: &mut Option<TranscriptCache>,
-) -> (Arc<Vec<TranscriptItem>>, Option<String>) {
+    offset: u64,
+) -> (Arc<Vec<TranscriptItem>>, Option<String>, u64, bool) {
     let local_signature = codex_transcript_path(agent_id)
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| (metadata.len(), metadata.modified().ok()));
     if let Some(cached) = cache.as_ref()
         && cached.agent_id == agent_id
+        && cached.offset == offset
         && ((local_signature.is_some() && cached.local_signature == local_signature)
             || cached.checked_at.elapsed() < Duration::from_secs(1))
     {
-        return (Arc::clone(&cached.items), cached.notice.clone());
+        return (
+            Arc::clone(&cached.items),
+            cached.notice.clone(),
+            cached.next_offset,
+            cached.has_more,
+        );
     }
-    let (items, notice) = read_codex_transcript(client, agent_id);
+    let (items, notice, next_offset, has_more) = read_codex_transcript(client, agent_id, offset);
     let items = Arc::new(items);
     *cache = Some(TranscriptCache {
         agent_id: agent_id.to_owned(),
         local_signature,
         checked_at: Instant::now(),
         items: Arc::clone(&items),
+        offset,
+        next_offset,
+        has_more,
         notice: notice.clone(),
     });
-    (items, notice)
+    (items, notice, next_offset, has_more)
 }
 
 fn read_agent_prompt(client: &Client, agent_id: &str) -> Option<String> {
@@ -1298,10 +1384,18 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
     let mut selected_id = rows.get(selected).map(|row| row.id.clone());
     let mut table_state = ratatui::widgets::TableState::default();
     let mut transcript_cache = None;
-    let (mut transcript_items, mut transcript_notice) = rows
-        .get(selected)
-        .map(|row| read_codex_transcript_cached(c, &row.agent, &mut transcript_cache))
-        .unwrap_or_default();
+    let mut transcript_offset = 0u64;
+    let (mut transcript_items, mut transcript_notice, mut transcript_next, mut transcript_more) =
+        rows.get(selected)
+            .map(|row| {
+                read_codex_transcript_cached(
+                    c,
+                    &row.agent,
+                    &mut transcript_cache,
+                    transcript_offset,
+                )
+            })
+            .unwrap_or_default();
     let mut transcript_prompt = rows
         .get(selected)
         .and_then(|row| read_agent_prompt(c, &row.agent));
@@ -1373,13 +1467,20 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                         } else {
                             selected = (selected + 1).min(rows.len().saturating_sub(1));
                             selected_id = rows.get(selected).map(|row| row.id.clone());
-                            (transcript_items, transcript_notice) = rows
+                            transcript_offset = 0;
+                            (
+                                transcript_items,
+                                transcript_notice,
+                                transcript_next,
+                                transcript_more,
+                            ) = rows
                                 .get(selected)
                                 .map(|row| {
                                     read_codex_transcript_cached(
                                         c,
                                         &row.agent,
                                         &mut transcript_cache,
+                                        transcript_offset,
                                     )
                                 })
                                 .unwrap_or_default();
@@ -1403,13 +1504,20 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                         } else {
                             selected = selected.saturating_sub(1);
                             selected_id = rows.get(selected).map(|row| row.id.clone());
-                            (transcript_items, transcript_notice) = rows
+                            transcript_offset = 0;
+                            (
+                                transcript_items,
+                                transcript_notice,
+                                transcript_next,
+                                transcript_more,
+                            ) = rows
                                 .get(selected)
                                 .map(|row| {
                                     read_codex_transcript_cached(
                                         c,
                                         &row.agent,
                                         &mut transcript_cache,
+                                        transcript_offset,
                                     )
                                 })
                                 .unwrap_or_default();
@@ -1422,12 +1530,58 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                         }
                     }
                     KeyCode::PageDown | KeyCode::Char(']') => {
-                        transcript_scroll = transcript_scroll
-                            .saturating_add(10)
-                            .min(max_transcript_scroll)
+                        if transcript_scroll >= max_transcript_scroll && transcript_more {
+                            transcript_offset = transcript_next;
+                            if let Some(row) = rows.get(selected) {
+                                (
+                                    transcript_items,
+                                    transcript_notice,
+                                    transcript_next,
+                                    transcript_more,
+                                ) = read_codex_transcript_cached(
+                                    c,
+                                    &row.agent,
+                                    &mut transcript_cache,
+                                    transcript_offset,
+                                );
+                                transcript_selected =
+                                    visible_transcript_selection(&transcript_items, 0);
+                                transcript_scroll = 0;
+                            }
+                        } else {
+                            transcript_scroll = transcript_scroll
+                                .saturating_add(10)
+                                .min(max_transcript_scroll);
+                        }
                     }
                     KeyCode::PageUp | KeyCode::Char('[') => {
-                        transcript_scroll = transcript_scroll.saturating_sub(10)
+                        if transcript_scroll == 0 && transcript_offset > 0 {
+                            let previous =
+                                transcript_offset.saturating_sub(TRANSCRIPT_WINDOW_BYTES as u64);
+                            transcript_offset = rows
+                                .get(selected)
+                                .and_then(|row| codex_transcript_path(&row.agent))
+                                .and_then(|path| align_transcript_offset(&path, previous))
+                                .unwrap_or(previous);
+                            if let Some(row) = rows.get(selected) {
+                                (
+                                    transcript_items,
+                                    transcript_notice,
+                                    transcript_next,
+                                    transcript_more,
+                                ) = read_codex_transcript_cached(
+                                    c,
+                                    &row.agent,
+                                    &mut transcript_cache,
+                                    transcript_offset,
+                                );
+                                transcript_selected =
+                                    visible_transcript_selection(&transcript_items, 0);
+                                transcript_scroll = max_transcript_scroll;
+                            }
+                        } else {
+                            transcript_scroll = transcript_scroll.saturating_sub(10);
+                        }
                     }
                     KeyCode::Char('v') => {
                         raw_view = !raw_view;
@@ -1462,10 +1616,20 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                     selected_id = rows.get(selected).map(|row| row.id.clone());
                     let current_agent = rows.get(selected).map(|row| row.agent.clone());
                     if current_agent != previous_agent {
-                        (transcript_items, transcript_notice) = rows
+                        (
+                            transcript_items,
+                            transcript_notice,
+                            transcript_next,
+                            transcript_more,
+                        ) = rows
                             .get(selected)
                             .map(|row| {
-                                read_codex_transcript_cached(c, &row.agent, &mut transcript_cache)
+                                read_codex_transcript_cached(
+                                    c,
+                                    &row.agent,
+                                    &mut transcript_cache,
+                                    transcript_offset,
+                                )
                             })
                             .unwrap_or_default();
                         transcript_prompt = rows
@@ -1488,8 +1652,17 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
         // this read to the status interval makes the transcript feel stale.
         if transcript_tick.elapsed() >= Duration::from_millis(500) {
             if let Some(row) = rows.get(selected) {
-                (transcript_items, transcript_notice) =
-                    read_codex_transcript_cached(c, &row.agent, &mut transcript_cache);
+                (
+                    transcript_items,
+                    transcript_notice,
+                    transcript_next,
+                    transcript_more,
+                ) = read_codex_transcript_cached(
+                    c,
+                    &row.agent,
+                    &mut transcript_cache,
+                    transcript_offset,
+                );
                 transcript_selected = if raw_view {
                     transcript_selected.min(transcript_items.len().saturating_sub(1))
                 } else {
@@ -1802,6 +1975,55 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn transcript_window_pages_a_file_larger_than_sixteen_mib() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "zzapi-transcript-window-{}.jsonl",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let payload = "x".repeat(10_000);
+        for index in 0..1_900 {
+            writeln!(file, "{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item-{index}\",\"type\":\"agentMessage\",\"text\":\"{payload}\"}}}}").unwrap();
+        }
+        drop(file);
+        assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+
+        let (first, notice, next, more) = read_transcript_window(&path, 0);
+        assert!(notice.is_none());
+        assert!(more);
+        assert!(next < std::fs::metadata(&path).unwrap().len());
+        assert!(
+            first.len() < 100,
+            "a page should contain only a bounded portion of the transcript"
+        );
+        let (second, _, second_next, second_more) = read_transcript_window(&path, next);
+        assert!(!second.is_empty());
+        assert!(second_next > next);
+        assert!(second_more);
+        assert_ne!(first[0].id, second[0].id);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transcript_window_alignment_starts_at_a_record_boundary() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "zzapi-transcript-align-{}.jsonl",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{{\"type\":\"thread.started\"}}").unwrap();
+        writeln!(file, "{{\"type\":\"turn.started\"}}").unwrap();
+        drop(file);
+        let offset = align_transcript_offset(&path, 4).unwrap();
+        let (items, _, _, _) = read_transcript_window(&path, offset);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, "turn.started");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
