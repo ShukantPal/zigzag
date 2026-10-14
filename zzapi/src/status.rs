@@ -1616,6 +1616,7 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                     selected_id = rows.get(selected).map(|row| row.id.clone());
                     let current_agent = rows.get(selected).map(|row| row.agent.clone());
                     if current_agent != previous_agent {
+                        transcript_offset = 0;
                         (
                             transcript_items,
                             transcript_notice,
@@ -1635,6 +1636,7 @@ pub(super) fn cmd_status(c: &Client, options: StatusOptions<'_>) -> Result<(), F
                         transcript_prompt = rows
                             .get(selected)
                             .and_then(|row| read_agent_prompt(c, &row.agent));
+                        transcript_scroll = 0;
                     }
                     transcript_selected = if raw_view {
                         transcript_selected.min(transcript_items.len().saturating_sub(1))
