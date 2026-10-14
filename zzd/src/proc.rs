@@ -82,29 +82,36 @@ pub(crate) fn agent_stderr_path(agent_id: &str) -> Option<PathBuf> {
 /// Remove the durable output artifacts for an agent after its relay record is
 /// deleted. Missing artifacts are normal; other failures are logged so they
 /// can be recovered manually from the relay logs.
-pub(crate) fn remove_agent_output_files(agent_id: &str) {
+pub(crate) fn remove_agent_output_files(agent_id: &str) -> bool {
     let paths = [agent_transcript_path(agent_id), agent_stderr_path(agent_id)];
-    remove_agent_output_paths(agent_id, paths);
+    remove_agent_output_paths(agent_id, paths)
 }
 
 #[cfg(test)]
-pub(crate) fn remove_agent_output_files_from(agent_id: &str, home: &Path) {
+pub(crate) fn remove_agent_output_files_from(agent_id: &str, home: &Path) -> bool {
     let transcript = agent_transcript_path_in(agent_id, home);
     let paths = [
         transcript.clone(),
         transcript.map(|path| path.with_extension("stderr")),
     ];
-    remove_agent_output_paths(agent_id, paths);
+    remove_agent_output_paths(agent_id, paths)
 }
 
-fn remove_agent_output_paths(agent_id: &str, paths: [Option<PathBuf>; 2]) {
-    for path in paths.into_iter().flatten() {
+fn remove_agent_output_paths(agent_id: &str, paths: [Option<PathBuf>; 2]) -> bool {
+    let mut transcript_removed = false;
+    for (index, path) in paths.into_iter().enumerate() {
+        let Some(path) = path else { continue };
         match fs::remove_file(&path) {
-            Ok(()) => log::info!(
-                "agent_output_cleanup removed agent={} path={}",
-                agent_id,
-                path.display()
-            ),
+            Ok(()) => {
+                if index == 0 {
+                    transcript_removed = true;
+                }
+                log::info!(
+                    "agent_output_cleanup removed agent={} path={}",
+                    agent_id,
+                    path.display()
+                )
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
                 "agent_output_cleanup kept agent={} path={}: {error}",
@@ -113,6 +120,7 @@ fn remove_agent_output_paths(agent_id: &str, paths: [Option<PathBuf>; 2]) {
             ),
         }
     }
+    transcript_removed
 }
 
 fn create_agent_output(path: PathBuf) -> Result<File, String> {

@@ -2155,6 +2155,69 @@ pub(crate) fn delete_inactive_agent_with_trust(
     }
 }
 
+/// Explicit deletion has a different worktree policy from the TTL sweep: keep
+/// a watched PR's worktree, and otherwise remove a clean, pushed worktree and
+/// its branch when Git cleanup permits it.
+pub(crate) struct ExplicitDeleteEffects {
+    pub(crate) worktree_removed: bool,
+    pub(crate) transcript_removed: bool,
+}
+
+pub(crate) fn delete_explicit_agent_with_trust(
+    registry: &zz::AgentRegistry,
+    agent_id: &str,
+    watched_pr: bool,
+    roots: &[PathBuf],
+    trusted_repos: &[PathBuf],
+) -> Result<Option<ExplicitDeleteEffects>, String> {
+    let Some(agent) = registry.get(agent_id) else {
+        return Ok(None);
+    };
+    if agent_is_live(&agent) {
+        return Ok(None);
+    }
+
+    let worktree_path = agent.worktree_path.as_deref();
+    let worktree_existed = worktree_path.is_some_and(|path| Path::new(path).exists());
+    if watched_pr {
+        log::info!("agent_delete id={agent_id}: retaining worktree for watched pull request");
+    } else if let Some(path) = worktree_path {
+        match crate::routes::worktrees::agent_worktree_is_clean_and_pushed(path, roots) {
+            Ok(true) => match crate::routes::worktrees::cleanup_agent_worktree_with_trust(
+                path,
+                roots,
+                trusted_repos,
+            ) {
+                Ok(()) => {}
+                Err(error) => log::warn!(
+                    "agent_delete id={agent_id}: worktree cleanup failed at {path}: {}",
+                    error.message
+                ),
+            },
+            Ok(false) => log::info!(
+                "agent_delete id={agent_id}: retaining worktree at {path}; it is dirty, its branch tip is not on origin, or safety could not be verified"
+            ),
+            Err(error) if error.message == "worktree_path_not_found" => {}
+            Err(error) => log::warn!(
+                "agent_delete id={agent_id}: worktree safety check failed at {path}: {}; retaining worktree",
+                error.message
+            ),
+        }
+    }
+
+    if registry.deregister(agent_id)?.is_none() {
+        return Ok(None);
+    }
+    let transcript_removed = crate::proc::remove_agent_output_files(agent_id);
+    log::info!("inactive agent record deleted agent={agent_id}");
+    let worktree_removed =
+        worktree_existed && worktree_path.is_some_and(|path| !Path::new(path).exists());
+    Ok(Some(ExplicitDeleteEffects {
+        worktree_removed,
+        transcript_removed,
+    }))
+}
+
 /// Completed agents remain inspectable for a day by default. Configure a
 /// longer or shorter positive retention window with ZIGZAG_AGENT_CLEANUP_TTL_SECS.
 const DEFAULT_AGENT_CLEANUP_TTL_SECS: u64 = 24 * 60 * 60;
@@ -2751,8 +2814,21 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
     };
     if !agent_is_live(&agent) {
         let worktree = agent.worktree_path.clone();
-        return match delete_inactive_agent(&state.supervisor.registry, &id) {
-            Ok(true) => reply(
+        let watched_pr = match watch_agent_pr(&agent) {
+            Ok(watching) => watching,
+            Err(message) => {
+                log::warn!("agent_delete PR discovery id={id} failed: {message}");
+                false
+            }
+        };
+        return match delete_explicit_agent_with_trust(
+            &state.supervisor.registry,
+            &id,
+            watched_pr,
+            &agent_worktree_roots(),
+            &crate::routes::worktrees::trusted_hook_repos(),
+        ) {
+            Ok(Some(effects)) => reply(
                 stream,
                 200,
                 Json::Object(vec![
@@ -2760,12 +2836,20 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
                     ("stopped".to_owned(), Json::Bool(true)),
                     ("deleted".to_owned(), Json::Bool(true)),
                     (
+                        "worktree_removed".to_owned(),
+                        Json::Bool(effects.worktree_removed),
+                    ),
+                    (
+                        "transcript_removed".to_owned(),
+                        Json::Bool(effects.transcript_removed),
+                    ),
+                    (
                         "worktree".to_owned(),
                         worktree.map(Json::String).unwrap_or(Json::Null),
                     ),
                 ]),
             ),
-            Ok(false) => reply(stream, 409, error("agent_still_live")),
+            Ok(None) => reply(stream, 409, error("agent_still_live")),
             Err(_) => reply(stream, 500, error("could_not_delete_agent")),
         };
     }

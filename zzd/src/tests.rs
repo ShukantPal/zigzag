@@ -40,11 +40,11 @@ use crate::routes::agents::{
     AgentRoute, AgentWorktreeFailure, agent_argv, agent_create_worktree,
     agent_create_worktree_with_trust, agent_harness_bin, agent_harness_config,
     agent_post_request_with_session_resolver, agent_route, default_agent_worktree,
-    delete_inactive_agent, delete_inactive_agent_with_trust, dispatch_agent_message,
-    handle_codex_notification, monitor_codex_events, monitor_codex_events_to_path,
-    parse_agent_cleanup_ttl, parse_agent_create_request, persisted_agent_config,
-    repair_transcript_tail, restart_argv, restart_config, sweep_inactive_agents_at,
-    transcript_json_with_sessions_dir, valid_agent_model,
+    delete_explicit_agent_with_trust, delete_inactive_agent, delete_inactive_agent_with_trust,
+    dispatch_agent_message, handle_codex_notification, monitor_codex_events,
+    monitor_codex_events_to_path, parse_agent_cleanup_ttl, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
@@ -1805,6 +1805,64 @@ fn completed_clean_pushed_worktree_is_removed_and_branch_is_retained() {
 }
 
 #[test]
+fn explicit_delete_of_watched_pr_retains_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-watched", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        true,
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!effects.worktree_removed);
+    assert!(path.exists(), "watched PR worktree was removed");
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-watched",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(branch.success(), "watched PR branch was removed");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
+fn explicit_delete_removes_safe_worktree_and_branch() {
+    let (repo, path, roots, registry, id) = completed_worktree_fixture("delete-branch", true);
+    let effects = delete_explicit_agent_with_trust(
+        &registry,
+        &id,
+        false,
+        &roots,
+        &[repo.canonicalize().unwrap()],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(effects.worktree_removed);
+    assert!(!path.exists(), "safe worktree was not removed");
+    assert!(registry.get(&id).is_none(), "agent record remains");
+    let branch = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/delete-branch",
+        ])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "explicit delete retained its branch");
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+#[test]
 fn completed_dirty_worktree_is_kept() {
     let (repo, path, _roots, registry, id) = completed_worktree_fixture("auto-dirty", true);
     std::fs::write(path.join("uncommitted.txt"), "recover me").unwrap();
@@ -3121,6 +3179,14 @@ fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body = response_json(response);
     assert_eq!(body.object("deleted").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        body.object("worktree_removed").and_then(Json::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        body.object("transcript_removed").and_then(Json::as_bool),
+        Some(false)
+    );
     assert!(state.supervisor.registry.get("done-agent").is_none());
 }
 

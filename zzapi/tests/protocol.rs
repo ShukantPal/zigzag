@@ -139,7 +139,7 @@ fn agents_delete_calls_the_agent_delete_endpoint() {
     let (port, server) = transcript_server([
         r#"{"id":"agent-123","state":"orphaned"}"#,
         r#"{"id":"agent-123","state":"orphaned"}"#,
-        r#"{"id":"agent-123","stopped":true,"worktree":null}"#,
+        r#"{"id":"agent-123","stopped":true,"deleted":true,"worktree_removed":true,"transcript_removed":false,"worktree":null}"#,
     ]);
     let output = Command::new(env!("CARGO_BIN_EXE_zzapi"))
         .args([
@@ -156,6 +156,12 @@ fn agents_delete_calls_the_agent_delete_endpoint() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("deleted agent-123 (worktree_removed=true, transcript_removed=false)"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 3);
