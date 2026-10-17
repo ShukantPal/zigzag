@@ -67,6 +67,18 @@ struct ApprovalContext {
 /// domain is its local user + Codex home/config/auth + trust policy.
 pub(crate) struct CodexServer {
     shared: Arc<Shared>,
+    codex_home: std::path::PathBuf,
+}
+
+fn default_codex_home() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        return home.into();
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".codex")
 }
 
 struct OpenCodeShared {
@@ -271,13 +283,46 @@ impl OpenCodeServer {
 }
 
 impl CodexServer {
+    pub(crate) fn codex_home(&self) -> &std::path::Path {
+        &self.codex_home
+    }
+
     pub(crate) fn active_turn_id(&self, thread_id: &str) -> Option<String> {
         self.shared.turns.lock().ok()?.get(thread_id).cloned()
     }
 
     pub(crate) fn start() -> Result<Arc<Self>, String> {
+        Self::start_with_codex_home(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_test_codex_home(home: &std::path::Path) -> Result<Arc<Self>, String> {
+        Self::start_with_codex_home(Some(home))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_empty_test_thread(&self, cwd: &str) -> Result<String, String> {
+        let response = self.rpc("thread/start", json!({"cwd":cwd,"model":"gpt-5-codex"}))?;
+        response
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .or_else(|| response.pointer("/threadId").and_then(Value::as_str))
+            .map(str::to_owned)
+            .ok_or_else(|| "app-server thread/start returned no thread ID".to_owned())
+    }
+
+    fn start_with_codex_home(codex_home: Option<&std::path::Path>) -> Result<Arc<Self>, String> {
+        let codex_home_path = codex_home
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(default_codex_home);
         let mut child = Command::new("codex")
             .args(["app-server", "--listen", "stdio://"])
+            .envs(
+                codex_home
+                    .map(|home| [("CODEX_HOME", home)])
+                    .into_iter()
+                    .flatten(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -308,13 +353,21 @@ impl CodexServer {
         });
         let reader_shared = Arc::clone(&shared);
         thread::spawn(move || read_messages(stdout, reader_shared));
-        let server = Arc::new(Self { shared });
+        let server = Arc::new(Self {
+            shared,
+            codex_home: codex_home_path,
+        });
         server.rpc(
             "initialize",
             json!({"clientInfo":{"name":"zigzag","version":env!("CARGO_PKG_VERSION")}}),
         )?;
         server.notify("initialized", json!({}))?;
         Ok(server)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_thread_list(&self) -> Result<Value, String> {
+        self.rpc("thread/list", json!({"limit":100}))
     }
 
     #[allow(dead_code)]
@@ -377,6 +430,33 @@ impl CodexServer {
             && let Some(list) = subscribers.get_mut(thread_id)
         {
             list.retain(|subscriber| subscriber.send(event.clone()).is_ok());
+        }
+        Ok(())
+    }
+
+    /// Permanently delete one persisted thread through app-server. The
+    /// protocol closes the loaded thread before removing its rollout and
+    /// associated metadata. Missing rollout/thread errors are idempotent.
+    pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<(), String> {
+        match self.rpc("thread/delete", json!({"threadId":thread_id})) {
+            Ok(_) => {}
+            Err(error) if missing_thread_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if let Ok(mut map) = self.shared.subscribers.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.turns.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.queued.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.completions.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.approval_contexts.lock() {
+            map.remove(thread_id);
         }
         Ok(())
     }
@@ -485,6 +565,22 @@ impl CodexServer {
             thread_id,
         })
     }
+}
+
+fn missing_thread_error(error: &str) -> bool {
+    let message = serde_json::from_str::<Value>(error)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| error.to_owned())
+        .to_ascii_lowercase();
+    message.contains("thread not found")
+        || message.contains("no rollout found for thread")
+        || message.contains("no codex thread found")
 }
 
 /// Build the same event consumed by the notification monitor when resume
@@ -1225,7 +1321,10 @@ fn read_messages(stdout: impl std::io::Read, shared: Arc<Shared>) {
                     let shared = Arc::clone(&shared);
                     let thread_id = thread_id.to_owned();
                     thread::spawn(move || {
-                        let server = CodexServer { shared };
+                        let server = CodexServer {
+                            shared,
+                            codex_home: default_codex_home(),
+                        };
                         if let Some(completion) = text.completion.as_ref()
                             && let Ok(mut completions) = server.shared.completions.lock()
                         {
@@ -1314,10 +1413,42 @@ fn reconcile_started_turn(shared: &Shared, thread_id: &str, turn_id: &str) {
 }
 
 #[cfg(test)]
+pub(crate) fn mock_codex_server(script: &str, thread_id: &str) -> Arc<CodexServer> {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let writer = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let shared = Arc::new(Shared {
+        writer: Mutex::new(writer),
+        child: Mutex::new(child),
+        pending: Mutex::new(HashMap::new()),
+        subscribers: Mutex::new(HashMap::from([(thread_id.to_owned(), Vec::new())])),
+        turns: Mutex::new(HashMap::new()),
+        queued: Mutex::new(HashMap::new()),
+        completions: Mutex::new(HashMap::new()),
+        early_completions: Mutex::new(std::collections::HashSet::new()),
+        approval_contexts: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(1),
+    });
+    let reader_shared = Arc::clone(&shared);
+    thread::spawn(move || read_messages(stdout, reader_shared));
+    Arc::new(CodexServer {
+        shared,
+        codex_home: default_codex_home(),
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ApprovalContext, CodexServer, HarnessEvent, QueuedTurn, Shared, approval_audit_line,
-        approval_response, command_approval,
+        approval_response, command_approval, default_codex_home, missing_thread_error,
+        mock_codex_server,
     };
     use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
@@ -1327,31 +1458,56 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn mock_server(script: &str, thread_id: &str) -> Arc<CodexServer> {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", script])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let writer = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let shared = Arc::new(Shared {
-            writer: Mutex::new(writer),
-            child: Mutex::new(child),
-            pending: Mutex::new(HashMap::new()),
-            subscribers: Mutex::new(HashMap::from([(thread_id.to_owned(), Vec::new())])),
-            turns: Mutex::new(HashMap::new()),
-            queued: Mutex::new(HashMap::new()),
-            completions: Mutex::new(HashMap::new()),
-            early_completions: Mutex::new(std::collections::HashSet::new()),
-            approval_contexts: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        });
-        let reader_shared = Arc::clone(&shared);
-        thread::spawn(move || super::read_messages(stdout, reader_shared));
-        Arc::new(CodexServer { shared })
+    #[test]
+    fn deleting_a_thread_uses_app_server_and_keeps_other_threads_attached() {
+        let script = r#"
+            IFS= read -r request
+            case "$request" in
+                *'"method":"thread/delete"'*'"threadId":"thread-delete-target"'*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+                    ;;
+                *)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"unexpected delete request"}}'
+                    ;;
+            esac
+        "#;
+        let server = mock_codex_server(script, "thread-delete-target");
+        server
+            .shared
+            .subscribers
+            .lock()
+            .unwrap()
+            .insert("another-agents-thread".to_owned(), Vec::new());
+
+        server.delete_thread("thread-delete-target").unwrap();
+
+        let subscribers = server.shared.subscribers.lock().unwrap();
+        assert!(!subscribers.contains_key("thread-delete-target"));
+        assert!(subscribers.contains_key("another-agents-thread"));
+    }
+
+    #[test]
+    fn deleting_a_thread_with_missing_rollout_is_idempotent() {
+        let script = r#"
+            IFS= read -r _request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"no rollout found for thread id thread-already-gone"}}'
+        "#;
+        let server = mock_codex_server(script, "thread-already-gone");
+        server.delete_thread("thread-already-gone").unwrap();
+        assert!(
+            !server
+                .shared
+                .subscribers
+                .lock()
+                .unwrap()
+                .contains_key("thread-already-gone")
+        );
+        assert!(missing_thread_error(
+            r#"{"code":-32600,"message":"thread not found"}"#
+        ));
+        assert!(!missing_thread_error(
+            r#"{"code":-32600,"message":"already has an active writer"}"#
+        ));
     }
 
     #[test]
@@ -1361,7 +1517,7 @@ mod tests {
             printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fast","turn":{"id":"turn-fast","status":"completed","output":"done"}}}'
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-fast"}}}'
         "#;
-        let server = mock_server(script, "thread-fast");
+        let server = mock_codex_server(script, "thread-fast");
         let session = server.session("thread-fast".to_owned());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
@@ -1400,7 +1556,7 @@ mod tests {
             printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-queue","turn":{"id":"turn-next","status":"completed","output":"queued done"}}}'
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"turn":{"id":"turn-next"}}}'
         "#;
-        let server = mock_server(script, "thread-queue");
+        let server = mock_codex_server(script, "thread-queue");
         server
             .shared
             .turns
@@ -1451,7 +1607,7 @@ mod tests {
             IFS= read -r request
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"thread not found"}}'
         "#;
-        let server = mock_server(script, "missing-thread");
+        let server = mock_codex_server(script, "missing-thread");
         server
             .shared
             .subscribers
@@ -1488,6 +1644,7 @@ mod tests {
                 approval_contexts: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
+            codex_home: default_codex_home(),
         });
 
         server
@@ -1529,7 +1686,10 @@ mod tests {
         });
         let reader_shared = Arc::clone(&shared);
         thread::spawn(move || super::read_messages(stdout, reader_shared));
-        let server = CodexServer { shared };
+        let server = CodexServer {
+            shared,
+            codex_home: default_codex_home(),
+        };
 
         let (thread_id, events) = server
             .start_thread("agent-fast", "/tmp", "finish immediately", "gpt-6-luna")
@@ -1580,7 +1740,10 @@ mod tests {
         });
         let reader_shared = Arc::clone(&shared);
         thread::spawn(move || super::read_messages(stdout, reader_shared));
-        let server = CodexServer { shared };
+        let server = CodexServer {
+            shared,
+            codex_home: default_codex_home(),
+        };
 
         let events = server.subscribe_thread("thread-finished").unwrap();
         server.resume_thread("thread-finished").unwrap();
