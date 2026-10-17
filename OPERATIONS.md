@@ -829,15 +829,18 @@ zzapi agents delete ID_OR_UNIQUE_PREFIX [--dry-run]
 ```
 
 Calls `DELETE /v1/agents/{id}` and refuses `running` or `paused` agents (use
-`zzapi agents stop` first). For terminal agents, the relay removes the record,
-diagnostic log spool, and Codex transcript/stderr files. Worktree cleanup runs
+`zzapi agents stop` first). For terminal agents, the relay deletes the recorded
+Codex thread through the existing app-server before removing the agent record,
+diagnostic log spool, and Codex transcript/stderr files. The app-server removes
+the thread's rollout and associated metadata after closing it. Worktree cleanup runs
 the repository stop hook only when the tree is clean and its branch tip matches
 its upstream; watched pull requests and unsafe or unverifiable trees are
 retained with their branch. A missing worktree does not block record removal.
 For `orphaned` agents, the relay attempts to stop the possibly live process
 and retains the record. `--dry-run` summarizes the state-specific cleanup
 effects without sending `DELETE`. Completed records otherwise remain available
-until the configured agent cleanup TTL expires.
+until the configured agent cleanup TTL expires. The TTL sweep uses a separate
+record cleanup path and does not currently delete Codex threads.
 
 ### `zzapi agents logs`
 

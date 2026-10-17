@@ -405,6 +405,7 @@ pub(crate) fn agent_bulk_delete(
         keep_last,
     );
     let result = apply_bulk_delete(selected, dry_run, |agent| {
+        delete_agent_codex_thread(state, agent)?;
         delete_explicit_agent_with_trust(
             &state.supervisor.registry,
             &agent.id,
@@ -2766,6 +2767,22 @@ pub(crate) fn delete_explicit_agent_with_trust(
     }))
 }
 
+fn delete_agent_codex_thread(state: &Server, agent: &AgentRecord) -> Result<(), String> {
+    if agent.harness.as_deref() != Some("codex") {
+        return Ok(());
+    }
+    let Some(thread_id) = agent.harness_session_id.as_deref() else {
+        // Older or partially persisted records may not have a thread ID. Do
+        // not infer one from another agent or scan Codex history.
+        return Ok(());
+    };
+    let server = state
+        .supervisor
+        .existing_codex_server()?
+        .ok_or("Codex app-server is not running")?;
+    server.delete_thread(thread_id)
+}
+
 /// Clean up a worktree after an explicit DELETE has stopped a live agent.
 /// Discovery failures retain the worktree, and cleanup rechecks registry
 /// attachments after any repository stop hook immediately before removal.
@@ -3419,6 +3436,10 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         return reply(stream, 404, error("unknown_agent"));
     };
     if !agent_is_live(&agent) {
+        if let Err(message) = delete_agent_codex_thread(state, &agent) {
+            log::warn!("could not delete Codex thread for agent {id}: {message}");
+            return reply(stream, 503, error("could_not_delete_codex_thread"));
+        }
         let worktree = agent.worktree_path.clone();
         let watched_pr = watch_agent_pr(&agent);
         return match delete_explicit_agent_with_trust(

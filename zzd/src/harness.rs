@@ -381,6 +381,33 @@ impl CodexServer {
         Ok(())
     }
 
+    /// Permanently delete one persisted thread through app-server. The
+    /// protocol closes the loaded thread before removing its rollout and
+    /// associated metadata. Missing rollout/thread errors are idempotent.
+    pub(crate) fn delete_thread(&self, thread_id: &str) -> Result<(), String> {
+        match self.rpc("thread/delete", json!({"threadId":thread_id})) {
+            Ok(_) => {}
+            Err(error) if missing_thread_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if let Ok(mut map) = self.shared.subscribers.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.turns.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.queued.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.completions.lock() {
+            map.remove(thread_id);
+        }
+        if let Ok(mut map) = self.shared.approval_contexts.lock() {
+            map.remove(thread_id);
+        }
+        Ok(())
+    }
+
     /// Subscribe before resuming so notifications emitted during the resume
     /// RPC are delivered to the recovered agent's monitor.
     pub(crate) fn subscribe_thread(
@@ -485,6 +512,22 @@ impl CodexServer {
             thread_id,
         })
     }
+}
+
+fn missing_thread_error(error: &str) -> bool {
+    let message = serde_json::from_str::<Value>(error)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| error.to_owned())
+        .to_ascii_lowercase();
+    message.contains("thread not found")
+        || message.contains("no rollout found for thread")
+        || message.contains("no codex thread found")
 }
 
 /// Build the same event consumed by the notification monitor when resume
@@ -1317,7 +1360,7 @@ fn reconcile_started_turn(shared: &Shared, thread_id: &str, turn_id: &str) {
 mod tests {
     use super::{
         ApprovalContext, CodexServer, HarnessEvent, QueuedTurn, Shared, approval_audit_line,
-        approval_response, command_approval,
+        approval_response, command_approval, missing_thread_error,
     };
     use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
@@ -1352,6 +1395,58 @@ mod tests {
         let reader_shared = Arc::clone(&shared);
         thread::spawn(move || super::read_messages(stdout, reader_shared));
         Arc::new(CodexServer { shared })
+    }
+
+    #[test]
+    fn deleting_a_thread_uses_app_server_and_keeps_other_threads_attached() {
+        let script = r#"
+            IFS= read -r request
+            case "$request" in
+                *'"method":"thread/delete"'*'"threadId":"thread-delete-target"'*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+                    ;;
+                *)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"unexpected delete request"}}'
+                    ;;
+            esac
+        "#;
+        let server = mock_server(script, "thread-delete-target");
+        server
+            .shared
+            .subscribers
+            .lock()
+            .unwrap()
+            .insert("another-agents-thread".to_owned(), Vec::new());
+
+        server.delete_thread("thread-delete-target").unwrap();
+
+        let subscribers = server.shared.subscribers.lock().unwrap();
+        assert!(!subscribers.contains_key("thread-delete-target"));
+        assert!(subscribers.contains_key("another-agents-thread"));
+    }
+
+    #[test]
+    fn deleting_a_thread_with_missing_rollout_is_idempotent() {
+        let script = r#"
+            IFS= read -r _request
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"no rollout found for thread id thread-already-gone"}}'
+        "#;
+        let server = mock_server(script, "thread-already-gone");
+        server.delete_thread("thread-already-gone").unwrap();
+        assert!(
+            !server
+                .shared
+                .subscribers
+                .lock()
+                .unwrap()
+                .contains_key("thread-already-gone")
+        );
+        assert!(missing_thread_error(
+            r#"{"code":-32600,"message":"thread not found"}"#
+        ));
+        assert!(!missing_thread_error(
+            r#"{"code":-32600,"message":"already has an active writer"}"#
+        ));
     }
 
     #[test]

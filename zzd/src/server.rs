@@ -66,6 +66,21 @@ impl Supervisor {
         Ok(server)
     }
 
+    /// Return the existing app-server without starting or replacing it.
+    /// Delete must never restart the long-lived app-server as a side effect.
+    pub(crate) fn existing_codex_server(
+        &self,
+    ) -> Result<Option<Arc<crate::harness::CodexServer>>, String> {
+        let current = self
+            .codex_app_server
+            .lock()
+            .map_err(|_| "app-server manager poisoned")?;
+        Ok(current
+            .as_ref()
+            .filter(|server| server.is_running())
+            .cloned())
+    }
+
     pub(crate) fn opencode_server(&self) -> Result<Arc<crate::harness::OpenCodeServer>, String> {
         let mut current = self
             .opencode_server

@@ -3658,6 +3658,35 @@ fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
 }
 
 #[test]
+fn agent_delete_codex_record_without_thread_id_succeeds_without_starting_app_server() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut record = agent_record("codex-agent-without-thread");
+    record.state = "succeeded".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = None;
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/codex-agent-without-thread",
+        "",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(state.supervisor.codex_app_server.lock().unwrap().is_none());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("codex-agent-without-thread")
+            .is_none()
+    );
+}
+
+#[test]
 fn agent_delete_inactive_agent_with_missing_worktree_removes_record_without_400() {
     let (state, _state_path) = test_server();
     let policy = test_policy();
