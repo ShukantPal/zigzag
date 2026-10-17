@@ -3058,7 +3058,7 @@ fn new_agent_worktree_starts_at_fetched_origin_main_and_existing_branch_is_prese
     let _ = std::fs::remove_dir_all(base);
 }
 
-fn agent_record(id: &str) -> AgentRecord {
+pub(crate) fn agent_record(id: &str) -> AgentRecord {
     AgentRecord {
         id: id.to_owned(),
         task_id: "task-1".to_owned(),
@@ -3782,6 +3782,19 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
             .and_then(Json::as_str),
         Some("partial transcript: delta only\n")
     );
+
+    // The orphan record still carries its exact thread ID. Model the daemon's
+    // existing app-server reporting that this rollout is already gone so the
+    // delete path can prove its idempotent protocol behavior without starting
+    // a replacement server.
+    *state.supervisor.codex_app_server.lock().unwrap() = Some(crate::harness::mock_codex_server(
+        r#"
+                IFS= read -r _request
+                printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"no rollout found for thread id thread-orphan"}}'
+                while IFS= read -r _request; do :; done
+            "#,
+        "thread-orphan",
+    ));
 
     let response = request_once(
         Arc::clone(&state),

@@ -2780,7 +2780,68 @@ fn delete_agent_codex_thread(state: &Server, agent: &AgentRecord) -> Result<(), 
         .supervisor
         .existing_codex_server()?
         .ok_or("Codex app-server is not running")?;
-    server.delete_thread(thread_id)
+    server.delete_thread(thread_id)?;
+    remove_codex_history_entries(server.codex_home(), thread_id)
+}
+
+/// Codex's thread/delete protocol removes the rollout, session index, and
+/// writer lock after closing the loaded thread. Its global history JSONL is
+/// append-only, so remove only rows that explicitly name this exact thread.
+fn remove_codex_history_entries(codex_home: &Path, thread_id: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let history = codex_home.join("history.jsonl");
+    let contents = match std::fs::read_to_string(&history) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not read Codex history: {error}")),
+    };
+    let mut filtered = Vec::with_capacity(contents.len());
+    let mut removed = false;
+    for line in contents.split_inclusive('\n') {
+        let value = serde_json::from_str::<serde_json::Value>(line.trim_end());
+        let is_target = value.is_ok_and(|value| {
+            ["session_id", "thread_id", "threadId"].iter().any(|field| {
+                value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
+            })
+        });
+        if is_target {
+            removed = true;
+        } else {
+            filtered.extend_from_slice(line.as_bytes());
+        }
+    }
+    if !removed {
+        return Ok(());
+    }
+
+    let temporary = codex_home.join(format!(
+        ".history.jsonl.zigzag-delete-{}.tmp",
+        random_hex_128()?
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("could not stage Codex history cleanup: {error}"))?;
+        file.write_all(&filtered)
+            .map_err(|error| format!("could not write Codex history cleanup: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("could not sync Codex history cleanup: {error}"))?;
+        let permissions = std::fs::metadata(&history)
+            .map_err(|error| format!("could not inspect Codex history: {error}"))?
+            .permissions();
+        std::fs::set_permissions(&temporary, permissions)
+            .map_err(|error| format!("could not preserve Codex history permissions: {error}"))?;
+        std::fs::rename(&temporary, &history)
+            .map_err(|error| format!("could not replace Codex history: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 /// Clean up a worktree after an explicit DELETE has stopped a live agent.
