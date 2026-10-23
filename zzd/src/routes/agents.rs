@@ -2796,13 +2796,14 @@ fn remove_codex_history_entries(codex_home: &Path, thread_id: &str) -> Result<()
     let _guard = CODEX_HISTORY_DELETE_LOCK
         .lock()
         .map_err(|_| "Codex history cleanup lock poisoned".to_owned())?;
-    remove_codex_history_entries_with_hook(codex_home, thread_id, || {})
+    remove_codex_history_entries_with_hook(codex_home, thread_id, || {}, |_| {})
 }
 
 fn remove_codex_history_entries_with_hook(
     codex_home: &Path,
     thread_id: &str,
     mut after_stage: impl FnMut(),
+    mut after_drain_eof: impl FnMut(&mut std::fs::File),
 ) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -2811,7 +2812,11 @@ fn remove_codex_history_entries_with_hook(
         // Keep the original inode open across rename. Codex may already have
         // this inode open for append, and those writes remain visible here
         // after the path starts naming the replacement file.
-        let mut original = match std::fs::File::open(&history) {
+        let mut original = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&history)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("could not read Codex history: {error}")),
@@ -2897,8 +2902,9 @@ fn remove_codex_history_entries_with_hook(
 
         // Rename leaves `original` attached to the old inode. Collect bytes
         // beyond the snapshot and merge only non-target rows into the new
-        // file. Repeat until a read reaches EOF without finding more bytes,
-        // since an append can race a previous drain/write pass.
+        // file. After EOF, check the held inode's length again before
+        // stopping: an append can land between the read returning EOF and
+        // that metadata check.
         let mut offset = snapshot_end;
         loop {
             original
@@ -2909,7 +2915,15 @@ fn remove_codex_history_entries_with_hook(
                 .read_to_end(&mut tail)
                 .map_err(|error| format!("could not read Codex history tail: {error}"))?;
             if tail.is_empty() {
-                break;
+                after_drain_eof(&mut original);
+                let current_len = original
+                    .metadata()
+                    .map_err(|error| format!("could not inspect Codex history tail: {error}"))?
+                    .len();
+                if current_len <= offset {
+                    break;
+                }
+                continue;
             }
             offset += tail.len() as u64;
             let mut survivors = Vec::with_capacity(tail.len());
@@ -3997,7 +4011,7 @@ mod agent_dx_tests {
     }
 
     #[test]
-    fn codex_history_cleanup_drains_appends_after_final_comparison() {
+    fn codex_history_cleanup_drains_appends_after_final_comparison_and_eof() {
         let home = std::env::temp_dir().join(format!(
             "zigzag-codex-history-race-{}-{}",
             std::process::id(),
@@ -4012,11 +4026,15 @@ mod agent_dx_tests {
         .unwrap();
 
         let mut appended = false;
-        remove_codex_history_entries_with_hook(&home, "delete-me", || {
-            if !appended {
-                appended = true;
-                use std::io::Write;
-                std::fs::OpenOptions::new()
+        let mut appended_after_eof = false;
+        remove_codex_history_entries_with_hook(
+            &home,
+            "delete-me",
+            || {
+                if !appended {
+                    appended = true;
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
                     .append(true)
                     .open(&history)
                     .unwrap()
@@ -4024,8 +4042,20 @@ mod agent_dx_tests {
                         b"{\"session_id\":\"concurrent-append\"}\n{\"session_id\":\"delete-me\"}\n",
                     )
                     .unwrap();
-            }
-        })
+                }
+            },
+            |original| {
+                if !appended_after_eof {
+                    appended_after_eof = true;
+                    use std::io::Write;
+                    original
+                    .write_all(
+                        b"{\"session_id\":\"after-eof-append\"}\n{\"session_id\":\"delete-me\"}\n",
+                    )
+                    .unwrap();
+                }
+            },
+        )
         .unwrap();
 
         let result = std::fs::read_to_string(&history).unwrap();
@@ -4040,6 +4070,10 @@ mod agent_dx_tests {
         assert!(
             result.contains("concurrent-append"),
             "concurrent append was lost: {result}"
+        );
+        assert!(
+            result.contains("after-eof-append"),
+            "append after drain EOF was lost: {result}"
         );
         std::fs::remove_dir_all(home).unwrap();
     }
