@@ -2804,15 +2804,25 @@ fn remove_codex_history_entries_with_hook(
     thread_id: &str,
     mut after_stage: impl FnMut(),
 ) -> Result<(), String> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     let history = codex_home.join("history.jsonl");
     loop {
-        let contents = match std::fs::read_to_string(&history) {
-            Ok(contents) => contents,
+        // Keep the original inode open across rename. Codex may already have
+        // this inode open for append, and those writes remain visible here
+        // after the path starts naming the replacement file.
+        let mut original = match std::fs::File::open(&history) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("could not read Codex history: {error}")),
         };
+        let mut contents = String::new();
+        original
+            .read_to_string(&mut contents)
+            .map_err(|error| format!("could not read Codex history: {error}"))?;
+        let snapshot_end = original
+            .stream_position()
+            .map_err(|error| format!("could not inspect Codex history position: {error}"))?;
         let mut filtered = Vec::with_capacity(contents.len());
         let mut removed = false;
         for line in contents.split_inclusive('\n') {
@@ -2859,10 +2869,9 @@ fn remove_codex_history_entries_with_hook(
             return Err(error);
         }
 
-        // Codex appends without taking our process-local lock. Re-read after
-        // staging and retry from the newest contents if an append landed
-        // between the snapshot and replacement.
-        after_stage();
+        // Codex appends without taking our process-local lock. Retry if the
+        // path changed before replacement; the held descriptor below covers
+        // writes that land after this comparison or during rename.
         let latest = match std::fs::read_to_string(&history) {
             Ok(latest) => latest,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2878,9 +2887,55 @@ fn remove_codex_history_entries_with_hook(
             let _ = std::fs::remove_file(&temporary);
             continue;
         }
+        // The hook intentionally sits in the final compare-to-rename window.
+        // Appends to the old inode after this point are drained below.
+        after_stage();
         if let Err(error) = std::fs::rename(&temporary, &history) {
             let _ = std::fs::remove_file(&temporary);
             return Err(format!("could not replace Codex history: {error}"));
+        }
+
+        // Rename leaves `original` attached to the old inode. Collect bytes
+        // beyond the snapshot and merge only non-target rows into the new
+        // file. Repeat until a read reaches EOF without finding more bytes,
+        // since an append can race a previous drain/write pass.
+        let mut offset = snapshot_end;
+        loop {
+            original
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("could not seek Codex history tail: {error}"))?;
+            let mut tail = Vec::new();
+            original
+                .read_to_end(&mut tail)
+                .map_err(|error| format!("could not read Codex history tail: {error}"))?;
+            if tail.is_empty() {
+                break;
+            }
+            offset += tail.len() as u64;
+            let mut survivors = Vec::with_capacity(tail.len());
+            for line in tail.split_inclusive(|byte| *byte == b'\n') {
+                let is_target =
+                    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|value| {
+                        ["session_id", "thread_id", "threadId"].iter().any(|field| {
+                            value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
+                        })
+                    });
+                if !is_target {
+                    survivors.extend_from_slice(line);
+                }
+            }
+            if !survivors.is_empty() {
+                let mut replacement = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&history)
+                    .map_err(|error| format!("could not merge Codex history tail: {error}"))?;
+                replacement
+                    .write_all(&survivors)
+                    .map_err(|error| format!("could not merge Codex history tail: {error}"))?;
+                replacement
+                    .sync_all()
+                    .map_err(|error| format!("could not sync Codex history tail: {error}"))?;
+            }
         }
         return Ok(());
     }
@@ -3942,7 +3997,7 @@ mod agent_dx_tests {
     }
 
     #[test]
-    fn codex_history_cleanup_retries_when_codex_appends_during_staging() {
+    fn codex_history_cleanup_drains_appends_after_final_comparison() {
         let home = std::env::temp_dir().join(format!(
             "zigzag-codex-history-race-{}-{}",
             std::process::id(),
@@ -3965,7 +4020,9 @@ mod agent_dx_tests {
                     .append(true)
                     .open(&history)
                     .unwrap()
-                    .write_all(b"{\"session_id\":\"concurrent-append\"}\n")
+                    .write_all(
+                        b"{\"session_id\":\"concurrent-append\"}\n{\"session_id\":\"delete-me\"}\n",
+                    )
                     .unwrap();
             }
         })
