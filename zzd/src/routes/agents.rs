@@ -22,9 +22,14 @@ use crate::server::{Server, Supervisor};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use zz::{AgentRecord, Json, parse_json};
+
+/// Serializes history read/filter/replace operations across all agent deletes
+/// handled by this relay process.
+static CODEX_HISTORY_DELETE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Grace period after SIGTERM before escalating to SIGKILL.
 const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
@@ -2788,60 +2793,97 @@ fn delete_agent_codex_thread(state: &Server, agent: &AgentRecord) -> Result<(), 
 /// writer lock after closing the loaded thread. Its global history JSONL is
 /// append-only, so remove only rows that explicitly name this exact thread.
 fn remove_codex_history_entries(codex_home: &Path, thread_id: &str) -> Result<(), String> {
+    let _guard = CODEX_HISTORY_DELETE_LOCK
+        .lock()
+        .map_err(|_| "Codex history cleanup lock poisoned".to_owned())?;
+    remove_codex_history_entries_with_hook(codex_home, thread_id, || {})
+}
+
+fn remove_codex_history_entries_with_hook(
+    codex_home: &Path,
+    thread_id: &str,
+    mut after_stage: impl FnMut(),
+) -> Result<(), String> {
     use std::io::Write;
 
     let history = codex_home.join("history.jsonl");
-    let contents = match std::fs::read_to_string(&history) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("could not read Codex history: {error}")),
-    };
-    let mut filtered = Vec::with_capacity(contents.len());
-    let mut removed = false;
-    for line in contents.split_inclusive('\n') {
-        let value = serde_json::from_str::<serde_json::Value>(line.trim_end());
-        let is_target = value.is_ok_and(|value| {
-            ["session_id", "thread_id", "threadId"].iter().any(|field| {
-                value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
-            })
-        });
-        if is_target {
-            removed = true;
-        } else {
-            filtered.extend_from_slice(line.as_bytes());
+    loop {
+        let contents = match std::fs::read_to_string(&history) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("could not read Codex history: {error}")),
+        };
+        let mut filtered = Vec::with_capacity(contents.len());
+        let mut removed = false;
+        for line in contents.split_inclusive('\n') {
+            let value = serde_json::from_str::<serde_json::Value>(line.trim_end());
+            let is_target = value.is_ok_and(|value| {
+                ["session_id", "thread_id", "threadId"].iter().any(|field| {
+                    value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
+                })
+            });
+            if is_target {
+                removed = true;
+            } else {
+                filtered.extend_from_slice(line.as_bytes());
+            }
         }
-    }
-    if !removed {
+        if !removed {
+            return Ok(());
+        }
+
+        let temporary = codex_home.join(format!(
+            ".history.jsonl.zigzag-delete-{}.tmp",
+            random_hex_128()?
+        ));
+        let staged = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| format!("could not stage Codex history cleanup: {error}"))?;
+            file.write_all(&filtered)
+                .map_err(|error| format!("could not write Codex history cleanup: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("could not sync Codex history cleanup: {error}"))?;
+            let permissions = std::fs::metadata(&history)
+                .map_err(|error| format!("could not inspect Codex history: {error}"))?
+                .permissions();
+            std::fs::set_permissions(&temporary, permissions).map_err(|error| {
+                format!("could not preserve Codex history permissions: {error}")
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+
+        // Codex appends without taking our process-local lock. Re-read after
+        // staging and retry from the newest contents if an append landed
+        // between the snapshot and replacement.
+        after_stage();
+        let latest = match std::fs::read_to_string(&history) {
+            Ok(latest) => latest,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&temporary);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("could not re-read Codex history: {error}"));
+            }
+        };
+        if latest != contents {
+            let _ = std::fs::remove_file(&temporary);
+            continue;
+        }
+        if let Err(error) = std::fs::rename(&temporary, &history) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("could not replace Codex history: {error}"));
+        }
         return Ok(());
     }
-
-    let temporary = codex_home.join(format!(
-        ".history.jsonl.zigzag-delete-{}.tmp",
-        random_hex_128()?
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("could not stage Codex history cleanup: {error}"))?;
-        file.write_all(&filtered)
-            .map_err(|error| format!("could not write Codex history cleanup: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("could not sync Codex history cleanup: {error}"))?;
-        let permissions = std::fs::metadata(&history)
-            .map_err(|error| format!("could not inspect Codex history: {error}"))?
-            .permissions();
-        std::fs::set_permissions(&temporary, permissions)
-            .map_err(|error| format!("could not preserve Codex history permissions: {error}"))?;
-        std::fs::rename(&temporary, &history)
-            .map_err(|error| format!("could not replace Codex history: {error}"))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
 }
 
 /// Clean up a worktree after an explicit DELETE has stopped a live agent.
@@ -3698,7 +3740,8 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
 mod agent_dx_tests {
     use super::{
         apply_bulk_delete, parse_duration, parse_rfc3339_epoch, parse_timestamp_epoch,
-        select_bulk_delete_candidates, select_transcript_items,
+        random_hex_128, remove_codex_history_entries_with_hook, select_bulk_delete_candidates,
+        select_transcript_items,
     };
     use std::process::Command;
     use std::time::{Duration, UNIX_EPOCH};
@@ -3896,5 +3939,51 @@ mod agent_dx_tests {
         assert!(failed.deleted.is_empty());
         assert_eq!(failed.skipped, 1);
         assert_eq!(failed.failures, ["terminal"]);
+    }
+
+    #[test]
+    fn codex_history_cleanup_retries_when_codex_appends_during_staging() {
+        let home = std::env::temp_dir().join(format!(
+            "zigzag-codex-history-race-{}-{}",
+            std::process::id(),
+            random_hex_128().unwrap()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let history = home.join("history.jsonl");
+        std::fs::write(
+            &history,
+            "{\"session_id\":\"delete-me\"}\n{\"session_id\":\"keep-me\"}\n",
+        )
+        .unwrap();
+
+        let mut appended = false;
+        remove_codex_history_entries_with_hook(&home, "delete-me", || {
+            if !appended {
+                appended = true;
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&history)
+                    .unwrap()
+                    .write_all(b"{\"session_id\":\"concurrent-append\"}\n")
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+        let result = std::fs::read_to_string(&history).unwrap();
+        assert!(
+            !result.contains("delete-me"),
+            "target history survived: {result}"
+        );
+        assert!(
+            result.contains("keep-me"),
+            "other history was lost: {result}"
+        );
+        assert!(
+            result.contains("concurrent-append"),
+            "concurrent append was lost: {result}"
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

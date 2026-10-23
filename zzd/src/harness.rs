@@ -1414,6 +1414,15 @@ fn reconcile_started_turn(shared: &Shared, thread_id: &str, turn_id: &str) {
 
 #[cfg(test)]
 pub(crate) fn mock_codex_server(script: &str, thread_id: &str) -> Arc<CodexServer> {
+    mock_codex_server_with_home(script, thread_id, &default_codex_home())
+}
+
+#[cfg(test)]
+pub(crate) fn mock_codex_server_with_home(
+    script: &str,
+    thread_id: &str,
+    codex_home: &std::path::Path,
+) -> Arc<CodexServer> {
     let mut child = Command::new("/bin/sh")
         .args(["-c", script])
         .stdin(Stdio::piped())
@@ -1439,7 +1448,7 @@ pub(crate) fn mock_codex_server(script: &str, thread_id: &str) -> Arc<CodexServe
     thread::spawn(move || read_messages(stdout, reader_shared));
     Arc::new(CodexServer {
         shared,
-        codex_home: default_codex_home(),
+        codex_home: codex_home.to_path_buf(),
     })
 }
 

@@ -37,6 +37,9 @@ fn delete_agent_closes_real_codex_thread_and_removes_conversation_files() {
         .output()
         .is_ok_and(|output| output.status.success())
     {
+        if std::env::var_os("CI").is_some() {
+            panic!("codex executable is required for the real app-server delete E2E in CI");
+        }
         eprintln!("skipping real app-server delete E2E: codex executable is unavailable");
         return;
     }

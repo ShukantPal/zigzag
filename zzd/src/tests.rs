@@ -24,7 +24,9 @@ use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
-use crate::harness::{Delivery, HarnessEvent, HarnessSession, resumed_completion_event};
+use crate::harness::{
+    Delivery, HarnessEvent, HarnessSession, mock_codex_server_with_home, resumed_completion_event,
+};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -4216,6 +4218,93 @@ fn bulk_agent_delete_dry_run_preserves_records_and_delete_skips_live_agents() {
     assert_eq!(deleted.object("skipped_count"), Some(&Json::number(1)));
     assert!(state.supervisor.registry.get("bulk-terminal").is_none());
     assert!(state.supervisor.registry.get("bulk-live").is_some());
+}
+
+#[test]
+fn bulk_agent_delete_removes_selected_codex_threads_and_reports_effects() {
+    let (state, _state_path) = test_server();
+    let codex_home = std::env::temp_dir().join(format!(
+        "zigzag-bulk-codex-delete-{}-{}",
+        std::process::id(),
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let history = codex_home.join("history.jsonl");
+    std::fs::write(
+        &history,
+        "{\"session_id\":\"bulk-thread-a\"}\n{\"session_id\":\"bulk-thread-b\"}\n{\"session_id\":\"preserve-thread\"}\n",
+    )
+    .unwrap();
+    let server = mock_codex_server_with_home(
+        r#"
+            while IFS= read -r request; do
+                id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+                printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            done
+        "#,
+        "bulk-thread-a",
+        &codex_home,
+    );
+    *state.supervisor.codex_app_server.lock().unwrap() = Some(Arc::clone(&server));
+
+    for (id, thread_id, branch) in [
+        ("bulk-codex-a", "bulk-thread-a", "bulk/selected"),
+        ("bulk-codex-b", "bulk-thread-b", "bulk/selected"),
+        ("bulk-codex-preserved", "preserve-thread", "bulk/other"),
+    ] {
+        let mut record = agent_record(id);
+        record.state = "succeeded".to_owned();
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some(thread_id.to_owned());
+        record.agent_config =
+            Some(serde_json::json!({"branch": branch, "project_dir": "/repo"}).to_string());
+        state.supervisor.registry.register(record).unwrap();
+    }
+
+    let response = request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "DELETE",
+        "/v1/agents?branch=bulk%2Fselected",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response_json(response);
+    assert_eq!(body.object("deleted_count"), Some(&Json::number(2)));
+    assert_eq!(body.object("skipped_count"), Some(&Json::number(0)));
+    assert_eq!(
+        body.object("deleted"),
+        Some(&Json::Array(vec![
+            Json::String("bulk-codex-a".to_owned()),
+            Json::String("bulk-codex-b".to_owned()),
+        ]))
+    );
+    assert_eq!(body.object("failures"), Some(&Json::Array(Vec::new())));
+    assert!(state.supervisor.registry.get("bulk-codex-a").is_none());
+    assert!(state.supervisor.registry.get("bulk-codex-b").is_none());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("bulk-codex-preserved")
+            .is_some()
+    );
+
+    let history = std::fs::read_to_string(&history).unwrap();
+    assert!(
+        !history.contains("bulk-thread-a"),
+        "selected history remains: {history}"
+    );
+    assert!(
+        !history.contains("bulk-thread-b"),
+        "selected history remains: {history}"
+    );
+    assert!(
+        history.contains("preserve-thread"),
+        "unselected history lost: {history}"
+    );
+    state.supervisor.stop_harness_servers().unwrap();
+    std::fs::remove_dir_all(codex_home).unwrap();
 }
 
 impl HarnessSession for MessageSession {
