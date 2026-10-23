@@ -24,7 +24,9 @@ use crate::exec;
 use crate::github::{
     parse_github_open_pull_requests, review_gate_parameters, should_start_legacy_watch,
 };
-use crate::harness::{Delivery, HarnessEvent, HarnessSession, resumed_completion_event};
+use crate::harness::{
+    Delivery, HarnessEvent, HarnessSession, mock_codex_server_with_home, resumed_completion_event,
+};
 use crate::http::{
     MAX_BODY, MAX_HEADER_BLOCK_BYTES, MAX_HEADER_COUNT, ReadRequestError, denial_json,
     denial_response, error, get_query, percent_decode, query, read_request, reply,
@@ -3058,7 +3060,7 @@ fn new_agent_worktree_starts_at_fetched_origin_main_and_existing_branch_is_prese
     let _ = std::fs::remove_dir_all(base);
 }
 
-fn agent_record(id: &str) -> AgentRecord {
+pub(crate) fn agent_record(id: &str) -> AgentRecord {
     AgentRecord {
         id: id.to_owned(),
         task_id: "task-1".to_owned(),
@@ -3658,6 +3660,35 @@ fn agent_delete_inactive_agent_uses_safe_relay_deletion_flow() {
 }
 
 #[test]
+fn agent_delete_codex_record_without_thread_id_succeeds_without_starting_app_server() {
+    let (state, _state_path) = test_server();
+    let policy = test_policy();
+    let mut record = agent_record("codex-agent-without-thread");
+    record.state = "succeeded".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = None;
+    state.supervisor.registry.register(record).unwrap();
+
+    let response = request_once(
+        Arc::clone(&state),
+        &policy,
+        "DELETE",
+        "/v1/agents/codex-agent-without-thread",
+        "",
+    );
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(state.supervisor.codex_app_server.lock().unwrap().is_none());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("codex-agent-without-thread")
+            .is_none()
+    );
+}
+
+#[test]
 fn agent_delete_inactive_agent_with_missing_worktree_removes_record_without_400() {
     let (state, _state_path) = test_server();
     let policy = test_policy();
@@ -3753,6 +3784,19 @@ fn disconnected_native_agent_partial_transcript_can_be_read_and_deleted_by_task_
             .and_then(Json::as_str),
         Some("partial transcript: delta only\n")
     );
+
+    // The orphan record still carries its exact thread ID. Model the daemon's
+    // existing app-server reporting that this rollout is already gone so the
+    // delete path can prove its idempotent protocol behavior without starting
+    // a replacement server.
+    *state.supervisor.codex_app_server.lock().unwrap() = Some(crate::harness::mock_codex_server(
+        r#"
+                IFS= read -r _request
+                printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"no rollout found for thread id thread-orphan"}}'
+                while IFS= read -r _request; do :; done
+            "#,
+        "thread-orphan",
+    ));
 
     let response = request_once(
         Arc::clone(&state),
@@ -4174,6 +4218,93 @@ fn bulk_agent_delete_dry_run_preserves_records_and_delete_skips_live_agents() {
     assert_eq!(deleted.object("skipped_count"), Some(&Json::number(1)));
     assert!(state.supervisor.registry.get("bulk-terminal").is_none());
     assert!(state.supervisor.registry.get("bulk-live").is_some());
+}
+
+#[test]
+fn bulk_agent_delete_removes_selected_codex_threads_and_reports_effects() {
+    let (state, _state_path) = test_server();
+    let codex_home = std::env::temp_dir().join(format!(
+        "zigzag-bulk-codex-delete-{}-{}",
+        std::process::id(),
+        unique_handle(&HashMap::new()).unwrap()
+    ));
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let history = codex_home.join("history.jsonl");
+    std::fs::write(
+        &history,
+        "{\"session_id\":\"bulk-thread-a\"}\n{\"session_id\":\"bulk-thread-b\"}\n{\"session_id\":\"preserve-thread\"}\n",
+    )
+    .unwrap();
+    let server = mock_codex_server_with_home(
+        r#"
+            while IFS= read -r request; do
+                id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+                printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            done
+        "#,
+        "bulk-thread-a",
+        &codex_home,
+    );
+    *state.supervisor.codex_app_server.lock().unwrap() = Some(Arc::clone(&server));
+
+    for (id, thread_id, branch) in [
+        ("bulk-codex-a", "bulk-thread-a", "bulk/selected"),
+        ("bulk-codex-b", "bulk-thread-b", "bulk/selected"),
+        ("bulk-codex-preserved", "preserve-thread", "bulk/other"),
+    ] {
+        let mut record = agent_record(id);
+        record.state = "succeeded".to_owned();
+        record.harness = Some("codex".to_owned());
+        record.harness_session_id = Some(thread_id.to_owned());
+        record.agent_config =
+            Some(serde_json::json!({"branch": branch, "project_dir": "/repo"}).to_string());
+        state.supervisor.registry.register(record).unwrap();
+    }
+
+    let response = request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "DELETE",
+        "/v1/agents?branch=bulk%2Fselected",
+        "",
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response_json(response);
+    assert_eq!(body.object("deleted_count"), Some(&Json::number(2)));
+    assert_eq!(body.object("skipped_count"), Some(&Json::number(0)));
+    assert_eq!(
+        body.object("deleted"),
+        Some(&Json::Array(vec![
+            Json::String("bulk-codex-a".to_owned()),
+            Json::String("bulk-codex-b".to_owned()),
+        ]))
+    );
+    assert_eq!(body.object("failures"), Some(&Json::Array(Vec::new())));
+    assert!(state.supervisor.registry.get("bulk-codex-a").is_none());
+    assert!(state.supervisor.registry.get("bulk-codex-b").is_none());
+    assert!(
+        state
+            .supervisor
+            .registry
+            .get("bulk-codex-preserved")
+            .is_some()
+    );
+
+    let history = std::fs::read_to_string(&history).unwrap();
+    assert!(
+        !history.contains("bulk-thread-a"),
+        "selected history remains: {history}"
+    );
+    assert!(
+        !history.contains("bulk-thread-b"),
+        "selected history remains: {history}"
+    );
+    assert!(
+        history.contains("preserve-thread"),
+        "unselected history lost: {history}"
+    );
+    state.supervisor.stop_harness_servers().unwrap();
+    std::fs::remove_dir_all(codex_home).unwrap();
 }
 
 impl HarnessSession for MessageSession {

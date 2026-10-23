@@ -22,9 +22,14 @@ use crate::server::{Server, Supervisor};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 use zz::{AgentRecord, Json, parse_json};
+
+/// Serializes history read/filter/replace operations across all agent deletes
+/// handled by this relay process.
+static CODEX_HISTORY_DELETE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Grace period after SIGTERM before escalating to SIGKILL.
 const AGENT_STOP_GRACE: Duration = Duration::from_secs(10);
@@ -405,6 +410,7 @@ pub(crate) fn agent_bulk_delete(
         keep_last,
     );
     let result = apply_bulk_delete(selected, dry_run, |agent| {
+        delete_agent_codex_thread(state, agent)?;
         delete_explicit_agent_with_trust(
             &state.supervisor.registry,
             &agent.id,
@@ -2766,6 +2772,201 @@ pub(crate) fn delete_explicit_agent_with_trust(
     }))
 }
 
+fn delete_agent_codex_thread(state: &Server, agent: &AgentRecord) -> Result<(), String> {
+    if agent.harness.as_deref() != Some("codex") {
+        return Ok(());
+    }
+    let Some(thread_id) = agent.harness_session_id.as_deref() else {
+        // Older or partially persisted records may not have a thread ID. Do
+        // not infer one from another agent or scan Codex history.
+        return Ok(());
+    };
+    let server = state
+        .supervisor
+        .existing_codex_server()?
+        .ok_or("Codex app-server is not running")?;
+    server.delete_thread(thread_id)?;
+    remove_codex_history_entries(server.codex_home(), thread_id)
+}
+
+/// Codex's thread/delete protocol removes the rollout, session index, and
+/// writer lock after closing the loaded thread. Its global history JSONL is
+/// append-only, so remove only rows that explicitly name this exact thread.
+fn remove_codex_history_entries(codex_home: &Path, thread_id: &str) -> Result<(), String> {
+    let _guard = CODEX_HISTORY_DELETE_LOCK
+        .lock()
+        .map_err(|_| "Codex history cleanup lock poisoned".to_owned())?;
+    remove_codex_history_entries_with_hook(codex_home, thread_id, || {}, |_| {})
+}
+
+fn remove_codex_history_entries_with_hook(
+    codex_home: &Path,
+    thread_id: &str,
+    mut after_stage: impl FnMut(),
+    mut after_drain_eof: impl FnMut(&mut std::fs::File),
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let history = codex_home.join("history.jsonl");
+    loop {
+        // Keep the original inode open across rename. Codex may already have
+        // this inode open for append, and those writes remain visible here
+        // after the path starts naming the replacement file.
+        let mut original = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&history)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("could not read Codex history: {error}")),
+        };
+        let mut contents = String::new();
+        original
+            .read_to_string(&mut contents)
+            .map_err(|error| format!("could not read Codex history: {error}"))?;
+        let snapshot_end = original
+            .stream_position()
+            .map_err(|error| format!("could not inspect Codex history position: {error}"))?;
+        let mut filtered = Vec::with_capacity(contents.len());
+        let mut removed = false;
+        for line in contents.split_inclusive('\n') {
+            let value = serde_json::from_str::<serde_json::Value>(line.trim_end());
+            let is_target = value.is_ok_and(|value| {
+                ["session_id", "thread_id", "threadId"].iter().any(|field| {
+                    value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
+                })
+            });
+            if is_target {
+                removed = true;
+            } else {
+                filtered.extend_from_slice(line.as_bytes());
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+
+        let temporary = codex_home.join(format!(
+            ".history.jsonl.zigzag-delete-{}.tmp",
+            random_hex_128()?
+        ));
+        let staged = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| format!("could not stage Codex history cleanup: {error}"))?;
+            file.write_all(&filtered)
+                .map_err(|error| format!("could not write Codex history cleanup: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("could not sync Codex history cleanup: {error}"))?;
+            let permissions = std::fs::metadata(&history)
+                .map_err(|error| format!("could not inspect Codex history: {error}"))?
+                .permissions();
+            std::fs::set_permissions(&temporary, permissions).map_err(|error| {
+                format!("could not preserve Codex history permissions: {error}")
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+
+        // Codex appends without taking our process-local lock. Retry if the
+        // path changed before replacement; the held descriptor below covers
+        // writes that land after this comparison or during rename.
+        let latest = match std::fs::read_to_string(&history) {
+            Ok(latest) => latest,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&temporary);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(format!("could not re-read Codex history: {error}"));
+            }
+        };
+        if latest != contents {
+            let _ = std::fs::remove_file(&temporary);
+            continue;
+        }
+        // The hook intentionally sits in the final compare-to-rename window.
+        // Appends to the old inode after this point are drained below.
+        after_stage();
+        if let Err(error) = std::fs::rename(&temporary, &history) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("could not replace Codex history: {error}"));
+        }
+
+        // Rename leaves `original` attached to the old inode. Collect bytes
+        // beyond the snapshot and merge only non-target rows into the new
+        // file. After EOF, check the held inode's length again before
+        // stopping: an append can land between the read returning EOF and
+        // that metadata check. Require two empty read-and-stat passes before
+        // treating the held inode as quiescent. The second pass catches an
+        // append that lands just after the first EOF was confirmed.
+        let mut offset = snapshot_end;
+        let mut confirmed_empty = false;
+        loop {
+            original
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("could not seek Codex history tail: {error}"))?;
+            let mut tail = Vec::new();
+            original
+                .read_to_end(&mut tail)
+                .map_err(|error| format!("could not read Codex history tail: {error}"))?;
+            if tail.is_empty() {
+                let current_len = original
+                    .metadata()
+                    .map_err(|error| format!("could not inspect Codex history tail: {error}"))?
+                    .len();
+                if current_len <= offset {
+                    if confirmed_empty {
+                        break;
+                    }
+                    confirmed_empty = true;
+                    // Test hook for a write after EOF and its confirming
+                    // metadata check, before the required second drain pass.
+                    after_drain_eof(&mut original);
+                    std::thread::yield_now();
+                    continue;
+                }
+                confirmed_empty = false;
+                continue;
+            }
+            confirmed_empty = false;
+            offset += tail.len() as u64;
+            let mut survivors = Vec::with_capacity(tail.len());
+            for line in tail.split_inclusive(|byte| *byte == b'\n') {
+                let is_target =
+                    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|value| {
+                        ["session_id", "thread_id", "threadId"].iter().any(|field| {
+                            value.get(field).and_then(serde_json::Value::as_str) == Some(thread_id)
+                        })
+                    });
+                if !is_target {
+                    survivors.extend_from_slice(line);
+                }
+            }
+            if !survivors.is_empty() {
+                let mut replacement = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&history)
+                    .map_err(|error| format!("could not merge Codex history tail: {error}"))?;
+                replacement
+                    .write_all(&survivors)
+                    .map_err(|error| format!("could not merge Codex history tail: {error}"))?;
+                replacement
+                    .sync_all()
+                    .map_err(|error| format!("could not sync Codex history tail: {error}"))?;
+            }
+        }
+        return Ok(());
+    }
+}
+
 /// Clean up a worktree after an explicit DELETE has stopped a live agent.
 /// Discovery failures retain the worktree, and cleanup rechecks registry
 /// attachments after any repository stop hook immediately before removal.
@@ -3419,6 +3620,10 @@ pub(crate) fn agent_delete(stream: &mut TcpStream, state: &Server, id: &str) -> 
         return reply(stream, 404, error("unknown_agent"));
     };
     if !agent_is_live(&agent) {
+        if let Err(message) = delete_agent_codex_thread(state, &agent) {
+            log::warn!("could not delete Codex thread for agent {id}: {message}");
+            return reply(stream, 503, error("could_not_delete_codex_thread"));
+        }
         let worktree = agent.worktree_path.clone();
         let watched_pr = watch_agent_pr(&agent);
         return match delete_explicit_agent_with_trust(
@@ -3616,7 +3821,8 @@ fn wait_for_group_exit(id: &str, pgid: i32, timeout: Duration, supervisor: &Supe
 mod agent_dx_tests {
     use super::{
         apply_bulk_delete, parse_duration, parse_rfc3339_epoch, parse_timestamp_epoch,
-        select_bulk_delete_candidates, select_transcript_items,
+        random_hex_128, remove_codex_history_entries_with_hook, select_bulk_delete_candidates,
+        select_transcript_items,
     };
     use std::process::Command;
     use std::time::{Duration, UNIX_EPOCH};
@@ -3814,5 +4020,73 @@ mod agent_dx_tests {
         assert!(failed.deleted.is_empty());
         assert_eq!(failed.skipped, 1);
         assert_eq!(failed.failures, ["terminal"]);
+    }
+
+    #[test]
+    fn codex_history_cleanup_drains_appends_after_final_comparison_and_eof() {
+        let home = std::env::temp_dir().join(format!(
+            "zigzag-codex-history-race-{}-{}",
+            std::process::id(),
+            random_hex_128().unwrap()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let history = home.join("history.jsonl");
+        std::fs::write(
+            &history,
+            "{\"session_id\":\"delete-me\"}\n{\"session_id\":\"keep-me\"}\n",
+        )
+        .unwrap();
+
+        let mut appended = false;
+        let mut appended_after_eof = false;
+        remove_codex_history_entries_with_hook(
+            &home,
+            "delete-me",
+            || {
+                if !appended {
+                    appended = true;
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&history)
+                    .unwrap()
+                    .write_all(
+                        b"{\"session_id\":\"concurrent-append\"}\n{\"session_id\":\"delete-me\"}\n",
+                    )
+                    .unwrap();
+                }
+            },
+            |original| {
+                if !appended_after_eof {
+                    appended_after_eof = true;
+                    use std::io::Write;
+                    original
+                    .write_all(
+                        b"{\"session_id\":\"after-eof-append\"}\n{\"session_id\":\"delete-me\"}\n",
+                    )
+                    .unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        let result = std::fs::read_to_string(&history).unwrap();
+        assert!(
+            !result.contains("delete-me"),
+            "target history survived: {result}"
+        );
+        assert!(
+            result.contains("keep-me"),
+            "other history was lost: {result}"
+        );
+        assert!(
+            result.contains("concurrent-append"),
+            "concurrent append was lost: {result}"
+        );
+        assert!(
+            result.contains("after-eof-append"),
+            "append after drain EOF was lost: {result}"
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

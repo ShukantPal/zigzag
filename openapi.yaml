@@ -791,7 +791,11 @@ paths:
         Never delete the feature branch. The relay removes completed records
         automatically at completion and sweeps persisted inactive records on
         startup. Lifecycle deletion also removes the agent's transcript and
-        stderr files.
+        stderr files. For terminal Codex agents with a recorded thread ID,
+        delete that exact thread through the existing app-server before
+        deregistering the agent; the app-server closes it and removes its
+        rollout and associated metadata. Automatic TTL cleanup remains on its
+        separate record cleanup path and does not delete Codex threads.
       security:
         - bearerAuth: []
       parameters:

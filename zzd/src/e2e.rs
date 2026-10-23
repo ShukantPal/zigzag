@@ -30,6 +30,139 @@ fn unique_id(prefix: &str) -> String {
     format!("e2e-{prefix}-{n}")
 }
 
+#[test]
+fn delete_agent_closes_real_codex_thread_and_removes_conversation_files() {
+    if !Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        if std::env::var_os("CI").is_some() {
+            panic!("codex executable is required for the real app-server delete E2E in CI");
+        }
+        eprintln!("skipping real app-server delete E2E: codex executable is unavailable");
+        return;
+    }
+
+    let codex_home = std::env::temp_dir().join(format!(
+        "zigzag-codex-delete-e2e-{}-{}",
+        std::process::id(),
+        crate::events::random_hex_128().unwrap()
+    ));
+    std::fs::create_dir_all(&codex_home).unwrap();
+    // Create a genuine thread in the isolated app-server. Its writer and
+    // session-index state are therefore owned by the real process before the
+    // HTTP DELETE reaches the relay.
+    let server = crate::harness::CodexServer::start_with_test_codex_home(&codex_home)
+        .expect("could not start isolated real Codex app-server");
+    let thread_id = server
+        .start_empty_test_thread(codex_home.to_str().unwrap())
+        .expect("could not create real app-server thread");
+    let other_thread_id = server
+        .start_empty_test_thread(codex_home.to_str().unwrap())
+        .expect("could not create second real app-server thread");
+    let rollout = codex_home
+        .join("sessions/2026/10/16")
+        .join(format!("rollout-2026-10-16T12-00-00-{thread_id}.jsonl"));
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(&rollout, format!("e2e rollout fixture {thread_id}\n")).unwrap();
+    let other_rollout = rollout.parent().unwrap().join(format!(
+        "rollout-2026-10-16T12-00-01-{other_thread_id}.jsonl"
+    ));
+    std::fs::write(
+        &other_rollout,
+        format!("other agent rollout fixture {other_thread_id}\n"),
+    )
+    .unwrap();
+    let history = codex_home.join("history.jsonl");
+    std::fs::write(
+        &history,
+        format!(
+            "{{\"session_id\":\"{thread_id}\",\"text\":\"e2e cleanup fixture\"}}\n{{\"session_id\":\"{other_thread_id}\",\"text\":\"other agent fixture\"}}\n"
+        ),
+    )
+    .unwrap();
+    assert!(rollout.exists(), "rollout fixture was not created");
+    assert!(
+        std::fs::read_to_string(&history)
+            .unwrap()
+            .contains(&thread_id)
+    );
+    let thread_lock = codex_home
+        .join("thread-writer-locks")
+        .join(format!("{thread_id}.lock"));
+    let other_thread_lock = codex_home
+        .join("thread-writer-locks")
+        .join(format!("{other_thread_id}.lock"));
+    assert!(
+        thread_lock.exists(),
+        "app-server did not hold the thread writer lock"
+    );
+    assert!(
+        other_thread_lock.exists(),
+        "second thread lock was not held"
+    );
+    let (state, _state_path) = test_server();
+    *state.supervisor.codex_app_server.lock().unwrap() = Some(Arc::clone(&server));
+    let agent_id = unique_id("codex-delete");
+    let mut record = crate::tests::agent_record(&agent_id);
+    record.state = "succeeded".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.clone());
+    state.supervisor.registry.register(record).unwrap();
+    let other_agent_id = unique_id("other-codex-delete");
+    let mut other_record = crate::tests::agent_record(&other_agent_id);
+    other_record.state = "succeeded".to_owned();
+    other_record.harness = Some("codex".to_owned());
+    other_record.harness_session_id = Some(other_thread_id.clone());
+    state.supervisor.registry.register(other_record).unwrap();
+
+    let raw = request_once(
+        Arc::clone(&state),
+        &test_policy(),
+        "DELETE",
+        &format!("/v1/agents/{agent_id}"),
+        "",
+    );
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(state.supervisor.registry.get(&agent_id).is_none());
+    assert!(state.supervisor.registry.get(&other_agent_id).is_some());
+    assert!(!rollout.exists(), "thread rollout was not removed");
+    assert!(
+        other_rollout.exists(),
+        "another agent's rollout was removed"
+    );
+
+    let thread_list = server.test_thread_list().expect("thread/list failed");
+    assert!(
+        !thread_list.to_string().contains(&thread_id),
+        "deleted thread remains in the app-server index: {thread_list}"
+    );
+    assert!(
+        !std::fs::read_to_string(&history)
+            .unwrap()
+            .contains(&thread_id),
+        "thread history entry remains after DELETE"
+    );
+    assert!(
+        std::fs::read_to_string(&history)
+            .unwrap()
+            .contains(&other_thread_id),
+        "another agent's history entry was removed"
+    );
+    assert!(
+        !thread_lock.exists(),
+        "thread writer lock file remains after DELETE"
+    );
+    assert!(
+        other_thread_lock.exists(),
+        "another agent's writer lock was removed"
+    );
+
+    state.supervisor.stop_harness_servers().unwrap();
+    std::fs::remove_dir_all(codex_home).unwrap();
+}
+
 fn json_array(value: &Json) -> &[Json] {
     match value {
         Json::Array(items) => items,
