@@ -15,6 +15,9 @@ info:
     header carrying the relay daemon secret. The only exception is
     `POST /v1/proc/{id}/kill`, which instead requires a separate control
     secret; when the control secret is unset, that route behaves as 404.
+    BuildBuddy credential provisioning and revocation also require the
+    separate control secret. The credential is stored in the daemon user's
+    macOS Keychain and is never returned by any route.
 servers:
   - url: http://localhost:{port}
     description: Relay daemon on the Mac. The port comes from the relay server config.
@@ -427,6 +430,93 @@ components:
         path:
           type: string
 paths:
+  /v1/secrets/buildbuddy:
+    post:
+      operationId: storeBuildBuddySecret
+      summary: Store a scoped BuildBuddy API key
+      description: >
+        Store the invocation-read API key in the daemon user's macOS Keychain.
+        Requires the separate control bearer. The raw key is never returned.
+        Expiry defaults to 30 days and is limited to 90 days.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  minLength: 8
+                  maxLength: 4096
+                  writeOnly: true
+                expires_in_days:
+                  type: integer
+                  minimum: 1
+                  maximum: 90
+                  default: 30
+      responses:
+        '200':
+          description: Stored service, purpose, and expiry; never the key.
+        '400':
+          description: Invalid secret request.
+        '401':
+          description: Missing or invalid control bearer.
+        '403':
+          description: Provisioning and revocation are available only over loopback.
+        '404':
+          description: Control bearer is not configured.
+    delete:
+      operationId: revokeBuildBuddySecret
+      summary: Revoke the stored BuildBuddy API key
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Key revoked (idempotent).
+        '401':
+          description: Missing or invalid control bearer.
+        '403':
+          description: Provisioning and revocation are available only over loopback.
+        '404':
+          description: Control bearer is not configured.
+  /v1/secrets/buildbuddy/invocations:
+    post:
+      operationId: getBuildBuddyInvocationSummary
+      summary: Read a BuildBuddy invocation through the daemon
+      description: >
+        Calls BuildBuddy server-side using the Keychain credential and returns
+        only a curated invocation metadata summary. Build metadata, artifacts,
+        logs, and unknown fields are dropped. The credential is never exposed.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [invocation_id]
+              properties:
+                invocation_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  pattern: '^[A-Za-z0-9_-]+$'
+      responses:
+        '200':
+          description: Curated invocation summary.
+        '400':
+          description: Invalid invocation ID.
+        '404':
+          description: No active credential or matching invocation.
+        '502':
+          description: BuildBuddy is unavailable.
   /v1/health:
     get:
       operationId: healthCheck

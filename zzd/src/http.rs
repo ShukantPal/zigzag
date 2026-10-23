@@ -248,8 +248,10 @@ pub(crate) fn reply(stream: &mut TcpStream, code: u16, value: Json) -> Result<()
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        403 => "Forbidden",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
+        502 => "Bad Gateway",
         _ => "Internal Server Error",
     };
     stream.write_all(format!("HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).map_err(|error| error.to_string())
