@@ -2904,8 +2904,11 @@ fn remove_codex_history_entries_with_hook(
         // beyond the snapshot and merge only non-target rows into the new
         // file. After EOF, check the held inode's length again before
         // stopping: an append can land between the read returning EOF and
-        // that metadata check.
+        // that metadata check. Require two empty read-and-stat passes before
+        // treating the held inode as quiescent. The second pass catches an
+        // append that lands just after the first EOF was confirmed.
         let mut offset = snapshot_end;
+        let mut confirmed_empty = false;
         loop {
             original
                 .seek(SeekFrom::Start(offset))
@@ -2915,16 +2918,25 @@ fn remove_codex_history_entries_with_hook(
                 .read_to_end(&mut tail)
                 .map_err(|error| format!("could not read Codex history tail: {error}"))?;
             if tail.is_empty() {
-                after_drain_eof(&mut original);
                 let current_len = original
                     .metadata()
                     .map_err(|error| format!("could not inspect Codex history tail: {error}"))?
                     .len();
                 if current_len <= offset {
-                    break;
+                    if confirmed_empty {
+                        break;
+                    }
+                    confirmed_empty = true;
+                    // Test hook for a write after EOF and its confirming
+                    // metadata check, before the required second drain pass.
+                    after_drain_eof(&mut original);
+                    std::thread::yield_now();
+                    continue;
                 }
+                confirmed_empty = false;
                 continue;
             }
+            confirmed_empty = false;
             offset += tail.len() as u64;
             let mut survivors = Vec::with_capacity(tail.len());
             for line in tail.split_inclusive(|byte| *byte == b'\n') {
