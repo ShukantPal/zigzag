@@ -2527,9 +2527,9 @@ fn monitor_codex_events_inner(
             );
             if is_completed
                 && let Some((server, thread_id)) = archive.as_ref()
-                && let Err(error) = server.archive_thread(thread_id)
+                && server.archive_thread(thread_id).is_err()
             {
-                log::warn!("could not archive completed relay Codex thread {thread_id}: {error}");
+                log::warn!("could not archive completed relay Codex thread");
             }
         }
         // The app-server event stream is the only live handle for a native

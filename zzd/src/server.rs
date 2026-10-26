@@ -66,9 +66,9 @@ impl Supervisor {
             if agent.harness.as_deref() == Some("codex")
                 && agent.state == "succeeded"
                 && let Some(thread_id) = agent.harness_session_id.as_deref()
-                && let Err(error) = server.archive_thread(thread_id)
+                && server.archive_thread(thread_id).is_err()
             {
-                log::warn!("could not archive completed relay Codex thread {thread_id}: {error}");
+                log::warn!("could not archive completed relay Codex thread");
             }
         }
         *current = Some(Arc::clone(&server));
