@@ -62,6 +62,15 @@ impl Supervisor {
         }
         *current = None;
         let server = crate::harness::CodexServer::start()?;
+        for agent in self.registry.list(None, None) {
+            if agent.harness.as_deref() == Some("codex")
+                && agent.state == "succeeded"
+                && let Some(thread_id) = agent.harness_session_id.as_deref()
+                && let Err(error) = server.archive_thread(thread_id)
+            {
+                log::warn!("could not archive completed relay Codex thread {thread_id}: {error}");
+            }
+        }
         *current = Some(Arc::clone(&server));
         Ok(server)
     }
