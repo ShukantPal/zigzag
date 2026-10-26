@@ -2382,13 +2382,15 @@ fn create_codex_thread(
             false
         }
     };
-    monitor_codex_events(
+    monitor_codex_events_with_archive(
         Arc::clone(&state.supervisor.registry),
         Arc::clone(&state.store),
         id.clone(),
         task_id.to_owned(),
         execution_id.to_owned(),
         events,
+        Arc::clone(&server),
+        thread_id.clone(),
     );
     if !event_persisted {
         return reply(stream, 500, error("could_not_persist_event"));
@@ -2420,7 +2422,7 @@ pub(crate) fn monitor_codex_events(
     execution_id: String,
     events: std::sync::mpsc::Receiver<HarnessEvent>,
 ) {
-    monitor_codex_events_to_path(
+    monitor_codex_events_inner(
         registry,
         store,
         agent_id.clone(),
@@ -2428,10 +2430,36 @@ pub(crate) fn monitor_codex_events(
         execution_id,
         events,
         agent_transcript_path(&agent_id),
+        None,
     );
 }
 
-pub(crate) fn monitor_codex_events_to_path(
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+fn monitor_codex_events_with_archive(
+    registry: Arc<zz::AgentRegistry>,
+    store: Arc<zz::Store>,
+    agent_id: String,
+    task_id: String,
+    execution_id: String,
+    events: std::sync::mpsc::Receiver<HarnessEvent>,
+    server: Arc<crate::harness::CodexServer>,
+    thread_id: String,
+) {
+    monitor_codex_events_inner(
+        registry,
+        store,
+        agent_id.clone(),
+        task_id,
+        execution_id,
+        events,
+        agent_transcript_path(&agent_id),
+        Some((server, thread_id)),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_codex_events_inner(
     registry: Arc<zz::AgentRegistry>,
     store: Arc<zz::Store>,
     agent_id: String,
@@ -2439,6 +2467,7 @@ pub(crate) fn monitor_codex_events_to_path(
     execution_id: String,
     events: std::sync::mpsc::Receiver<HarnessEvent>,
     transcript: Option<std::path::PathBuf>,
+    archive: Option<(Arc<crate::harness::CodexServer>, String)>,
 ) {
     thread::spawn(move || {
         while let Ok(event) = events.recv() {
@@ -2446,6 +2475,8 @@ pub(crate) fn monitor_codex_events_to_path(
                 value,
                 terminal_turn,
             } = event;
+            let is_completed =
+                value.get("method").and_then(serde_json::Value::as_str) == Some("turn/completed");
             if let Some(path) = transcript.as_ref() {
                 let line = value.to_string() + "\n";
                 let mut last_warning = std::time::Instant::now();
@@ -2494,6 +2525,12 @@ pub(crate) fn monitor_codex_events_to_path(
                 &value,
                 terminal_turn,
             );
+            if is_completed
+                && let Some((server, thread_id)) = archive.as_ref()
+                && let Err(error) = server.archive_thread(thread_id)
+            {
+                log::warn!("could not archive completed relay Codex thread {thread_id}: {error}");
+            }
         }
         // The app-server event stream is the only live handle for a native
         // Codex thread. A disconnected stream has no process-table reaper to
@@ -2527,6 +2564,28 @@ pub(crate) fn monitor_codex_events_to_path(
             );
         }
     });
+}
+
+#[cfg(test)]
+pub(crate) fn monitor_codex_events_to_path(
+    registry: Arc<zz::AgentRegistry>,
+    store: Arc<zz::Store>,
+    agent_id: String,
+    task_id: String,
+    execution_id: String,
+    events: std::sync::mpsc::Receiver<HarnessEvent>,
+    transcript: Option<std::path::PathBuf>,
+) {
+    monitor_codex_events_inner(
+        registry,
+        store,
+        agent_id,
+        task_id,
+        execution_id,
+        events,
+        transcript,
+        None,
+    );
 }
 
 fn persist_monitor_event(store: &zz::Store, event: Json) {
