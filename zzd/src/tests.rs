@@ -4833,6 +4833,112 @@ fn agent_message_route_returns_503_when_harness_send_fails() {
     );
 }
 
+fn post_message_with_session(
+    state: &Server,
+    id: &str,
+    text: &str,
+    delivery: &str,
+    session: Arc<dyn HarnessSession>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    });
+    let (mut stream, _) = listener.accept().unwrap();
+    agent_post_request_with_session_resolver(
+        &mut stream,
+        state,
+        AgentRoute::Message(id),
+        serde_json::json!({"text":text,"delivery":delivery})
+            .to_string()
+            .into_bytes(),
+        move |_, _, _| Ok(Arc::clone(&session)),
+    )
+    .unwrap();
+    drop(stream);
+    client.join().unwrap()
+}
+
+#[test]
+fn agent_message_queue_on_idle_codex_thread_runs_next_turn() {
+    let (state, _state_path) = test_server();
+    let id = "message-idle-queue";
+    let mut record = agent_record(id);
+    record.state = "succeeded".to_owned();
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let session = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    });
+    let response = post_message_with_session(&state, id, "next turn", "queue", session.clone());
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        response_json(response)
+            .object("turn")
+            .and_then(|turn| turn.object("output"))
+            .and_then(Json::as_str),
+        Some("follow-up-result")
+    );
+    assert_eq!(
+        session.sent.lock().unwrap().as_slice(),
+        [("next turn".to_owned(), Delivery::Queue)]
+    );
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "succeeded"
+    );
+}
+
+#[test]
+fn agent_message_queue_on_running_interactive_agent_keeps_dispatch_behavior() {
+    let (state, _state_path) = test_server();
+    let id = "message-running-queue";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let session = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    });
+    let response = post_message_with_session(&state, id, "next turn", "queue", session.clone());
+    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    assert_eq!(
+        response_json(response).object("accepted"),
+        Some(&Json::Bool(true))
+    );
+    assert_eq!(
+        session.sent.lock().unwrap().as_slice(),
+        [("next turn".to_owned(), Delivery::Queue)]
+    );
+}
+
+#[test]
+fn agent_message_steer_on_running_interactive_agent_keeps_dispatch_behavior() {
+    let (state, _state_path) = test_server();
+    let id = "message-running-steer";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some("codex-session".to_owned());
+    state.supervisor.registry.register(record).unwrap();
+    let session = Arc::new(MessageSession {
+        sent: Mutex::new(Vec::new()),
+        failure: false,
+    });
+    let response = post_message_with_session(&state, id, "steer now", "steer", session.clone());
+    assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    assert_eq!(
+        session.sent.lock().unwrap().as_slice(),
+        [("steer now".to_owned(), Delivery::Steer)]
+    );
+}
+
 #[test]
 fn agent_delete_dead_process_deregisters_without_signalling() {
     let (state, _state_path) = test_server();
