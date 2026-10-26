@@ -2434,9 +2434,8 @@ pub(crate) fn monitor_codex_events(
     );
 }
 
-#[cfg(not(test))]
 #[allow(clippy::too_many_arguments)]
-fn monitor_codex_events_with_archive(
+pub(crate) fn monitor_codex_events_with_archive(
     registry: Arc<zz::AgentRegistry>,
     store: Arc<zz::Store>,
     agent_id: String,
@@ -2526,6 +2525,7 @@ fn monitor_codex_events_inner(
                 terminal_turn,
             );
             if is_completed
+                && terminal_turn
                 && let Some((server, thread_id)) = archive.as_ref()
                 && server.archive_thread(thread_id).is_err()
             {
