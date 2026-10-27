@@ -461,6 +461,16 @@ impl CodexServer {
         Ok(())
     }
 
+    /// Hide a completed relay thread from Codex's active session list while
+    /// retaining its rollout for transcript recovery and resumption.
+    pub(crate) fn archive_thread(&self, thread_id: &str) -> Result<(), String> {
+        match self.rpc("thread/archive", json!({"threadId":thread_id})) {
+            Ok(_) => Ok(()),
+            Err(error) if missing_thread_error(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Subscribe before resuming so notifications emitted during the resume
     /// RPC are delivered to the recovered agent's monitor.
     pub(crate) fn subscribe_thread(

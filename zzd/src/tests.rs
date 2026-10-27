@@ -45,9 +45,10 @@ use crate::routes::agents::{
     cleanup_stopped_agent_worktree_with_trust, default_agent_worktree,
     delete_explicit_agent_with_trust, delete_inactive_agent, delete_inactive_agent_with_trust,
     dispatch_agent_message, handle_codex_notification, monitor_codex_events,
-    monitor_codex_events_to_path, orphan_transcript_json_from_paths, parse_agent_cleanup_ttl,
-    parse_agent_create_request, persisted_agent_config, repair_transcript_tail, restart_argv,
-    restart_config, sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
+    monitor_codex_events_to_path, monitor_codex_events_with_archive,
+    orphan_transcript_json_from_paths, parse_agent_cleanup_ttl, parse_agent_create_request,
+    persisted_agent_config, repair_transcript_tail, restart_argv, restart_config,
+    sweep_inactive_agents_at, transcript_json_with_sessions_dir, valid_agent_model,
 };
 
 use crate::routes::events::{phase_events, same_clock_duration, timeline_output};
@@ -3596,6 +3597,143 @@ fn monitor_retries_append_failure_and_drains_queued_delta_on_channel_close() {
     let _ = std::fs::remove_file(state_path.with_extension("agents"));
 }
 
+fn archive_mock_codex_server(
+    capture: &std::path::Path,
+    thread_id: &str,
+) -> Arc<crate::harness::CodexServer> {
+    if let Some(parent) = capture.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let script = format!(
+        r#"
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{}'
+  request_id=$(printf '%s\n' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$request_id"
+done
+"#,
+        capture.display()
+    );
+    crate::harness::mock_codex_server(&script, thread_id)
+}
+
+#[test]
+fn completed_turn_monitor_archives_only_terminal_completion_and_uses_owned_thread_id() {
+    let (state, _) = test_server();
+    let id = "monitor-archive-terminal";
+    let thread_id = "thread-monitor-archive";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let base = worktree_test_base("terminal-turn-archive");
+    let captured = base.join("archive-request.jsonl");
+    let server = archive_mock_codex_server(&captured, thread_id);
+    let (tx, rx) = std::sync::mpsc::channel();
+    monitor_codex_events_with_archive(
+        Arc::clone(&state.supervisor.registry),
+        Arc::clone(&state.store),
+        id.to_owned(),
+        "task-1".to_owned(),
+        "exec-1".to_owned(),
+        rx,
+        Arc::clone(&server),
+        thread_id.to_owned(),
+    );
+
+    let completion = serde_json::json!({
+        "method":"turn/completed",
+        "params":{"threadId":"notification-thread-id","turn":{"id":"turn-1","status":"completed"}}
+    });
+    tx.send(HarnessEvent::Notification {
+        value: completion.clone(),
+        terminal_turn: false,
+    })
+    .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !captured.exists(),
+        "queued follow-up completion must not archive its still-active thread"
+    );
+
+    tx.send(HarnessEvent::Notification {
+        value: completion,
+        terminal_turn: true,
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !captured.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let request: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&captured)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["method"], "thread/archive");
+    assert_eq!(request["params"]["threadId"], thread_id);
+    drop(tx);
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn recovered_running_agent_archives_its_thread_after_terminal_completion() {
+    let (state, _) = test_server();
+    let id = "recovered-archive-agent";
+    let thread_id = "thread-recovered-archive";
+    let mut record = agent_record(id);
+    record.harness = Some("codex".to_owned());
+    record.harness_session_id = Some(thread_id.to_owned());
+    state.supervisor.registry.register(record).unwrap();
+
+    let base = worktree_test_base("recovered-terminal-archive");
+    let captured = base.join("archive-request.jsonl");
+    let server = archive_mock_codex_server(&captured, thread_id);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut events = Some(rx);
+    crate::recover_native_agents(
+        &state.supervisor.registry,
+        &state.store,
+        |_| Ok((Arc::clone(&server), events.take().unwrap())),
+        |_| Ok(()),
+    );
+    tx.send(HarnessEvent::Notification {
+        value: serde_json::json!({
+            "method":"turn/completed",
+            "params":{"threadId":thread_id,"turn":{"id":"turn-1","status":"completed"}}
+        }),
+        terminal_turn: true,
+    })
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !captured.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let request: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&captured)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["method"], "thread/archive");
+    assert_eq!(request["params"]["threadId"], thread_id);
+    assert_eq!(
+        state.supervisor.registry.get(id).unwrap().state,
+        "succeeded"
+    );
+    drop(tx);
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn transcript_repair_truncates_only_an_unterminated_tail() {
     let (state, state_path) = test_server();
@@ -3834,13 +3972,15 @@ fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
 
     let mut codex_sessions = Vec::new();
     let mut opencode_sessions = Vec::new();
+    let base = worktree_test_base("recovered-agent-reattach");
+    let server = archive_mock_codex_server(&base.join("unused-archive.jsonl"), "thread-1");
     crate::recover_native_agents(
         &state.supervisor.registry,
         &state.store,
         |session_id| {
             codex_sessions.push(session_id.to_owned());
             let (_tx, rx) = std::sync::mpsc::channel();
-            Ok(rx)
+            Ok((Arc::clone(&server), rx))
         },
         |session_id| {
             opencode_sessions.push(session_id.to_owned());
@@ -3868,6 +4008,8 @@ fn native_agent_restart_recovery_reattaches_codex_and_opencode_sessions() {
             .state,
         "running"
     );
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -3878,6 +4020,9 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
     record.harness_session_id = Some("thread-recovered".to_owned());
     state.supervisor.registry.register(record).unwrap();
 
+    let base = worktree_test_base("recovered-codex-completion");
+    let archive_file = base.join("archive-request.jsonl");
+    let server = archive_mock_codex_server(&archive_file, "thread-recovered");
     crate::recover_native_agents(
         &state.supervisor.registry,
         &state.store,
@@ -3893,7 +4038,7 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
                 terminal_turn: true,
             })
             .unwrap();
-            Ok(rx)
+            Ok((Arc::clone(&server), rx))
         },
         |_| panic!("OpenCode callback should not run for a Codex agent"),
     );
@@ -3932,6 +4077,22 @@ fn recovered_codex_completion_transitions_agent_and_records_completion_events() 
         .collect();
     assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
     assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !archive_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let archive: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&archive_file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(archive["method"], "thread/archive");
+    assert_eq!(archive["params"]["threadId"], "thread-recovered");
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -3942,6 +4103,11 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
     record.harness_session_id = Some("thread-already-finished".to_owned());
     state.supervisor.registry.register(record).unwrap();
 
+    let base = worktree_test_base("recovered-codex-resume-terminal");
+    let server = archive_mock_codex_server(
+        &base.join("archive-request.jsonl"),
+        "thread-already-finished",
+    );
     crate::recover_native_agents(
         &state.supervisor.registry,
         &state.store,
@@ -3958,7 +4124,7 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
                 .expect("resume response has a persisted terminal turn");
             let (tx, rx) = std::sync::mpsc::channel();
             tx.send(event).unwrap();
-            Ok(rx)
+            Ok((Arc::clone(&server), rx))
         },
         |_| panic!("OpenCode callback should not run for a Codex agent"),
     );
@@ -3997,6 +4163,8 @@ fn recovered_codex_terminal_turn_in_resume_response_transitions_agent() {
         .collect();
     assert!(kinds.contains(&"agent_turn_completed"), "{kinds:?}");
     assert!(kinds.contains(&"process_completed"), "{kinds:?}");
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]

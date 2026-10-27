@@ -417,7 +417,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-model-te
 IFS= read -r turn_start
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-model-test"}}}'
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-model-test","turn":{"id":"turn-model-test","status":"completed"}}}'
-while IFS= read -r request; do :; done
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"thread/archive"'*)
+      printf '%s\n' "$request" > "$HOME/thread-archive.json"
+      request_id=$(printf '%s\n' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$request_id"
+      ;;
+  esac
+done
 "##,
     )
     .unwrap();
@@ -447,6 +455,15 @@ while IFS= read -r request; do :; done
         std::fs::canonicalize(&relay.dir).unwrap().to_str().unwrap()
     );
     assert_eq!(request["params"]["model"], expected_model);
+    let archive_request = relay.dir.join("thread-archive.json");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !archive_request.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let archive_request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(archive_request).unwrap()).unwrap();
+    assert_eq!(archive_request["method"], "thread/archive");
+    assert_eq!(archive_request["params"]["threadId"], "thread-model-test");
 }
 
 #[test]

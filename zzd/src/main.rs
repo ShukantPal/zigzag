@@ -126,7 +126,7 @@ fn run() -> Result<(), String> {
             state.supervisor.codex_server().and_then(|server| {
                 let events = server.subscribe_thread(session_id)?;
                 server.resume_thread(session_id)?;
-                Ok(events)
+                Ok((server, events))
             })
         },
         |session_id| {
@@ -327,8 +327,13 @@ fn recover_native_agents(
     store: &Arc<Store>,
     mut resume_codex: impl FnMut(
         &str,
-    )
-        -> Result<std::sync::mpsc::Receiver<harness::HarnessEvent>, String>,
+    ) -> Result<
+        (
+            Arc<harness::CodexServer>,
+            std::sync::mpsc::Receiver<harness::HarnessEvent>,
+        ),
+        String,
+    >,
     mut resume_opencode: impl FnMut(&str) -> Result<(), String>,
 ) {
     let native_agents: Vec<_> = registry
@@ -353,13 +358,15 @@ fn recover_native_agents(
                 }
             }
             _ => match resume_codex(&session_id) {
-                Ok(events) => crate::routes::agents::monitor_codex_events(
+                Ok((server, events)) => crate::routes::agents::monitor_codex_events_with_archive(
                     Arc::clone(registry),
                     Arc::clone(store),
                     agent.id.clone(),
                     agent.task_id.clone(),
                     agent.execution_id.clone(),
                     events,
+                    server,
+                    session_id,
                 ),
                 Err(error) => {
                     log::error!(

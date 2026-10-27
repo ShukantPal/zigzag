@@ -62,6 +62,7 @@ impl Supervisor {
         }
         *current = None;
         let server = crate::harness::CodexServer::start()?;
+        archive_completed_relay_threads(&self.registry, &server);
         *current = Some(Arc::clone(&server));
         Ok(server)
     }
@@ -117,6 +118,19 @@ impl Supervisor {
         Ok(())
     }
 }
+
+fn archive_completed_relay_threads(registry: &AgentRegistry, server: &crate::harness::CodexServer) {
+    for agent in registry.list(None, None) {
+        if agent.harness.as_deref() == Some("codex")
+            && agent.state == "succeeded"
+            && let Some(thread_id) = agent.harness_session_id.as_deref()
+            && server.archive_thread(thread_id).is_err()
+        {
+            log::warn!("could not archive completed relay Codex thread");
+        }
+    }
+}
+
 /// Admission control for inbound connections. The permit is held for the
 /// whole handler thread and released on drop, so at most `max` connections
 /// are ever in flight at once.
@@ -420,4 +434,95 @@ pub(crate) fn get(stream: &mut TcpStream, state: &Server, target: &str) -> Resul
         }
     };
     reply(stream, 200, read_json(result))
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::archive_completed_relay_threads;
+    use crate::harness::mock_codex_server;
+
+    #[test]
+    fn startup_sweep_archives_only_succeeded_codex_threads_from_registry() {
+        let base = std::env::temp_dir().join(format!(
+            "zigzag-archive-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let registry = zz::AgentRegistry::open(base.join("agents.json")).unwrap();
+        for (id, state, harness, thread_id) in [
+            (
+                "relay-done-1",
+                "succeeded",
+                Some("codex"),
+                Some("thread-done-1"),
+            ),
+            (
+                "relay-done-2",
+                "succeeded",
+                Some("codex"),
+                Some("thread-done-2"),
+            ),
+            (
+                "relay-running",
+                "running",
+                Some("codex"),
+                Some("thread-running"),
+            ),
+            (
+                "opencode-done",
+                "succeeded",
+                Some("opencode"),
+                Some("session-done"),
+            ),
+            ("no-session", "succeeded", Some("codex"), None),
+            (
+                "untyped-session",
+                "succeeded",
+                None,
+                Some("personal-session"),
+            ),
+        ] {
+            let mut record = crate::tests::agent_record(id);
+            record.state = state.to_owned();
+            record.harness = harness.map(str::to_owned);
+            record.harness_session_id = thread_id.map(str::to_owned);
+            registry.register(record).unwrap();
+        }
+
+        let captured = base.join("archive-requests.jsonl");
+        let script = format!(
+            r#"
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> '{}'
+  request_id=$(printf '%s\n' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$request_id"
+done
+"#,
+            captured.display()
+        );
+        let server = mock_codex_server(&script, "unused-thread");
+
+        archive_completed_relay_threads(&registry, &server);
+
+        let requests = std::fs::read_to_string(&captured).unwrap();
+        let requests: Vec<serde_json::Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let archived: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                assert_eq!(request["method"], "thread/archive");
+                request["params"]["threadId"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(archived, ["thread-done-1", "thread-done-2"]);
+
+        server.stop().unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
