@@ -1026,6 +1026,22 @@ fn agent_message_request(
     let Some(agent) = state.supervisor.registry.get(id) else {
         return reply(stream, 404, error("unknown_agent"));
     };
+    // A queued message on an idle Codex app-server thread is its next turn.
+    // There is no active turn for app-server's queue to attach to, so use the
+    // same persisted-thread resume and continuation path as /continue.
+    if delivery == crate::harness::Delivery::Queue
+        && agent.state == "succeeded"
+        && agent.harness.as_deref() == Some("codex")
+        && agent.harness_session_id.is_some()
+    {
+        return agent_continue_request(
+            stream,
+            state,
+            id,
+            serde_json::json!({"prompt": text}).to_string().into_bytes(),
+            resolve_session,
+        );
+    }
     if agent.state != "running" {
         return reply(stream, 409, error("agent_not_running"));
     }
