@@ -13,9 +13,11 @@ set -euo pipefail
 
 # Must match the requirement built in zzd/src/update.rs verify_codesign().
 UPDATER_REQUIREMENT='anchor apple generic and identifier "com.shukantpal.zigzag" and certificate leaf[subject.OU] = "7YZK8D3B48"'
+SIGNING_REQUIREMENT="${SIGNING_REQUIREMENT:-$UPDATER_REQUIREMENT}"
+SIGNING_TIMESTAMP="${SIGNING_TIMESTAMP:---timestamp}"
 
 binary="${1:?usage: sign-ci-release.sh BINARY}"
 codesign --force --sign "$SIGNING_IDENTITY" \
-    --identifier com.shukantpal.zigzag --options runtime --timestamp "$binary"
+    --identifier com.shukantpal.zigzag --options runtime "$SIGNING_TIMESTAMP" "$binary"
 codesign --verify --strict --deep --verbose=2 "$binary"
-codesign --verify --strict --deep --verbose=2 -R="$UPDATER_REQUIREMENT" "$binary"
+codesign --verify --strict --deep --verbose=2 -R="$SIGNING_REQUIREMENT" "$binary"
