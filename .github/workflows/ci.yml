@@ -201,11 +201,11 @@ jobs:
             -subj '/CN=Zigzag CI Test/OU=CI' \
             -addext 'keyUsage=digitalSignature' -addext 'extendedKeyUsage=codeSigning'
           openssl pkcs12 -export -out "$RUNNER_TEMP/signing.p12" \
-            -inkey "$RUNNER_TEMP/signing.key" -in "$RUNNER_TEMP/signing.crt" -passout pass:
+            -inkey "$RUNNER_TEMP/signing.key" -in "$RUNNER_TEMP/signing.crt" -passout pass:zigzag-ci
           security create-keychain -p "" "$KEYCHAIN"
           security set-keychain-settings -t 3600 -u "$KEYCHAIN"
           security unlock-keychain -p "" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -A -P "" \
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -A -P zigzag-ci \
             -T /usr/bin/codesign -T /usr/bin/security
           security list-keychains -d user -s "$KEYCHAIN" \
             $(security list-keychains -d user | tr -d '\"')
