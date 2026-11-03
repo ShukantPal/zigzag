@@ -156,7 +156,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: zzapi-macos-aarch64
           - os: ubuntu-latest
@@ -180,13 +180,53 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
+  release-validation:
+    # Exercise the real Sequoia release build and signing path on trusted
+    # same-repository PRs without publishing artifacts or a GitHub release.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable, pinned 2026-10-07
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Create ephemeral code signing identity
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing_temp.keychain-db"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/signing.key" \
+            -out "$RUNNER_TEMP/signing.crt" -days 1 \
+            -subj '/CN=Zigzag CI Test/OU=CI' \
+            -addext 'keyUsage=digitalSignature' -addext 'extendedKeyUsage=codeSigning'
+          openssl pkcs12 -export -out "$RUNNER_TEMP/signing.p12" \
+            -inkey "$RUNNER_TEMP/signing.key" -in "$RUNNER_TEMP/signing.crt" -passout pass:zigzag-ci
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -A -P zigzag-ci \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '\"')
+          rm -f "$RUNNER_TEMP/signing.key" "$RUNNER_TEMP/signing.crt" "$RUNNER_TEMP/signing.p12"
+      - name: Build and sign the ARM64 relay
+        env:
+          SIGNING_IDENTITY: Zigzag CI Test
+          SIGNING_REQUIREMENT: identifier "com.shukantpal.zigzag" and certificate leaf[subject.CN] = "Zigzag CI Test"
+          SIGNING_TIMESTAMP: --timestamp=none
+        run: |
+          cargo build --release --locked -p zigzag
+          cp target/release/zigzag zigzag-macos-aarch64
+          bash scripts/sign-ci-release.sh zigzag-macos-aarch64
+
   release:
-    # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
-    # immutable image digest. The Actions, toolchain, signed binary, and
-    # provenance below are pinned verification boundaries.
+    # GitHub exposes macos-15 as the ARM64 hosted image, not an immutable
+    # image digest. The Actions, toolchain, signed binary, and provenance
+    # below are pinned verification boundaries.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [python, rust, zzapi]
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write
       id-token: write
