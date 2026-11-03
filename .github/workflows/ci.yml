@@ -156,7 +156,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: zzapi-macos-aarch64
           - os: ubuntu-latest
@@ -181,12 +181,12 @@ jobs:
           if-no-files-found: error
 
   release:
-    # GitHub exposes macos-14 as the supported ARM64 hosted image, not an
-    # immutable image digest. The Actions, toolchain, signed binary, and
-    # provenance below are pinned verification boundaries.
+    # GitHub exposes macos-15 as the ARM64 hosted image, not an immutable
+    # image digest. The Actions, toolchain, signed binary, and provenance
+    # below are pinned verification boundaries.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [python, rust, zzapi]
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write
       id-token: write
